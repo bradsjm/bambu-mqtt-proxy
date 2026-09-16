@@ -1,0 +1,21 @@
+# Example Docker Compose deployment for bambu-mqtt-proxy.
+# Copy to compose.yaml, fill in your printers, then: docker compose up -d
+
+services:
+  bambu-mqtt-proxy:
+    image: ghcr.io/bradsjm/bambu-mqtt-proxy:latest
+    container_name: bambu-mqtt-proxy
+    restart: unless-stopped
+    ports:
+      - "8883:8883" # MQTT (TLS) — point your apps here
+      - "8080:8080" # health endpoints (/livez, /readyz, /status)
+    environment:
+      # One entry per printer, separated by ';'. Replace the placeholders.
+      BMBPX_PRINTERS: >-
+        serial=01P00A123456789,address=192.168.1.42:8883,tls=true,insecure_skip_verify=true,password=12345678;
+        serial=01S00C351100139,address=192.168.1.43:8883,tls=true,insecure_skip_verify=true,password=87654321
+      # BMBPX_LOG_LEVEL: debug
+    # Alternative: mount a YAML config file instead of BMBPX_PRINTERS.
+    # Comment out the environment block above, then uncomment:
+    # volumes:
+    #   - ./bambu-mqtt-proxy.yaml:/config/bambu-mqtt-proxy.yaml:ro

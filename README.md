@@ -77,6 +77,13 @@ docker run -d --name bambu-mqtt-proxy -p 8883:8883 -p 8080:8080 \
 Point your apps at the proxy host, port 8883, username `bblp`, and any
 configured printer's access code.
 
+### Docker Compose
+
+```sh
+cp compose.example.yaml compose.yaml   # then fill in your printers
+docker compose up -d
+```
+
 ### From source
 
 ```sh
