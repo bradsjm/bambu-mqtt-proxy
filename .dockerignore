@@ -1,0 +1,6 @@
+.git
+certs/
+bambu-mqtt-proxy
+bambu-mqtt-proxy.yaml
+config.example.yaml
+*.test

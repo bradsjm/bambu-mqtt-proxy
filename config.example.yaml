@@ -1,0 +1,48 @@
+# bambu-mqtt-proxy example configuration.
+# Copy to bambu-mqtt-proxy.yaml and edit the printers section.
+
+listen:
+  # Default: the port every Bambu app expects. TLS with a self-signed
+  # certificate that is generated here on first start (clients skip
+  # verification, as they do against the printer).
+  - port: 8883
+    tls: true
+    cert_file: ./certs/proxy.crt
+    key_file: ./certs/proxy.key
+  # Optional extra listener for custom dashboards:
+  # - port: 1883
+  #   tls: false
+
+auth:
+  # printer:     require username bblp and a password matching any
+  #              configured access code (recommended).
+  # accept_all:  allow any CONNECT.
+  mode: printer
+
+# One entry per printer. The serial routes traffic: clients talk to
+# device/{serial}/report and device/{serial}/request.
+printers:
+  - serial: "01P00A123456789"
+    address: "192.168.1.42:8883"
+    tls: true
+    insecure_skip_verify: true
+    username: "bblp"
+    password: "12345678"
+  # Non-standard endpoint (custom firmware or fronting relay):
+  # - serial: "01P00A987654321"
+  #   address: "192.168.1.43:1883"
+  #   tls: false
+  #   username: "bblp"
+  #   password: "87654321"
+
+behavior:
+  qos_max: 1
+  warmup_commands:
+    - '{"pushing":{"sequence_id":"0","command":"pushall"}}'
+  upstream_keepalive_seconds: 30
+  upstream_connect_timeout_seconds: 5
+  upstream_backoff_initial_seconds: 1
+  upstream_backoff_max_seconds: 30
+
+log:
+  level: info # debug logs per-packet routing decisions
