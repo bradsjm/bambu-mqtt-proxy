@@ -50,7 +50,7 @@ type Server struct {
 // listener per configured port (TLS with a generated or loaded self-signed
 // certificate where enabled).
 func New(cfg *config.Config, table *routing.Table, pool *upstream.Pool, inject *Injector, log *slog.Logger) (*Server, error) {
-	srv := mqtt.New(&mqtt.Options{InlineClient: true})
+	srv := mqtt.New(&mqtt.Options{InlineClient: true, Logger: log})
 	srv.Options.Capabilities.MaximumQos = cfg.Behavior.QoSMax
 
 	if err := srv.AddHook(newBridge(cfg, table, pool, log), nil); err != nil {
