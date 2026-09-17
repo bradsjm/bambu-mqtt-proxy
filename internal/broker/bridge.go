@@ -61,6 +61,7 @@ func (b *Bridge) Provides(k byte) bool {
 	return bytes.Contains([]byte{
 		mqtt.OnConnectAuthenticate,
 		mqtt.OnACLCheck,
+		mqtt.OnConnect,
 		mqtt.OnSubscribed,
 		mqtt.OnUnsubscribed,
 		mqtt.OnDisconnect,
@@ -79,6 +80,15 @@ func (b *Bridge) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool 
 	}
 	_, ok := b.accessCodes[string(pk.Connect.Password)]
 	return ok
+}
+
+// OnConnect logs downstream client connections for state visibility.
+func (b *Bridge) OnConnect(cl *mqtt.Client, _ packets.Packet) error {
+	if cl.Net.Inline {
+		return nil
+	}
+	b.log.Info("client connected", "client", cl.ID, "remote", cl.Net.Remote)
+	return nil
 }
 
 // OnACLCheck enforces the topic contract. Writes must be
@@ -117,10 +127,16 @@ func (b *Bridge) OnSubscribed(cl *mqtt.Client, pk packets.Packet, reasonCodes []
 		if i >= len(reasonCodes) || reasonCodes[i] >= 0x80 {
 			continue
 		}
+		printers := b.table.PrintersFor(sub.Filter)
 		b.recordFilter(cl, sub.Filter, true)
-		for _, serial := range b.table.PrintersFor(sub.Filter) {
+		for _, serial := range printers {
 			b.pool.Subscribe(serial, sub.Filter, sub.Qos)
 		}
+		b.log.Info("client subscribed",
+			"client", cl.ID,
+			"filter", sub.Filter,
+			"printers", strings.Join(printers, ","),
+			"qos", sub.Qos)
 	}
 }
 
@@ -131,9 +147,11 @@ func (b *Bridge) OnUnsubscribed(cl *mqtt.Client, pk packets.Packet) {
 	}
 	for _, sub := range pk.Filters {
 		if b.recordFilter(cl, sub.Filter, false) {
-			for _, serial := range b.table.PrintersFor(sub.Filter) {
+			printers := b.table.PrintersFor(sub.Filter)
+			for _, serial := range printers {
 				b.pool.Unsubscribe(serial, sub.Filter)
 			}
+			b.log.Info("client unsubscribed", "client", cl.ID, "filter", sub.Filter, "printers", strings.Join(printers, ","))
 		}
 	}
 }
@@ -148,6 +166,7 @@ func (b *Bridge) OnDisconnect(cl *mqtt.Client, err error, expire bool) {
 	filters, ok := b.clients[cl]
 	delete(b.clients, cl)
 	b.mu.Unlock()
+	b.log.Info("client disconnected", "client", cl.ID, "reason", cleanErr(err), "filters", len(filters))
 	if !ok {
 		return
 	}
@@ -171,8 +190,17 @@ func (b *Bridge) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, 
 	if len(serials) == 0 {
 		return pk, packets.CodeSuccessIgnore
 	}
+	b.log.Debug("request forwarded", "client", cl.ID, "serial", serials[0], "bytes", len(pk.Payload))
 	b.pool.Publish(serials[0], pk.TopicName, pk.Payload, pk.FixedHeader.Qos)
 	return pk, packets.CodeSuccessIgnore
+}
+
+// cleanErr renders a disconnect reason without a nil error string.
+func cleanErr(err error) string {
+	if err == nil {
+		return "clean"
+	}
+	return err.Error()
 }
 
 // recordFilter adds or removes filter in the client's granted set; it reports

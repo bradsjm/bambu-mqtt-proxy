@@ -123,6 +123,7 @@ func (p *Pool) conn(serial string) *Conn {
 	if !ok {
 		c = newConn(p.specs[serial], p.behavior, p.inject, p.log)
 		p.conns[serial] = c
+		p.log.Info("upstream state created", "serial", serial, "address", c.spec.Address)
 	}
 	return c
 }
@@ -190,6 +191,11 @@ func (s *subRefs) snapshot() map[string]byte {
 	return out
 }
 
+// count returns the number of downstream clients sharing one filter.
+func (s *subRefs) count(filter string) int {
+	return s.refs[filter].count
+}
+
 // Conn is the single upstream MQTT connection for one printer. The supervisor
 // retries the initial connect with capped exponential backoff; after the first
 // success paho AutoReconnect owns outage recovery (bounded by
@@ -213,6 +219,8 @@ type Conn struct {
 	backoffN  int
 	nextRetry time.Time
 	connCh    chan struct{} // closed (and replaced) on every successful connect
+	// lastFailureAt records the latest paho failure for reconnect delay logging.
+	lastFailureAt time.Time
 }
 
 // newConn builds the connection state for one printer.
@@ -281,6 +289,7 @@ func (c *Conn) supervise() {
 			c.client = c.newClientLocked()
 		}
 		client := c.client
+		attempt := c.backoffN + 1
 		c.mu.Unlock()
 
 		tok := client.Connect()
@@ -297,17 +306,24 @@ func (c *Conn) supervise() {
 		if ok {
 			c.backoffN = 0
 			c.nextRetry = time.Time{}
+			c.lastFailureAt = time.Time{}
 			close(c.connCh)
 			c.connCh = make(chan struct{})
 			c.mu.Unlock()
-			c.log.Info("upstream connected", "serial", c.spec.Serial, "address", c.spec.Address)
+			c.log.Info("upstream connected", "serial", c.spec.Serial, "address", c.spec.Address, "attempt", attempt)
 			return
 		}
 		c.backoffN++
 		d := nextBackoff(c.backoffN, c.backoffInit, c.backoffMax)
 		c.nextRetry = time.Now().Add(d)
 		c.mu.Unlock()
-		c.log.Warn("upstream connect failed", "serial", c.spec.Serial, "address", c.spec.Address, "retry_in", d.String(), "error", errString(connErr))
+		c.log.Info("upstream backoff scheduled",
+			"serial", c.spec.Serial,
+			"address", c.spec.Address,
+			"state", "BACKOFF",
+			"attempt", attempt,
+			"retry_in", d.String(),
+			"error", errString(connErr))
 
 		select {
 		case <-time.After(d):
@@ -325,28 +341,86 @@ func (c *Conn) onConnect(_ mqtt.Client) {
 	client := c.client
 	c.mu.Unlock()
 
+	restored := 0
+	pending := 0
 	for f, q := range subs {
 		tok := client.Subscribe(f, q, c.onMessage)
 		if !tok.WaitTimeout(c.connectTO) {
 			// Fire-and-forget: the command was handed to the connection; a
 			// slow broker ack may trail the wait budget.
+			pending++
 			continue
 		}
 		if err := tok.Error(); err != nil {
 			c.log.Warn("upstream resubscribe failed", "serial", c.spec.Serial, "filter", f, "error", errString(tok.Error()))
+			continue
 		}
+		restored++
 	}
+	if len(subs) > 0 {
+		c.log.Info("upstream subscriptions restored",
+			"serial", c.spec.Serial,
+			"filters", len(subs),
+			"restored", restored,
+			"pending", pending)
+	}
+	warmupSent := 0
 	for _, cmd := range c.warmup {
 		tok := client.Publish(c.requestTopic(), 1, false, []byte(cmd))
 		if !tok.WaitTimeout(c.connectTO) || tok.Error() != nil {
 			c.log.Warn("upstream warmup failed", "serial", c.spec.Serial, "error", errString(tok.Error()))
+			continue
 		}
+		warmupSent++
+	}
+	if len(c.warmup) > 0 {
+		c.log.Info("upstream warmup complete", "serial", c.spec.Serial, "commands", len(c.warmup), "acknowledged", warmupSent)
 	}
 }
 
 // onLost is the paho ConnectionLost callback.
 func (c *Conn) onLost(_ mqtt.Client, err error) {
-	c.log.Warn("upstream connection lost", "serial", c.spec.Serial, "error", errString(err))
+	c.mu.Lock()
+	c.lastFailureAt = time.Now()
+	c.mu.Unlock()
+	c.log.Warn("upstream connection lost",
+		"serial", c.spec.Serial,
+		"state", "RECONNECTING",
+		"backoff_max", c.backoffMax.String(),
+		"error", errString(err))
+}
+
+// onConnectionNotification logs paho connection attempts and failures,
+// including the measured delay between automatic reconnect attempts.
+func (c *Conn) onConnectionNotification(_ mqtt.Client, notification mqtt.ConnectionNotification) {
+	switch n := notification.(type) {
+	case mqtt.ConnectionNotificationConnecting:
+		state := "CONNECTING"
+		retryAfter := ""
+		if n.IsReconnect {
+			state = "RECONNECTING"
+			c.mu.Lock()
+			if !c.lastFailureAt.IsZero() {
+				retryAfter = time.Since(c.lastFailureAt).Round(time.Millisecond).String()
+			}
+			c.mu.Unlock()
+		}
+		c.log.Info("upstream connection attempt",
+			"serial", c.spec.Serial,
+			"address", c.spec.Address,
+			"state", state,
+			"attempt", n.Attempt+1,
+			"retry_after", retryAfter)
+	case mqtt.ConnectionNotificationFailed:
+		c.mu.Lock()
+		c.lastFailureAt = time.Now()
+		c.mu.Unlock()
+		c.log.Info("upstream connection attempt failed",
+			"serial", c.spec.Serial,
+			"address", c.spec.Address,
+			"state", "BACKOFF",
+			"error", errString(n.Reason))
+	}
 }
 
 // onMessage forwards an upstream report into the downstream broker; the broker
@@ -386,10 +460,15 @@ func (c *Conn) subscribe(filter string, qos byte) {
 	client := c.client
 	c.mu.Unlock()
 	tok := client.Subscribe(filter, qos, c.onMessage)
-	if !tok.WaitTimeout(c.connectTO) || tok.Error() != nil {
-		// Recorded; onConnect resubscribes after the next recovery.
-		c.log.Warn("upstream subscribe failed", "serial", c.spec.Serial, "filter", filter, "error", errString(tok.Error()))
+	if tok.WaitTimeout(c.connectTO) && tok.Error() == nil {
+		c.mu.Lock()
+		refs := c.subs.count(filter)
+		c.mu.Unlock()
+		c.log.Info("upstream subscribed", "serial", c.spec.Serial, "filter", filter, "refs", refs, "qos", qos)
+		return
 	}
+	// Recorded; onConnect resubscribes after the next recovery.
+	c.log.Warn("upstream subscribe failed", "serial", c.spec.Serial, "filter", filter, "error", errString(tok.Error()))
 }
 
 // unsubscribe removes one interest; the last removal unsubscribes upstream.
@@ -401,9 +480,11 @@ func (c *Conn) unsubscribe(filter string) {
 
 	if last && connected {
 		tok := client.Unsubscribe(filter)
-		if !tok.WaitTimeout(c.connectTO) || tok.Error() != nil {
-			c.log.Warn("upstream unsubscribe failed", "serial", c.spec.Serial, "filter", filter, "error", errString(tok.Error()))
+		if tok.WaitTimeout(c.connectTO) && tok.Error() == nil {
+			c.log.Info("upstream unsubscribed", "serial", c.spec.Serial, "filter", filter)
+			return
 		}
+		c.log.Warn("upstream unsubscribe failed", "serial", c.spec.Serial, "filter", filter, "error", errString(tok.Error()))
 	}
 }
 
@@ -480,6 +561,7 @@ func (c *Conn) newClientLocked() mqtt.Client {
 		SetPingTimeout(10 * time.Second).
 		SetOrderMatters(false).
 		SetOnConnectHandler(c.onConnect).
+		SetConnectionNotificationHandler(c.onConnectionNotification).
 		SetConnectionLostHandler(c.onLost)
 	if c.spec.TLS {
 		opts.SetTLSConfig(&tls.Config{InsecureSkipVerify: c.spec.InsecureSkipVerify})

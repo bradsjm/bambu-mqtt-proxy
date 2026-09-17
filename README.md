@@ -127,8 +127,14 @@ log:
 | `BMBPX_LISTEN_TLS` | `true` | TLS on the downstream listener |
 | `BMBPX_CERT_FILE` / `BMBPX_KEY_FILE` | *(empty)* | Empty = ephemeral in-memory self-signed certificate |
 | `BMBPX_AUTH_MODE` | `printer` | `printer` or `accept_all` |
-| `BMBPX_LOG_LEVEL` | `info` | `debug` logs every routing decision |
+| `BMBPX_LOG_LEVEL` | `info` | `info` logs client/upstream state, subscriptions, retries, and backoffs; `debug` adds per-packet routing |
 | `BMBPX_HEALTH_PORT` | `8080` in image, `0` elsewhere | Health endpoint port |
+
+At the default `info` level, logs identify downstream clients by MQTT client ID
+and remote address, show which configured printers each client subscribes to,
+and report upstream connection attempts, recovery, merged subscriptions,
+warmup commands, retries, and measured reconnect delays. Use `debug` when
+per-packet request routing is also required.
 
 ## Health
 
