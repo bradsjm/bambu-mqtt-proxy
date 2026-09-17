@@ -366,7 +366,7 @@ func (c *Conn) onConnect(_ mqtt.Client) {
 	}
 	warmupSent := 0
 	for _, cmd := range c.warmup {
-		tok := client.Publish(c.requestTopic(), 1, false, []byte(cmd))
+		tok := client.Publish(c.requestTopic(), 0, false, []byte(cmd))
 		if !tok.WaitTimeout(c.connectTO) || tok.Error() != nil {
 			c.log.Warn("upstream warmup failed", "serial", c.spec.Serial, "error", errString(tok.Error()))
 			continue
@@ -374,7 +374,7 @@ func (c *Conn) onConnect(_ mqtt.Client) {
 		warmupSent++
 	}
 	if len(c.warmup) > 0 {
-		c.log.Info("upstream warmup complete", "serial", c.spec.Serial, "commands", len(c.warmup), "acknowledged", warmupSent)
+		c.log.Info("upstream warmup complete", "serial", c.spec.Serial, "commands", len(c.warmup), "sent", warmupSent)
 	}
 }
 
@@ -433,12 +433,22 @@ func (c *Conn) onMessage(_ mqtt.Client, msg mqtt.Message) {
 	c.inject.PublishDownstream(msg.Topic(), msg.Payload(), qos)
 }
 
+// reportFilter maps a downstream filter to this printer's exact report topic;
+// request-only filters are not subscribed upstream.
+func (c *Conn) reportFilter(filter string) string {
+	if strings.HasSuffix(filter, "/request") {
+		return ""
+	}
+	return fmt.Sprintf("device/%s/report", c.spec.Serial)
+}
+
 // subscribe records the filter and subscribes upstream when connected.
 func (c *Conn) subscribe(filter string, qos byte) {
 	// Upstream subscriptions cover report-leaf filters only. Subscribing to
 	// request filters upstream would make the printer broker echo proxied
 	// requests back to the proxy and out to downstream subscribers.
-	if !strings.HasSuffix(filter, "/report") {
+	filter = c.reportFilter(filter)
+	if filter == "" {
 		return
 	}
 	if qos > 1 {
@@ -473,6 +483,10 @@ func (c *Conn) subscribe(filter string, qos byte) {
 
 // unsubscribe removes one interest; the last removal unsubscribes upstream.
 func (c *Conn) unsubscribe(filter string) {
+	filter = c.reportFilter(filter)
+	if filter == "" {
+		return
+	}
 	c.mu.Lock()
 	last := c.subs.remove(filter)
 	client, connected := c.client, c.connectedLocked()
