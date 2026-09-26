@@ -164,7 +164,17 @@ served; with `http.port: 0` no HTTP server starts at all.
 | `/camera/{serial}/snapshot` | Single JPEG frame (P1/A1 camera protocol, port 6000) |
 | `/camera/{serial}/stream` | Live multipart MJPEG stream |
 | `/camera/status` | Display state for every printer (no credentials) |
-| `/overlay` | Browser wall: camera images layered with live printer state |
+| `/overlay` | Streaming overlay wall |
+| `/camwall` | Multi-printer camera wall with status chips and live/snapshot/off modes |
+
+The Cam Wall polls printer state every 5 seconds. It streams up to four visible,
+connected printer cameras at a time; other visible tiles use snapshots, while
+off-screen and disconnected tiles do not hold camera connections. The toolbar
+sets the live-stream cap (1–16), snapshot refresh interval (2–60 seconds), and
+status overlay (`off`, `compact`, or `full`). Settings persist in that browser.
+`full` mode adds the filename, progress, layer count, remaining time, and
+temperature details. The existing `/overlay` page remains a full-screen wall
+for streaming use.
 
 Camera capture is restricted to models that use the Bambu chamber image
 protocol: `P1P`, `P1S`, `A1`, and `A1MINI`. Support is auto-detected from the
@@ -175,6 +185,9 @@ unknown prefixes) answer `404` (unknown serial) or `422` (unsupported model)
 without ever opening a camera socket. Camera and overlay endpoints are
 unauthenticated by design — anyone who can reach the HTTP port can view
 cameras and telemetry, and the state endpoint never includes credentials.
+Chamber temperature is shown only for models known to have a physical chamber
+sensor (including X1/X2/P2/H2 models). P1 and A1 models omit the chamber
+reading even if their MQTT report contains `chamber_temper`.
 
 ## Security notes
 

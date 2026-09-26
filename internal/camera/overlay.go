@@ -71,6 +71,10 @@ func (r *StatusRenderer) Tiles() []Tile {
 		if strings.TrimSpace(model) == "" {
 			model = config.ModelFromSerial(st.Serial)
 		}
+		chamberTemp := st.ChamberTemp
+		if !config.ChamberTemperatureSupported(st.Model, st.Serial) {
+			chamberTemp = nil
+		}
 		t := Tile{
 			Serial:       st.Serial,
 			Model:        model,
@@ -86,7 +90,7 @@ func (r *StatusRenderer) Tiles() []Tile {
 			NozzleTarget: st.NozzleTarget,
 			BedTemp:      st.BedTemp,
 			BedTarget:    st.BedTarget,
-			ChamberTemp:  st.ChamberTemp,
+			ChamberTemp:  chamberTemp,
 		}
 		if f := r.cameras.Latest(st.Serial); f != nil {
 			t.FrameAge = time.Since(f.Captured).Seconds()
@@ -97,7 +101,7 @@ func (r *StatusRenderer) Tiles() []Tile {
 	return tiles
 }
 
-// RegisterStatus mounts /camera/status and /overlay on the shared mux.
+// RegisterStatus mounts /camera/status, /overlay and /camwall on the shared mux.
 func (r *StatusRenderer) RegisterStatus(mux *http.ServeMux) {
 	mux.HandleFunc("GET /camera/status", func(w http.ResponseWriter, _ *http.Request) {
 		noStore(w)
@@ -106,9 +110,11 @@ func (r *StatusRenderer) RegisterStatus(mux *http.ServeMux) {
 		sort.Slice(list, func(i, j int) bool { return list[i].Serial < list[j].Serial })
 		_ = json.NewEncoder(w).Encode(map[string]any{"printers": list})
 	})
-	mux.HandleFunc("GET /overlay", func(w http.ResponseWriter, _ *http.Request) {
+	wall := func(w http.ResponseWriter, _ *http.Request) {
 		noStore(w)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write(overlayHTML)
-	})
+	}
+	mux.HandleFunc("GET /overlay", wall)
+	mux.HandleFunc("GET /camwall", wall)
 }

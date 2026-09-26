@@ -48,6 +48,30 @@ func TestCameraEligible(t *testing.T) {
 	}
 }
 
+// TestChamberTemperatureSupported matches the physical sensor whitelist:
+// P1/A1 reports must not make the wall display a meaningless chamber value.
+func TestChamberTemperatureSupported(t *testing.T) {
+	for _, model := range []string{"P1P", "P1S", "A1", "A1MINI", "A1 Mini"} {
+		if ChamberTemperatureSupported(model, "") {
+			t.Errorf("%s must not report chamber temperature", model)
+		}
+	}
+	for _, model := range []string{"X1", "X1C", "X1E", "X2D", "P2S", "H2C", "H2D", "H2DPRO", "H2S", "O1C", "N7"} {
+		if !ChamberTemperatureSupported(model, "") {
+			t.Errorf("%s has a chamber sensor", model)
+		}
+	}
+	if ChamberTemperatureSupported("", "01S00C351100139") {
+		t.Fatal("model-less P1S serial must not expose chamber temperature")
+	}
+	if ChamberTemperatureSupported("", "00M09A123456789") {
+		t.Fatal("X1C serial prefix alone must not infer chamber sensor support")
+	}
+	if !ChamberTemperatureSupported("X1C", "01S00C351100139") {
+		t.Fatal("explicit model must override serial-derived P1S")
+	}
+}
+
 // TestPortZeroDisablesHTTP pins the documented contract: an explicit
 // http.port 0 (YAML or env) survives defaults and disables HTTP.
 func TestPortZeroDisablesHTTP(t *testing.T) {

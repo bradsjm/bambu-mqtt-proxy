@@ -168,11 +168,27 @@ HTTP surface (all on the shared `http.port` listener, unauthenticated by design)
 | `GET /camera/{serial}/snapshot` | Freshest frame younger than 5 s from the shared buffer; otherwise waits up to 15 s for a new frame; 503 if none arrives |
 | `GET /camera/{serial}/stream` | Multipart MJPEG; complete parts flushed per frame; survives printer outages while the client stays connected |
 | `GET /camera/status` | Display state for every printer (state, filename, progress, layers, temperatures, frame age). No credentials, no addresses |
-| `GET /overlay` | Embedded single-page camera wall; polls `/camera/status` every 2 s; composites camera images with telemetry in the browser |
+| `GET /overlay` | Full-screen streaming overlay; composites camera images with telemetry in the browser |
+| `GET /camwall` | Multi-printer camera wall with status chips and live/snapshot/off modes |
+
+The Cam Wall polls status every 5 s. It uses a stable printer-ordered live
+budget (default 4, configurable 1–16), snapshots for other visible eligible
+printers, and no camera connection for off-screen or disconnected tiles.
+Snapshot refresh defaults to 8 s and is configurable from 2–60 s. The status
+overlay supports `off`, `compact`, and `full` modes. Settings persist in the
+browser's local storage. There is no token-authenticated kiosk mode: the proxy
+has no user/session system, and these camera routes are intentionally open on
+the configured HTTP interface.
 
 Eligibility is checked before any camera socket is opened, with no operator configuration required: the model is inferred from the serial prefix (01P→P1P, 01S→P1S, 030→A1 MINI, 039→A1; 01P/01S verified against live printers), and an explicit `model` field overrides the inference when present. Unknown serial → 404; non-chamber-image printers (X1-class RTSP, unknown prefixes) → 422. Camera capture never affects MQTT proxying. A disabled camera feature (`BMBPX_CAMERA_ENABLED=false`) removes the routes, stops capture workers, and skips the overlay's per-printer report subscriptions, which are otherwise held asynchronously so HTTP starts without waiting for printers.
 
 Telemetry for `/camera/status` comes from a delta-merging cache that observes upstream reports through the pool observer hook. Merges apply only fields present in each report; P1 `pushall` warmup supplies the initial full state. The cache never feeds back into MQTT forwarding.
+
+Chamber temperature is model-filtered before `/camera/status` is serialized.
+P1P/P1S and A1/A1 MINI do not have this sensor, and their reported
+`chamber_temper` value is meaningless; the field is omitted for those models.
+Only known chamber-sensor models expose it. Unknown model capability defaults
+to hidden rather than displaying a possibly invalid reading.
 
 ## 7. Routing model (core)
 

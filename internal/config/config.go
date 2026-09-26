@@ -175,6 +175,29 @@ func CameraEligible(model, serial string) bool {
 	return CameraSupported(ModelFromSerial(serial))
 }
 
+// chamberTemperatureModels lists printer models with a physical chamber
+// temperature sensor. P1 and A1 series report a meaningless chamber value,
+// so they are deliberately absent. This list follows Bambuddy's
+// CHAMBER_TEMP_SUPPORTED_MODELS source set.
+var chamberTemperatureModels = map[string]struct{}{
+	"X1": {}, "X1C": {}, "X1E": {},
+	"X2D": {}, "P2S": {},
+	"H2C": {}, "H2D": {}, "H2DPRO": {}, "H2S": {},
+	"BL-P001": {}, "C13": {}, "N6": {},
+	"O1D": {}, "O1C": {}, "O1C2": {}, "O1S": {}, "O1E": {}, "O2D": {}, "N7": {},
+}
+
+// ChamberTemperatureSupported reports whether this printer model has a
+// physical chamber temperature sensor. Explicit models take precedence;
+// without one, only a serial-derived model can establish support.
+func ChamberTemperatureSupported(model, serial string) bool {
+	if strings.TrimSpace(model) == "" {
+		model = ModelFromSerial(serial)
+	}
+	_, ok := chamberTemperatureModels[NormalizeModel(model)]
+	return ok
+}
+
 // CameraEnabled reports whether the camera and overlay routes should be
 // served. Cameras are enabled unless explicitly disabled.
 func (c *Config) CameraEnabled() bool {

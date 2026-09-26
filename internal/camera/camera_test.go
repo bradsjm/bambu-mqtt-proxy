@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -15,7 +17,14 @@ import (
 	"time"
 
 	"bambu-mqtt-proxy/internal/config"
+	"bambu-mqtt-proxy/internal/telemetry"
 )
+
+// testConnectivity is an empty upstream-status source for route tests.
+type testConnectivity struct{}
+
+// Status returns no connected printers for route tests.
+func (testConnectivity) Status() map[string]bool { return map[string]bool{} }
 
 // discardLogger keeps test output quiet.
 func discardLogger() *slog.Logger {
@@ -259,6 +268,85 @@ func TestStreamWritesMultipart(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("stream handler did not return after client hangup")
+	}
+}
+
+// TestCamWallAndOverlayRoutesServeEmbeddedWall asserts that both page routes
+// expose the same embedded wall and no-store response headers.
+func TestCamWallAndOverlayRoutesServeEmbeddedWall(t *testing.T) {
+	printers := []config.Printer{
+		{
+			Serial:   "01S00C351100139",
+			Model:    "P1S",
+			Address:  "127.0.0.1:8883",
+			Username: "bblp",
+			Password: "secret-test-only",
+		},
+		{
+			Serial:   "00M09A123456789",
+			Model:    "X1C",
+			Address:  "127.0.0.1:8884",
+			Username: "bblp",
+			Password: "another-secret",
+		},
+	}
+	manager := NewManager(printers, discardLogger())
+	state := telemetry.NewCache(printers, discardLogger())
+	state.Observe("01S00C351100139", []byte(`{"print":{"chamber_temper":5.0}}`))
+	state.Observe("00M09A123456789", []byte(`{"print":{"chamber_temper":24.0}}`))
+	renderer := NewStatusRenderer(manager, state, testConnectivity{})
+	mux := http.NewServeMux()
+	renderer.RegisterStatus(mux)
+
+	pages := make(map[string]string, 2)
+	for _, path := range []string{"/overlay", "/camwall"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d, want 200", path, w.Code)
+		}
+		if w.Header().Get("Cache-Control") != "no-store" {
+			t.Errorf("GET %s Cache-Control = %q", path, w.Header().Get("Cache-Control"))
+		}
+		if !strings.HasPrefix(w.Header().Get("Content-Type"), "text/html") {
+			t.Errorf("GET %s Content-Type = %q", path, w.Header().Get("Content-Type"))
+		}
+		pages[path] = w.Body.String()
+	}
+	if pages["/overlay"] != pages["/camwall"] {
+		t.Fatal("/camwall and /overlay must serve the same wall page")
+	}
+	if !strings.Contains(pages["/camwall"], "camera/status") {
+		t.Fatal("embedded wall does not load camera status")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/camera/status", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	var payload struct {
+		Printers []Tile `json:"printers"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode /camera/status: %v", err)
+	}
+	if len(payload.Printers) != 2 {
+		t.Fatalf("camera status tiles = %+v", payload.Printers)
+	}
+	tiles := make(map[string]Tile, len(payload.Printers))
+	for _, tile := range payload.Printers {
+		tiles[tile.Serial] = tile
+	}
+	p1s, ok := tiles["01S00C351100139"]
+	if !ok || !p1s.CameraOK || p1s.ChamberTemp != nil {
+		t.Fatalf("P1S tile must be camera-supported and omit chamber temp: %+v", p1s)
+	}
+	x1c, ok := tiles["00M09A123456789"]
+	if !ok || x1c.CameraOK || x1c.ChamberTemp == nil || *x1c.ChamberTemp != 24 {
+		t.Fatalf("X1C tile must retain its valid chamber temp: %+v", x1c)
+	}
+	if strings.Contains(w.Body.String(), "secret-test-only") || strings.Contains(w.Body.String(), "another-secret") || strings.Contains(w.Body.String(), "127.0.0.1") {
+		t.Fatal("Cam Wall status leaked credentials or printer address")
 	}
 }
 
