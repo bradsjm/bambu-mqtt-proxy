@@ -174,13 +174,17 @@ body.kiosk .bar { display: none; }
              border: 1px solid color-mix(in srgb, var(--sev) 40%, transparent); }
 .alert-row .ic { color: var(--sev); font-size: 1rem; }
 .alert-row .alert-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.alert-row .alert-code { color: inherit; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .92em; }
+.alert-row a:hover { text-decoration: underline; }
 [data-sev="fatal"], [data-sev="serious"], [data-sev="error"] { --sev: var(--failed); }
 [data-sev="common"] { --sev: var(--paused); }
 [data-sev="warning"] { --sev: var(--paused); }
 [data-sev="info"] { --sev: var(--preparing); }
 code { font: .74rem ui-monospace, SFMono-Regular, Menlo, monospace; }
 .alert-list { margin: 0; padding: 0; list-style: none; display: grid; gap: .2rem; }
-.alert-list li { display: flex; align-items: center; gap: .4rem; }
+.alert-list li { display: flex; align-items: center; gap: .4rem; flex-wrap: wrap; }
+.alert-list a { color: inherit; }
+.alert-list .alert-fix { flex-basis: 100%; color: var(--dim); font-size: .78rem; }
 .alert-list li::before { content: ""; width: .5rem; height: .5rem; border-radius: 50%; background: var(--sev, var(--dim)); flex: none; }
 .alert-list small { color: var(--dim); }
 .activity h3 { margin: 0 0 .3rem; color: var(--dim); font-size: .8rem; font-weight: 650; }
@@ -441,7 +445,7 @@ const STATES = {
 };
 const ATTENTION = { label: "Needs attention", icon: "i-bell" };
 const FILTER_KEYS = ["attention", ...Object.keys(STATES)];
-const SEVERITY_RANK = { fatal: 4, serious: 3, error: 3, common: 2, info: 1, unknown: 1 };
+const SEVERITY_RANK = { fatal: 4, serious: 3, error: 3, common: 2, warning: 2, info: 1, unknown: 1 };
 const grid = document.getElementById("grid");
 const params = new URLSearchParams(location.search);
 const kiosk = params.get("kiosk") === "1";
@@ -635,8 +639,8 @@ function detectAlerts(d, b) {
 // Print errors and HMS alerts, most severe first, with detection findings in
 // the same row without masking severe HMS.
 function alertsOf(p) {
-  const list = (p.hms || []).map(h => ({ code: h.code, severity: h.severity, prio: 0, label: "HMS alert" }));
-  if (p.print_error) list.push({ code: p.print_error, severity: "error", prio: 0, label: "Print error" });
+  const list = (p.hms || []).map(h => ({ code: h.code, severity: h.severity, prio: 0, label: "HMS alert", text: h.text, fix: h.fix, url: h.url }));
+  if (p.print_error) list.push({ code: p.print_error, severity: p.print_error_severity || "error", prio: 0, label: "Print error", text: p.print_error_text, fix: p.print_error_fix, url: p.print_error_url });
   const d = detectOf(p);
   if (d) list.push(...detectAlerts(d, bucket(p)));
   return list.sort((a, b) => (SEVERITY_RANK[b.severity] || 0) - (SEVERITY_RANK[a.severity] || 0) ||
@@ -922,10 +926,25 @@ function renderTile(t) {
   if (alerts.length) {
     const top = alerts[0];
     r.alertRow.dataset.sev = top.severity;
-    r.alertText.textContent = (top.text ?? `${top.label} ${top.code}`) +
-      `${top.sevHidden || top.severity === "error" ? "" : ` · ${top.severity}`}` +
-      `${alerts.length > 1 ? ` · +${alerts.length - 1} more` : ""}`;
-    r.alertRow.title = alerts.map(a => a.text ?? `${a.label} ${a.code} (${a.severity})`).join("\n");
+    // Human description first, then the raw code linked to Printara3D's
+    // lookup; codes without a dataset entry still carry the link.
+    r.alertText.replaceChildren();
+    if (top.text != null) r.alertText.append(top.text);
+    if (top.code) {
+      if (top.text != null) r.alertText.append(" · ");
+      const ref = document.createElement("a");
+      ref.className = "alert-code";
+      ref.href = top.url;
+      ref.target = "_blank";
+      ref.rel = "noopener";
+      ref.textContent = top.code;
+      r.alertText.append(ref);
+    }
+    if (!(top.sevHidden || top.severity === "error")) r.alertText.append(` · ${top.severity}`);
+    if (alerts.length > 1) r.alertText.append(` · +${alerts.length - 1} more`);
+    r.alertRow.title = alerts
+      .map(a => a.text ? `${a.text}${a.code ? ` (${a.code})` : ""}` : `${a.label} ${a.code} (${a.severity})`)
+      .join("\n");
   }
 
   // Detection rendering: a compact badge on the stage, inspection details at
@@ -1000,8 +1019,28 @@ function renderTile(t) {
       const code = document.createElement("code");
       code.textContent = a.text ?? a.code;
       const note = document.createElement("small");
-      if (!a.text) note.textContent = a.severity === "error" ? a.label.toLowerCase() : a.severity;
-      li.append(code, note);
+      if (a.text) {
+        if (a.code) note.textContent = a.code;
+      } else {
+        note.textContent = a.severity === "error" ? a.label.toLowerCase() : a.severity;
+      }
+      if (a.url) {
+        const ref = document.createElement("a");
+        ref.href = a.url;
+        ref.target = "_blank";
+        ref.rel = "noopener";
+        ref.append(code);
+        li.append(ref);
+      } else {
+        li.append(code);
+      }
+      if (a.fix) {
+        const fix = document.createElement("div");
+        fix.className = "alert-fix";
+        fix.textContent = a.fix;
+        li.append(fix);
+      }
+      li.append(note);
       list.append(li);
     }
     r.fAlerts.replaceChildren(list);

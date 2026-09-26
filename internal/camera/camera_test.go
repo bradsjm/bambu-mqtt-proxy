@@ -294,7 +294,7 @@ func TestCamWallRoutesServeEmbeddedWall(t *testing.T) {
 	state := telemetry.NewCache(printers, discardLogger())
 	activities := activity.New(printers)
 	activities.Record("01S00C351100139", "print_started", activity.Info, "Print started")
-	state.Observe("01S00C351100139", []byte(`{"print":{"chamber_temper":5.0,"print_error":50348044,"hms":[{"attr":50331904,"code":65543}]}}`))
+	state.Observe("01S00C351100139", []byte(`{"print":{"chamber_temper":5.0,"print_error":50348044,"hms":[{"attr":50331904,"code":65543},{"attr":117473296,"code":65543}]}}`))
 	state.Observe("00M09A123456789", []byte(`{"print":{"chamber_temper":24.0}}`))
 	renderer := NewStatusRenderer(manager, state, testConnectivity{})
 	renderer.SetActivity(activities)
@@ -353,9 +353,23 @@ func TestCamWallRoutesServeEmbeddedWall(t *testing.T) {
 	if !ok || !p1s.CameraOK || p1s.ChamberTemp != nil {
 		t.Fatalf("P1S tile must be camera-supported and omit chamber temp: %+v", p1s)
 	}
-	if p1s.Name != "Garage" || p1s.PrintError != "0300_400C" || p1s.ReportAge == nil ||
-		len(p1s.HMS) != 1 || p1s.HMS[0] != (HMS{Code: "HMS_0300_0100_0001_0007", Severity: "fatal"}) {
+	if p1s.Name != "Garage" || p1s.PrintError != "0300_400C" || p1s.ReportAge == nil || len(p1s.HMS) != 2 {
 		t.Fatalf("P1S tile name/errors/report age wrong: %+v", p1s)
+	}
+	if p1s.PrintErrorText != "Print Cancelled" || p1s.PrintErrorSeverity != "info" || p1s.PrintErrorFix == "" ||
+		p1s.PrintErrorURL != "https://printara3d.com/tools/bambu-error-codes/hms-0300-400c/" {
+		t.Fatalf("P1S print error description wrong: %+v", p1s)
+	}
+	// The unknown print-module alert keeps its code and gains only the
+	// reference link; the AMS alert carries the dataset description.
+	if p1s.HMS[0] != (HMS{Code: "HMS_0300_0100_0001_0007", Severity: "fatal",
+		URL: "https://printara3d.com/tools/bambu-error-codes/?code=0300-0100"}) {
+		t.Fatalf("unknown HMS alert must keep code and reference link: %+v", p1s.HMS[0])
+	}
+	hms := p1s.HMS[1]
+	if hms.Code != "HMS_0700_8010_0001_0007" || hms.Severity != "fatal" || hms.Text != "AMS Motor Overload" ||
+		hms.Fix == "" || hms.URL != "https://printara3d.com/tools/bambu-error-codes/hms-0700-8010/" {
+		t.Fatalf("known HMS alert must carry description: %+v", p1s.HMS[1])
 	}
 	if len(p1s.Activity) != 1 || p1s.Activity[0].Kind != "print_started" {
 		t.Fatalf("P1S tile activity = %+v", p1s.Activity)

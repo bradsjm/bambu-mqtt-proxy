@@ -16,6 +16,7 @@ import (
 
 	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/config"
+	"bambu-mqtt-proxy/internal/hmscodes"
 	"bambu-mqtt-proxy/internal/telemetry"
 )
 
@@ -61,7 +62,14 @@ type Tile struct {
 	BedTarget    *float64 `json:"bed_target,omitempty"`
 	ChamberTemp  *float64 `json:"chamber_temp,omitempty"`
 	PrintError   string   `json:"print_error,omitempty"`
-	HMS          []HMS    `json:"hms,omitempty"`
+	// PrintErrorText, PrintErrorSeverity, and PrintErrorFix carry the
+	// error-code dataset's description of PrintError and stay empty for
+	// codes it does not cover. PrintErrorURL always links to Printara3D.
+	PrintErrorText     string `json:"print_error_text,omitempty"`
+	PrintErrorSeverity string `json:"print_error_severity,omitempty"`
+	PrintErrorFix      string `json:"print_error_fix,omitempty"`
+	PrintErrorURL      string `json:"print_error_url,omitempty"`
+	HMS                []HMS  `json:"hms,omitempty"`
 	// Detection is the optional OctoEverywhere detection status object,
 	// omitted when the feature is not configured.
 	Detection any              `json:"detection,omitempty"`
@@ -71,10 +79,15 @@ type Tile struct {
 	FrameSeq  uint64           `json:"frame_seq,omitempty"`
 }
 
-// HMS is one Health Management System alert in display form.
+// HMS is one Health Management System alert in display form. Text and Fix
+// come from the error-code dataset and stay empty for codes it does not
+// cover; URL always links the code to Printara3D.
 type HMS struct {
 	Code     string `json:"code"`
 	Severity string `json:"severity"`
+	Text     string `json:"text,omitempty"`
+	Fix      string `json:"fix,omitempty"`
+	URL      string `json:"url,omitempty"`
 }
 
 // statusPayload is the shared /camera/status and /camera/events body.
@@ -160,10 +173,24 @@ func (r *StatusRenderer) Tiles() []Tile {
 			ChamberTemp:  chamberTemp,
 		}
 		if st.PrintError != 0 {
-			t.PrintError = fmt.Sprintf("%04X_%04X", uint32(st.PrintError)>>16, uint32(st.PrintError)&0xFFFF)
+			v := uint32(st.PrintError)
+			t.PrintError = fmt.Sprintf("%04X_%04X", v>>16, v&0xFFFF)
+			// The link is set even when the dataset does not describe
+			// the code, so every alert can reach the lookup tool.
+			info := hmscodes.PrintError(v)
+			t.PrintErrorURL = info.URL
+			if info.Title != "" {
+				t.PrintErrorText, t.PrintErrorSeverity, t.PrintErrorFix = info.Title, info.Severity, info.Fix
+			}
 		}
 		for _, a := range st.HMS {
-			t.HMS = append(t.HMS, HMS{Code: a.ID(), Severity: a.Severity()})
+			h := HMS{Code: a.ID(), Severity: a.Severity()}
+			info := hmscodes.HMS(a.Attr)
+			h.URL = info.URL
+			if info.Title != "" {
+				h.Text, h.Fix = info.Title, info.Fix
+			}
+			t.HMS = append(t.HMS, h)
 		}
 		if !st.LastReport.IsZero() {
 			age := time.Since(st.LastReport).Seconds()
