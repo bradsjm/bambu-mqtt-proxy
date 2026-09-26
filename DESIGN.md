@@ -173,6 +173,8 @@ HTTP surface (all on the shared `http.port` listener, unauthenticated by design)
 | `GET /camera/{serial}/stream` | Multipart MJPEG; complete parts flushed per frame; survives printer outages while the client stays connected |
 | `GET /camera/status` | Display state for every printer (name, state, filename, progress, layers, temperatures, print error, HMS alerts, report and frame age). No credentials, no addresses |
 | `GET /camera/events` | Server-sent events carrying the `/camera/status` payload: on connect, when display state changes (checked every 1 s), and at least every 10 s |
+| `GET /activity` | Recent events for every configured printer, newest first |
+| `GET /activity/{serial}` | Recent events for one configured printer; 404 for an unknown serial |
 | `GET /camwall` | Multi-printer camera wall dashboard; composes camera images with telemetry in the browser |
 | `GET /favicon.ico`, `GET /apple-touch-icon.png` | Embedded raster icons for the wall (browser probes, bookmarks, iOS home screen); the page itself inlines an SVG favicon |
 
@@ -199,6 +201,18 @@ these camera routes are intentionally open on the configured HTTP interface.
 Eligibility is checked before any camera socket is opened, with no operator configuration required: the model is inferred from the serial prefix (01P→P1P, 01S→P1S, 030→A1 MINI, 039→A1; 01P/01S verified against live printers), and an explicit `model` field overrides the inference when present. Unknown serial → 404; non-chamber-image printers (X1-class RTSP, unknown prefixes) → 422. Camera capture never affects MQTT proxying. A disabled camera feature (`BMBPX_CAMERA_ENABLED=false`) removes the routes, stops capture workers, and skips the camera wall's per-printer report subscriptions, which are otherwise held asynchronously so HTTP starts without waiting for printers.
 
 Telemetry for `/camera/status` comes from a delta-merging cache that observes upstream reports through the pool observer hook. Merges apply only fields present in each report; P1 `pushall` warmup supplies the initial full state. The cache never feeds back into MQTT forwarding.
+
+The in-memory activity log keeps the 50 newest events per configured printer
+and clears on restart. It records print state changes, changes to HMS alerts
+and `print_error`, upstream connect/loss events, and notable AI detection
+transitions. `/camera/status` and `/camera/events` include each printer's
+activity entries; the camera wall shows them at the Full detail level. The
+separate `/activity` endpoints work whenever HTTP is enabled, even when the
+camera feature is disabled. Report-derived events require observed reports;
+the proxy does not add report subscriptions solely to populate activity.
+Each entry has an increasing ID, UTC timestamp, stable event kind, severity,
+display message, and server-computed age in seconds. Event ages do not cause
+camera SSE updates by themselves.
 
 Chamber temperature is model-filtered before `/camera/status` is serialized.
 P1P/P1S and A1/A1 MINI do not have this sensor, and their reported

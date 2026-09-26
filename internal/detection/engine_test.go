@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/telemetry"
 )
@@ -233,6 +234,49 @@ func newEtWorld(t *testing.T) *etWorld {
 	// sleep for real.
 	w.engine, w.worker = e, e.workers["S1"]
 	return w
+}
+
+func TestEngineActivityEventsFollowLifecycle(t *testing.T) {
+	w := newEtWorld(t)
+	printers := []config.Printer{{Serial: "S1", Name: "Shop", Model: "P1S"}}
+	activities := activity.New(printers)
+	w.engine.SetActivity(activities)
+
+	w.startSession(1, 1)
+	w.client.queue(etPauseResult())
+	w.worker.step(context.Background())
+	w.sessions.running(w.clock, 2, 1, "PAUSE")
+	w.worker.step(context.Background())
+	for _, kind := range []string{"ai_monitoring", "ai_pause_sent", "ai_pause_confirmed"} {
+		if !hasActivityKind(activities.Recent("S1"), kind) {
+			t.Fatalf("activity is missing %q: %+v", kind, activities.Recent("S1"))
+		}
+	}
+
+	// Rebuild the pending pause, then let the confirm window expire on a
+	// RUNNING sample, which routes through the guard to unconfirmed.
+	w.clock.Advance(21 * time.Second)
+	w.sessions.running(w.clock, 3, 1, "RUNNING")
+	w.client.queue(etClearResult())
+	w.worker.step(context.Background())
+	w.clock.Advance(21 * time.Second)
+	w.sessions.running(w.clock, 4, 1, "RUNNING")
+	w.client.queue(etPauseResult())
+	w.worker.step(context.Background())
+	w.clock.Advance(31 * time.Second)
+	w.sessions.running(w.clock, 5, 1, "RUNNING")
+	w.client.queue(etClearResult())
+	w.worker.step(context.Background())
+	if !hasActivityKind(activities.Recent("S1"), "ai_pause_unconfirmed") {
+		t.Fatalf("activity is missing the unconfirmed pause: %+v", activities.Recent("S1"))
+	}
+
+	w.engine.suspend("account error")
+	for _, serial := range []string{"S1"} {
+		if !hasActivityKind(activities.Recent(serial), "ai_suspended") {
+			t.Fatalf("activity is missing %q: %+v", "ai_suspended", activities.Recent(serial))
+		}
+	}
 }
 
 // startSession starts a fresh RUNNING print observation: fresh telemetry on
@@ -655,34 +699,40 @@ func TestEngineTemporaryErrorKeepsMonitoring(t *testing.T) {
 // generation logic.
 
 type etbWorld struct {
-	clock  *etClock
-	client *etClient
-	frames *etFrames
-	pauser *etPauser
-	gens   *etGens
-	engine *Engine
-	worker *worker
-	cache  *telemetry.Cache
-	seq    uint64
+	clock    *etClock
+	client   *etClient
+	frames   *etFrames
+	pauser   *etPauser
+	gens     *etGens
+	engine   *Engine
+	worker   *worker
+	cache    *telemetry.Cache
+	activity *activity.Log
+	seq      uint64
 }
 
 func newEtbWorld(t *testing.T) *etbWorld {
 	t.Helper()
-	cache := telemetry.NewCache([]config.Printer{{Serial: "S1", Name: "Shop", Model: "P1S"}},
+	printers := []config.Printer{{Serial: "S1", Name: "Shop", Model: "P1S"}}
+	cache := telemetry.NewCache(printers,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	activities := activity.New(printers)
+	cache.SetActivity(activities)
 	w := &etbWorld{
-		clock:  newEtClock(),
-		client: &etClient{},
-		frames: &etFrames{acquireOK: true, serve: true},
-		pauser: &etPauser{},
-		gens:   &etGens{gen: 1},
-		cache:  cache,
+		clock:    newEtClock(),
+		client:   &etClient{},
+		frames:   &etFrames{acquireOK: true, serve: true},
+		pauser:   &etPauser{},
+		gens:     &etGens{gen: 1},
+		cache:    cache,
+		activity: activities,
 	}
 	w.frames.clock = w.clock
 	e := New([]config.Printer{{Serial: "S1", Name: "Shop", Model: "P1S"}},
 		w.client, w.frames, w.cache, w.pauser, w.gens,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	e.now = w.clock.Now
+	e.SetActivity(activities)
 	w.engine, w.worker = e, e.workers["S1"]
 	return w
 }
@@ -717,6 +767,9 @@ func TestEngineTelemetryResumeKeepsContextAndLatch(t *testing.T) {
 	if calls := w.pauser.calls(); calls != 1 {
 		t.Fatalf("pause calls = %d, want the first suggestion to pause", calls)
 	}
+	if !hasActivityKind(w.activity.Recent("S1"), "ai_pause_sent") || !hasActivityKind(w.activity.Recent("S1"), "ai_monitoring") {
+		t.Fatalf("activity did not record monitoring and pause request: %+v", w.activity.Recent("S1"))
+	}
 
 	// The user pauses, then resumes: telemetry bumps the decision epoch at
 	// both boundaries without starting a new print session.
@@ -724,6 +777,9 @@ func TestEngineTelemetryResumeKeepsContextAndLatch(t *testing.T) {
 	w.worker.step(context.Background())
 	if got := w.status().PauseState; got != PauseConfirmed {
 		t.Fatalf("pause_state = %q, want confirmed by the PAUSE report", got)
+	}
+	if !hasActivityKind(w.activity.Recent("S1"), "ai_pause_confirmed") {
+		t.Fatalf("activity did not record confirmed pause: %+v", w.activity.Recent("S1"))
 	}
 	w.report(t, `{"print":{"gcode_state":"RUNNING"}}`)
 	w.worker.step(context.Background())
@@ -756,6 +812,16 @@ func TestEngineTelemetryResumeKeepsContextAndLatch(t *testing.T) {
 	if calls := w.pauser.calls(); calls != 2 {
 		t.Fatalf("pause calls = %d, want the rearm to allow a new command", calls)
 	}
+}
+
+// hasActivityKind reports whether an activity snapshot contains kind.
+func hasActivityKind(events []activity.Entry, kind string) bool {
+	for _, event := range events {
+		if event.Kind == kind {
+			return true
+		}
+	}
+	return false
 }
 
 func TestEngineTelemetrySameFileNewPrintResetsSession(t *testing.T) {

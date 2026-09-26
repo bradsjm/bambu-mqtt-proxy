@@ -32,16 +32,20 @@ type Injector interface {
 // generation of the connection that replaced it.
 type ObserveFunc func(serial string, seq, gen uint64, payload []byte)
 
+// ConnectivityObserver receives established and lost upstream connections.
+type ConnectivityObserver func(serial string, connected bool, err error)
+
 // Pool owns one Conn per configured printer and merges downstream
 // subscriptions onto each printer's single upstream connection.
 type Pool struct {
-	mu       sync.Mutex
-	conns    map[string]*Conn
-	specs    map[string]config.Printer
-	behavior config.Behavior
-	inject   Injector
-	observe  ObserveFunc
-	log      *slog.Logger
+	mu           sync.Mutex
+	conns        map[string]*Conn
+	specs        map[string]config.Printer
+	behavior     config.Behavior
+	inject       Injector
+	observe      ObserveFunc
+	connectivity ConnectivityObserver // observer copied to new connections
+	log          *slog.Logger
 }
 
 // NewPool creates a pool; connections are created lazily per printer on first
@@ -141,7 +145,7 @@ func (p *Pool) conn(serial string) *Conn {
 	defer p.mu.Unlock()
 	c, ok := p.conns[serial]
 	if !ok {
-		c = newConn(p.specs[serial], p.behavior, p.inject, p.observe, p.log)
+		c = newConn(p.specs[serial], p.behavior, p.inject, p.observe, p.connectivity, p.log)
 		p.conns[serial] = c
 		p.log.Info("upstream state created", "serial", serial, "address", c.spec.Address)
 	}
@@ -153,6 +157,14 @@ func (p *Pool) conn(serial string) *Conn {
 func (p *Pool) SetObserver(observe ObserveFunc) {
 	p.mu.Lock()
 	p.observe = observe
+	p.mu.Unlock()
+}
+
+// SetConnectivityObserver registers an observer for successful upstream
+// connections and connection losses. Call it before connections are created.
+func (p *Pool) SetConnectivityObserver(observer ConnectivityObserver) {
+	p.mu.Lock()
+	p.connectivity = observer
 	p.mu.Unlock()
 }
 
@@ -303,8 +315,9 @@ type Conn struct {
 	inject      Injector
 	// observe sees every upstream report before downstream forwarding.
 	// Telemetry registers it; nil on ordinary pools.
-	observe ObserveFunc
-	log     *slog.Logger
+	observe      ObserveFunc
+	connectivity ConnectivityObserver // observer called at connection boundaries
+	log          *slog.Logger
 
 	stopCh    chan struct{}
 	mu        sync.Mutex
@@ -335,20 +348,21 @@ func (c *Conn) bumpGeneration() {
 
 // newConn builds the connection state for one printer. observe may be nil.
 func newConn(spec config.Printer, behavior config.Behavior, inject Injector,
-	observe ObserveFunc, log *slog.Logger) *Conn {
+	observe ObserveFunc, connectivity ConnectivityObserver, log *slog.Logger) *Conn {
 	return &Conn{
-		spec:        spec,
-		keepalive:   time.Duration(behavior.UpstreamKeepaliveSeconds) * time.Second,
-		connectTO:   time.Duration(behavior.UpstreamConnectTimeoutSeconds) * time.Second,
-		backoffInit: time.Duration(behavior.UpstreamBackoffInitialSeconds) * time.Second,
-		backoffMax:  time.Duration(behavior.UpstreamBackoffMaxSeconds) * time.Second,
-		warmup:      behavior.WarmupCommands,
-		inject:      inject,
-		observe:     observe,
-		log:         log,
-		stopCh:      make(chan struct{}),
-		subs:        newSubRefs(),
-		connCh:      make(chan struct{}),
+		spec:         spec,
+		keepalive:    time.Duration(behavior.UpstreamKeepaliveSeconds) * time.Second,
+		connectTO:    time.Duration(behavior.UpstreamConnectTimeoutSeconds) * time.Second,
+		backoffInit:  time.Duration(behavior.UpstreamBackoffInitialSeconds) * time.Second,
+		backoffMax:   time.Duration(behavior.UpstreamBackoffMaxSeconds) * time.Second,
+		warmup:       behavior.WarmupCommands,
+		inject:       inject,
+		observe:      observe,
+		connectivity: connectivity,
+		log:          log,
+		stopCh:       make(chan struct{}),
+		subs:         newSubRefs(),
+		connCh:       make(chan struct{}),
 	}
 }
 
@@ -449,6 +463,9 @@ func (c *Conn) supervise() {
 // set and send the warmup commands so clients converge to full state.
 func (c *Conn) onConnect(_ mqtt.Client) {
 	c.bumpGeneration()
+	if c.connectivity != nil {
+		c.connectivity(c.spec.Serial, true, nil)
+	}
 	c.mu.Lock()
 	subs := c.subs.snapshot()
 	client := c.client
@@ -494,6 +511,9 @@ func (c *Conn) onConnect(_ mqtt.Client) {
 // onLost is the paho ConnectionLost callback.
 func (c *Conn) onLost(_ mqtt.Client, err error) {
 	c.bumpGeneration()
+	if c.connectivity != nil {
+		c.connectivity(c.spec.Serial, false, err)
+	}
 	c.mu.Lock()
 	c.lastFailureAt = time.Now()
 	c.mu.Unlock()

@@ -5,8 +5,44 @@ import (
 	"log/slog"
 	"testing"
 
+	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/config"
 )
+
+func TestObserveReportRecordsPrintAndAlertTransitions(t *testing.T) {
+	printers := []config.Printer{{Serial: "S1", Name: "Shop"}}
+	c := NewCache(printers, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	log := activity.New(printers)
+	c.SetActivity(log)
+	report := func(seq uint64, payload string) {
+		t.Helper()
+		c.ObserveReport("S1", seq, 1, []byte(payload))
+	}
+	report(1, `{"print":{"gcode_state":"RUNNING","subtask_name":"benchy.3mf"}}`)
+	report(2, `{"print":{"gcode_state":"PAUSE"}}`)
+	report(3, `{"print":{"gcode_state":"RUNNING"}}`)
+	report(4, `{"print":{"gcode_state":"FINISH"}}`)
+	report(5, `{"print":{"print_error":50348044,"hms":[{"attr":50331904,"code":131079}]}}`)
+	report(6, `{"print":{"print_error":0,"hms":[]}}`)
+
+	events := log.Recent("S1")
+	kinds := make([]string, len(events))
+	for i, event := range events {
+		kinds[len(events)-1-i] = event.Kind
+	}
+	want := []string{
+		"state_initial", "print_paused", "print_resumed", "print_finished",
+		"hms_alert", "print_error", "hms_cleared", "print_error_cleared",
+	}
+	if len(kinds) != len(want) {
+		t.Fatalf("event kinds = %v, want %v", kinds, want)
+	}
+	for i := range want {
+		if kinds[i] != want[i] {
+			t.Fatalf("event kinds = %v, want %v", kinds, want)
+		}
+	}
+}
 
 func TestMergeErrorsAndHMS(t *testing.T) {
 	c := NewCache([]config.Printer{{Serial: "S1", Name: "Garage"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))

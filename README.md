@@ -180,6 +180,8 @@ endpoint is separate: it listens on TLS port 6000 whenever cameras are enabled
 |---|---|
 | `/livez`, `/readyz` | `200 ok` once serving (printer state deliberately excluded — clients stay connected while printers recover) |
 | `/status` | JSON: `{"status":"ok","upstreams":{"<serial>":true\|false}}`, plus a `detection` map per printer when the OctoEverywhere key is set |
+| `/activity` | Recent per-printer event lists (in memory; cleared when the proxy restarts) |
+| `/activity/{serial}` | Recent events for one configured printer |
 | `/camera/{serial}/snapshot` | Single JPEG frame (P1/A1 camera protocol, port 6000) |
 | `/camera/{serial}/stream` | Live multipart MJPEG stream |
 | `/camera/status` | Display state for every printer (no credentials) |
@@ -196,7 +198,12 @@ progress edge on the camera, and a headline progress/time-left figure. Print
 errors and HMS alerts appear on every tile as a severity-colored banner, with
 the full list and last report age in the full detail level. Click or tap a tile's details panel to
 step through compact, vitals (progress, layers, finish time, nozzle/bed/chamber
-temperature gauges), and full details.
+temperature gauges), and full details. Full details also show the recent
+activity log, with timestamps for print state changes, printer alerts,
+connectivity changes, and AI detection events. The log is held in memory and
+starts empty after each proxy restart. Report-derived events are available
+when the proxy receives printer reports, such as when an MQTT client or the
+camera wall holds a report subscription.
 With an OctoEverywhere key, each tile also carries a compact AI-inspection
 badge with the current quality score; inspection findings join the alert rows
 at the same severity scale, higher detail levels add inspection facts, and

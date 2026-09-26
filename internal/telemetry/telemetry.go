@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/config"
 )
 
@@ -88,11 +89,13 @@ func (a HMSAlert) Severity() string {
 
 // Cache stores merged state for every configured printer.
 type Cache struct {
-	mu     sync.Mutex
-	states map[string]*State
-	watch  map[string]chan struct{}
-	seq    atomic.Uint64
-	log    *slog.Logger
+	mu         sync.Mutex
+	activityMu sync.Mutex // keeps activity events in report-merge order
+	states     map[string]*State
+	watch      map[string]chan struct{}
+	seq        atomic.Uint64
+	log        *slog.Logger
+	activity   *activity.Log // optional recent-event log
 }
 
 // NewCache indexes the configured printers; serials without reports still
@@ -103,6 +106,12 @@ func NewCache(printers []config.Printer, log *slog.Logger) *Cache {
 		states[p.Serial] = &State{Serial: p.Serial, Name: p.Name, Model: p.Model}
 	}
 	return &Cache{states: states, watch: make(map[string]chan struct{}), log: log}
+}
+
+// SetActivity attaches the optional in-memory event log. Call before observing
+// reports.
+func (c *Cache) SetActivity(log *activity.Log) {
+	c.activity = log
 }
 
 // obsSeqBase starts the cache-assigned sequence space far above the pool's
@@ -126,6 +135,8 @@ func (c *Cache) ObserveReport(serial string, seq, gen uint64, payload []byte) {
 	if seq == 0 {
 		seq = obsSeqBase + c.seq.Add(1)
 	}
+	var events []activityRecord
+	var real bool
 	c.mu.Lock()
 	if st, ok := c.states[serial]; ok {
 		if seq < st.lastSeq {
@@ -137,16 +148,116 @@ func (c *Cache) ObserveReport(serial string, seq, gen uint64, payload []byte) {
 			return
 		}
 		st.lastSeq = seq
-		real := mergeReport(st, gen, payload)
+		before := activitySnapshot{state: st.PrintingState, sessionGen: st.sessionGen, printError: st.PrintError, hms: append([]HMSAlert(nil), st.HMS...)}
+		real = mergeReport(st, gen, payload)
 		st.LastReport = time.Now()
-		defer func() {
-			if real {
-				c.notify(serial)
+		if real {
+			events = collectActivityEvents(before, st)
+			if len(events) > 0 {
+				// Reserve event-recording order while report merges are still
+				// serialized. Record after releasing c.mu to avoid nested locks.
+				c.activityMu.Lock()
 			}
-		}()
+		}
 	}
 	c.mu.Unlock()
-	return
+	for _, event := range events {
+		c.activity.Record(serial, event.kind, event.severity, event.message)
+	}
+	if len(events) > 0 {
+		c.activityMu.Unlock()
+	}
+	if real {
+		c.notify(serial)
+	}
+}
+
+// activitySnapshot is the state needed to identify notable report changes.
+type activitySnapshot struct {
+	state      string
+	sessionGen uint64
+	printError int
+	hms        []HMSAlert
+}
+
+// activityRecord is an event collected while Cache.mu is held and recorded
+// after it is released.
+type activityRecord struct {
+	kind, severity, message string
+}
+
+// collectActivityEvents derives user-facing events from one merged report.
+func collectActivityEvents(before activitySnapshot, st *State) []activityRecord {
+	var events []activityRecord
+	add := func(kind, severity, message string) {
+		events = append(events, activityRecord{kind: kind, severity: severity, message: message})
+	}
+	filename := ""
+	if st.Filename != "" {
+		filename = " · " + st.Filename
+	}
+	if st.PrintingState != "" && before.state == "" {
+		add("state_initial", activity.Info, "Printer was "+strings.ToLower(st.PrintingState)+" when first observed"+filename)
+	} else if st.sessionGen > before.sessionGen {
+		add("print_started", activity.Info, "Print started"+filename)
+	} else if st.PrintingState != before.state {
+		switch st.PrintingState {
+		case "PREPARE", "SLICING":
+			add("print_preparing", activity.Info, "Print preparing"+filename)
+		case "PAUSE", "PAUSED":
+			if before.state != "PAUSE" && before.state != "PAUSED" {
+				add("print_paused", activity.Warning, "Print paused"+filename)
+			}
+		case "RUNNING":
+			if before.state == "PAUSE" || before.state == "PAUSED" {
+				add("print_resumed", activity.Info, "Print resumed"+filename)
+			}
+		case "FINISH":
+			add("print_finished", activity.Info, "Print finished"+filename)
+		case "FAILED":
+			add("print_failed", activity.Error, "Print failed or was cancelled"+filename)
+		case "IDLE":
+			if isControlState(before.state) {
+				add("print_stopped", activity.Warning, "Print stopped before finishing"+filename)
+			}
+		}
+	}
+
+	oldHMS := make(map[string]HMSAlert, len(before.hms))
+	for _, alert := range before.hms {
+		oldHMS[alert.ID()] = alert
+	}
+	newHMS := make(map[string]HMSAlert, len(st.HMS))
+	for _, alert := range st.HMS {
+		id := alert.ID()
+		newHMS[id] = alert
+		if _, existed := oldHMS[id]; existed {
+			continue
+		}
+		severity := activity.Info
+		switch alert.Severity() {
+		case "fatal", "serious":
+			severity = activity.Error
+		case "common":
+			severity = activity.Warning
+		}
+		add("hms_alert", severity, "HMS alert "+id+" ("+alert.Severity()+")")
+	}
+	for _, alert := range before.hms {
+		id := alert.ID()
+		if _, active := newHMS[id]; !active {
+			add("hms_cleared", activity.Info, "HMS alert "+id+" cleared")
+		}
+	}
+	if before.printError != st.PrintError {
+		if st.PrintError == 0 {
+			add("print_error_cleared", activity.Info, "Printer error cleared")
+		} else {
+			code := fmt.Sprintf("%04X_%04X", uint32(st.PrintError)>>16, uint32(st.PrintError)&0xFFFF)
+			add("print_error", activity.Error, "Printer error "+code)
+		}
+	}
+	return events
 }
 
 // notify wakes detection watchers, coalescing bursts into one token.

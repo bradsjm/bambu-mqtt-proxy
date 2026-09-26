@@ -9,11 +9,13 @@ package detection
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"sync"
 	"time"
 
+	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/telemetry"
 )
@@ -155,6 +157,7 @@ type Engine struct {
 	pauser   Pauser
 	gens     GenerationSource
 	log      *slog.Logger
+	activity *activity.Log // optional recent-event log
 
 	specs   map[string]config.Printer
 	blocked string // non-empty: feature blocked; the value is the reason
@@ -214,6 +217,11 @@ func New(printers []config.Printer, client gadgetClient, frames FrameSource,
 	return e
 }
 
+// SetActivity attaches the optional in-memory event log. Call before Start.
+func (e *Engine) SetActivity(log *activity.Log) {
+	e.activity = log
+}
+
 // SetBlocked parks every worker in the blocked state before Start: the key
 // is present but the camera feature is disabled, so detection must be
 // visible yet perform no camera or API activity.
@@ -259,14 +267,18 @@ func (e *Engine) sessionsWatch(serial string) <-chan struct{} {
 // wins; workers observe it through the closed channel.
 func (e *Engine) suspend(message string) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	if e.suspended {
+		e.mu.Unlock()
 		return
 	}
 	e.suspended = true
 	e.suspendMsg = message
 	close(e.suspendCh)
+	e.mu.Unlock()
 	e.log.Error("detection suspended until restart", "reason", message)
+	for serial := range e.workers {
+		e.activity.Record(serial, "ai_suspended", activity.Error, "AI inspection suspended: "+message)
+	}
 }
 
 // isSuspended reports the account-wide suspension state.
@@ -492,6 +504,7 @@ func (w *worker) onPauseHold(snap telemetry.SessionView) time.Duration {
 			s.State = StatePaused
 		})
 		w.log.Info("pause confirmed by printer report")
+		w.e.activity.Record(w.serial, "ai_pause_confirmed", activity.Warning, "Printer confirmed AI pause")
 		return w.e.kIdlePoll
 	case w.pauseState == PausePending && w.e.now().After(w.pauseDeadline):
 		w.pauseState = PauseUnconfirmed
@@ -501,6 +514,7 @@ func (w *worker) onPauseHold(snap telemetry.SessionView) time.Duration {
 			s.Message = "pause command was not confirmed within 30s"
 			s.State = StateAttention
 		})
+		w.e.activity.Record(w.serial, "ai_pause_unconfirmed", activity.Error, "Pause was not confirmed within 30 seconds")
 		return w.e.kIdlePoll
 	default:
 		st := w.st.State
@@ -613,6 +627,7 @@ func (w *worker) guardPauseOnRunning() {
 				s.Message = "pause command was not confirmed within 30s"
 			})
 			w.recomputeState()
+			w.e.activity.Record(w.serial, "ai_pause_unconfirmed", activity.Error, "Pause was not confirmed within 30 seconds")
 		}
 	case PauseConfirmed:
 		w.mu.Lock()
@@ -668,6 +683,7 @@ func (w *worker) inspect(ctx context.Context, snap telemetry.SessionView) time.D
 		w.useFallback = false
 		w.mu.Unlock()
 		w.log.Info("gadget context created")
+		w.e.activity.Record(w.serial, "ai_monitoring", activity.Info, "AI inspection started")
 	}
 
 	url := w.sessionURL()
@@ -739,7 +755,9 @@ func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, r
 	}
 	w.mu.Lock()
 	w.tempAttempts = 0
+	wasDegraded := w.degraded != ""
 	w.degraded = ""
+	wasWarning := w.st.Warning
 	pauseWanted := res.PauseSuggested && !w.awaitingClear
 	w.mu.Unlock()
 
@@ -802,6 +820,22 @@ func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, r
 			s.Reason, s.Message = "", ""
 		}
 	})
+	if wasDegraded {
+		w.e.activity.Record(w.serial, "ai_recovered", activity.Info, "AI inspection recovered")
+	}
+	if res.WarningSuggested && !wasWarning {
+		w.e.activity.Record(w.serial, "ai_warning", activity.Warning,
+			fmt.Sprintf("Possible print failure · quality %d/10", res.PrintQuality))
+	} else if !res.WarningSuggested && wasWarning {
+		w.e.activity.Record(w.serial, "ai_warning_cleared", activity.Info, "AI warning cleared")
+	}
+	if attempted {
+		if pauseState == PausePending {
+			w.e.activity.Record(w.serial, "ai_pause_sent", activity.Error, "AI requested a pause; waiting for printer confirmation")
+		} else {
+			w.e.activity.Record(w.serial, "ai_pause_failed", activity.Error, "AI pause command could not be sent")
+		}
+	}
 	w.recomputeState()
 	return true
 }
@@ -900,6 +934,7 @@ func (w *worker) tempBackoff() time.Duration {
 // degrade records a degraded condition with the sticky result preserved.
 func (w *worker) degrade(reason, message string, delay time.Duration, cameraLost bool) time.Duration {
 	w.mu.Lock()
+	newDegradation := w.degraded == ""
 	w.degraded = reason
 	w.nextDue = w.e.now().Add(delay)
 	w.mu.Unlock()
@@ -909,6 +944,9 @@ func (w *worker) degrade(reason, message string, delay time.Duration, cameraLost
 		s.CameraLost = s.CameraLost || cameraLost
 	})
 	w.recomputeState()
+	if newDegradation {
+		w.e.activity.Record(w.serial, "ai_degraded", activity.Warning, message)
+	}
 	return delay
 }
 

@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/telemetry"
 )
@@ -63,10 +64,11 @@ type Tile struct {
 	HMS          []HMS    `json:"hms,omitempty"`
 	// Detection is the optional OctoEverywhere detection status object,
 	// omitted when the feature is not configured.
-	Detection any      `json:"detection,omitempty"`
-	ReportAge *float64 `json:"report_age_seconds,omitempty"`
-	FrameAge  float64  `json:"frame_age_seconds,omitempty"`
-	FrameSeq  uint64   `json:"frame_seq,omitempty"`
+	Detection any              `json:"detection,omitempty"`
+	Activity  []activity.Entry `json:"activity,omitempty"` // recent events, newest first
+	ReportAge *float64         `json:"report_age_seconds,omitempty"`
+	FrameAge  float64          `json:"frame_age_seconds,omitempty"`
+	FrameSeq  uint64           `json:"frame_seq,omitempty"`
 }
 
 // HMS is one Health Management System alert in display form.
@@ -90,6 +92,7 @@ type StatusRenderer struct {
 	state     *telemetry.Cache
 	status    connectivitySource
 	detection detectionSource
+	activity  *activity.Log // optional recent-event source
 }
 
 // NewStatusRenderer builds the /camera/status payload renderer.
@@ -107,6 +110,11 @@ type detectionSource interface {
 // SetDetection attaches the optional detection engine after construction.
 func (r *StatusRenderer) SetDetection(d detectionSource) {
 	r.detection = d
+}
+
+// SetActivity attaches the recent activity log shown in printer tiles.
+func (r *StatusRenderer) SetActivity(log *activity.Log) {
+	r.activity = log
 }
 
 // connectivitySource reports upstream MQTT connectivity per serial, so the
@@ -168,6 +176,7 @@ func (r *StatusRenderer) Tiles() []Tile {
 		if r.detection != nil {
 			t.Detection = r.detection.DetectionStatus(st.Serial)
 		}
+		t.Activity = r.activity.Recent(st.Serial)
 		tiles = append(tiles, t)
 	}
 	sort.Slice(tiles, func(i, j int) bool { return tiles[i].Serial < tiles[j].Serial })
@@ -190,6 +199,10 @@ func changeKey(tiles []Tile) ([]byte, error) {
 	stable := make([]Tile, len(tiles))
 	for i, t := range tiles {
 		t.ReportAge, t.FrameAge, t.FrameSeq = nil, 0, 0
+		t.Activity = append([]activity.Entry(nil), t.Activity...)
+		for j := range t.Activity {
+			t.Activity[j].AgeSeconds = 0
+		}
 		// Detection ages (age_seconds, next_check_seconds) are continuously
 		// changing; the detection object carries a stable projection.
 		if d, ok := t.Detection.(interface{ StableKey() any }); ok {

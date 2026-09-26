@@ -2,6 +2,7 @@ package camera
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -16,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/telemetry"
 )
@@ -290,9 +292,12 @@ func TestCamWallRoutesServeEmbeddedWall(t *testing.T) {
 	}
 	manager := NewManager(printers, discardLogger())
 	state := telemetry.NewCache(printers, discardLogger())
+	activities := activity.New(printers)
+	activities.Record("01S00C351100139", "print_started", activity.Info, "Print started")
 	state.Observe("01S00C351100139", []byte(`{"print":{"chamber_temper":5.0,"print_error":50348044,"hms":[{"attr":50331904,"code":65543}]}}`))
 	state.Observe("00M09A123456789", []byte(`{"print":{"chamber_temper":24.0}}`))
 	renderer := NewStatusRenderer(manager, state, testConnectivity{})
+	renderer.SetActivity(activities)
 	mux := http.NewServeMux()
 	renderer.RegisterStatus(mux)
 
@@ -352,12 +357,34 @@ func TestCamWallRoutesServeEmbeddedWall(t *testing.T) {
 		len(p1s.HMS) != 1 || p1s.HMS[0] != (HMS{Code: "HMS_0300_0100_0001_0007", Severity: "fatal"}) {
 		t.Fatalf("P1S tile name/errors/report age wrong: %+v", p1s)
 	}
+	if len(p1s.Activity) != 1 || p1s.Activity[0].Kind != "print_started" {
+		t.Fatalf("P1S tile activity = %+v", p1s.Activity)
+	}
 	x1c, ok := tiles["00M09A123456789"]
 	if !ok || x1c.CameraOK || x1c.ChamberTemp == nil || *x1c.ChamberTemp != 24 {
 		t.Fatalf("X1C tile must retain its valid chamber temp: %+v", x1c)
 	}
 	if strings.Contains(w.Body.String(), "secret-test-only") || strings.Contains(w.Body.String(), "another-secret") || strings.Contains(w.Body.String(), "127.0.0.1") {
 		t.Fatal("Cam Wall status leaked credentials or printer address")
+	}
+}
+
+func TestChangeKeyIgnoresActivityAge(t *testing.T) {
+	first := []Tile{{Serial: "S1", Activity: []activity.Entry{{ID: 1, AgeSeconds: 2}}}}
+	second := []Tile{{Serial: "S1", Activity: []activity.Entry{{ID: 1, AgeSeconds: 8}}}}
+	a, err := changeKey(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := changeKey(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(a, b) {
+		t.Fatalf("activity aging changed the SSE key: %s != %s", a, b)
+	}
+	if first[0].Activity[0].AgeSeconds != 2 || second[0].Activity[0].AgeSeconds != 8 {
+		t.Fatal("changeKey mutated its input activity ages")
 	}
 }
 

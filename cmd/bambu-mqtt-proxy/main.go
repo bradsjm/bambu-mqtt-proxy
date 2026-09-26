@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/broker"
 	"bambu-mqtt-proxy/internal/camera"
 	"bambu-mqtt-proxy/internal/config"
@@ -60,11 +61,20 @@ func run() error {
 	table := routing.NewTable(serials)
 	inject := broker.NewInjector(logger)
 	pool := upstream.NewPool(cfg.Printers, inject, cfg.Behavior, logger)
+	activities := activity.New(cfg.Printers)
+	pool.SetConnectivityObserver(func(serial string, connected bool, err error) {
+		if connected {
+			activities.Record(serial, "connected", activity.Info, "Upstream connection established")
+			return
+		}
+		activities.Record(serial, "disconnected", activity.Warning, "Upstream connection lost; reconnecting")
+	})
 	// Telemetry observes upstream reports without changing forwarding. The
 	// wrapper stamps each report with its per-connection delivery order and
 	// the connection generation it arrived on, read before the merge, so
 	// detection can never treat a pre-reconnect observation as current.
 	state := telemetry.NewCache(cfg.Printers, logger)
+	state.SetActivity(activities)
 	pool.SetObserver(func(serial string, seq, gen uint64, payload []byte) {
 		state.ObserveReport(serial, seq, gen, payload)
 	})
@@ -74,6 +84,7 @@ func run() error {
 	if cfg.CameraEnabled() {
 		cameras = camera.NewManager(cfg.Printers, logger)
 		renderer = camera.NewStatusRenderer(cameras, state, pool)
+		renderer.SetActivity(activities)
 	}
 
 	// Optional OctoEverywhere Gadget detection. The key is env-only; with a
@@ -93,6 +104,7 @@ func run() error {
 			detector = detection.New(cfg.Printers, client, cameraFrames{m: cameras}, state, pool, pool, logger)
 			logger.Info("octoeverywhere detection enabled")
 		}
+		detector.SetActivity(activities)
 	}
 	if renderer != nil && detector != nil {
 		renderer.SetDetection(detector)
@@ -168,6 +180,7 @@ func run() error {
 
 	if cfg.HTTP.Port > 0 {
 		httpSrv = httpsrv.New(cfg.HTTP.Port, logger)
+		activities.Register(httpSrv.Mux())
 		health.Routes(httpSrv.Mux(), pool, detectionSource(detector))
 		if cfg.CameraEnabled() {
 			camera.Register(httpSrv.Mux(), cameras)

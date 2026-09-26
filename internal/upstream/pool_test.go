@@ -1,9 +1,31 @@
 package upstream
 
 import (
+	"errors"
+	"io"
+	"log/slog"
 	"testing"
 	"time"
+
+	"bambu-mqtt-proxy/internal/config"
 )
+
+func TestConnectivityObserverReceivesConnectionLoss(t *testing.T) {
+	var gotSerial string
+	var gotConnected bool
+	var gotErr error
+	p := NewPool([]config.Printer{{Serial: "S1"}}, nil, config.Behavior{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	p.SetConnectivityObserver(func(serial string, connected bool, err error) {
+		gotSerial, gotConnected, gotErr = serial, connected, err
+	})
+	c := p.conn("S1")
+	wantErr := errors.New("lost")
+	c.onLost(nil, wantErr)
+	if gotSerial != "S1" || gotConnected || !errors.Is(gotErr, wantErr) {
+		t.Fatalf("observer got %q/%v/%v, want S1/false/lost", gotSerial, gotConnected, gotErr)
+	}
+}
 
 func TestNextBackoff(t *testing.T) {
 	initial := time.Second
