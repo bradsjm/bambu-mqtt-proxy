@@ -140,9 +140,10 @@ body.kiosk .bar { display: none; }
 .pill.feed[data-mode="error"], .pill.feed.stale { color: var(--paused); }
 .pill.detect { top: auto; left: .55rem; bottom: .6rem; max-width: calc(100% - 1.1rem); color: var(--tone, var(--dim));
                border: 1px solid color-mix(in srgb, var(--tone, var(--dim)) 45%, transparent); }
-.pill.detect[data-tone="info"] { --tone: var(--preparing); }
-.pill.detect[data-tone="warn"] { --tone: var(--paused); }
+.pill.detect[data-tone="calm"] { --tone: var(--printing); }
+.pill.detect[data-tone="info"], .pill.detect[data-tone="warn"] { --tone: var(--paused); }
 .pill.detect[data-tone="error"] { --tone: var(--failed); }
+.pill.detect[data-processing="true"] { animation: detect-scan 1.5s ease-in-out infinite; }
 .pill.detect .q { color: var(--text); font-variant-numeric: tabular-nums; }
 .pill.detect .q:empty { display: none; }
 .pill.detect .label { overflow: hidden; text-overflow: ellipsis; }
@@ -202,8 +203,7 @@ code { font: .74rem ui-monospace, SFMono-Regular, Menlo, monospace; }
              color: var(--dim); font-variant-numeric: tabular-nums; }
 .detect-l2 .ic { color: var(--tone); font-size: 1rem; }
 .detect-l2 .d-q { font-weight: 650; color: var(--tone); }
-.detect-l2[data-tone="info"] { --tone: var(--preparing); }
-.detect-l2[data-tone="warn"] { --tone: var(--paused); }
+.detect-l2[data-tone="info"], .detect-l2[data-tone="warn"] { --tone: var(--paused); }
 .detect-l2[data-tone="error"] { --tone: var(--failed); }
 .meter { flex: 1 1 auto; height: 8px; border-radius: 4px; background: var(--panel-2); overflow: hidden; }
 .meter > div { height: 100%; width: var(--pct, 0%); background: var(--accent); border-radius: inherit;
@@ -271,6 +271,9 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
 .check:has(input:disabled) { color: var(--dim); cursor: default; }
 
 @keyframes pulse { 50% { opacity: .35; } }
+@keyframes detect-scan {
+  50% { border-color: var(--tone); box-shadow: 0 0 9px color-mix(in srgb, var(--tone) 55%, transparent); }
+}
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
@@ -286,6 +289,7 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
   <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.3 4.2 2.6 18a2 2 0 0 0 1.7 3h15.4a2 2 0 0 0 1.7-3L13.7 4.2a2 2 0 0 0-3.4 0zM12 9.5v4M12 17h.01"/></symbol>
   <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14.5A8.5 8.5 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z"/></symbol>
   <symbol id="i-loader" viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9"/></symbol>
+  <symbol id="i-ai" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="4"/><path d="M8.5 15 10 9h1l1.5 6m-3.3-2h2.6M14 9v6M2 9v6M22 9v6M9 2v2M15 2v2M9 20v2M15 20v2"/></symbol>
   <symbol id="i-offline" viewBox="0 0 24 24"><path d="m3 3 18 18M8.5 16.4a5 5 0 0 1 7 0M5 12.9a10 10 0 0 1 5-2.7M19 12.9a10 10 0 0 0-2.3-1.7M2 8.8a15 15 0 0 1 3.5-2.4M22 8.8a15 15 0 0 0-11.3-3.7M12 20h.01"/></symbol>
   <symbol id="i-camera" viewBox="0 0 24 24"><path d="M4 7.5h3l2-2.5h6l2 2.5h3a1 1 0 0 1 1 1V19a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V8.5a1 1 0 0 1 1-1z"/><circle cx="12" cy="13.5" r="3.5"/></symbol>
   <symbol id="i-camera-off" viewBox="0 0 24 24"><path d="m3 3 18 18M9.5 5H15l2 2.5h3a1 1 0 0 1 1 1V17M18 20H4a1 1 0 0 1-1-1V8.5a1 1 0 0 1 1-1h3M14.5 16a3.5 3.5 0 0 1-5-5"/></symbol>
@@ -363,7 +367,7 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
       <button class="cam-hit" type="button" aria-pressed="false"></button>
       <span class="pill state"><svg class="ic" aria-hidden="true"><use/></svg><span class="label"></span></span>
       <span class="pill feed" hidden><span class="dot" aria-hidden="true"></span><svg class="ic" aria-hidden="true"><use href="#i-camera"/></svg><span class="feed-label"></span></span>
-      <span class="pill detect" hidden><svg class="ic" aria-hidden="true"><use/></svg><span class="label"></span><span class="q"></span></span>
+      <span class="pill detect" hidden><svg class="ic" aria-hidden="true"><use href="#i-ai"/></svg><span class="label"></span><span class="q"></span></span>
       <div class="cam-progress" hidden><div></div></div>
     </div>
     <div class="details">
@@ -516,6 +520,8 @@ function detectOf(p) {
     suspended: d.suspended === true,
     age: num(d.age_seconds),
     nextCheck: num(d.next_check_seconds),
+    // processing is true only while the AI request is analyzing an image.
+    processing: d.processing === true,
     faster: d.faster_inspection === true,
     fallback: d.using_fallback === true,
     layerNum: num(d.last_inspected_layer),
@@ -556,38 +562,36 @@ function detectOld(d) {
   return d.age > DETECT_OLD_SEC;
 }
 // One compact verdict for the stage badge. Visible while a print session is
-// active — normal monitoring stays recognizable as a quiet gray "AI 8/10" —
+// active — normal monitoring stays recognizable as a quiet green "AI 8/10" —
 // and hidden when the session is idle. The printer's own state pill always
 // stays authoritative; this badge only adds what the AI saw.
 function detectBadge(d, b) {
   if (!d || d.state === "idle") return null;
-  if (detectPausePending(d)) return { icon: "i-pause", tone: "error", label: "Pause pending" };
-  if (detectPauseUnconfirmed(d)) return { icon: "i-pause", tone: "error", label: "Pause unconfirmed" };
-  if (detectPauseConfirmed(d)) return { icon: "i-pause", tone: "warn", label: "Pause confirmed" };
-  if (d.warning) return { icon: "i-alert", tone: "warn", label: "AI warning" };
-  if (d.suspended) return { icon: "i-camera-off", tone: "warn", label: "AI off · account" };
+  if (detectPausePending(d)) return { tone: "error", label: "Pause pending" };
+  if (detectPauseUnconfirmed(d)) return { tone: "error", label: "Pause unconfirmed" };
+  if (detectPauseConfirmed(d)) return { tone: "warn", label: "Pause confirmed" };
+  if (d.warning) return { tone: "warn", label: "AI warning" };
+  if (d.suspended) return { tone: "warn", label: "AI off · account" };
   if (d.state === "degraded") {
-    return d.cameraLost || reasonWords(d).startsWith("camera")
-      ? { icon: "i-camera-off", tone: "warn", label: "AI view lost" }
-      : { icon: "i-loader", tone: "warn", label: "AI retrying" };
+    return { tone: "warn", label: d.cameraLost || reasonWords(d).startsWith("camera") ? "AI view lost" : "AI retrying" };
   }
-  if (d.cameraLost && isActive(b)) return { icon: "i-camera-off", tone: "warn", label: "AI view lost" };
-  if (d.state === "attention") return { icon: "i-alert", tone: "warn", label: "AI attention" };
-  if (d.state === "unsupported") return { icon: "i-camera-off", tone: "calm", label: "AI unsupported" };
-  if (d.state === "blocked") return { icon: "i-camera-off", tone: "calm", label: "AI blocked" };
+  if (d.cameraLost && isActive(b)) return { tone: "warn", label: "AI view lost" };
+  if (d.state === "attention") return { tone: "warn", label: "AI attention" };
+  if (d.state === "unsupported") return { tone: "warn", label: "AI unsupported" };
+  if (d.state === "blocked") return { tone: "warn", label: "AI blocked" };
   // An offline printer never reports, so "AI starting" would pulse forever
   // next to the Offline pill; the badge only adds what the AI saw, and it
   // has seen nothing yet. Connected printers keep the starting cue.
   if (d.state === "starting") {
-    return b === "offline" ? null : { icon: "i-loader", tone: "calm", label: "AI starting" };
+    return b === "offline" ? null : { tone: "warn", label: "AI starting" };
   }
   // Quality bands color the rating but never raise an alert; the approved
   // flags above drive attention.
   if (d.quality != null && d.quality <= 5) {
-    return d.quality <= 3 ? { icon: "i-camera", tone: "warn", label: "AI" }
-      : { icon: "i-camera", tone: "info", label: "AI watching" };
+    return d.quality <= 3 ? { tone: "warn", label: "AI" }
+      : { tone: "info", label: "AI watching" };
   }
-  return { icon: "i-camera", tone: "calm", label: "AI" };
+  return { tone: "calm", label: "AI" };
 }
 // Detection findings as alert-row entries. The text carries the meaning;
 // severity reuses the HMS scale for color, and prio keeps printer-reported
@@ -747,7 +751,7 @@ function createTile(p) {
       alertRow: q(".alert-row"), alertText: q(".alert-text"),
       l2: q(".l2"), l3: q(".l3"), progressRow: q(".progress-row"), meter: q(".meter"),
       layers: q(".layers span"), eta: q(".eta span"), temps: q(".temps"),
-      detect: q(".pill.detect"), detectUse: q(".pill.detect use"), detectLabel: q(".pill.detect .label"),
+      detect: q(".pill.detect"), detectLabel: q(".pill.detect .label"),
       detectQ: q(".pill.detect .q"), d2: q(".detect-l2"), d2q: q(".detect-l2 .d-q"),
       d2text: q(".detect-l2 .d-text"), fDetectDt: q(".dt-detect"), fDetect: q(".f-detect"),
       fFile: q(".f-file"), fRemain: q(".f-remain"), fCamera: q(".f-camera"), fAlerts: q(".f-alerts"),
@@ -887,7 +891,7 @@ function renderTile(t) {
   if (bd) {
     r.detect.dataset.tone = bd.tone;
     r.detect.dataset.old = String(detectOld(d));
-    r.detectUse.setAttribute("href", `#${bd.icon}`);
+    r.detect.dataset.processing = String(d.processing);
     r.detectLabel.textContent = bd.label;
     // A suspended result is history; never dress it up as current quality.
     r.detectQ.textContent = !d.suspended && d.quality != null ? `${d.quality}/10` : "";

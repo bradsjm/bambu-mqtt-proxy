@@ -82,9 +82,11 @@ const (
 // served as Tile.detection on the camera endpoints and as the values of the
 // /status detection map. Only State and PauseState are always present.
 type Status struct {
-	State              string  `json:"state"`
-	Reason             string  `json:"reason,omitempty"`
-	Quality            int     `json:"quality,omitempty"`
+	State   string `json:"state"`
+	Reason  string `json:"reason,omitempty"`
+	Quality int    `json:"quality,omitempty"`
+	// Processing is true only while the image-analysis request is in flight.
+	Processing         bool    `json:"processing,omitempty"`
 	Warning            bool    `json:"warning,omitempty"`
 	PauseState         string  `json:"pause_state"`
 	LastInspectedLayer *int    `json:"last_inspected_layer,omitempty"`
@@ -670,8 +672,10 @@ func (w *worker) inspect(ctx context.Context, snap telemetry.SessionView) time.D
 
 	url := w.sessionURL()
 	rctx, cancel := context.WithTimeout(ctx, requestTimeout)
+	w.publish(func(s *Status) { s.Processing = true })
 	res, err := w.e.client.Process(rctx, url, frame.JPEG)
 	cancel()
+	w.publish(func(s *Status) { s.Processing = false })
 	if err != nil {
 		if ctx.Err() != nil {
 			return -1
