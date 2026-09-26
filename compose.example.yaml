@@ -11,9 +11,10 @@ services:
       - "8080:8080" # HTTP: health + camera endpoints + camera wall
     environment:
       # One entry per printer, separated by ';'. Replace the placeholders.
+      # name= sets an optional friendly camera wall label; routing always uses the serial.
       # Camera support is auto-detected from the serial prefix (01P/01S/030/039).
       BMBPX_PRINTERS: >-
-        serial=01P00A123456789,address=192.168.1.42:8883,tls=true,insecure_skip_verify=true,password=12345678;
+        serial=01P00A123456789,address=192.168.1.42:8883,tls=true,insecure_skip_verify=true,password=12345678,name=Garage P1S;
         serial=01S00C351100139,address=192.168.1.43:8883,tls=true,insecure_skip_verify=true,password=87654321
       # BMBPX_CAMERA_ENABLED: "false"  # disable camera endpoints and camera wall
       # BMBPX_OCTOEVERYWHERE_API_KEY: ""  # optional: enables OctoEverywhere Gadget AI failure detection

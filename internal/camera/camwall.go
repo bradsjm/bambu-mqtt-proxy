@@ -21,6 +21,16 @@ import (
 //go:embed camwall.html
 var camwallHTML []byte
 
+// Bookmark and home-screen icons for the wall. The page also inlines an SVG
+// favicon; these raster forms cover /favicon.ico probes and iOS, which
+// ignores SVG touch icons.
+var (
+	//go:embed favicon.ico
+	faviconICO []byte
+	//go:embed apple-touch-icon.png
+	appleTouchIconPNG []byte
+)
+
 // eventsInterval is how often /camera/events checks for status changes,
 // coalescing bursts of report deltas into at most one event per interval.
 // eventsKeepalive bounds how long an unchanged status goes unsent, so
@@ -236,8 +246,8 @@ func (r *StatusRenderer) handleEvents(w http.ResponseWriter, req *http.Request) 
 	}
 }
 
-// RegisterStatus mounts /camera/status, /camera/events and /camwall on the
-// shared mux.
+// RegisterStatus mounts /camera/status, /camera/events, /camwall and the
+// wall's icons on the shared mux.
 func (r *StatusRenderer) RegisterStatus(mux *http.ServeMux) {
 	mux.HandleFunc("GET /camera/status", func(w http.ResponseWriter, _ *http.Request) {
 		noStore(w)
@@ -250,4 +260,15 @@ func (r *StatusRenderer) RegisterStatus(mux *http.ServeMux) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write(camwallHTML)
 	})
+	mux.HandleFunc("GET /favicon.ico", staticAsset("image/x-icon", faviconICO))
+	mux.HandleFunc("GET /apple-touch-icon.png", staticAsset("image/png", appleTouchIconPNG))
+}
+
+// staticAsset serves an embedded, immutable-per-build asset.
+func staticAsset(contentType string, body []byte) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("Cache-Control", "public, max-age=86400")
+		_, _ = w.Write(body)
+	}
 }

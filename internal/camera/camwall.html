@@ -6,6 +6,10 @@
 <meta name="color-scheme" content="dark">
 <meta name="theme-color" content="#0b0d10">
 <title>Printer wall · bambu-mqtt-proxy</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230b0d10'/%3E%3Cg fill='%2334d399'%3E%3Crect x='6' y='6' width='8.75' height='8.75' rx='2'/%3E%3Crect x='17.25' y='6' width='8.75' height='8.75' rx='2'/%3E%3Crect x='6' y='17.25' width='8.75' height='8.75' rx='2'/%3E%3Crect x='17.25' y='17.25' width='8.75' height='8.75' rx='2'/%3E%3C/g%3E%3C/svg%3E">
+<link rel="icon" href="/favicon.ico" sizes="32x32">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-title" content="Printer wall">
 <style>
 :root {
   color-scheme: dark;
@@ -571,7 +575,12 @@ function detectBadge(d, b) {
   if (d.state === "attention") return { icon: "i-alert", tone: "warn", label: "AI attention" };
   if (d.state === "unsupported") return { icon: "i-camera-off", tone: "calm", label: "AI unsupported" };
   if (d.state === "blocked") return { icon: "i-camera-off", tone: "calm", label: "AI blocked" };
-  if (d.state === "starting") return { icon: "i-loader", tone: "calm", label: "AI starting" };
+  // An offline printer never reports, so "AI starting" would pulse forever
+  // next to the Offline pill; the badge only adds what the AI saw, and it
+  // has seen nothing yet. Connected printers keep the starting cue.
+  if (d.state === "starting") {
+    return b === "offline" ? null : { icon: "i-loader", tone: "calm", label: "AI starting" };
+  }
   // Quality bands color the rating but never raise an alert; the approved
   // flags above drive attention.
   if (d.quality != null && d.quality <= 5) {

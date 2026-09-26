@@ -170,9 +170,11 @@ HTTP surface (all on the shared `http.port` listener, unauthenticated by design)
 | `GET /camera/status` | Display state for every printer (name, state, filename, progress, layers, temperatures, print error, HMS alerts, report and frame age). No credentials, no addresses |
 | `GET /camera/events` | Server-sent events carrying the `/camera/status` payload: on connect, when display state changes (checked every 1 s), and at least every 10 s |
 | `GET /camwall` | Multi-printer camera wall dashboard; composes camera images with telemetry in the browser |
+| `GET /favicon.ico`, `GET /apple-touch-icon.png` | Embedded raster icons for the wall (browser probes, bookmarks, iOS home screen); the page itself inlines an SVG favicon |
 
 The camera wall is one self-contained embedded HTML page (inline CSS, JS, and
-SVG icons; no external assets). It receives status through `/camera/events`
+SVG icons, including an inline SVG favicon; no external assets beyond the
+raster bookmark icons served by the same binary). It receives status through `/camera/events`
 (EventSource, reopened if silent for 30 s or closed while the tab is hidden) and gives the live
 budget (default 4, configurable 1–16) to the focused camera first, then active
 prints (RUNNING or PAUSE) and busy printers with stale reports in wall order. Other visible eligible printers get
@@ -561,7 +563,7 @@ Configuration comes from a YAML file, environment variables, or both; environmen
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `BMBPX_PRINTERS` | — | Semicolon-separated printer entries: `serial=SN,address=host:port,password=code[,username=bblp][,tls=true][,insecure_skip_verify=true]` |
+| `BMBPX_PRINTERS` | — | Semicolon-separated printer entries: `serial=SN,address=host:port,password=code[,name=label][,username=bblp][,tls=true][,insecure_skip_verify=true]`. The optional `name` is a display label for the camera wall; routing always uses the serial. |
 | `BMBPX_LISTEN_PORT` | `8883` | Downstream MQTT port |
 | `BMBPX_LISTEN_TLS` | `true` | TLS on the downstream listener |
 | `BMBPX_CERT_FILE` / `BMBPX_KEY_FILE` | empty | Empty = ephemeral in-memory self-signed certificate |

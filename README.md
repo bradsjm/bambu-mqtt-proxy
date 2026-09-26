@@ -68,9 +68,12 @@ firmware) and note the access code.
 
 ```sh
 docker run -d --name bambu-mqtt-proxy -p 8883:8883 -p 8080:8080 \
-  -e BMBPX_PRINTERS='serial=01P00A123456789,address=192.168.1.42:8883,tls=true,password=12345678' \
+  -e BMBPX_PRINTERS='serial=01P00A123456789,address=192.168.1.42:8883,tls=true,password=12345678,name=Garage P1S' \
   ghcr.io/bradsjm/bambu-mqtt-proxy:latest
 ```
+
+The optional `name=…` part is a friendly display label for the camera wall.
+Routing always uses the serial number.
 
 ### Docker (config file)
 
@@ -119,7 +122,7 @@ printers:
     username: "bblp"
     password: "12345678"
   - serial: "01S00C351100139"
-    name: "Garage P1S"               # optional; label shown on the camera wall
+    name: "Garage P1S"               # optional friendly label for the camera wall; never used for routing
     model: "P1S"                     # optional; camera support is auto-detected from the serial prefix
     address: "192.168.1.42:8883"
     tls: true
@@ -171,6 +174,7 @@ served; with `http.port: 0` no HTTP server starts at all.
 | `/camera/status` | Display state for every printer (no credentials) |
 | `/camera/events` | The same display state as server-sent events: on connect, on change, and at least every 10 s |
 | `/camwall` | Multi-printer camera wall dashboard |
+| `/favicon.ico`, `/apple-touch-icon.png` | Camera wall browser-tab, bookmark, and home-screen icons |
 
 The camera wall receives printer state over `/camera/events` and sizes its tiles to the
 window width, from one column on phones to a full grid on wall displays. Each

@@ -314,6 +314,16 @@ func TestCamWallRoutesServeEmbeddedWall(t *testing.T) {
 	if !strings.Contains(wallResp.Body.String(), "/camera/events") {
 		t.Fatal("embedded wall does not subscribe to camera status events")
 	}
+	for path, want := range map[string]string{"/favicon.ico": "image/x-icon", "/apple-touch-icon.png": "image/png"} {
+		if !strings.Contains(wallResp.Body.String(), `href="`+path+`"`) {
+			t.Errorf("embedded wall does not link %s", path)
+		}
+		iconResp := httptest.NewRecorder()
+		mux.ServeHTTP(iconResp, httptest.NewRequest(http.MethodGet, path, nil))
+		if iconResp.Code != http.StatusOK || iconResp.Header().Get("Content-Type") != want || iconResp.Body.Len() == 0 {
+			t.Errorf("GET %s = %d %q (%d bytes), want 200 %q", path, iconResp.Code, iconResp.Header().Get("Content-Type"), iconResp.Body.Len(), want)
+		}
+	}
 
 	overlayResp := httptest.NewRecorder()
 	mux.ServeHTTP(overlayResp, httptest.NewRequest(http.MethodGet, "/overlay", nil))
