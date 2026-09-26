@@ -920,9 +920,10 @@ function finishMove(t) {
 // Fleet chips are built once and updated in place so keyboard focus survives
 // status updates. State chips double as toggle filters.
 const fleetChips = new Map();
-function chip(tag, iconId, accent) {
+function chip(iconId, accent) {
   const li = document.createElement("li");
-  const el = document.createElement(tag);
+  const el = document.createElement("button");
+  el.type = "button";
   el.className = "chip";
   el.style.setProperty("--accent", accent);
   const n = document.createElement("b");
@@ -936,45 +937,37 @@ function chip(tag, iconId, accent) {
 function buildFleet() {
   for (const key of FILTER_KEYS) {
     const def = key === "attention" ? ATTENTION : STATES[key];
-    const c = chip("button", def.icon, `var(--${key})`);
-    c.el.type = "button";
+    // Offline counts read as errors; the other chips keep their state color.
+    const c = chip(def.icon, key === "offline" ? "var(--failed)" : `var(--${key})`);
     c.label.textContent = def.label.toLowerCase();
     c.el.addEventListener("click", () => toggleFilter(key));
     fleetChips.set(key, c);
   }
-  const clear = chip("button", "i-close", "var(--text)");
+  const clear = chip("i-close", "var(--text)");
   clear.el.classList.add("clear");
-  clear.el.type = "button";
   clear.label.textContent = "clear filter";
   clear.el.setAttribute("aria-label", "Clear filter and show all printers");
   clear.el.addEventListener("click", clearFilter);
   fleetChips.set("clear", clear);
-  const live = chip("span", "i-camera", "var(--live)");
-  live.label.textContent = "live";
-  fleetChips.set("live", live);
 }
 function renderFleet() {
   const counts = { attention: 0 };
-  let live = 0;
   for (const t of tiles.values()) {
     const b = bucket(t.data);
     counts[b] = (counts[b] || 0) + 1;
     if (needsAttention(t.data)) counts.attention++;
-    if (t.feed === "live") live++;
   }
   for (const key of FILTER_KEYS) {
     const c = fleetChips.get(key), count = counts[key] || 0, on = filter.has(key);
-    c.li.hidden = !count && !on;
+    // The offline chip hides at zero even when its filter is on; the clear
+    // chip and "show all printers" remain for dismissing that filter.
+    c.li.hidden = !count && (key === "offline" || !on);
     c.n.textContent = count;
     c.el.setAttribute("aria-pressed", String(on));
     c.el.setAttribute("aria-label", `${count} ${c.label.textContent}`);
     c.el.title = `${count} ${c.label.textContent} · ${on ? "remove from filter" : "show only these"}`;
   }
   fleetChips.get("clear").li.hidden = filter.size === 0;
-  const lc = fleetChips.get("live");
-  lc.li.hidden = tiles.size === 0;
-  lc.n.textContent = `${live}/${prefs.maxLive}`;
-  lc.el.title = `${live} of ${prefs.maxLive} live streams in use`;
 }
 function toggleFilter(key) {
   if (filter.has(key)) filter.delete(key); else filter.add(key);
