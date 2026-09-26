@@ -28,8 +28,11 @@ const (
 
 // Frame is an immutable captured JPEG. Buffers are never reused, so a frame
 // handed to an HTTP handler stays valid while the capture loop moves on.
+// Header holds the exact 16 raw header bytes the printer sent; the raw
+// camera server replays them verbatim instead of synthesizing one.
 type Frame struct {
 	JPEG     []byte
+	Header   []byte
 	Seq      uint64
 	Captured time.Time
 }
@@ -38,6 +41,10 @@ type Frame struct {
 type capture struct {
 	spec config.Printer
 	log  *slog.Logger
+	// endpoint resolves the printer's camera address. Production code uses
+	// cameraAddress; tests point captures at loopback fakes without
+	// changing printer configuration.
+	endpoint func(config.Printer) (string, error)
 
 	mu        sync.Mutex
 	consumers int
@@ -53,15 +60,17 @@ type capture struct {
 	backoffN  int
 }
 
-// newCapture builds the idle capture for one printer serial.
-func newCapture(spec config.Printer, log *slog.Logger) *capture {
+// newCapture builds the idle capture for one printer serial. The endpoint
+// function resolves where to dial; see capture.endpoint.
+func newCapture(spec config.Printer, log *slog.Logger, endpoint func(config.Printer) (string, error)) *capture {
 	return &capture{
-		spec:   spec,
-		log:    log,
-		notify: make(chan struct{}),
-		done:   make(chan struct{}),
-		frame:  nil,
-		cancel: nil,
+		spec:     spec,
+		log:      log,
+		endpoint: endpoint,
+		notify:   make(chan struct{}),
+		done:     make(chan struct{}),
+		frame:    nil,
+		cancel:   nil,
 	}
 }
 
@@ -249,7 +258,7 @@ func (c *capture) close() {
 func (c *capture) run(ctx context.Context, cancel context.CancelFunc, done chan struct{}) {
 	defer cancel()
 	defer close(done)
-	address, err := cameraAddress(c.spec)
+	address, err := c.endpoint(c.spec)
 	if err != nil {
 		c.log.Error("camera capture cannot start", "serial", c.spec.Serial, "error", err)
 		return
@@ -321,15 +330,17 @@ func (c *capture) streamOnce(ctx context.Context, address string) bool {
 	}
 }
 
-// publish stores the newest frame and wakes every waiter. Frames are large;
-// a new buffer per frame keeps handler-held bytes valid without copies.
-func (c *capture) publish(jpeg []byte) {
+// publish stamps the frame with its sequence and capture time, stores it as
+// the newest frame, and wakes every waiter. Frames are large; a new buffer
+// per frame keeps handler-held bytes valid without copies.
+func (c *capture) publish(f *Frame) {
 	c.mu.Lock()
 	seq := uint64(0)
 	if c.frame != nil {
 		seq = c.frame.Seq
 	}
-	f := &Frame{JPEG: jpeg, Seq: seq + 1, Captured: time.Now()}
+	f.Seq = seq + 1
+	f.Captured = time.Now()
 	c.frame = f
 	old := c.notify
 	c.notify = make(chan struct{})

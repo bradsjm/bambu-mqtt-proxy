@@ -16,7 +16,7 @@ Many Bambu integrations (Bambu Studio, Home Assistant, xtouch, OctoPrint plugins
 4. Route publishes and subscriptions bidirectionally by serial number.
 5. Stay transparent: forward payloads byte-for-byte. No JSON parsing.
 6. Ship as one small static Go binary with a YAML config file.
-7. Serve live camera snapshots, MJPEG streams, and a browser camera wall over one shared HTTP port for P1/A1-series printers.
+7. Serve live camera snapshots, MJPEG streams, and a browser camera wall over one shared HTTP port for P1/A1-series printers, and expose the camera also through a printer-compatible raw TLS endpoint on camera port 6000.
 
 ### Non-goals
 
@@ -80,6 +80,7 @@ Gap: no existing project combines ONE MQTT endpoint + serial-based routing to MU
         │                              │
         │  serial → upstream table     │
         │  HTTP :8080 health + camera  │
+        │  TLS :6000 raw camera        │
         └───┬──────────────┬───────────┘
             │ 1 conn       │ 1 conn        (paho.mqtt.golang)
             ▼              ▼
@@ -87,11 +88,12 @@ Gap: no existing project combines ONE MQTT endpoint + serial-based routing to MU
        :8883 MQTTS       :1883 MQTT (configurable)
 ```
 
-Three parts, one process:
+Four parts, one process:
 
 1. **Downstream broker** — mochi-mqtt v2 with a TLS listener on 1883. Mochi owns all MQTT protocol mechanics for clients (CONNECT/CONNACK, keepalive per client, SUBACK/PUBACK, session takeover).
 2. **Upstream pool** — one paho.mqtt.golang client per configured printer, created lazily, reconnected automatically. A routing table maps serial → upstream connection and tracks merged subscriptions.
 3. **HTTP service** — one `net/http` listener (`http.port`, default 8080) for the health endpoints and, when cameras are enabled, the camera snapshot/stream endpoints and the embedded camera wall.
+4. **Raw camera endpoint** — a TLS listener on printer camera port 6000 serving the chamber-image protocol to camera clients; the access code a client authenticates with selects the printer (§6). It starts whenever cameras are enabled, independent of the HTTP port.
 
 A custom mochi hook is the only coupling between the broker and the pool. The hook rewrites where packets go; it does not rewrite packets. The telemetry cache observes reports through the pool without changing forwarding.
 
@@ -160,6 +162,8 @@ The printer allows exactly ONE camera connection. The proxy enforces this with o
 - Capture starts on demand (first snapshot or stream consumer) and stops after a 5 s idle grace period.
 - Every consumer reads the latest immutable frame; slow clients skip frames and never block capture.
 - Connection loss reconnects with capped backoff (0.5 s → 5 s) while consumers remain.
+
+Besides the HTTP surface, the proxy runs a printer-compatible raw camera endpoint: a TLS listener on port 6000, the printer's camera port. A camera client connects, sends the 80-byte `bblp` + access-code authentication payload, and receives the native length-prefixed JPEG frame flow unchanged. No topic serial travels on this path, so the access code is the routing key: the proxy assumes printer-generated codes are unique and does not reject duplicates, but two printers sharing one access code are indistinguishable to this endpoint (MQTT serial routing is unaffected). The listener serves exactly when the camera feature is enabled — independent of `http.port`, which can stay 0 — shares the one-capture-owner rule with the HTTP consumers above, and closes before the capture manager on shutdown. Startup fails fast with a wrapped `raw camera endpoint` error when the port or its ephemeral certificate (`tlsutil.Ensure("", "")`) cannot be prepared; the deferred teardown then stops every already-started service.
 
 HTTP surface (all on the shared `http.port` listener, unauthenticated by design):
 
@@ -359,7 +363,7 @@ training.
   reach logs or status.
 ## 7. Routing model (core)
 
-Topic grammar: `device/{serial}/report` and `device/{serial}/request`. The serial is the second level. Any other topic shape is denied/dropped and logged.
+Topic grammar: `device/{serial}/report` and `device/{serial}/request`. The serial is the second level. Any other topic shape is denied/dropped and logged. This routing model covers MQTT only: the raw camera endpoint (§6) carries no topics and routes by the access code instead.
 
 ### 7.1 Subscribe path (downstream → upstream)
 
@@ -496,7 +500,7 @@ internal/upstream/pool.go      serial → connection table, lazy connect, reconn
 internal/upstream/conn.go      paho client wrapper (connect, publish, merged subscribe)
 internal/routing/topic.go      serial extraction, wildcard expansion, filter↔serial sets
 internal/telemetry/            delta-merging display-state cache fed by upstream reports
-internal/camera/               P1/A1 chamber-image capture, snapshot/stream/camera wall handlers
+internal/camera/               P1/A1 chamber-image capture, raw TLS camera endpoint, snapshot/stream/camera wall handlers
 internal/httpsrv/              shared health + camera HTTP listener
 internal/tlsutil/              self-signed certificate generation and persistence
 ```
@@ -520,6 +524,7 @@ Dependencies: `github.com/mochi-mqtt/server/v2`, `github.com/eclipse/paho.mqtt.g
 | A1 series printer (single-client limit) | Proxy holds one upstream connection regardless of model | The printer's limit stops affecting apps entirely |
 | Camera requested for unknown serial or non-P1/A1 model | 404 / 422 before any camera socket opens | Supported models: P1P, P1S, A1, A1MINI; X1-class RTSP cameras are not implemented |
 | Camera connection drops mid-stream | Capture reconnects with 0.5–5 s backoff while consumers remain; streams resume | Brief frame gap; slow clients skip frames instead of stalling capture |
+| Raw camera port 6000 busy at startup (second proxy instance, another service) or its certificate cannot be created | Startup fails fast with a wrapped `raw camera endpoint` error after the deferred teardown stops every already-started service | Operator frees the port or sets `camera.enabled: false`; no half-started services remain |
 | Unauthenticated HTTP exposure | Camera, camera wall, and status endpoints have no login | Anyone who can reach `http.port` sees cameras and telemetry; bind accordingly (state responses carry no credentials) |
 | Bambu Studio "add printer by IP" | Studio probes camera/FTP ports in addition to MQTT; probe failure can block discovery | MQTT control and status work; camera/FTP passthrough is future work |
 | Tools that pin the printer TLS certificate | The self-signed proxy cert fails pinning | Load a custom cert/key via config, or disable pinning (clients must already skip verify against the real printer) |
@@ -545,6 +550,7 @@ Dependencies: `github.com/mochi-mqtt/server/v2`, `github.com/eclipse/paho.mqtt.g
 4. **Smoke (manual, performed)**: real P1S in LAN Mode at `10.10.20.141` — MQTT upstream connected on first attempt with `pushall` warmup; snapshot returned a valid 1280×720 JPEG (~87 KB); 4-second stream sample contained 3 complete multipart JPEG parts; 404/422 gates answered without opening a camera socket; overlay served. This smoke run caught and fixed a real defect: the camera endpoint derived from the MQTT port instead of always using 6000.
 5. **Smoke (manual, remaining)**: Bambu Studio and Home Assistant connected through the proxy on `:8883` with the printer's access code, observing `pushall` warmup and delta flow in debug logs.
 6. **Gadget integration (optional feature)**: designed coverage — unit and integration tests against a fake Gadget HTTP server for create-context URL validation, response contract enforcement (quality bounds, required flags, interval clamping), error taxonomy (terminal account suspension vs transient backoff vs fallback-URL switch), local 6 MiB frame rejection, backoff reset on success, and status-object shape. No real-printer smoke and no live-API call back the detection feature, and no real printer report fixtures are available; hardware behavior is unverified.
+7. **Cmd wiring** (subprocess, real `run()`): cameras enabled with `BMBPX_HTTP_PORT=0` must answer a TLS handshake on 127.0.0.1:6000 and exit cleanly on SIGTERM; `BMBPX_CAMERA_ENABLED=false` must serve health while port 6000 is held, proving it never binds; a pre-held port 6000 must fail startup with the wrapped `raw camera endpoint` error.
 
 ## 14. Future work (explicitly out of scope for v1)
 
@@ -563,14 +569,14 @@ Configuration comes from a YAML file, environment variables, or both; environmen
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `BMBPX_PRINTERS` | — | Semicolon-separated printer entries: `serial=SN,address=host:port,password=code[,name=label][,username=bblp][,tls=true][,insecure_skip_verify=true]`. The optional `name` is a display label for the camera wall; routing always uses the serial. |
+| `BMBPX_PRINTERS` | — | Semicolon-separated printer entries: `serial=SN,address=host:port,password=code[,name=label][,username=bblp][,tls=true][,insecure_skip_verify=true]`. The optional `name` is a display label for the camera wall; MQTT routing always uses the serial, while the raw camera endpoint routes by access code (§6). |
 | `BMBPX_LISTEN_PORT` | `8883` | Downstream MQTT port |
 | `BMBPX_LISTEN_TLS` | `true` | TLS on the downstream listener |
 | `BMBPX_CERT_FILE` / `BMBPX_KEY_FILE` | empty | Empty = ephemeral in-memory self-signed certificate |
 | `BMBPX_AUTH_MODE` | `printer` | `printer` or `accept_all` |
 | `BMBPX_LOG_LEVEL` | `info` | `debug` logs routing decisions |
 | `BMBPX_HTTP_PORT` | `8080` | Shared health + camera HTTP port (0 off) |
-| `BMBPX_CAMERA_ENABLED` | `true` | Camera and camera wall endpoints |
+| `BMBPX_CAMERA_ENABLED` | `true` | Camera endpoints, camera wall, and the raw camera listener on port 6000 |
 | `BMBPX_OCTOEVERYWHERE_API_KEY` | empty | Empty = off; set to an OctoEverywhere Gadget API key to enable AI failure detection (consents to external snapshot upload and automatic pause; see §6.1) |
 
 Behavior tuning (`behavior:` in YAML) has no environment surface — its defaults match the design.
@@ -590,12 +596,12 @@ The image runs as a non-root user and ships a `HEALTHCHECK` probing `/livez` (in
 docker buildx build --platform linux/amd64,linux/arm64 -t bambu-mqtt-proxy .
 
 # env-only (stateless):
-docker run -d -p 8883:8883 -p 8080:8080 \
+docker run -d -p 8883:8883 -p 6000:6000 -p 8080:8080 \
   -e BMBPX_PRINTERS='serial=SN,address=printer.lan:8883,tls=true,password=CODE' \
   bambu-mqtt-proxy
 
 # config file:
-docker run -d -p 8883:8883 -p 8080:8080 \
+docker run -d -p 8883:8883 -p 6000:6000 -p 8080:8080 \
   -v /path/to/bambu-mqtt-proxy.yaml:/config/bambu-mqtt-proxy.yaml:ro \
   bambu-mqtt-proxy
 ```

@@ -13,16 +13,29 @@ import (
 	"errors"
 	"math/big"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"bambu-mqtt-proxy/internal/config"
 )
 
 // fakeCamera is a minimal P1/A1 camera stand-in: TLS semantics, an 80-byte
 // auth payload, then length-prefixed JPEG frames (no login reply).
 type fakeCamera struct {
-	ln      net.Listener
-	frames  chan []byte
-	authErr chan error
+	ln       net.Listener
+	addr     string
+	frames   chan []byte
+	custom   chan rawTestFrame
+	authErr  chan error
+	sessions atomic.Int64
+}
+
+// rawTestFrame is one verbatim header+payload pair the fake sends as-is, so
+// tests can prove the raw server preserves non-canonical header bytes.
+type rawTestFrame struct {
+	header  []byte
+	payload []byte
 }
 
 // errBadMagic reports a malformed auth payload in tests.
@@ -35,17 +48,23 @@ func newFakeCamera(t *testing.T) *fakeCamera {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The production capture always derives camera port 6000 from the
-	// printer host, so the fake binds the real port. Tests run sequentially
-	// (no t.Parallel) and release the listener via t.Cleanup, so rebinding
-	// per test is safe.
-	ln, err := tls.Listen("tcp", "127.0.0.1:6000", &tls.Config{
-		Certificates: []tls.Certificate{cert},
-	})
+	// The fake binds an ephemeral loopback port; tests inject that address
+	// into the manager's camera endpoint so the capture never dials the
+	// fixed camera port 6000 (which belongs to the production raw server).
+	tcp, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	fc := &fakeCamera{ln: ln, frames: make(chan []byte, 8), authErr: make(chan error, 8)}
+	ln := tls.NewListener(tcp, &tls.Config{
+		Certificates: []tls.Certificate{cert},
+	})
+	fc := &fakeCamera{
+		ln:      ln,
+		addr:    ln.Addr().String(),
+		frames:  make(chan []byte, 8),
+		custom:  make(chan rawTestFrame, 8),
+		authErr: make(chan error, 8),
+	}
 	go func() {
 		for {
 			conn, err := ln.Accept()
@@ -62,6 +81,7 @@ func newFakeCamera(t *testing.T) *fakeCamera {
 // handle serves one camera session.
 func (fc *fakeCamera) handle(conn net.Conn) {
 	defer conn.Close()
+	fc.sessions.Add(1)
 	r := bufio.NewReader(conn)
 	var header [16]byte
 	if _, err := readFull(r, header[:]); err != nil {
@@ -77,13 +97,41 @@ func (fc *fakeCamera) handle(conn net.Conn) {
 		fc.authErr <- err
 		return
 	}
-	for frame := range fc.frames {
-		hdr := make([]byte, 16)
-		binary.LittleEndian.PutUint32(hdr[0:4], uint32(len(frame)))
-		if _, err := conn.Write(append(hdr, frame...)); err != nil {
-			return
+	for {
+		select {
+		case frame, ok := <-fc.frames:
+			if !ok {
+				return
+			}
+			hdr := make([]byte, 16)
+			binary.LittleEndian.PutUint32(hdr[0:4], uint32(len(frame)))
+			if _, err := conn.Write(append(hdr, frame...)); err != nil {
+				return
+			}
+		case f, ok := <-fc.custom:
+			if !ok {
+				return
+			}
+			// Verbatim: the fake writes exactly the header and payload
+			// the test generated, including non-canonical marker bytes.
+			blob := make([]byte, 0, len(f.header)+len(f.payload))
+			blob = append(blob, f.header...)
+			blob = append(blob, f.payload...)
+			if _, err := conn.Write(blob); err != nil {
+				return
+			}
 		}
 	}
+}
+
+// newFakeManager builds a manager whose captures dial the fake camera's
+// ephemeral address instead of deriving the fixed camera port 6000.
+func newFakeManager(t *testing.T, fc *fakeCamera, printers ...config.Printer) *Manager {
+	t.Helper()
+	m := NewManager(printers, discardLogger())
+	m.cameraEndpoint = func(config.Printer) (string, error) { return fc.addr, nil }
+	t.Cleanup(m.Close)
+	return m
 }
 
 // serveError reports why the fake camera dropped a session, for tests.

@@ -27,7 +27,11 @@ type Manager struct {
 	mu       sync.Mutex
 	captures map[string]*capture
 	bySerial map[string]config.Printer
-	log      *slog.Logger
+	// cameraEndpoint resolves a printer's camera address. Production code
+	// uses cameraAddress; tests inject loopback fakes so they never fight
+	// over the fixed camera port.
+	cameraEndpoint func(config.Printer) (string, error)
+	log            *slog.Logger
 }
 
 // NewManager indexes the configured printers. Only P1 and A1 series models
@@ -38,9 +42,10 @@ func NewManager(printers []config.Printer, log *slog.Logger) *Manager {
 		bySerial[p.Serial] = p
 	}
 	return &Manager{
-		captures: make(map[string]*capture),
-		bySerial: bySerial,
-		log:      log,
+		captures:       make(map[string]*capture),
+		bySerial:       bySerial,
+		cameraEndpoint: cameraAddress,
+		log:            log,
 	}
 }
 
@@ -64,9 +69,47 @@ func (m *Manager) get(serial string) *capture {
 	if c, ok := m.captures[serial]; ok {
 		return c
 	}
-	c := newCapture(m.bySerial[serial], m.log)
+	c := newCapture(m.bySerial[serial], m.log, m.cameraEndpoint)
 	m.captures[serial] = c
 	return c
+}
+
+// matchCameraCredentials resolves a raw camera session's NUL-padded username
+// and access-code fields to the configured eligible printer they belong to.
+// Access codes are printer-generated and unique, so an exact field match
+// identifies one printer; ineligible models never match even when their
+// credentials happen to coincide. Credential uniqueness and format are the
+// configuration's concern; nothing is validated or rewritten here.
+func (m *Manager) matchCameraCredentials(username, accessCode []byte) (config.Printer, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, p := range m.bySerial {
+		if !config.CameraEligible(p.Model, p.Serial) {
+			continue
+		}
+		if nulPaddedEqual(username, p.Username) && nulPaddedEqual(accessCode, p.Password) {
+			return p, true
+		}
+	}
+	return config.Printer{}, false
+}
+
+// nulPaddedEqual reports whether a fixed-length authentication field is
+// exactly value followed by NUL padding, the shape this proxy itself sends
+// upstream in authPayload.
+func nulPaddedEqual(field []byte, value string) bool {
+	if len(value) > len(field) {
+		return false
+	}
+	if string(field[:len(value)]) != value {
+		return false
+	}
+	for _, b := range field[len(value):] {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // Snapshot returns the freshest frame for serial. It reports the failure
@@ -125,8 +168,10 @@ func (m *Manager) Latest(serial string) *Frame {
 	return c.latest()
 }
 
-// Wait is a small indirection over capture.wait so handler tests can stub
-// timing without real cameras.
+// Wait blocks until the capture publishes a frame with a sequence greater
+// than after, the context ends, or the timeout expires. It is the shared
+// wait path for HTTP streams, detection, and raw camera sessions; each call
+// takes a temporary capture reference that the call itself balances.
 func (m *Manager) Wait(serial string, ctx context.Context, after uint64, timeout time.Duration) *Frame {
 	m.mu.Lock()
 	c, ok := m.captures[serial]

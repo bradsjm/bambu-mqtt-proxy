@@ -25,6 +25,7 @@ a single upstream connection per printer.
         ┌──────────────────────────────┐
         │  bambu-mqtt-proxy            │
         │  TLS :8883 (self-signed)     │
+        │  TLS :6000 raw camera        │
         │  serial → upstream table     │
         └───┬──────────────┬───────────┘
             │ 1 conn       │ 1 conn
@@ -39,8 +40,10 @@ a single upstream connection per printer.
   forwarded byte-for-byte (compatible with 2025+ signed-firmware printers).
 - **One upstream connection per printer** — N clients share one merged
   subscription per printer; the printer's connection limit stops mattering.
-- **Serial-based routing** — a single endpoint serves every configured printer;
-  topics `device/{serial}/report` and `device/{serial}/request` select the target.
+- **Serial-based MQTT routing** — a single endpoint serves every configured
+  printer; topics `device/{serial}/report` and `device/{serial}/request` select
+  the target. The raw camera endpoint below is the one exception: it routes by
+  access code.
 - **Printer outage tolerant** — capped exponential backoff with jitter,
   automatic reconnect + resubscribe, and a `pushall` warmup so late joiners get
   full state (P1 printers otherwise send deltas only).
@@ -51,6 +54,9 @@ a single upstream connection per printer.
 - **P1/A1 camera wall** — serial-addressed JPEG snapshots and live MJPEG
   streams from the printer's chamber camera, plus a dashboard page that pairs
   every camera with color-coded print state, progress, and temperatures.
+- **Raw camera passthrough** — a printer-compatible TLS listener on port 6000:
+  camera apps authenticate with `bblp` plus a printer's access code, and the
+  access code selects the printer.
 - **Optional Gadget AI failure detection** — with an OctoEverywhere API key,
   snapshots from active prints are analyzed by the Gadget service and the proxy
   pauses the print on a likely failure. No key, no uploads, no automatic pauses.
@@ -67,24 +73,27 @@ firmware) and note the access code.
 ### Docker (env only — stateless)
 
 ```sh
-docker run -d --name bambu-mqtt-proxy -p 8883:8883 -p 8080:8080 \
+docker run -d --name bambu-mqtt-proxy -p 8883:8883 -p 6000:6000 -p 8080:8080 \
   -e BMBPX_PRINTERS='serial=01P00A123456789,address=192.168.1.42:8883,tls=true,password=12345678,name=Garage P1S' \
   ghcr.io/bradsjm/bambu-mqtt-proxy:latest
 ```
 
 The optional `name=…` part is a friendly display label for the camera wall.
-Routing always uses the serial number.
+MQTT routing always uses the serial number; the raw camera endpoint on port
+6000 instead identifies the printer by the access code a client connects with.
 
 ### Docker (config file)
 
 ```sh
-docker run -d --name bambu-mqtt-proxy -p 8883:8883 -p 8080:8080 \
+docker run -d --name bambu-mqtt-proxy -p 8883:8883 -p 6000:6000 -p 8080:8080 \
   -v $(pwd)/bambu-mqtt-proxy.yaml:/config/bambu-mqtt-proxy.yaml:ro \
   ghcr.io/bradsjm/bambu-mqtt-proxy:latest
 ```
 
 Point your apps at the proxy host, port 8883, username `bblp`, and any
-configured printer's access code.
+configured printer's access code. Camera apps that speak the printer's camera
+protocol point at the proxy host, port 6000, with the same `bblp` username and
+the target printer's access code.
 
 ### Docker Compose
 
@@ -128,7 +137,7 @@ printers:
     tls: true
     insecure_skip_verify: true
     username: "bblp"
-    password: "12345678"
+    password: "87654321"
 behavior:
   qos_max: 1
   warmup_commands:
@@ -136,7 +145,7 @@ behavior:
 http:
   port: 8080                         # 0 disables the HTTP server entirely
 camera:
-  enabled: true                      # false removes camera routes and the camera wall
+  enabled: true                      # false removes camera routes, the camera wall, and the raw camera listener on port 6000
 log:
   level: info
 ```
@@ -149,8 +158,8 @@ log:
 | `BMBPX_CERT_FILE` / `BMBPX_KEY_FILE` | *(empty)* | Empty = ephemeral in-memory self-signed certificate |
 | `BMBPX_AUTH_MODE` | `printer` | `printer` or `accept_all` |
 | `BMBPX_LOG_LEVEL` | `info` | `info` logs client/upstream state, subscriptions, retries, and backoffs; `debug` adds per-packet routing |
-| `BMBPX_HTTP_PORT` | `8080` | Shared health + camera HTTP port; `0` disables HTTP |
-| `BMBPX_CAMERA_ENABLED` | `true` | `false` removes the camera routes, the camera wall, and their MQTT report subscriptions |
+| `BMBPX_HTTP_PORT` | `8080` | Shared health + camera HTTP port; `0` disables HTTP (the raw camera listener on 6000 keeps serving while cameras are enabled) |
+| `BMBPX_CAMERA_ENABLED` | `true` | `false` removes the camera routes, the camera wall, and their MQTT report subscriptions, plus the raw camera listener on port 6000 |
 | `BMBPX_OCTOEVERYWHERE_API_KEY` | *(empty)* | OctoEverywhere Gadget API key; empty = detection off. Setting it consents to external snapshot uploads and automatic pauses — see [Gadget AI failure detection](#gadget-ai-failure-detection-optional) |
 
 At the default `info` level, logs identify downstream clients by MQTT client ID
@@ -163,7 +172,9 @@ per-packet request routing is also required.
 
 Health and camera endpoints share one HTTP listener (`BMBPX_HTTP_PORT`,
 YAML `http.port`). When cameras are disabled only the health endpoints are
-served; with `http.port: 0` no HTTP server starts at all.
+served; with `http.port: 0` no HTTP server starts at all. The raw camera
+endpoint is separate: it listens on TLS port 6000 whenever cameras are enabled
+— including with `http.port: 0` — and never starts when they are disabled.
 
 | Endpoint | Meaning |
 |---|---|
@@ -223,6 +234,16 @@ cameras and telemetry, and the state endpoint never includes credentials.
 Chamber temperature is shown only for models known to have a physical chamber
 sensor (including X1/X2/P2/H2 models). P1 and A1 models omit the chamber
 reading even if their MQTT report contains `chamber_temper`.
+
+The raw camera endpoint serves the printer's own camera protocol on TCP port
+6000. A client connects over TLS, sends the printer's 80-byte `bblp` +
+access-code authentication, and receives the printer's native JPEG frame flow
+unchanged. No topic serial travels on this path: the access code selects the
+printer, so the proxy needs unique access codes across printers to route raw
+camera clients correctly (MQTT routing is unaffected, and the proxy does not
+reject duplicate codes). The listener starts with the camera feature — even
+with `http.port: 0` — and a port or certificate failure fails startup with a
+wrapped error.
 
 ### Gadget AI failure detection (optional)
 
@@ -300,6 +321,8 @@ DESIGN.md §13.
   `bambu-mqtt-proxy.yaml`).
 - TLS certificates are unverified on both hops, matching Bambu's own LAN
   protocol; the proxy is intended for trusted home LANs.
+- The raw camera endpoint on port 6000 authenticates with `bblp` plus a
+  configured printer access code; the code selects the printer.
 - The optional OctoEverywhere key is a secret: keep it in your environment
   (`.env` is git-ignored) and share the account with caution — setting it
   authorizes external upload of camera snapshots and automatic print pauses,

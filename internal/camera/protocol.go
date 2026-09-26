@@ -24,6 +24,10 @@ import (
 const (
 	// Port is the chamber image camera port on P1 and A1 series printers.
 	Port = 6000
+	// cameraAuthMagic and cameraAuthCommand open every authentication
+	// payload.
+	cameraAuthMagic   = 0x40
+	cameraAuthCommand = 0x3000
 	// authPayloadLen is the fixed authentication payload length.
 	authPayloadLen = 80
 	// frameHeaderLen is the per-frame header length; its first little-endian
@@ -38,11 +42,19 @@ const (
 // null-padded to 32 bytes.
 func authPayload(username, accessCode string) []byte {
 	p := make([]byte, authPayloadLen)
-	binary.LittleEndian.PutUint32(p[0:4], 0x40)
-	binary.LittleEndian.PutUint32(p[4:8], 0x3000)
+	binary.LittleEndian.PutUint32(p[0:4], cameraAuthMagic)
+	binary.LittleEndian.PutUint32(p[4:8], cameraAuthCommand)
 	copy(p[16:48], username)
 	copy(p[48:80], accessCode)
 	return p
+}
+
+// validAuthHeader reports whether a received payload opens with the camera
+// authentication magic and command.
+func validAuthHeader(payload []byte) bool {
+	return len(payload) >= 8 &&
+		binary.LittleEndian.Uint32(payload[0:4]) == cameraAuthMagic &&
+		binary.LittleEndian.Uint32(payload[4:8]) == cameraAuthCommand
 }
 
 // cameraAddress derives the camera endpoint from the printer MQTT address
@@ -88,10 +100,12 @@ func authenticate(w io.Writer, r *bufio.Reader, username, accessCode string) err
 	return nil
 }
 
-// readFrame reads one JPEG frame: a 16-byte header whose first little-endian
-// uint32 is the payload length, then the JPEG payload. JPEG start and end
-// markers are validated so partial TLS reads never reach clients.
-func readFrame(r *bufio.Reader) ([]byte, error) {
+// readFrame reads one raw frame: a 16-byte header whose first little-endian
+// uint32 is the payload length, then the JPEG payload. The header bytes are
+// returned untouched so raw camera sessions can replay them verbatim; JPEG
+// start and end markers are validated so partial TLS reads never reach
+// clients.
+func readFrame(r *bufio.Reader) (*Frame, error) {
 	var header [frameHeaderLen]byte
 	if _, err := io.ReadFull(r, header[:]); err != nil {
 		return nil, fmt.Errorf("read camera frame header: %w", err)
@@ -100,14 +114,16 @@ func readFrame(r *bufio.Reader) ([]byte, error) {
 	if length == 0 || length > maxPayloadLen {
 		return nil, fmt.Errorf("camera frame length %d out of range", length)
 	}
-	frame := make([]byte, length)
-	if _, err := io.ReadFull(r, frame); err != nil {
+	jpeg := make([]byte, length)
+	if _, err := io.ReadFull(r, jpeg); err != nil {
 		return nil, fmt.Errorf("read camera frame: %w", err)
 	}
-	if !isJPEG(frame) {
+	if !isJPEG(jpeg) {
 		return nil, fmt.Errorf("camera frame is not JPEG")
 	}
-	return frame, nil
+	raw := make([]byte, frameHeaderLen)
+	copy(raw, header[:])
+	return &Frame{JPEG: jpeg, Header: raw}, nil
 }
 
 // isJPEG validates the SOI and EOI markers that bracket every JPEG.

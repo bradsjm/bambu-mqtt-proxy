@@ -31,8 +31,9 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// cameraSpec builds a supported printer whose MQTT address is addr; the
-// capture derives the camera endpoint 127.0.0.1:6000 from that host.
+// cameraSpec builds a supported printer whose MQTT address is addr. Tests
+// pair it with newFakeManager so the capture dials the fake's ephemeral
+// address instead of the derived camera port.
 func cameraSpec(serial, addr string) config.Printer {
 	host, port, _ := net.SplitHostPort(addr)
 	return config.Printer{
@@ -50,8 +51,7 @@ func cameraSpec(serial, addr string) config.Printer {
 // stream paths and asserts one shared upstream session per printer.
 func TestSnapshotAndStreamLifecycle(t *testing.T) {
 	fc := newFakeCamera(t)
-	m := NewManager([]config.Printer{cameraSpec("S1", "127.0.0.1:8883")}, discardLogger())
-	t.Cleanup(m.Close)
+	m := newFakeManager(t, fc, cameraSpec("S1", "127.0.0.1:8883"))
 
 	// Snapshot before any frame: bounded wait must fail with 503 shape.
 	frame, st := m.Snapshot("S1", func(c *capture) (*Frame, bool) {
@@ -132,9 +132,8 @@ func TestUnsupportedModelNeverDials(t *testing.T) {
 }
 
 // TestSerialPrefixInferenceGates asserts the eligibility path for configs
-// without model fields: a P1S-prefix serial gets a capture (the gateway
-// dialed 127.0.0.1:6000 and failed fast), an X1C-prefix serial is refused
-// without ever creating one.
+// without model fields: a P1S-prefix serial gets a capture, an X1C-prefix
+// serial is refused without ever creating one.
 func TestSerialPrefixInferenceGates(t *testing.T) {
 	m := NewManager([]config.Printer{
 		{Serial: "01S00C351100139", Address: "127.0.0.1:1", Username: "bblp", Password: "x"},
@@ -170,8 +169,7 @@ func TestHandlerStatusCodes(t *testing.T) {
 		{Serial: "P1PONLY", Model: "a1 mini", Address: "127.0.0.1:8883", Username: "bblp", Password: "x"},
 		{Serial: "XSERIES", Model: "X1C", Address: "127.0.0.1:1", Username: "bblp", Password: "x"},
 	}
-	m := NewManager(printers, discardLogger())
-	t.Cleanup(m.Close)
+	m := newFakeManager(t, fc, printers...)
 
 	get := func(serial string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest("GET", "/camera/"+serial+"/snapshot", nil)
@@ -219,8 +217,7 @@ func TestHandlerStatusCodes(t *testing.T) {
 // TestStreamWritesMultipart asserts stream framing end to end.
 func TestStreamWritesMultipart(t *testing.T) {
 	fc := newFakeCamera(t)
-	m := NewManager([]config.Printer{cameraSpec("S1", "127.0.0.1:8883")}, discardLogger())
-	t.Cleanup(m.Close)
+	m := newFakeManager(t, fc, cameraSpec("S1", "127.0.0.1:8883"))
 
 	m.Acquire("S1")
 	fc.frames <- jpeg(40)
@@ -465,7 +462,10 @@ func TestFrameValidation(t *testing.T) {
 	binary.LittleEndian.PutUint32(header[0:4], 4)
 	r := bufio.NewReader(strings.NewReader(string(header[:]) + "\xff\xd8\xff\xd9"))
 	f, err := readFrame(r)
-	if err != nil || !isJPEG(f) {
+	if err != nil || !isJPEG(f.JPEG) {
 		t.Fatalf("minimal jpeg = %v, %v", f, err)
+	}
+	if len(f.Header) != frameHeaderLen || string(f.Header) != string(header[:]) {
+		t.Fatal("readFrame must preserve the printer's raw header bytes")
 	}
 }

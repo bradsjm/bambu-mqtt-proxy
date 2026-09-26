@@ -33,8 +33,8 @@ func main() {
 }
 
 // run resolves configuration (file, environment, or both), wires routing,
-// the upstream pool, broker, and health server, then serves until an
-// interrupt signal.
+// the upstream pool, broker, raw camera endpoint, and health server, then
+// serves until an interrupt signal.
 func run() error {
 	configPath := flag.String("config", "", "path to the YAML config file (optional when BMBPX_* env vars are set)")
 	logLevel := flag.String("log-level", "", "override log level (debug, info, warn, error)")
@@ -111,15 +111,21 @@ func run() error {
 	}
 
 	// The broker is up. Defer every teardown from here so both the signal
-	// path and later startup errors (an HTTP bind failure) stop the
-	// detector, camera captures, upstream pool, HTTP server, and broker —
-	// in that order. Each stop is idempotent, so the single deferred call
-	// never double-stops a service.
+	// path and later startup errors (a raw camera or HTTP bind failure) stop
+	// the detector, the raw camera listener, camera captures, upstream pool,
+	// HTTP server, and broker — in that order. The raw listener closes
+	// before the capture manager so its camera sockets never outlive the
+	// captures they read. Each stop is idempotent, so the single deferred
+	// call never double-stops a service.
 	var httpSrv *httpsrv.Server
+	var raw *camera.RawServer
 	defer func() {
 		logger.Info("shutting down")
 		if detector != nil {
 			detector.Close()
+		}
+		if raw != nil {
+			raw.Close()
 		}
 		if cameras != nil {
 			cameras.Close()
@@ -130,6 +136,19 @@ func run() error {
 		}
 		_ = srv.Close()
 	}()
+
+	// Raw camera endpoint: the camera feature keeps its printer-compatible
+	// listener even when the HTTP port is off. Starting it after the
+	// deferred teardown is installed keeps a bind or certificate failure on
+	// the same full shutdown path.
+	if cfg.CameraEnabled() {
+		r := camera.NewRawServer(cameras, logger)
+		if err := r.Start(); err != nil {
+			return fmt.Errorf("raw camera endpoint: %w", err)
+		}
+		raw = r
+		logger.Info("raw camera endpoint serving", "port", camera.Port)
+	}
 
 	// Start detection workers only after the broker accepted its
 	// listeners.

@@ -19,8 +19,10 @@ auth:
   # accept_all:  allow any CONNECT.
   mode: printer
 
-# One entry per printer. The serial routes traffic: clients talk to
-# device/{serial}/report and device/{serial}/request.
+# One entry per printer. The serial routes MQTT traffic: clients talk to
+# device/{serial}/report and device/{serial}/request. The raw camera endpoint
+# on port 6000 instead routes by the access code, so each printer needs its
+# own code.
 printers:
   - serial: "01P00A123456789"
     name: "Garage P1S" # optional friendly label for the camera wall; never used for routing
@@ -43,7 +45,8 @@ http:
 
 camera:
   # Enabled by default; false removes the camera routes, the camera wall,
-  # and the camera wall's own MQTT report subscriptions.
+  # the camera wall's own MQTT report subscriptions, and the raw camera
+  # listener on port 6000.
   # enabled: false
 
 behavior:
