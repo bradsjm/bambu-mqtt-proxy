@@ -19,7 +19,7 @@ import (
 // Capture tuning. Fixed internal defaults keep the configuration surface
 // small; they are not printer guarantees.
 const (
-	idleStopAfter    = 5 * time.Second // stop capture with no consumers
+	idleStopAfter    = 2 * time.Minute // idle grace after the last consumer release
 	backoffInitial   = 500 * time.Millisecond
 	backoffMax       = 5 * time.Second
 	snapshotMaxAge   = 5 * time.Second  // accept a shared frame younger than this
@@ -43,6 +43,10 @@ type capture struct {
 	consumers int
 	notify    chan struct{} // closed and replaced on every published frame
 	closed    bool
+	stopping  bool          // idle-stopped and waiting for the loop to exit
+	retired   chan struct{} // closed when a retirement fully completes
+	idle      *time.Timer   // armed while the last consumer is gone
+	idleGen   uint64        // bumped on every arm; stale callbacks abort
 	frame     *Frame
 	cancel    context.CancelFunc
 	done      chan struct{} // closed when the capture loop exits
@@ -62,11 +66,29 @@ func newCapture(spec config.Printer, log *slog.Logger) *capture {
 }
 
 // acquire registers a consumer and starts the capture loop when this is the
-// first consumer or the idle-stop has not yet fired. It returns the current
-// notification channel; see wait.
+// first consumer, restarts it after an idle stop, and otherwise joins the
+// live loop. It returns the current notification channel; see wait.
 func (c *capture) acquire() chan struct{} {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		return c.notify
+	}
+	if c.idle != nil {
+		c.idle.Stop()
+		c.idle = nil
+	}
+	// A retiring capture is idle-stopped with its loop still exiting. The
+	// printer allows one camera connection, so wait for the retirement to
+	// complete — retired closes only after the loop exited and the flag
+	// cleared — before starting a new one, then re-check: shutdown or a
+	// concurrent acquire may have won the race meanwhile.
+	for c.cancel == nil && c.stopping {
+		retired := c.retired
+		c.mu.Unlock()
+		<-retired
+		c.mu.Lock()
+	}
 	if c.closed {
 		return c.notify
 	}
@@ -85,30 +107,46 @@ func (c *capture) acquire() chan struct{} {
 // timer ends the capture loop unless someone acquires first.
 func (c *capture) release() {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.consumers > 0 {
 		c.consumers--
 	}
-	last := c.consumers == 0 && c.cancel != nil && !c.closed
-	serial := c.spec.Serial
-	c.mu.Unlock()
-	if last {
-		time.AfterFunc(idleStopAfter, func() { c.stopIdle(serial) })
+	// Arming a fresh timer on every last release measures the grace from
+	// the most recent release; acquire stops the pending one. At most one
+	// timer can be pending here: consumers reach zero only through this
+	// arm, and acquire cancels it before counting a new consumer.
+	if c.consumers == 0 && c.cancel != nil && !c.closed {
+		c.idleGen++
+		gen := c.idleGen
+		c.idle = time.AfterFunc(idleStopAfter, func() { c.stopIdle(gen) })
 	}
 }
 
 // stopIdle ends the capture loop when no consumer re-acquired in time.
-func (c *capture) stopIdle(serial string) {
+// The generation rejects a callback delayed past its own grace: a later
+// release has armed a newer timer by then. The stopping flag and retired
+// channel stay until the loop has fully exited, so a concurrent acquire
+// waits instead of dialing a second camera connection.
+func (c *capture) stopIdle(gen uint64) {
 	c.mu.Lock()
-	if c.closed || c.consumers > 0 || c.cancel == nil {
+	if gen != c.idleGen || c.closed || c.consumers > 0 || c.cancel == nil {
 		c.mu.Unlock()
 		return
 	}
 	cancel, done := c.cancel, c.done
 	c.cancel = nil
+	c.stopping = true
+	c.retired = make(chan struct{})
+	c.idle = nil
 	c.mu.Unlock()
 	cancel()
 	<-done
-	c.log.Info("camera capture idle-stopped", "serial", serial)
+	c.mu.Lock()
+	c.stopping = false
+	retired := c.retired
+	c.mu.Unlock()
+	close(retired)
+	c.log.Info("camera capture idle-stopped", "serial", c.spec.Serial)
 }
 
 // latest returns the newest frame, or nil before the first frame.
@@ -122,15 +160,16 @@ func (c *capture) latest() *Frame {
 // starts a bounded wait for the next published one; the returned ok flag is
 // false when no fresh frame arrives in time or the capture is closed.
 func (c *capture) snapshot(ctx context.Context) (*Frame, bool) {
-	if f := c.latest(); f != nil && time.Since(f.Captured) <= snapshotMaxAge {
-		return f, true
-	}
+	// Acquiring before the fresh check counts every caller as a consumer,
+	// so repeated cached-frame answers keep resetting the idle-stop timer
+	// and hold the transport open.
 	notify := c.acquire()
 	defer c.release()
 	c.mu.Lock()
 	notify = c.notify
+	f := c.frame
 	c.mu.Unlock()
-	if f := c.latest(); f != nil && time.Since(f.Captured) <= snapshotMaxAge {
+	if f != nil && time.Since(f.Captured) <= snapshotMaxAge {
 		return f, true
 	}
 	timer := time.NewTimer(initialFrameWait)
@@ -181,7 +220,8 @@ func (c *capture) wait(ctx context.Context, after uint64, timeout time.Duration)
 	}
 }
 
-// close shuts the capture down permanently.
+// close shuts the capture down permanently. It cancels any pending idle
+// stop and waits for a running or retiring loop to exit.
 func (c *capture) close() {
 	c.mu.Lock()
 	if c.closed {
@@ -189,11 +229,17 @@ func (c *capture) close() {
 		return
 	}
 	c.closed = true
-	cancel, done := c.cancel, c.done
+	if c.idle != nil {
+		c.idle.Stop()
+		c.idle = nil
+	}
+	cancel, done, stopping := c.cancel, c.done, c.stopping
 	c.cancel = nil
 	c.mu.Unlock()
 	if cancel != nil {
 		cancel()
+	}
+	if cancel != nil || stopping {
 		<-done
 	}
 }
