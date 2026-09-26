@@ -122,6 +122,37 @@ func TestUnsupportedModelNeverDials(t *testing.T) {
 	}
 }
 
+// TestSerialPrefixInferenceGates asserts the eligibility path for configs
+// without model fields: a P1S-prefix serial gets a capture (the gateway
+// dialed 127.0.0.1:6000 and failed fast), an X1C-prefix serial is refused
+// without ever creating one.
+func TestSerialPrefixInferenceGates(t *testing.T) {
+	m := NewManager([]config.Printer{
+		{Serial: "01S00C351100139", Address: "127.0.0.1:1", Username: "bblp", Password: "x"},
+		{Serial: "00M09A123456789", Address: "127.0.0.1:1", Username: "bblp", Password: "x"},
+	}, discardLogger())
+	t.Cleanup(m.Close)
+
+	if _, st := m.Snapshot("01S00C351100139", func(c *capture) (*Frame, bool) {
+		return c.latest(), c.latest() != nil
+	}); st != StatusUnavailable {
+		t.Fatalf("model-less P1S serial = %v, want eligible (unavailable, not refused)", st)
+	}
+	m.mu.Lock()
+	_, p1sCapture := m.captures["01S00C351100139"]
+	_, x1cCapture := m.captures["00M09A123456789"]
+	m.mu.Unlock()
+	if !p1sCapture {
+		t.Fatal("eligible serial must have a capture created")
+	}
+	if x1cCapture {
+		t.Fatal("X1C-prefix serial must not create a capture")
+	}
+	if _, st := m.Snapshot("00M09A123456789", func(c *capture) (*Frame, bool) { return nil, false }); st != StatusUnsupportedModel {
+		t.Fatalf("X1C-prefix serial = %v, want unsupported", st)
+	}
+}
+
 // TestHandlerStatusCodes asserts the HTTP contract for snapshot.
 func TestHandlerStatusCodes(t *testing.T) {
 	fc := newFakeCamera(t)

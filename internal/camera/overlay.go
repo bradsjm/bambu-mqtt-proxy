@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"bambu-mqtt-proxy/internal/config"
@@ -64,10 +65,16 @@ func (r *StatusRenderer) Tiles() []Tile {
 	states := r.state.Snapshot()
 	tiles := make([]Tile, 0, len(states))
 	for _, st := range states {
+		// Display model falls back to the serial-prefix inference so tiles
+		// from configs without model fields still show a useful label.
+		model := st.Model
+		if strings.TrimSpace(model) == "" {
+			model = config.ModelFromSerial(st.Serial)
+		}
 		t := Tile{
 			Serial:       st.Serial,
-			Model:        st.Model,
-			CameraOK:     config.CameraSupported(st.Model),
+			Model:        model,
+			CameraOK:     config.CameraEligible(st.Model, st.Serial),
 			Connected:    st.Connected,
 			State:        st.PrintingState,
 			Filename:     st.Filename,

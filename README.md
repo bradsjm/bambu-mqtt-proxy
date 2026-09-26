@@ -110,7 +110,13 @@ auth:
   mode: printer                    # require bblp + a configured access code
 printers:
   - serial: "01P00A123456789"
-    model: "P1S"                     # required for camera capture (P1P, P1S, A1, A1MINI)
+    address: "192.168.1.42:8883"
+    tls: true
+    insecure_skip_verify: true
+    username: "bblp"
+    password: "12345678"
+  - serial: "01S00C351100139"
+    model: "P1S"                     # optional; camera support is auto-detected from the serial prefix
     address: "192.168.1.42:8883"
     tls: true
     insecure_skip_verify: true
@@ -161,12 +167,14 @@ served; with `http.port: 0` no HTTP server starts at all.
 | `/overlay` | Browser wall: camera images layered with live printer state |
 
 Camera capture is restricted to models that use the Bambu chamber image
-protocol: `P1P`, `P1S`, `A1`, and `A1MINI`. The printer's `model` must be
-configured; ineligible serials answer `404` (unknown) or `422` (unsupported
-or missing model) without ever opening a camera socket. Camera and overlay
-endpoints are unauthenticated by design — anyone who can reach the HTTP port
-can view cameras and telemetry, and the state endpoint never includes
-credentials.
+protocol: `P1P`, `P1S`, `A1`, and `A1MINI`. Support is auto-detected from the
+serial prefix (`01P`=P1P, `01S`=P1S, `030`=A1 MINI, `039`=A1), so no
+per-printer configuration is required. An explicit `model` field overrides
+the inference if you ever need it. Ineligible serials (X1-class RTSP cameras,
+unknown prefixes) answer `404` (unknown serial) or `422` (unsupported model)
+without ever opening a camera socket. Camera and overlay endpoints are
+unauthenticated by design — anyone who can reach the HTTP port can view
+cameras and telemetry, and the state endpoint never includes credentials.
 
 ## Security notes
 

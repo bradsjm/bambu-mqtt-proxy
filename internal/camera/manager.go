@@ -45,11 +45,12 @@ func NewManager(printers []config.Printer, log *slog.Logger) *Manager {
 }
 
 // supported reports whether the serial names a configured camera-capable
-// printer. Unknown serials and missing-or-unsupported models are refused
-// before any camera socket is opened.
+// printer. The explicit model wins when present; otherwise the model is
+// inferred from the serial prefix (01P/01S/030/039). Unknown serials and
+// non-chamber-image printers are refused before any camera socket opens.
 func (m *Manager) supported(serial string) (config.Printer, bool) {
 	p, ok := m.bySerial[serial]
-	if !ok || !config.CameraSupported(p.Model) {
+	if !ok || !config.CameraEligible(p.Model, p.Serial) {
 		return config.Printer{}, false
 	}
 	return p, true

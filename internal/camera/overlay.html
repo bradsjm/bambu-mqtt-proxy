@@ -112,7 +112,7 @@ function update(tile, p) {
   const msg = tile.querySelector(".msg");
   if (!p.camera_supported) {
     img.hidden = true;
-    msg.textContent = p.model ? "camera unsupported" : "printer model not configured";
+    msg.textContent = "camera unsupported on this model";
     return;
   }
   if (liveSlots.has(p.serial)) {

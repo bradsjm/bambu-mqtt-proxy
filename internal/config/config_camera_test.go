@@ -1,6 +1,52 @@
 package config
 
-import "testing"
+import (
+	"testing"
+)
+
+// TestModelFromSerial pins the serial-prefix inference table.
+func TestModelFromSerial(t *testing.T) {
+	cases := map[string]string{
+		"01P00A123456789": "P1P",
+		"01S00C351100139": "P1S", // live-printer verified prefix
+		"030123456789012": "A1MINI",
+		"039123456789012": "A1",
+		"00M09A123456789": "", // X1-class: never chamber-image
+		"ZZZ":             "",
+		"":                "",
+	}
+	for serial, want := range cases {
+		if got := ModelFromSerial(serial); got != want {
+			t.Errorf("ModelFromSerial(%q) = %q, want %q", serial, got, want)
+		}
+	}
+	if ModelFromSerial("01s00c351100139") != "P1S" {
+		t.Fatal("serial inference must be case-insensitive")
+	}
+}
+
+// TestCameraEligible pins precedence: explicit model wins; otherwise the
+// serial prefix decides. Existing configs without model fields must keep
+// working for P1/A1 printers.
+func TestCameraEligible(t *testing.T) {
+	if !CameraEligible("", "01S00C351100139") {
+		t.Fatal("P1S serial without model must be camera-eligible")
+	}
+	if !CameraEligible("", "01P00A123456789") ||
+		!CameraEligible("", "039123456789012") ||
+		!CameraEligible("", "030123456789012") {
+		t.Fatal("P1P/A1/A1MINI serials without model must be eligible")
+	}
+	if CameraEligible("", "00M09A123456789") || CameraEligible("", "ABC123") || CameraEligible("", "") {
+		t.Fatal("X1-class or unknown serials must not be camera-eligible")
+	}
+	if CameraEligible("X1C", "01S00C351100139") {
+		t.Fatal("explicit non-camera model must override camera-capable prefix")
+	}
+	if !CameraEligible("P1S", "00M09A123456789") {
+		t.Fatal("explicit camera-capable model must override foreign prefix")
+	}
+}
 
 // TestPortZeroDisablesHTTP pins the documented contract: an explicit
 // http.port 0 (YAML or env) survives defaults and disables HTTP.

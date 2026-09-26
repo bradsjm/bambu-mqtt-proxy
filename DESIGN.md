@@ -170,7 +170,7 @@ HTTP surface (all on the shared `http.port` listener, unauthenticated by design)
 | `GET /camera/status` | Display state for every printer (state, filename, progress, layers, temperatures, frame age). No credentials, no addresses |
 | `GET /overlay` | Embedded single-page camera wall; polls `/camera/status` every 2 s; composites camera images with telemetry in the browser |
 
-Eligibility is checked before any camera socket is opened: unknown serial → 404; missing or non-chamber-image model (X1-class uses RTSP, not implemented) → 422. Camera capture never affects MQTT proxying. A disabled camera feature (`BMBPX_CAMERA_ENABLED=false`) removes the routes, stops capture workers, and skips the overlay's per-printer report subscriptions, which are otherwise held asynchronously so HTTP starts without waiting for printers.
+Eligibility is checked before any camera socket is opened, with no operator configuration required: the model is inferred from the serial prefix (01P→P1P, 01S→P1S, 030→A1 MINI, 039→A1; 01P/01S verified against live printers), and an explicit `model` field overrides the inference when present. Unknown serial → 404; non-chamber-image printers (X1-class RTSP, unknown prefixes) → 422. Camera capture never affects MQTT proxying. A disabled camera feature (`BMBPX_CAMERA_ENABLED=false`) removes the routes, stops capture workers, and skips the overlay's per-printer report subscriptions, which are otherwise held asynchronously so HTTP starts without waiting for printers.
 
 Telemetry for `/camera/status` comes from a delta-merging cache that observes upstream reports through the pool observer hook. Merges apply only fields present in each report; P1 `pushall` warmup supplies the initial full state. The cache never feeds back into MQTT forwarding.
 
@@ -264,7 +264,7 @@ auth:
 
 printers:
   - serial: "01P00A123456789"
-    model: "P1S"              # optional display name; camera capture needs P1P/P1S/A1/A1MINI
+    # model: "P1S"            # optional; camera support is inferred from the serial prefix
     address: "192.168.1.42:8883"
     tls: true
     insecure_skip_verify: true

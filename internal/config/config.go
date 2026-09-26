@@ -140,6 +140,41 @@ func CameraSupported(model string) bool {
 	}
 }
 
+// serialModelPrefixes maps community-observed Bambu serial prefixes to
+// printer models. 01P (P1P) and 01S (P1S) were verified against live
+// printers; 030 (A1 MINI) and 039 (A1) come from community references.
+var serialModelPrefixes = []struct {
+	prefix string
+	model  string
+}{
+	{"01P", "P1P"},
+	{"01S", "P1S"},
+	{"030", "A1MINI"},
+	{"039", "A1"},
+}
+
+// ModelFromSerial infers the printer model from the serial prefix.
+// It returns "" for unknown prefixes rather than guessing.
+func ModelFromSerial(serial string) string {
+	s := strings.ToUpper(strings.TrimSpace(serial))
+	for _, p := range serialModelPrefixes {
+		if strings.HasPrefix(s, p.prefix) {
+			return p.model
+		}
+	}
+	return ""
+}
+
+// CameraEligible decides camera support for one printer: an explicit model
+// wins when present; otherwise the model is inferred from the serial
+// prefix, so existing configs work without adding model fields.
+func CameraEligible(model, serial string) bool {
+	if strings.TrimSpace(model) != "" {
+		return CameraSupported(model)
+	}
+	return CameraSupported(ModelFromSerial(serial))
+}
+
 // CameraEnabled reports whether the camera and overlay routes should be
 // served. Cameras are enabled unless explicitly disabled.
 func (c *Config) CameraEnabled() bool {

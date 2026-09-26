@@ -23,7 +23,7 @@ auth:
 # device/{serial}/report and device/{serial}/request.
 printers:
   - serial: "01P00A123456789"
-    model: "P1S" # optional; required for camera capture (P1P, P1S, A1, A1MINI)
+    # model: "P1S" # optional; camera support is auto-detected from the serial prefix
     address: "192.168.1.42:8883"
     tls: true
     insecure_skip_verify: true
