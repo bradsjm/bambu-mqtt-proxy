@@ -96,8 +96,6 @@ func (m *Manager) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "multipart/x-mixed-replace; boundary="+boundary)
 	w.WriteHeader(http.StatusOK)
-	_, _ = fmt.Fprintf(w, "--%s\r\n", boundary)
-	flusher.Flush()
 
 	var lastSeq uint64
 	for {
@@ -120,9 +118,12 @@ func (m *Manager) handleStream(w http.ResponseWriter, r *http.Request) {
 		// exotic ResponseWriters skip it; the heartbeat loop still bounds
 		// stalled clients through read-side disconnect detection.
 		_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(streamHeartbeat))
+		// The boundary must precede EVERY part: browsers delimit frames on
+		// it, and a single leading preamble leaves them unable to find the
+		// second frame.
 		if _, err := fmt.Fprintf(w,
-			"Content-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n",
-			len(frame.JPEG)); err != nil {
+			"--%s\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n",
+			boundary, len(frame.JPEG)); err != nil {
 			return
 		}
 		if _, err := w.Write(frame.JPEG); err != nil {

@@ -247,6 +247,9 @@ func TestStreamWritesMultipart(t *testing.T) {
 	if !strings.Contains(body, "--frame") {
 		t.Fatalf("stream boundary missing in body: %q", body[:min(80, len(body))])
 	}
+	if got, want := strings.Count(body, "--frame\r\n"), strings.Count(body, "Content-Type: image/jpeg"); got != want {
+		t.Fatalf("multipart has %d boundaries for %d JPEG parts; every part must be boundary-prefixed", got, want)
+	}
 	// Client hangup ends the handler promptly: mark the recorder closed and
 	// publish one more frame so the handler's next write fails immediately
 	// rather than idling in the frame wait.
