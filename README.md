@@ -48,9 +48,9 @@ a single upstream connection per printer.
   takeover, auth refusal, retain stripping.
 - **Health endpoints** — `/livez`, `/readyz`, and `/status` (per-printer
   upstream connectivity JSON) for Docker/Kubernetes supervision.
-- **P1/A1 camera + overlay wall** — serial-addressed JPEG snapshots and live
-  MJPEG streams from the printer's chamber camera, plus a browser page that
-  layers live print state (progress, layers, temps) over every camera tile.
+- **P1/A1 camera wall** — serial-addressed JPEG snapshots and live MJPEG
+  streams from the printer's chamber camera, plus a dashboard page that pairs
+  every camera with color-coded print state, progress, and temperatures.
 - **Stateless** — no database, no volumes required. Config from a YAML file,
   environment variables, or both.
 - **Multi-arch** — `linux/amd64` and `linux/arm64` images published automatically.
@@ -116,6 +116,7 @@ printers:
     username: "bblp"
     password: "12345678"
   - serial: "01S00C351100139"
+    name: "Garage P1S"               # optional; label shown on the camera wall
     model: "P1S"                     # optional; camera support is auto-detected from the serial prefix
     address: "192.168.1.42:8883"
     tls: true
@@ -129,21 +130,21 @@ behavior:
 http:
   port: 8080                         # 0 disables the HTTP server entirely
 camera:
-  enabled: true                      # false removes camera routes and overlay
+  enabled: true                      # false removes camera routes and the camera wall
 log:
   level: info
 ```
 
 | Environment variable | Default | Meaning |
 |---|---|---|
-| `BMBPX_PRINTERS` | — | Semicolon-separated printers: `serial=…,address=…,password=…[,model=…][,username=…][,tls=…][,insecure_skip_verify=…]` |
+| `BMBPX_PRINTERS` | — | Semicolon-separated printers: `serial=…,address=…,password=…[,name=…][,model=…][,username=…][,tls=…][,insecure_skip_verify=…]` |
 | `BMBPX_LISTEN_PORT` | `8883` | Downstream MQTT port |
 | `BMBPX_LISTEN_TLS` | `true` | TLS on the downstream listener |
 | `BMBPX_CERT_FILE` / `BMBPX_KEY_FILE` | *(empty)* | Empty = ephemeral in-memory self-signed certificate |
 | `BMBPX_AUTH_MODE` | `printer` | `printer` or `accept_all` |
 | `BMBPX_LOG_LEVEL` | `info` | `info` logs client/upstream state, subscriptions, retries, and backoffs; `debug` adds per-packet routing |
 | `BMBPX_HTTP_PORT` | `8080` | Shared health + camera HTTP port; `0` disables HTTP |
-| `BMBPX_CAMERA_ENABLED` | `true` | `false` removes the camera routes, the overlay wall, and their MQTT report subscriptions |
+| `BMBPX_CAMERA_ENABLED` | `true` | `false` removes the camera routes, the camera wall, and their MQTT report subscriptions |
 
 At the default `info` level, logs identify downstream clients by MQTT client ID
 and remote address, show which configured printers each client subscribes to,
@@ -164,18 +165,35 @@ served; with `http.port: 0` no HTTP server starts at all.
 | `/camera/{serial}/snapshot` | Single JPEG frame (P1/A1 camera protocol, port 6000) |
 | `/camera/{serial}/stream` | Live multipart MJPEG stream |
 | `/camera/status` | Display state for every printer (no credentials) |
-| `/overlay` | Streaming overlay wall |
-| `/camwall` | Multi-printer camera wall with status chips and live/snapshot/off modes |
+| `/camera/events` | The same display state as server-sent events: on connect, on change, and at least every 10 s |
+| `/camwall` | Multi-printer camera wall dashboard |
 
-The Cam Wall polls printer state every 5 seconds. Active prints (running or
-paused) hold the live streams — up to four visible, connected printers at a
-time. Idle printers and other visible tiles use snapshots, and off-screen or
-disconnected tiles hold no camera connection. The toolbar
-sets the live-stream cap (1–16), snapshot refresh interval (2–60 seconds), and
-status overlay (`off`, `compact`, or `full`). Settings persist in that browser.
-`full` mode adds the filename, progress, layer count, remaining time, and
-temperature details. The existing `/overlay` page remains a full-screen wall
-for streaming use.
+The camera wall receives printer state over `/camera/events` and sizes its tiles to the
+window width, from one column on phones to a full grid on wall displays. Each
+tile shows its configured `name` (or model and serial), its state with an icon
+and color (printing, paused, preparing, failed, finished, idle, offline, and
+"no recent data" when a busy printer has not reported for 2 minutes), a
+progress edge on the camera, and a headline progress/time-left figure. Print
+errors and HMS alerts appear on every tile as a severity-colored banner, with
+the full list and last report age in the full detail level. Click or tap a tile's details panel to
+step through compact, vitals (progress, layers, finish time, nozzle/bed/chamber
+temperature gauges), and full details. Click a camera to focus it full-width.
+Drag the grip (or focus it and use the arrow keys) to reorder tiles. The
+fleet chips in the top bar count printers per state and double as filters;
+"needs attention" collects failed, paused, stale, and serious-alert printers.
+
+Focused cameras and active prints (running or paused) hold the live streams,
+up to four visible, connected printers by default. Other visible tiles use
+snapshots; off-screen tiles, disconnected printers, and background browser
+tabs hold no camera connection. The settings dialog sets the live-stream cap
+(1–16), snapshot refresh interval (2–60 seconds), tile size, and detail level
+for every tile, plus an option to keep the screen awake. Order, filters, detail
+levels, and settings persist in that browser's local storage only; the proxy
+stores no wall state. `?kiosk=1` hides the top bar and always requests a screen
+wake lock, and `?maxLive=` / `?interval=` override the stored stream settings.
+Browsers grant wake locks only on HTTPS or `localhost` pages, and over plain
+HTTP they allow about six connections per host, shared by live streams,
+snapshots, and the status stream.
 
 Camera capture is restricted to models that use the Bambu chamber image
 protocol: `P1P`, `P1S`, `A1`, and `A1MINI`. Support is auto-detected from the
@@ -183,7 +201,7 @@ serial prefix (`01P`=P1P, `01S`=P1S, `030`=A1 MINI, `039`=A1), so no
 per-printer configuration is required. An explicit `model` field overrides
 the inference if you ever need it. Ineligible serials (X1-class RTSP cameras,
 unknown prefixes) answer `404` (unknown serial) or `422` (unsupported model)
-without ever opening a camera socket. Camera and overlay endpoints are
+without ever opening a camera socket. Camera and camera wall endpoints are
 unauthenticated by design — anyone who can reach the HTTP port can view
 cameras and telemetry, and the state endpoint never includes credentials.
 Chamber temperature is shown only for models known to have a physical chamber

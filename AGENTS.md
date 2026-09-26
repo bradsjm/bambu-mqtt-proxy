@@ -45,6 +45,9 @@ CI runs the formatting check, `go vet ./...`, and `go test -race ./...` on pushe
 - Wrap startup errors with operation context using `%w`. Log errors on asynchronous paths that cannot return them to the caller.
 - Keep MQTT payloads byte-for-byte unchanged. Apply routing and access rules in broker hooks, not in payload transformations.
 - Treat printer serials and configured topic filters as routing keys. `internal/routing/topic.go` defines the accepted topic grammar.
+- Keep the embedded camera wall (`internal/camera/camwall.html`) a single self-contained file: inline CSS, JS, and SVG, with no external assets, frameworks, or build step.
+
+**Browser Support:** The camera wall targets current evergreen browsers (latest Chrome, Edge, Firefox, and Safari, including iOS Safari). Use current web platform features natively without polyfills or legacy fallbacks. APIs a browser gates on context, such as Screen Wake Lock (secure origins only) or Fullscreen (unavailable on iPhone), must be feature-detected and degrade by hiding or disabling the control.
 
 ## Important Files
 

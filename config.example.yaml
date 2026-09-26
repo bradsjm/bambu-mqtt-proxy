@@ -23,6 +23,7 @@ auth:
 # device/{serial}/report and device/{serial}/request.
 printers:
   - serial: "01P00A123456789"
+    # name: "Garage P1S" # optional; label shown on the camera wall
     # model: "P1S" # optional; camera support is auto-detected from the serial prefix
     address: "192.168.1.42:8883"
     tls: true
@@ -41,8 +42,8 @@ http:
   port: 8080
 
 camera:
-  # Enabled by default; false removes the camera routes, the overlay wall,
-  # and the overlay's own MQTT report subscriptions.
+  # Enabled by default; false removes the camera routes, the camera wall,
+  # and the camera wall's own MQTT report subscriptions.
   # enabled: false
 
 behavior:

@@ -91,7 +91,7 @@ Three parts, one process:
 
 1. **Downstream broker** — mochi-mqtt v2 with a TLS listener on 1883. Mochi owns all MQTT protocol mechanics for clients (CONNECT/CONNACK, keepalive per client, SUBACK/PUBACK, session takeover).
 2. **Upstream pool** — one paho.mqtt.golang client per configured printer, created lazily, reconnected automatically. A routing table maps serial → upstream connection and tracks merged subscriptions.
-3. **HTTP service** — one `net/http` listener (`http.port`, default 8080) for the health endpoints and, when cameras are enabled, the camera snapshot/stream endpoints and the embedded overlay wall.
+3. **HTTP service** — one `net/http` listener (`http.port`, default 8080) for the health endpoints and, when cameras are enabled, the camera snapshot/stream endpoints and the embedded camera wall.
 
 A custom mochi hook is the only coupling between the broker and the pool. The hook rewrites where packets go; it does not rewrite packets. The telemetry cache observes reports through the pool without changing forwarding.
 
@@ -151,7 +151,7 @@ Policy details:
 - **Recovery is automatic and self-verifying**: SUBSCRIBE failures during an outage leave no half state; when the connection returns, the merged subscription set (kept by refcount) is re-issued wholesale.
 - **Resubscribe failure after connect** (e.g. access code changed on the printer): logged at WARN; the next reconnect cycle retries. Backoff state transitions are logged at INFO so outages are visible in logs.
 
-## 6. Camera and overlay (P1/A1 series)
+## 6. Camera and camera wall (P1/A1 series)
 
 P1P, P1S, A1, and A1 MINI expose a camera through the Bambu chamber image protocol: TLS on printer port 6000. The client sends an 80-byte authentication payload (magic 0x40, command 0x3000, username `bblp`, LAN access code) and the printer answers with length-prefixed JPEG frames — a 16-byte header whose first little-endian uint32 is the payload length, then the JPEG. There is no login reply; the first frame follows the auth payload directly. Verified against a real P1S (1280×720 JPEG) and cross-checked against the bambuddy reference implementation.
 
@@ -167,21 +167,30 @@ HTTP surface (all on the shared `http.port` listener, unauthenticated by design)
 |---|---|
 | `GET /camera/{serial}/snapshot` | Freshest frame younger than 5 s from the shared buffer; otherwise waits up to 15 s for a new frame; 503 if none arrives |
 | `GET /camera/{serial}/stream` | Multipart MJPEG; complete parts flushed per frame; survives printer outages while the client stays connected |
-| `GET /camera/status` | Display state for every printer (state, filename, progress, layers, temperatures, frame age). No credentials, no addresses |
-| `GET /overlay` | Full-screen streaming overlay; composites camera images with telemetry in the browser |
-| `GET /camwall` | Multi-printer camera wall with status chips and live/snapshot/off modes |
+| `GET /camera/status` | Display state for every printer (name, state, filename, progress, layers, temperatures, print error, HMS alerts, report and frame age). No credentials, no addresses |
+| `GET /camera/events` | Server-sent events carrying the `/camera/status` payload: on connect, when display state changes (checked every 1 s), and at least every 10 s |
+| `GET /camwall` | Multi-printer camera wall dashboard; composes camera images with telemetry in the browser |
 
-The Cam Wall polls status every 5 s. It gives the live budget (default 4,
-configurable 1–16) to active prints (RUNNING or PAUSE) in stable printer order,
-snapshots for other visible eligible printers including idle ones, and no
-camera connection for off-screen or disconnected tiles.
-Snapshot refresh defaults to 8 s and is configurable from 2–60 s. The status
-overlay supports `off`, `compact`, and `full` modes. Settings persist in the
-browser's local storage. There is no token-authenticated kiosk mode: the proxy
-has no user/session system, and these camera routes are intentionally open on
-the configured HTTP interface.
+The camera wall is one self-contained embedded HTML page (inline CSS, JS, and
+SVG icons; no external assets). It receives status through `/camera/events`
+(EventSource, reopened if silent for 30 s or closed while the tab is hidden) and gives the live
+budget (default 4, configurable 1–16) to the focused camera first, then active
+prints (RUNNING or PAUSE) and busy printers with stale reports in wall order. Other visible eligible printers get
+snapshots; off-screen tiles, disconnected printers, and hidden browser tabs
+hold no camera connection. Snapshot refresh defaults to 8 s and is
+configurable from 2–60 s. Tiles carry icon and color state, fill the window
+width, cycle through three detail levels when their details panel is clicked,
+and reorder by drag or keyboard. Fleet chips filter the wall by state or
+"needs attention". Print errors (`print_error`, formatted `XXXX_XXXX`) and HMS
+alerts (`HMS_AAAA_BBBB_CCCC_DDDD`, severity from the code's high half) stay
+visible at every detail level. A busy printer silent for 120 s shows as stale.
+Kiosk mode or a setting requests a Screen Wake Lock where the origin allows it.
+Order, filters, detail levels, and settings persist
+only in the browser's local storage; the proxy holds no wall state. There is
+no token-authenticated kiosk mode: the proxy has no user/session system, and
+these camera routes are intentionally open on the configured HTTP interface.
 
-Eligibility is checked before any camera socket is opened, with no operator configuration required: the model is inferred from the serial prefix (01P→P1P, 01S→P1S, 030→A1 MINI, 039→A1; 01P/01S verified against live printers), and an explicit `model` field overrides the inference when present. Unknown serial → 404; non-chamber-image printers (X1-class RTSP, unknown prefixes) → 422. Camera capture never affects MQTT proxying. A disabled camera feature (`BMBPX_CAMERA_ENABLED=false`) removes the routes, stops capture workers, and skips the overlay's per-printer report subscriptions, which are otherwise held asynchronously so HTTP starts without waiting for printers.
+Eligibility is checked before any camera socket is opened, with no operator configuration required: the model is inferred from the serial prefix (01P→P1P, 01S→P1S, 030→A1 MINI, 039→A1; 01P/01S verified against live printers), and an explicit `model` field overrides the inference when present. Unknown serial → 404; non-chamber-image printers (X1-class RTSP, unknown prefixes) → 422. Camera capture never affects MQTT proxying. A disabled camera feature (`BMBPX_CAMERA_ENABLED=false`) removes the routes, stops capture workers, and skips the camera wall's per-printer report subscriptions, which are otherwise held asynchronously so HTTP starts without waiting for printers.
 
 Telemetry for `/camera/status` comes from a delta-merging cache that observes upstream reports through the pool observer hook. Merges apply only fields present in each report; P1 `pushall` warmup supplies the initial full state. The cache never feeds back into MQTT forwarding.
 
@@ -281,6 +290,7 @@ auth:
 
 printers:
   - serial: "01P00A123456789"
+    # name: "Garage P1S"      # optional; camera wall label, never used for routing
     # model: "P1S"            # optional; camera support is inferred from the serial prefix
     address: "192.168.1.42:8883"
     tls: true
@@ -311,7 +321,7 @@ HTTP and camera configuration (shared listener; see §6):
 http:
   port: 8080                # 0 disables the HTTP server entirely
 camera:
-  enabled: true             # false removes camera routes and overlay
+  enabled: true             # false removes camera routes and the camera wall
 ```
 
 Validation at startup: unique serials, resolvable addresses, TLS flag consistency, HTTP port range. Startup fails fast on invalid config.
@@ -329,7 +339,7 @@ internal/upstream/pool.go      serial → connection table, lazy connect, reconn
 internal/upstream/conn.go      paho client wrapper (connect, publish, merged subscribe)
 internal/routing/topic.go      serial extraction, wildcard expansion, filter↔serial sets
 internal/telemetry/            delta-merging display-state cache fed by upstream reports
-internal/camera/               P1/A1 chamber-image capture, snapshot/stream/overlay handlers
+internal/camera/               P1/A1 chamber-image capture, snapshot/stream/camera wall handlers
 internal/httpsrv/              shared health + camera HTTP listener
 internal/tlsutil/              self-signed certificate generation and persistence
 ```
@@ -340,7 +350,7 @@ Dependencies: `github.com/mochi-mqtt/server/v2`, `github.com/eclipse/paho.mqtt.g
 
 | Failure | Behavior | Consequence |
 |---|---|---|
-| Printer offline at startup | HTTP starts immediately; overlay report interests are recorded asynchronously and restored on reconnect | No startup delay proportional to printer count |
+| Printer offline at startup | HTTP starts immediately; camera wall report interests are recorded asynchronously and restored on reconnect | No startup delay proportional to printer count |
 | Printer offline at subscribe time | SUBACK 0x80 for that filter; supervisor keeps background retrying at capped backoff | Client retries when printer returns; no proxy-side queue; no tight retry loop |
 | Printer reboot (1-2 min) | paho reconnect (≤30 s between attempts), resubscribe merged set, warmup pushall | Reports during the gap are lost; state converges automatically after pushall |
 | Printer power-cut without TCP close | keepalive 30 s + ping timeout 10 s detect the dead peer | Same reconnect path as reboot |
@@ -353,7 +363,7 @@ Dependencies: `github.com/mochi-mqtt/server/v2`, `github.com/eclipse/paho.mqtt.g
 | A1 series printer (single-client limit) | Proxy holds one upstream connection regardless of model | The printer's limit stops affecting apps entirely |
 | Camera requested for unknown serial or non-P1/A1 model | 404 / 422 before any camera socket opens | Supported models: P1P, P1S, A1, A1MINI; X1-class RTSP cameras are not implemented |
 | Camera connection drops mid-stream | Capture reconnects with 0.5–5 s backoff while consumers remain; streams resume | Brief frame gap; slow clients skip frames instead of stalling capture |
-| Unauthenticated HTTP exposure | Camera, overlay, and status endpoints have no login | Anyone who can reach `http.port` sees cameras and telemetry; bind accordingly (state responses carry no credentials) |
+| Unauthenticated HTTP exposure | Camera, camera wall, and status endpoints have no login | Anyone who can reach `http.port` sees cameras and telemetry; bind accordingly (state responses carry no credentials) |
 | Bambu Studio "add printer by IP" | Studio probes camera/FTP ports in addition to MQTT; probe failure can block discovery | MQTT control and status work; camera/FTP passthrough is future work |
 | Tools that pin the printer TLS certificate | The self-signed proxy cert fails pinning | Load a custom cert/key via config, or disable pinning (clients must already skip verify against the real printer) |
 | Downstream QoS 1 command while printer offline | PUBACK was already issued; command does not reach the printer | App-level retry, identical to a direct-connection drop |
@@ -399,7 +409,7 @@ Configuration comes from a YAML file, environment variables, or both; environmen
 | `BMBPX_AUTH_MODE` | `printer` | `printer` or `accept_all` |
 | `BMBPX_LOG_LEVEL` | `info` | `debug` logs routing decisions |
 | `BMBPX_HTTP_PORT` | `8080` | Shared health + camera HTTP port (0 off) |
-| `BMBPX_CAMERA_ENABLED` | `true` | Camera and overlay endpoints |
+| `BMBPX_CAMERA_ENABLED` | `true` | Camera and camera wall endpoints |
 
 Behavior tuning (`behavior:` in YAML) has no environment surface — its defaults match the design.
 

@@ -1,5 +1,5 @@
 // Package httpsrv owns the single HTTP listener that serves the health,
-// camera, and overlay endpoints on one port.
+// camera, and camera wall endpoints on one port.
 package httpsrv
 
 import (

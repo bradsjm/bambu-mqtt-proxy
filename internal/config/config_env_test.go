@@ -8,7 +8,7 @@ import (
 
 func TestApplyEnvFullConfig(t *testing.T) {
 	t.Setenv(EnvPrinters,
-		"serial=S1,address=10.0.0.1:8883,password=1111; serial=S2,address=10.0.0.2:1883,tls=false,password=2222,username=other")
+		"serial=S1,address=10.0.0.1:8883,password=1111,name= Garage P1S ; serial=S2,address=10.0.0.2:1883,tls=false,password=2222,username=other")
 	t.Setenv(EnvListenPort, "9999")
 	t.Setenv(EnvListenTLS, "false")
 	t.Setenv(EnvAuthMode, "accept_all")
@@ -42,10 +42,10 @@ func TestApplyEnvFullConfig(t *testing.T) {
 		t.Fatalf("printers = %d, want 2", len(cfg.Printers))
 	}
 	s1, s2 := cfg.Printers[0], cfg.Printers[1]
-	if s1.Serial != "S1" || !s1.TLS || !s1.InsecureSkipVerify || s1.Username != "bblp" {
+	if s1.Serial != "S1" || !s1.TLS || !s1.InsecureSkipVerify || s1.Username != "bblp" || s1.Name != "Garage P1S" {
 		t.Fatalf("S1 = %+v", s1)
 	}
-	if s2.Serial != "S2" || s2.TLS || s2.Username != "other" {
+	if s2.Serial != "S2" || s2.TLS || s2.Username != "other" || s2.Name != "" {
 		t.Fatalf("S2 = %+v", s2)
 	}
 }

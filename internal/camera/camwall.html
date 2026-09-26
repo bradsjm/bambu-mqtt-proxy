@@ -1,0 +1,1206 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0b0d10">
+<title>Printer wall · bambu-mqtt-proxy</title>
+<style>
+:root {
+  color-scheme: dark;
+  --bg: #0b0d10; --panel: #14181d; --panel-2: #1b2027; --line: #262d36;
+  --text: #e6ebf0; --dim: #8d9aa8; --faint: #5b6673;
+  --printing: #34d399; --paused: #fbbf24; --preparing: #60a5fa; --finished: #22d3ee;
+  --failed: #f87171; --stale: #a78bfa; --idle: #94a3b8; --waiting: #94a3b8; --offline: #64748b;
+  --live: #ef4444; --attention: #f87171;
+  --heat: #fb923c; --tile-min: 340px; --gap: clamp(.5rem, 1.4vw, 1rem); --radius: 14px;
+  --ease: cubic-bezier(.2, .7, .2, 1);
+  accent-color: var(--printing);
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0; min-height: 100dvh; background: var(--bg); color: var(--text);
+  font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  padding: 0 env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+}
+button { font: inherit; color: inherit; }
+.ic { width: 1em; height: 1em; flex: none; fill: none; stroke: currentColor; stroke-width: 2;
+      stroke-linecap: round; stroke-linejoin: round; }
+.sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden;
+           clip-path: inset(50%); white-space: nowrap; }
+:focus-visible { outline: 2px solid var(--preparing); outline-offset: 2px; }
+
+/* Top bar: brand, fleet summary, connection health, actions. */
+.bar { position: sticky; top: 0; z-index: 20; display: flex; flex-wrap: wrap; align-items: center;
+       gap: .5rem 1rem; padding: calc(.55rem + env(safe-area-inset-top)) var(--gap) .55rem;
+       background: color-mix(in srgb, var(--bg) 85%, transparent); border-bottom: 1px solid var(--line);
+       -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px); }
+.brand { display: flex; align-items: center; gap: .5rem; font-size: 1.05rem; }
+.brand h1 { margin: 0; font-size: inherit; font-weight: 650; letter-spacing: .01em; }
+.brand .ic { color: var(--printing); font-size: 1.2rem; }
+.fleet { display: flex; gap: .35rem; margin: 0; padding: 0; list-style: none; flex: 1 1 auto;
+         overflow-x: auto; scrollbar-width: none; }
+.chip { --accent: var(--dim); display: inline-flex; align-items: center; gap: .35rem; white-space: nowrap;
+        min-height: 2rem; padding: .2rem .65rem; border-radius: 999px; font-size: .8rem;
+        background: color-mix(in srgb, var(--accent) 14%, transparent);
+        border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent); }
+button.chip { cursor: pointer; transition: background .2s, border-color .2s; }
+button.chip:hover { background: color-mix(in srgb, var(--accent) 24%, transparent); }
+button.chip[aria-pressed="true"] { background: color-mix(in srgb, var(--accent) 34%, transparent);
+                                   border-color: var(--accent); }
+button.chip[aria-pressed="true"] .chip-label { color: var(--text); }
+.chip.clear { --accent: var(--text); }
+.chip .ic { color: var(--accent); }
+.chip b { font-variant-numeric: tabular-nums; }
+.chip-label { color: var(--dim); }
+.actions { display: flex; align-items: center; gap: .35rem; margin-left: auto; }
+.health { display: inline-flex; align-items: center; gap: .45rem; font-size: .8rem; color: var(--dim);
+          white-space: nowrap; margin-right: .25rem; }
+.health i { width: .55rem; height: .55rem; border-radius: 50%; background: var(--faint); }
+.health[data-health="ok"] i { background: var(--printing); animation: pulse 2s infinite; }
+.health[data-health="stale"] i { background: var(--paused); }
+.health[data-health="down"] { color: var(--failed); }
+.health[data-health="down"] i { background: var(--failed); }
+.icon-btn { display: inline-grid; place-items: center; width: 2.5rem; height: 2.5rem; border-radius: 10px;
+            border: 1px solid var(--line); background: var(--panel); cursor: pointer; font-size: 1.1rem; }
+.icon-btn:hover { background: var(--panel-2); }
+body.kiosk .bar { display: none; }
+@media (max-width: 640px) {
+  .fleet { order: 3; flex-basis: 100%; }
+  .chip-label, .health span { display: none; }
+}
+
+/* Wall grid: tiles stretch to fill the width, wrapping at --tile-min. */
+#grid { position: relative; display: grid; gap: var(--gap); padding: var(--gap); align-items: start;
+        grid-template-columns: repeat(auto-fit, minmax(min(100%, var(--tile-min)), 1fr)); }
+#grid[hidden] { display: none; }
+#grid.arranging { -webkit-user-select: none; user-select: none; }
+.empty { margin: 3rem auto; max-width: 28rem; padding: 2rem; text-align: center; color: var(--dim);
+         border: 1px dashed var(--line); border-radius: var(--radius); }
+.empty .ic { font-size: 2.5rem; color: var(--faint); }
+
+/* Tile: camera stage on top, clickable details panel below. */
+.tile { --accent: var(--idle); container: tile / inline-size; position: relative; display: flex;
+        flex-direction: column; overflow: hidden; border-radius: var(--radius); background: var(--panel);
+        border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--line));
+        transition: border-color .4s, box-shadow .4s; }
+.tile[data-state="printing"] { --accent: var(--printing); }
+.tile[data-state="paused"] { --accent: var(--paused); }
+.tile[data-state="preparing"] { --accent: var(--preparing); }
+.tile[data-state="finished"] { --accent: var(--finished); }
+.tile[data-state="failed"] { --accent: var(--failed); }
+.tile[data-state="stale"] { --accent: var(--stale); }
+.tile[data-state="waiting"] { --accent: var(--waiting); }
+.tile[data-state="offline"] { --accent: var(--offline); }
+.tile[data-state="failed"], .tile[data-state="paused"], .tile[data-state="stale"] {
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 60%, transparent),
+              0 0 28px -8px color-mix(in srgb, var(--accent) 70%, transparent); }
+.tile[data-alert="high"] {
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--failed) 70%, transparent),
+              0 0 28px -8px color-mix(in srgb, var(--failed) 80%, transparent); }
+.tile.spot { grid-column: 1 / -1; }
+.tile.dragging { z-index: 10; cursor: grabbing; transition: none;
+                 box-shadow: 0 18px 40px -12px #000, 0 0 0 2px var(--preparing); }
+
+.cam { position: relative; aspect-ratio: 16 / 9; max-height: 78dvh; background: #000; overflow: hidden; }
+.cam img { position: absolute; inset: 0; z-index: 1; width: 100%; height: 100%; object-fit: contain;
+           transition: filter .4s; }
+.tile[data-state="offline"] .cam img { filter: grayscale(1) brightness(.45); }
+.placeholder { position: absolute; inset: 0; z-index: 0; display: flex; flex-direction: column; gap: .5rem;
+               align-items: center; justify-content: center; padding: 1rem; text-align: center;
+               color: var(--dim); font-size: .85rem;
+               background: radial-gradient(circle at 50% 40%, color-mix(in srgb, var(--accent) 16%, #000), #000 70%); }
+.placeholder .ic { font-size: 2.2rem; color: color-mix(in srgb, var(--accent) 70%, var(--dim)); }
+.cam.blocked .placeholder { z-index: 2; background: rgb(0 0 0 / .55); }
+.cam.blocked:not(.has-frame) .placeholder {
+  background: radial-gradient(circle at 50% 40%, color-mix(in srgb, var(--accent) 16%, #000), #000 70%); }
+.cam-hit { position: absolute; inset: 0; z-index: 3; width: 100%; border: 0; padding: 0;
+           background: none; cursor: zoom-in; }
+.tile.spot .cam-hit { cursor: zoom-out; }
+.cam-hit:focus-visible { outline-offset: -3px; }
+.pill { position: absolute; z-index: 4; top: .55rem; display: inline-flex; align-items: center; gap: .35rem;
+        padding: .2rem .55rem; border-radius: 999px; font-size: .72rem; font-weight: 650;
+        letter-spacing: .03em; pointer-events: none; background: rgb(10 12 15 / .72);
+        -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); }
+.pill[hidden] { display: none; }
+.pill.state { left: .55rem; color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent); }
+.pill.state .label { color: var(--text); }
+.pill.feed { right: .55rem; color: var(--dim); font-variant-numeric: tabular-nums; }
+.pill.feed[data-mode="live"] { color: #fff; background: color-mix(in srgb, var(--live) 85%, transparent); }
+.pill.feed .dot, .pill.feed[data-mode="live"] .ic { display: none; }
+.pill.feed[data-mode="live"] .dot { display: block; width: .5rem; height: .5rem; border-radius: 50%; background: #fff;
+                                   animation: pulse 1.6s infinite; }
+.pill.feed[data-mode="error"], .pill.feed.stale { color: var(--paused); }
+.cam-progress { position: absolute; z-index: 4; left: 0; right: 0; bottom: 0; height: 4px;
+                background: rgb(255 255 255 / .12); pointer-events: none; }
+.cam-progress > div { height: 100%; width: var(--pct, 0%); background: var(--accent);
+                      box-shadow: 0 0 10px var(--accent); transition: width .8s var(--ease); }
+.cam-progress[hidden] { display: none; }
+
+.details { padding: .6rem .7rem .7rem; cursor: pointer; }
+.head { display: flex; align-items: center; gap: .5rem; min-height: 2.5rem; }
+.grip { display: inline-grid; place-items: center; width: 2rem; height: 2.5rem; margin-left: -.35rem;
+        border: 0; border-radius: 8px; background: none; color: var(--faint); cursor: grab;
+        touch-action: none; font-size: 1.1rem; }
+.grip:hover, .grip:focus-visible { color: var(--text); background: var(--panel-2); }
+.ident { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
+.model { font-weight: 650; font-size: 1rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.serial { font: .72rem/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--dim);
+          white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.kpi { display: flex; flex-direction: column; align-items: flex-end; text-align: right; white-space: nowrap; }
+.kpi-main { font-size: 1.3rem; font-size: clamp(1.1rem, .75rem + 3.2cqi, 1.75rem); font-weight: 700;
+            line-height: 1.1; font-variant-numeric: tabular-nums; color: var(--accent); }
+.kpi-sub { font-size: .76rem; color: var(--dim); }
+.alert-row { --sev: var(--dim); display: flex; align-items: center; gap: .45rem; margin-top: .45rem;
+             padding: .4rem .55rem; border-radius: 8px; font-size: .8rem;
+             background: color-mix(in srgb, var(--sev) 15%, transparent);
+             border: 1px solid color-mix(in srgb, var(--sev) 40%, transparent); }
+.alert-row .ic { color: var(--sev); font-size: 1rem; }
+.alert-row .alert-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+[data-sev="fatal"], [data-sev="serious"], [data-sev="error"] { --sev: var(--failed); }
+[data-sev="common"] { --sev: var(--paused); }
+[data-sev="info"] { --sev: var(--preparing); }
+code { font: .74rem ui-monospace, SFMono-Regular, Menlo, monospace; }
+.alert-list { margin: 0; padding: 0; list-style: none; display: grid; gap: .2rem; }
+.alert-list li { display: flex; align-items: center; gap: .4rem; }
+.alert-list li::before { content: ""; width: .5rem; height: .5rem; border-radius: 50%; background: var(--sev, var(--dim)); flex: none; }
+.alert-list small { color: var(--dim); }
+.level { display: inline-flex; align-items: flex-end; gap: 2px; width: 2rem; height: 2.5rem; padding: 0 .45rem .8rem;
+         margin-right: -.35rem; border: 0; border-radius: 8px; background: none; cursor: pointer; }
+.level:hover { background: var(--panel-2); }
+.level i { width: 4px; border-radius: 1px; background: var(--faint); transition: background .2s; }
+.level i:nth-child(1) { height: 6px; } .level i:nth-child(2) { height: 10px; } .level i:nth-child(3) { height: 14px; }
+.tile[data-level="1"] .level i:nth-child(-n+1), .tile[data-level="2"] .level i:nth-child(-n+2),
+.tile[data-level="3"] .level i { background: var(--text); }
+
+/* Smooth expand: rows animate between 0fr and 1fr. */
+.more { display: grid; grid-template-rows: 0fr; opacity: 0;
+        transition: grid-template-rows .32s var(--ease), opacity .24s; }
+.more > div { min-height: 0; overflow: hidden; }
+.tile[data-level="2"] .l2, .tile[data-level="3"] .l2, .tile[data-level="3"] .l3 { grid-template-rows: 1fr; opacity: 1; }
+.pad { padding-top: .6rem; display: grid; gap: .55rem; }
+.progress-row { display: flex; align-items: center; gap: .6rem; font-size: .8rem; color: var(--dim);
+                font-variant-numeric: tabular-nums; }
+.progress-row[hidden] { display: none; }
+.meter { flex: 1 1 auto; height: 8px; border-radius: 4px; background: var(--panel-2); overflow: hidden; }
+.meter > div { height: 100%; width: var(--pct, 0%); background: var(--accent); border-radius: inherit;
+               transition: width .8s var(--ease); }
+.stat { display: inline-flex; align-items: center; gap: .3rem; white-space: nowrap; }
+.temps { display: grid; grid-template-columns: repeat(auto-fit, minmax(6.5rem, 1fr)); gap: .4rem; }
+.temp { --t: var(--faint); position: relative; display: flex; align-items: center; gap: .4rem; overflow: hidden;
+        padding: .35rem .5rem; border-radius: 8px; background: var(--panel-2); font-size: .8rem;
+        font-variant-numeric: tabular-nums; }
+.temp::before { content: ""; position: absolute; inset: 0; width: var(--fill, 0%);
+                background: color-mix(in srgb, var(--t) 18%, transparent); transition: width .8s var(--ease); }
+.temp > * { position: relative; }
+.temp .ic { color: var(--t); font-size: 1rem; }
+.temp b { font-weight: 650; }
+.temp small { color: var(--dim); }
+.temp.heating { --t: var(--heat); }
+.temp.hot { --t: var(--printing); }
+.temp.cooling { --t: var(--preparing); }
+.facts { display: grid; grid-template-columns: auto 1fr; gap: .25rem .75rem; margin: 0; font-size: .8rem; }
+.facts dt { color: var(--dim); display: flex; align-items: center; gap: .35rem; }
+.facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.open { display: inline-flex; align-items: center; gap: .4rem; justify-self: start; padding: .35rem .7rem;
+        border-radius: 8px; border: 1px solid var(--line); color: var(--text); text-decoration: none; font-size: .8rem; }
+.open:hover { background: var(--panel-2); }
+.open[hidden] { display: none; }
+.muted { color: var(--dim); font-size: .8rem; }
+.no-match { display: grid; justify-items: center; gap: .75rem; margin: 3rem auto; color: var(--dim); }
+.no-match .btn { flex: none; }
+
+@container tile (width < 300px) {
+  .pill .label, .serial { display: none; }
+  .temps { grid-template-columns: 1fr; }
+}
+@container tile (width > 560px) {
+  .pill { font-size: .8rem; }
+  .model { font-size: 1.1rem; }
+}
+
+/* Settings dialog. */
+dialog { width: min(26rem, calc(100vw - 2rem)); padding: 0; border: 1px solid var(--line); border-radius: var(--radius);
+         background: var(--panel); color: var(--text); box-shadow: 0 24px 60px -20px #000; }
+dialog::backdrop { background: rgb(0 0 0 / .55); }
+dialog form { display: grid; gap: 1rem; padding: 1rem 1.1rem 1.2rem; }
+.dlg-head { display: flex; align-items: center; justify-content: space-between; }
+.dlg-head h2 { margin: 0; font-size: 1rem; }
+.field { display: grid; gap: .4rem; }
+.field > span { display: flex; justify-content: space-between; font-size: .85rem; }
+.field output { color: var(--dim); font-variant-numeric: tabular-nums; }
+.field input { width: 100%; }
+.hint { margin: -.5rem 0 0; font-size: .75rem; color: var(--dim); }
+fieldset { margin: 0; padding: 0; border: 0; display: grid; gap: .4rem; }
+legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
+.seg { display: flex; gap: .35rem; }
+.seg label, .btn { flex: 1; display: grid; place-items: center; min-height: 2.4rem; padding: 0 .6rem;
+                   border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2);
+                   cursor: pointer; font-size: .85rem; }
+.seg input { position: absolute; opacity: 0; pointer-events: none; }
+.seg label:has(input:checked) { border-color: var(--printing); color: var(--printing); }
+.seg label:has(input:focus-visible) { outline: 2px solid var(--preparing); outline-offset: 2px; }
+.btn:hover { background: var(--line); }
+.check { display: flex; align-items: center; gap: .6rem; font-size: .85rem; cursor: pointer; }
+.check input { width: 1.1rem; height: 1.1rem; }
+.check:has(input:disabled) { color: var(--dim); cursor: default; }
+
+@keyframes pulse { 50% { opacity: .35; } }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+</style>
+</head>
+<body>
+<svg hidden xmlns="http://www.w3.org/2000/svg">
+  <symbol id="i-wall" viewBox="0 0 24 24"><rect x="3" y="4" width="8" height="7" rx="1.5"/><rect x="13" y="4" width="8" height="7" rx="1.5"/><rect x="3" y="13" width="8" height="7" rx="1.5"/><rect x="13" y="13" width="8" height="7" rx="1.5"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5.5v13l10.5-6.5z" fill="currentColor"/></symbol>
+  <symbol id="i-pause" viewBox="0 0 24 24"><rect x="6.5" y="5" width="4" height="14" rx="1" fill="currentColor" stroke="none"/><rect x="13.5" y="5" width="4" height="14" rx="1" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-hourglass" viewBox="0 0 24 24"><path d="M6 3h12M6 21h12M8 3v3.5a4 4 0 0 0 1.6 3.2L12 12l2.4-2.3A4 4 0 0 0 16 6.5V3M8 21v-3.5a4 4 0 0 1 1.6-3.2L12 12l2.4 2.3a4 4 0 0 1 1.6 3.2V21"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m8 12.5 2.8 2.8L16.5 9"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.3 4.2 2.6 18a2 2 0 0 0 1.7 3h15.4a2 2 0 0 0 1.7-3L13.7 4.2a2 2 0 0 0-3.4 0zM12 9.5v4M12 17h.01"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14.5A8.5 8.5 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z"/></symbol>
+  <symbol id="i-loader" viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9"/></symbol>
+  <symbol id="i-offline" viewBox="0 0 24 24"><path d="m3 3 18 18M8.5 16.4a5 5 0 0 1 7 0M5 12.9a10 10 0 0 1 5-2.7M19 12.9a10 10 0 0 0-2.3-1.7M2 8.8a15 15 0 0 1 3.5-2.4M22 8.8a15 15 0 0 0-11.3-3.7M12 20h.01"/></symbol>
+  <symbol id="i-camera" viewBox="0 0 24 24"><path d="M4 7.5h3l2-2.5h6l2 2.5h3a1 1 0 0 1 1 1V19a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V8.5a1 1 0 0 1 1-1z"/><circle cx="12" cy="13.5" r="3.5"/></symbol>
+  <symbol id="i-camera-off" viewBox="0 0 24 24"><path d="m3 3 18 18M9.5 5H15l2 2.5h3a1 1 0 0 1 1 1V17M18 20H4a1 1 0 0 1-1-1V8.5a1 1 0 0 1 1-1h3M14.5 16a3.5 3.5 0 0 1-5-5"/></symbol>
+  <symbol id="i-nozzle" viewBox="0 0 24 24"><rect x="6" y="3" width="12" height="6" rx="1"/><path d="M8.5 9h7L13.5 15h-3zM12 18.5v.01M9 21h6"/></symbol>
+  <symbol id="i-bed" viewBox="0 0 24 24"><rect x="3" y="16" width="18" height="4" rx="1"/><path d="M8 13c-1.2-1.5 1.2-2.5 0-4.5M12 13c-1.2-1.5 1.2-2.5 0-4.5M16 13c-1.2-1.5 1.2-2.5 0-4.5"/></symbol>
+  <symbol id="i-thermo" viewBox="0 0 24 24"><path d="M14 14.8V5a2 2 0 0 0-4 0v9.8a4 4 0 1 0 4 0zM12 9v7"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24"><path d="m12 3 9 5-9 5-9-5zM3 13l9 5 9-5"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+  <symbol id="i-flag" viewBox="0 0 24 24"><path d="M5 21V4M5 4h11l-2 4 2 4H5"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3H6a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8zM14 3v5h5"/></symbol>
+  <symbol id="i-tag" viewBox="0 0 24 24"><path d="M3 12V4a1 1 0 0 1 1-1h8l9 9-9 9zM7.5 7.5h.01"/></symbol>
+  <symbol id="i-grip" viewBox="0 0 24 24"><g fill="currentColor" stroke="none"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></g></symbol>
+  <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/></symbol>
+  <symbol id="i-fullscreen" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></symbol>
+  <symbol id="i-external" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+  <symbol id="i-bell" viewBox="0 0 24 24"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10.3 21a1.94 1.94 0 0 0 3.4 0"/></symbol>
+  <symbol id="i-clock-alert" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-9-9M12 7v5l3 2M19 3v4M19 10.5v.01"/></symbol>
+</svg>
+
+<header class="bar">
+  <div class="brand"><svg class="ic" aria-hidden="true"><use href="#i-wall"/></svg><h1>Printer wall</h1></div>
+  <ul class="fleet" id="fleet" aria-label="Fleet summary and filters"></ul>
+  <div class="actions">
+    <span class="health" id="health" data-health="wait"><i aria-hidden="true"></i><span id="health-text">Connecting…</span></span>
+    <button class="icon-btn" id="btn-fullscreen" type="button" aria-label="Toggle full screen" hidden><svg class="ic" aria-hidden="true"><use href="#i-fullscreen"/></svg></button>
+    <button class="icon-btn" id="btn-settings" type="button" aria-label="Wall settings" aria-haspopup="dialog"><svg class="ic" aria-hidden="true"><use href="#i-sliders"/></svg></button>
+  </div>
+</header>
+
+<main id="grid" aria-label="Printers" hidden></main>
+<div class="no-match" id="no-match" hidden>
+  <p>No printers match the current filter.</p>
+  <button class="btn" type="button" id="clear-filter">Show all printers</button>
+</div>
+<div class="empty" id="empty" hidden>
+  <svg class="ic" aria-hidden="true"><use href="#i-wall"/></svg>
+  <p>No printers configured. Add printer serials to the proxy config.</p>
+</div>
+<div class="sr-only" id="announce" aria-live="polite" aria-atomic="true"></div>
+
+<dialog id="settings" aria-labelledby="settings-title">
+  <form method="dialog">
+    <div class="dlg-head"><h2 id="settings-title">Wall settings</h2>
+      <button class="icon-btn" value="close" aria-label="Close settings"><svg class="ic" aria-hidden="true"><use href="#i-close"/></svg></button></div>
+    <label class="field"><span>Live streams <output id="out-live" for="set-live"></output></span>
+      <input type="range" id="set-live" min="1" max="16" step="1"></label>
+    <p class="hint">Focused cameras and active prints stream live first. Other visible cameras show snapshots.
+      Over plain HTTP, browsers open about six connections per server, shared by streams, snapshots, and status updates.</p>
+    <label class="field"><span>Snapshot refresh <output id="out-snap" for="set-snap"></output></span>
+      <input type="range" id="set-snap" min="2" max="60" step="1"></label>
+    <fieldset><legend>Tile size</legend>
+      <div class="seg">
+        <label><input type="radio" name="size" value="s">Small</label>
+        <label><input type="radio" name="size" value="m">Medium</label>
+        <label><input type="radio" name="size" value="l">Large</label>
+      </div></fieldset>
+    <fieldset><legend>Detail level for all printers</legend>
+      <div class="seg">
+        <button class="btn" type="button" data-all-level="1">Compact</button>
+        <button class="btn" type="button" data-all-level="2">Vitals</button>
+        <button class="btn" type="button" data-all-level="3">Full</button>
+      </div></fieldset>
+    <button class="btn" type="button" id="reset-layout">Reset order and details</button>
+    <label class="check"><input type="checkbox" id="set-wake">Keep the screen awake while this page is open</label>
+    <p class="hint" id="wake-hint"></p>
+  </form>
+</dialog>
+
+<template id="tile-tpl">
+  <article class="tile">
+    <div class="cam">
+      <div class="placeholder"><svg class="ic ph-icon" aria-hidden="true"><use/></svg><span class="ph-text"></span></div>
+      <img alt="" decoding="async" hidden>
+      <button class="cam-hit" type="button" aria-pressed="false"></button>
+      <span class="pill state"><svg class="ic" aria-hidden="true"><use/></svg><span class="label"></span></span>
+      <span class="pill feed" hidden><span class="dot" aria-hidden="true"></span><svg class="ic" aria-hidden="true"><use href="#i-camera"/></svg><span class="feed-label"></span></span>
+      <div class="cam-progress" hidden><div></div></div>
+    </div>
+    <div class="details">
+      <div class="head">
+        <button class="grip" type="button"><svg class="ic" aria-hidden="true"><use href="#i-grip"/></svg></button>
+        <div class="ident"><span class="model"></span><span class="serial"></span></div>
+        <div class="kpi"><span class="kpi-main"></span><span class="kpi-sub"></span></div>
+        <button class="level" type="button"><i></i><i></i><i></i></button>
+      </div>
+      <div class="alert-row" hidden><svg class="ic" aria-hidden="true"><use href="#i-alert"/></svg><span class="alert-text"></span></div>
+      <div class="more l2"><div><div class="pad">
+        <div class="progress-row">
+          <div class="meter" role="progressbar" aria-valuemin="0" aria-valuemax="100"><div></div></div>
+          <span class="stat layers"><svg class="ic" aria-hidden="true"><use href="#i-layers"/></svg><span></span></span>
+          <span class="stat eta"><svg class="ic" aria-hidden="true"><use href="#i-flag"/></svg><span></span></span>
+        </div>
+        <div class="temps"></div>
+      </div></div></div>
+      <div class="more l3"><div><div class="pad">
+        <dl class="facts">
+          <dt><svg class="ic" aria-hidden="true"><use href="#i-file"/></svg>File</dt><dd class="f-file"></dd>
+          <dt><svg class="ic" aria-hidden="true"><use href="#i-clock"/></svg>Remaining</dt><dd class="f-remain"></dd>
+          <dt><svg class="ic" aria-hidden="true"><use href="#i-camera"/></svg>Camera</dt><dd class="f-camera"></dd>
+          <dt><svg class="ic" aria-hidden="true"><use href="#i-bell"/></svg>Alerts</dt><dd class="f-alerts"></dd>
+          <dt><svg class="ic" aria-hidden="true"><use href="#i-clock-alert"/></svg>Last report</dt><dd class="f-report"></dd>
+          <dt><svg class="ic" aria-hidden="true"><use href="#i-tag"/></svg>Serial</dt><dd class="f-serial"></dd>
+        </dl>
+        <a class="open" target="_blank" rel="noopener"><svg class="ic" aria-hidden="true"><use href="#i-external"/></svg>Open live stream</a>
+      </div></div></div>
+    </div>
+  </article>
+</template>
+
+<script>
+"use strict";
+const STORE_KEY = "camwall.v2";
+const LIVE_LIMITS = [1, 16, 4];
+const SNAP_LIMITS = [2, 60, 8];
+const TILE_SIZES = { s: 260, m: 340, l: 460 };
+// An active printer that has not reported for this long is shown as stale.
+const STALE_REPORT_SEC = 120;
+// The server sends at least every 10 s; reconnect if nothing arrives for this long.
+const EVENTS_SILENCE_MS = 30000;
+const STATES = {
+  printing: { label: "Printing", icon: "i-play" },
+  paused: { label: "Paused", icon: "i-pause" },
+  preparing: { label: "Preparing", icon: "i-hourglass" },
+  failed: { label: "Failed", icon: "i-alert" },
+  stale: { label: "No recent data", icon: "i-clock-alert" },
+  finished: { label: "Finished", icon: "i-check" },
+  idle: { label: "Idle", icon: "i-moon" },
+  waiting: { label: "Waiting for data", icon: "i-loader" },
+  offline: { label: "Offline", icon: "i-offline" },
+};
+const ATTENTION = { label: "Needs attention", icon: "i-bell" };
+const FILTER_KEYS = ["attention", ...Object.keys(STATES)];
+const SEVERITY_RANK = { fatal: 4, serious: 3, error: 3, common: 2, info: 1, unknown: 1 };
+const grid = document.getElementById("grid");
+const params = new URLSearchParams(location.search);
+const kiosk = params.get("kiosk") === "1";
+const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)");
+const tiles = new Map();
+let visible = new Set();
+let spotlight = null;
+let lastOk = 0, connectedAt = 0, failing = false, drag = null, source = null;
+
+if (kiosk) document.body.classList.add("kiosk");
+
+// Preferences live only in this browser; URL parameters override on load.
+function limit(raw, [min, max, def]) {
+  const n = Math.round(Number(raw));
+  return raw == null || raw === "" || !Number.isFinite(n) ? def : Math.min(max, Math.max(min, n));
+}
+const prefs = (() => {
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(STORE_KEY)) || {}; } catch {}
+  return {
+    order: Array.isArray(saved.order) ? saved.order.filter(s => typeof s === "string") : [],
+    levels: saved.levels && typeof saved.levels === "object" ? saved.levels : {},
+    maxLive: limit(params.get("maxLive") ?? saved.maxLive, LIVE_LIMITS),
+    snapSec: limit(params.get("interval") ?? saved.snapSec, SNAP_LIMITS),
+    size: TILE_SIZES[saved.size] ? saved.size : "m",
+    filter: Array.isArray(saved.filter) ? saved.filter.filter(k => FILTER_KEYS.includes(k)) : [],
+    wake: saved.wake === true,
+  };
+})();
+const filter = new Set(prefs.filter);
+function savePrefs() {
+  prefs.filter = [...filter];
+  try { localStorage.setItem(STORE_KEY, JSON.stringify(prefs)); } catch {}
+}
+
+// Formatting helpers.
+function fmtDuration(min) {
+  const total = Math.round(min || 0);
+  if (total <= 0) return "";
+  const h = Math.floor(total / 60), m = total % 60;
+  return h ? `${h}h ${m}m` : `${m}m`;
+}
+function fmtAgo(sec) {
+  if (sec < 60) return `${sec}s ago`;
+  if (sec < 3600) return `${Math.floor(sec / 60)}m ago`;
+  return `${Math.floor(sec / 3600)}h ago`;
+}
+function fmtFinish(min) {
+  if (!(min > 0)) return "";
+  const at = new Date(Date.now() + min * 60000);
+  const time = at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return at.toDateString() === new Date().toDateString()
+    ? time : `${at.toLocaleDateString([], { weekday: "short" })} ${time}`;
+}
+function bucket(p) {
+  if (!p.connected) return "offline";
+  const base = {
+    RUNNING: "printing", PAUSE: "paused", PREPARE: "preparing", SLICING: "preparing",
+    FINISH: "finished", FAILED: "failed", "": "waiting",
+  }[(p.state || "").toUpperCase()] ?? "idle";
+  // Busy printers report constantly; silence while connected means stale data.
+  const busy = base === "printing" || base === "paused" || base === "preparing";
+  return busy && p.report_age_seconds > STALE_REPORT_SEC ? "stale" : base;
+}
+const isActive = b => b === "printing" || b === "paused";
+const showsProgress = (b, p) => isActive(b) || b === "finished" || b === "failed" || (b === "stale" && p.progress > 0);
+const nameOf = t => t.data.name || `${t.data.model || "Printer"} ${t.serial}`;
+// Print errors and HMS alerts, most severe first.
+function alertsOf(p) {
+  const list = (p.hms || []).map(h => ({ code: h.code, severity: h.severity, label: "HMS alert" }));
+  if (p.print_error) list.push({ code: p.print_error, severity: "error", label: "Print error" });
+  return list.sort((a, b) => (SEVERITY_RANK[b.severity] || 0) - (SEVERITY_RANK[a.severity] || 0));
+}
+const highAlert = p => alertsOf(p).some(a => (SEVERITY_RANK[a.severity] || 0) >= 3);
+function needsAttention(p) {
+  const b = bucket(p);
+  return b === "failed" || b === "paused" || b === "stale" || highAlert(p);
+}
+function matchesFilter(p) {
+  return filter.size === 0 || filter.has(bucket(p)) || (filter.has("attention") && needsAttention(p));
+}
+function icon(id) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("class", "ic");
+  svg.setAttribute("aria-hidden", "true");
+  const use = document.createElementNS("http://www.w3.org/2000/svg", "use");
+  use.setAttribute("href", `#${id}`);
+  svg.append(use);
+  return svg;
+}
+function announce(text) {
+  const el = document.getElementById("announce");
+  el.textContent = "";
+  requestAnimationFrame(() => { el.textContent = text; });
+}
+
+// DOM moves keep live <img> streams and focus when moveBefore is available.
+function move(el, ref) {
+  if ("moveBefore" in Element.prototype) {
+    try { grid.moveBefore(el, ref); return; } catch {}
+  }
+  grid.insertBefore(el, ref);
+}
+// FLIP: animate tiles from their old positions after a layout change.
+function flip(mutate) {
+  if (reduceMotion.matches) { mutate(); return; }
+  const before = new Map([...grid.children].map(el => [el, el.getBoundingClientRect()]));
+  mutate();
+  for (const el of grid.children) {
+    const a = before.get(el);
+    if (!a || !a.width || el.hidden || el.classList.contains("dragging")) continue;
+    el.getAnimations().forEach(anim => { if (anim.id === "flip") anim.cancel(); });
+    const b = el.getBoundingClientRect();
+    const dx = a.left - b.left, dy = a.top - b.top;
+    if (!dx && !dy) continue;
+    const anim = el.animate([{ translate: `${dx}px ${dy}px` }, { translate: "0 0" }],
+      { duration: 280, easing: "cubic-bezier(.2,.7,.2,1)" });
+    anim.id = "flip";
+  }
+}
+function persistOrder() {
+  const current = [...grid.children].map(el => el.dataset.serial);
+  prefs.order = [...current, ...prefs.order.filter(s => !current.includes(s))];
+  savePrefs();
+}
+
+// Tile construction and rendering.
+function createTile(p) {
+  const el = document.getElementById("tile-tpl").content.firstElementChild.cloneNode(true);
+  el.dataset.serial = p.serial;
+  const q = sel => el.querySelector(sel);
+  const t = {
+    serial: p.serial, el, data: p, feed: "none", hasFrame: false, liveError: false, blobURL: "",
+    snap: { ctrl: null, pending: false, requested: 0, at: 0, error: false },
+    level: [1, 2, 3].includes(prefs.levels[p.serial]) ? prefs.levels[p.serial] : 1,
+    r: {
+      cam: q(".cam"), img: q("img"), phUse: q(".ph-icon use"), phText: q(".ph-text"), hit: q(".cam-hit"),
+      stateUse: q(".pill.state use"), stateLabel: q(".pill.state .label"),
+      feed: q(".pill.feed"), feedLabel: q(".feed-label"), camBar: q(".cam-progress"),
+      details: q(".details"), grip: q(".grip"), model: q(".model"), serial: q(".serial"),
+      kpiMain: q(".kpi-main"), kpiSub: q(".kpi-sub"), level: q(".level"),
+      alertRow: q(".alert-row"), alertText: q(".alert-text"),
+      l2: q(".l2"), l3: q(".l3"), progressRow: q(".progress-row"), meter: q(".meter"),
+      layers: q(".layers span"), eta: q(".eta span"), temps: q(".temps"),
+      fFile: q(".f-file"), fRemain: q(".f-remain"), fCamera: q(".f-camera"), fAlerts: q(".f-alerts"),
+      fReport: q(".f-report"), fSerial: q(".f-serial"), open: q(".open"),
+    },
+  };
+  const { img, details, grip, hit, open } = t.r;
+  open.href = `/camera/${encodeURIComponent(p.serial)}/stream`;
+  img.addEventListener("load", () => {
+    if (t.feed !== "live" || (t.hasFrame && !t.liveError)) return;
+    t.hasFrame = true;
+    t.liveError = false;
+    renderTile(t);
+  });
+  img.addEventListener("error", () => {
+    if (t.feed !== "live" || !img.getAttribute("src")) return;
+    t.liveError = true;
+    t.hasFrame = false;
+    renderTile(t);
+    setTimeout(() => {
+      if (t.feed === "live" && t.liveError) img.src = `/camera/${encodeURIComponent(t.serial)}/stream?retry=${Date.now()}`;
+    }, 5000);
+  });
+  hit.addEventListener("click", () => toggleSpotlight(t));
+  details.addEventListener("click", e => {
+    if (e.target.closest("a, .grip") || getSelection()?.toString()) return;
+    t.level = t.level % 3 + 1;
+    prefs.levels[t.serial] = t.level;
+    savePrefs();
+    applyLevel(t);
+  });
+  grip.addEventListener("pointerdown", e => startDrag(t, e));
+  grip.addEventListener("keydown", e => keyMove(t, e));
+  applyLevel(t);
+  return t;
+}
+function applyLevel(t) {
+  const names = ["compact", "vitals", "full details"];
+  t.el.dataset.level = t.level;
+  t.r.l2.inert = t.level < 2;
+  t.r.l3.inert = t.level < 3;
+  t.r.level.setAttribute("aria-label",
+    `Detail level: ${names[t.level - 1]}. Switch to ${names[t.level % 3]}.`);
+}
+
+function camView(t) {
+  const p = t.data;
+  if (!p.camera_supported) return ["i-camera-off", `No chamber camera on ${p.model || "this model"}`, true];
+  if (!p.connected) return ["i-offline", "Printer offline", true];
+  if (t.feed === "live" && t.liveError) return ["i-camera-off", "Camera unavailable · retrying", true];
+  if (t.feed === "snap" && t.snap.error && !t.hasFrame) return ["i-camera-off", "Camera unavailable · retrying", true];
+  if (t.hasFrame) return null;
+  if (t.feed === "live") return ["i-camera", "Connecting to camera…", false];
+  if (t.feed === "snap") return ["i-camera", "Loading snapshot…", false];
+  return ["i-camera", "Camera paused", false];
+}
+
+function renderFeed(t) {
+  const { feed, feedLabel } = t.r;
+  const errored = (t.feed === "live" && t.liveError) || (t.feed === "snap" && t.snap.error);
+  feed.hidden = t.feed === "none";
+  feed.dataset.mode = errored ? "error" : t.feed;
+  let label = "";
+  if (errored) label = "Retrying";
+  else if (t.feed === "live") label = "LIVE";
+  else if (t.feed === "snap") label = t.snap.at ? `${Math.round((Date.now() - t.snap.at) / 1000)}s` : "…";
+  if (feedLabel.textContent !== label) feedLabel.textContent = label;
+  const frameAge = Number(t.data.frame_age_seconds || 0);
+  feed.classList.toggle("stale", t.feed === "snap" && frameAge > prefs.snapSec * 3);
+}
+
+function tempChip(iconId, name, cur, target) {
+  if (cur == null) return null;
+  const hasTarget = target != null && target > 0;
+  const state = hasTarget ? (cur < target - 3 ? "heating" : "hot") : cur > 45 ? "cooling" : "cold";
+  const el = document.createElement("span");
+  el.className = `temp ${state}`;
+  el.setAttribute("role", "img");
+  el.style.setProperty("--fill", hasTarget ? `${Math.min(100, (cur / target) * 100)}%` : "0%");
+  const words = { heating: "heating", hot: "at target", cooling: "cooling down", cold: "off" }[state];
+  el.title = `${name} ${Math.round(cur)}°C${hasTarget ? ` of ${Math.round(target)}°C` : ""}, ${words}`;
+  el.setAttribute("aria-label", el.title);
+  const value = document.createElement("b");
+  value.textContent = `${Math.round(cur)}°`;
+  el.append(icon(iconId), value);
+  if (hasTarget) {
+    const small = document.createElement("small");
+    small.textContent = `/${Math.round(target)}`;
+    el.append(small);
+  }
+  return el;
+}
+
+function renderTile(t) {
+  const p = t.data, r = t.r, b = bucket(p), s = STATES[b];
+  const pct = Math.max(0, Math.min(100, Math.round(p.progress || 0)));
+  const progress = showsProgress(b, p);
+  const alerts = alertsOf(p);
+  t.el.dataset.state = b;
+  t.el.dataset.alert = highAlert(p) ? "high" : alerts.length ? "low" : "none";
+  t.el.setAttribute("aria-label", `${nameOf(t)}, ${s.label}${progress ? `, ${pct}%` : ""}` +
+    `${alerts.length ? `, ${alerts.length} alert${alerts.length > 1 ? "s" : ""}` : ""}`);
+  r.stateUse.setAttribute("href", `#${s.icon}`);
+  r.stateLabel.textContent = s.label;
+  r.model.textContent = p.name || p.model || "Printer";
+  r.serial.textContent = p.name ? `${p.model ? `${p.model} · ` : ""}${p.serial}` : p.serial;
+  r.grip.setAttribute("aria-label", `Reorder ${nameOf(t)}. Drag, or use arrow keys.`);
+  r.hit.setAttribute("aria-label", `${t.serial === spotlight ? "Exit focus view for" : "Focus camera of"} ${nameOf(t)}`);
+  r.hit.setAttribute("aria-pressed", String(t.serial === spotlight));
+  r.hit.hidden = !p.camera_supported;
+
+  // Headline metric: progress and time left for jobs, otherwise the state.
+  const remain = fmtDuration(p.remain_min);
+  const reportAge = p.report_age_seconds != null ? Math.round(p.report_age_seconds) : null;
+  r.kpiMain.textContent = progress ? `${pct}%` : "";
+  r.kpiSub.textContent = isActive(b) ? (remain ? `${remain} left` : s.label)
+    : b === "finished" ? "Complete" : b === "failed" ? "Stopped"
+    : b === "stale" ? `No data for ${fmtAgo(reportAge).replace(" ago", "")}` : s.label;
+
+  // Alerts stay visible at every detail level: they are why someone looks.
+  r.alertRow.hidden = alerts.length === 0;
+  if (alerts.length) {
+    const top = alerts[0];
+    r.alertRow.dataset.sev = top.severity;
+    r.alertText.textContent = `${top.label} ${top.code}` +
+      `${top.severity !== "error" ? ` · ${top.severity}` : ""}${alerts.length > 1 ? ` · +${alerts.length - 1} more` : ""}`;
+    r.alertRow.title = alerts.map(a => `${a.label} ${a.code} (${a.severity})`).join("\n");
+  }
+
+  t.el.style.setProperty("--pct", `${pct}%`);
+  r.camBar.hidden = !progress;
+  r.progressRow.hidden = !progress;
+  r.meter.setAttribute("aria-valuenow", String(pct));
+  r.meter.setAttribute("aria-label", `Print progress ${pct}%`);
+  r.layers.textContent = p.layer_num != null && p.total_layers ? `${p.layer_num}/${p.total_layers}` : "–";
+  r.layers.parentElement.title = "Layer";
+  const finish = isActive(b) ? fmtFinish(p.remain_min) : "";
+  r.eta.textContent = finish || "–";
+  r.eta.parentElement.title = finish ? "Estimated finish" : "";
+
+  const chips = [
+    tempChip("i-nozzle", "Nozzle", p.nozzle_temp, p.nozzle_target),
+    tempChip("i-bed", "Bed", p.bed_temp, p.bed_target),
+    tempChip("i-thermo", "Chamber", p.chamber_temp, null),
+  ].filter(Boolean);
+  if (chips.length) r.temps.replaceChildren(...chips);
+  else {
+    const none = document.createElement("span");
+    none.className = "muted";
+    none.textContent = p.connected ? "No temperatures reported yet" : "No live temperatures while offline";
+    r.temps.replaceChildren(none);
+  }
+
+  r.fFile.textContent = p.filename || "–";
+  r.fRemain.textContent = isActive(b) && remain ? `${remain} (finish ${finish})` : "–";
+  if (alerts.length) {
+    const list = document.createElement("ul");
+    list.className = "alert-list";
+    for (const a of alerts) {
+      const li = document.createElement("li");
+      li.dataset.sev = a.severity;
+      const code = document.createElement("code");
+      code.textContent = a.code;
+      const note = document.createElement("small");
+      note.textContent = a.severity === "error" ? a.label.toLowerCase() : a.severity;
+      li.append(code, note);
+      list.append(li);
+    }
+    r.fAlerts.replaceChildren(list);
+  } else {
+    r.fAlerts.textContent = "None";
+  }
+  r.fReport.textContent = reportAge == null ? "No report yet" : reportAge < 2 ? "Just now" : fmtAgo(reportAge);
+  r.fSerial.textContent = p.serial;
+  const frameAge = Math.round(Number(p.frame_age_seconds || 0));
+  const frameNote = p.frame_seq ? ` · frame captured ${frameAge ? fmtAgo(frameAge) : "just now"}` : "";
+  r.fCamera.textContent = !p.camera_supported ? "Not supported on this model"
+    : t.feed === "live" ? `Live stream${frameNote}`
+    : t.feed === "snap" ? `Snapshot every ${prefs.snapSec}s${frameNote}`
+    : !p.connected ? "Printer offline" : "Paused while off-screen";
+  r.open.hidden = !p.camera_supported;
+
+  const view = camView(t);
+  r.cam.classList.toggle("blocked", !!view?.[2]);
+  r.cam.classList.toggle("has-frame", t.hasFrame);
+  r.img.hidden = !r.img.getAttribute("src");
+  r.img.alt = `Camera view of ${nameOf(t)}`;
+  if (view) {
+    r.phUse.setAttribute("href", `#${view[0]}`);
+    r.phText.textContent = view[1];
+  }
+  r.cam.querySelector(".placeholder").hidden = !view;
+  renderFeed(t);
+}
+
+// Camera feeds: bounded live MJPEG slots, snapshot polling for the rest.
+function eligible(t) {
+  return !document.hidden && !t.el.hidden && visible.has(t.serial) && t.data.connected && t.data.camera_supported;
+}
+function allocate() {
+  const order = [...grid.children].map(el => tiles.get(el.dataset.serial));
+  for (const t of order) t.el.hidden = !matchesFilter(t.data);
+  const wantsLive = t => isActive(bucket(t.data)) || bucket(t.data) === "stale" || t.serial === spotlight;
+  const live = new Set();
+  const spot = spotlight && tiles.get(spotlight);
+  if (spot && eligible(spot)) live.add(spot.serial);
+  // Current holders keep their slot first so streams do not restart.
+  for (const pass of [t => t.feed === "live", () => true]) {
+    for (const t of order) {
+      if (live.size >= prefs.maxLive) break;
+      if (pass(t) && eligible(t) && wantsLive(t)) live.add(t.serial);
+    }
+  }
+  for (const t of order) {
+    setFeed(t, !eligible(t) ? "none" : live.has(t.serial) ? "live" : "snap");
+    renderTile(t);
+  }
+  document.getElementById("no-match").hidden = !order.length || order.some(t => !t.el.hidden);
+  renderFleet();
+}
+function stopFeed(t) {
+  t.snap.ctrl?.abort();
+  t.snap.ctrl = null;
+  t.snap.pending = false;
+  if (t.feed === "live") {
+    t.r.img.removeAttribute("src");
+    t.hasFrame = false;
+  }
+  t.feed = "none";
+}
+function setFeed(t, mode) {
+  if (t.feed === mode) return;
+  stopFeed(t);
+  t.feed = mode;
+  t.liveError = false;
+  t.snap.error = false;
+  if (mode === "live") {
+    t.hasFrame = false;
+    t.r.img.src = `/camera/${encodeURIComponent(t.serial)}/stream`;
+  } else if (mode === "snap") {
+    fetchSnapshot(t);
+  }
+}
+async function fetchSnapshot(t) {
+  if (t.snap.pending) return;
+  const ctrl = new AbortController();
+  Object.assign(t.snap, { ctrl, pending: true, requested: Date.now() });
+  try {
+    const res = await fetch(`/camera/${encodeURIComponent(t.serial)}/snapshot`, { cache: "no-store", signal: ctrl.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const url = URL.createObjectURL(await res.blob());
+    // Decode off-screen first so the visible frame swaps without flashing.
+    const pre = new Image();
+    pre.src = url;
+    try { await pre.decode(); } catch { URL.revokeObjectURL(url); throw new Error("bad image"); }
+    if (t.snap.ctrl !== ctrl) { URL.revokeObjectURL(url); return; }
+    if (t.blobURL) URL.revokeObjectURL(t.blobURL);
+    t.blobURL = url;
+    t.r.img.src = url;
+    t.hasFrame = true;
+    t.snap.error = false;
+    t.snap.at = Date.now();
+  } catch (err) {
+    if (err.name !== "AbortError" && t.snap.ctrl === ctrl) t.snap.error = true;
+  } finally {
+    if (t.snap.ctrl === ctrl) { t.snap.ctrl = null; t.snap.pending = false; }
+    if (tiles.get(t.serial) === t) renderTile(t);
+  }
+}
+
+// Focus view: one camera spans the full row and gets a live slot first.
+function toggleSpotlight(t) {
+  const next = spotlight === t.serial ? null : t.serial;
+  flip(() => {
+    for (const other of tiles.values()) other.el.classList.toggle("spot", other.serial === next);
+  });
+  spotlight = next;
+  allocate();
+  if (next) t.el.scrollIntoView({ block: "nearest", behavior: reduceMotion.matches ? "auto" : "smooth" });
+}
+
+// Reordering: pointer drag on the grip (mouse, pen, touch) or arrow keys.
+function startDrag(t, e) {
+  if (drag || e.button !== 0) return;
+  e.preventDefault();
+  const rect = t.el.getBoundingClientRect();
+  drag = { t, id: e.pointerId, x: e.clientX, y: e.clientY, grabX: e.clientX - rect.left,
+           grabY: e.clientY - rect.top, start: [...grid.children].indexOf(t.el), moved: false, raf: 0 };
+  t.el.classList.add("dragging");
+  grid.classList.add("arranging");
+  addEventListener("pointermove", onDragMove);
+  addEventListener("pointerup", endDrag);
+  addEventListener("pointercancel", endDrag);
+  addEventListener("keydown", onDragKey);
+  follow();
+  drag.raf = requestAnimationFrame(autoScroll);
+}
+function follow() {
+  const g = grid.getBoundingClientRect(), el = drag.t.el;
+  el.style.translate = `${drag.x - g.left - drag.grabX - el.offsetLeft}px ${drag.y - g.top - drag.grabY - el.offsetTop}px`;
+}
+function onDragMove(e) {
+  if (e.pointerId !== drag.id) return;
+  drag.x = e.clientX;
+  drag.y = e.clientY;
+  follow();
+  reorderAtPointer();
+}
+function reorderAtPointer() {
+  const g = grid.getBoundingClientRect(), el = drag.t.el;
+  const px = drag.x - g.left, py = drag.y - g.top;
+  for (const other of grid.children) {
+    if (other === el || other.hidden || px < other.offsetLeft || px > other.offsetLeft + other.offsetWidth ||
+        py < other.offsetTop || py > other.offsetTop + other.offsetHeight) continue;
+    const kids = [...grid.children];
+    const after = kids.indexOf(el) < kids.indexOf(other);
+    flip(() => { move(el, after ? other.nextElementSibling : other); follow(); });
+    drag.moved = true;
+    return;
+  }
+}
+function autoScroll() {
+  if (!drag) return;
+  const edge = 70;
+  const dy = drag.y < edge ? -(edge - drag.y) / 4 : drag.y > innerHeight - edge ? (drag.y - innerHeight + edge) / 4 : 0;
+  if (dy) { scrollBy(0, Math.round(dy)); follow(); reorderAtPointer(); }
+  drag.raf = requestAnimationFrame(autoScroll);
+}
+function onDragKey(e) {
+  if (e.key !== "Escape") return;
+  const { t, start } = drag;
+  flip(() => {
+    const others = [...grid.children].filter(el => el !== t.el);
+    move(t.el, others[start] || null);
+  });
+  drag.moved = false;
+  endDrag();
+}
+function endDrag() {
+  if (!drag) return;
+  const { t, moved, raf } = drag;
+  cancelAnimationFrame(raf);
+  removeEventListener("pointermove", onDragMove);
+  removeEventListener("pointerup", endDrag);
+  removeEventListener("pointercancel", endDrag);
+  removeEventListener("keydown", onDragKey);
+  drag = null;
+  const from = t.el.getBoundingClientRect();
+  t.el.style.translate = "";
+  t.el.classList.remove("dragging");
+  grid.classList.remove("arranging");
+  if (!reduceMotion.matches) {
+    const to = t.el.getBoundingClientRect();
+    t.el.animate([{ translate: `${from.left - to.left}px ${from.top - to.top}px` }, { translate: "0 0" }],
+      { duration: 200, easing: "cubic-bezier(.2,.7,.2,1)" });
+  }
+  if (moved) finishMove(t);
+}
+function keyMove(t, e) {
+  // Moves step over tiles hidden by the filter, so each key press is visible.
+  const kids = [...grid.children].filter(el => !el.hidden), i = kids.indexOf(t.el);
+  const target = { ArrowLeft: i - 1, ArrowUp: i - 1, ArrowRight: i + 1, ArrowDown: i + 1, Home: 0, End: kids.length - 1 }[e.key];
+  if (target == null) return;
+  e.preventDefault();
+  if (target < 0 || target >= kids.length || target === i) return;
+  flip(() => move(t.el, target > i ? kids[target].nextElementSibling : kids[target]));
+  t.r.grip.focus();
+  finishMove(t);
+}
+function finishMove(t) {
+  persistOrder();
+  const kids = [...grid.children].filter(el => !el.hidden);
+  announce(`${nameOf(t)} moved to position ${kids.indexOf(t.el) + 1} of ${kids.length}.`);
+  allocate();
+}
+
+// Header: fleet counts and proxy connection health.
+// Fleet chips are built once and updated in place so keyboard focus survives
+// status updates. State chips double as toggle filters.
+const fleetChips = new Map();
+function chip(tag, iconId, accent) {
+  const li = document.createElement("li");
+  const el = document.createElement(tag);
+  el.className = "chip";
+  el.style.setProperty("--accent", accent);
+  const n = document.createElement("b");
+  const label = document.createElement("span");
+  label.className = "chip-label";
+  el.append(icon(iconId), n, label);
+  li.append(el);
+  document.getElementById("fleet").append(li);
+  return { li, el, n, label };
+}
+function buildFleet() {
+  for (const key of FILTER_KEYS) {
+    const def = key === "attention" ? ATTENTION : STATES[key];
+    const c = chip("button", def.icon, `var(--${key})`);
+    c.el.type = "button";
+    c.label.textContent = def.label.toLowerCase();
+    c.el.addEventListener("click", () => toggleFilter(key));
+    fleetChips.set(key, c);
+  }
+  const clear = chip("button", "i-close", "var(--text)");
+  clear.el.classList.add("clear");
+  clear.el.type = "button";
+  clear.label.textContent = "clear filter";
+  clear.el.setAttribute("aria-label", "Clear filter and show all printers");
+  clear.el.addEventListener("click", clearFilter);
+  fleetChips.set("clear", clear);
+  const live = chip("span", "i-camera", "var(--live)");
+  live.label.textContent = "live";
+  fleetChips.set("live", live);
+}
+function renderFleet() {
+  const counts = { attention: 0 };
+  let live = 0;
+  for (const t of tiles.values()) {
+    const b = bucket(t.data);
+    counts[b] = (counts[b] || 0) + 1;
+    if (needsAttention(t.data)) counts.attention++;
+    if (t.feed === "live") live++;
+  }
+  for (const key of FILTER_KEYS) {
+    const c = fleetChips.get(key), count = counts[key] || 0, on = filter.has(key);
+    c.li.hidden = !count && !on;
+    c.n.textContent = count;
+    c.el.setAttribute("aria-pressed", String(on));
+    c.el.setAttribute("aria-label", `${count} ${c.label.textContent}`);
+    c.el.title = `${count} ${c.label.textContent} · ${on ? "remove from filter" : "show only these"}`;
+  }
+  fleetChips.get("clear").li.hidden = filter.size === 0;
+  const lc = fleetChips.get("live");
+  lc.li.hidden = tiles.size === 0;
+  lc.n.textContent = `${live}/${prefs.maxLive}`;
+  lc.el.title = `${live} of ${prefs.maxLive} live streams in use`;
+}
+function toggleFilter(key) {
+  if (filter.has(key)) filter.delete(key); else filter.add(key);
+  savePrefs();
+  flip(allocate);
+  const shown = [...tiles.values()].filter(t => !t.el.hidden).length;
+  announce(filter.size ? `Filter applied: ${shown} of ${tiles.size} printers shown.` : "Filter cleared.");
+}
+function clearFilter() {
+  filter.clear();
+  savePrefs();
+  flip(allocate);
+  announce("Filter cleared.");
+}
+function renderHealth() {
+  const el = document.getElementById("health");
+  const age = lastOk ? Math.round((Date.now() - lastOk) / 1000) : 0;
+  const quiet = age * 1000 > EVENTS_SILENCE_MS - 5000;
+  el.dataset.health = failing ? "down" : !lastOk ? "wait" : quiet ? "stale" : "ok";
+  document.getElementById("health-text").textContent = failing
+    ? (lastOk ? `Reconnecting · updated ${fmtAgo(age)}` : "Proxy unreachable")
+    : !lastOk ? "Connecting…" : quiet ? `Updated ${fmtAgo(age)}` : "Live";
+  el.title = lastOk ? `Last status update ${new Date(lastOk).toLocaleTimeString()}` : "";
+}
+
+// Status updates keep tile nodes (and their streams) stable.
+function sync(list) {
+  const seen = new Set(list.map(p => p.serial));
+  for (const [serial, t] of tiles) {
+    if (seen.has(serial)) continue;
+    stopFeed(t);
+    if (t.blobURL) URL.revokeObjectURL(t.blobURL);
+    observer.unobserve(t.el);
+    t.el.remove();
+    tiles.delete(serial);
+    visible.delete(serial);
+    if (spotlight === serial) spotlight = null;
+  }
+  let added = false;
+  for (const p of list) {
+    const t = tiles.get(p.serial);
+    if (t) { t.data = p; continue; }
+    const nt = createTile(p);
+    tiles.set(p.serial, nt);
+    grid.append(nt.el);
+    observer.observe(nt.el);
+    added = true;
+  }
+  if (added && !drag) {
+    const rank = new Map(prefs.order.map((s, i) => [s, i]));
+    const sorted = [...tiles.values()].sort((a, b) =>
+      (rank.get(a.serial) ?? Infinity) - (rank.get(b.serial) ?? Infinity) || a.serial.localeCompare(b.serial));
+    sorted.forEach((t, i) => { if (grid.children[i] !== t.el) move(t.el, grid.children[i]); });
+  }
+  grid.hidden = list.length === 0;
+  document.getElementById("empty").hidden = list.length !== 0;
+  allocate();
+}
+
+// The proxy pushes status over server-sent events: on connect, on every
+// change, and at least every 10 s. EventSource retries on its own; a stream
+// the browser gave up on (non-200 answer) or one gone silent is reopened here.
+function markFailed(reason) {
+  if (!failing) announce(`Lost status updates (${reason}). Showing the last known state.`);
+  failing = true;
+  renderHealth();
+}
+function connect() {
+  if (source || document.hidden) return;
+  const es = new EventSource("/camera/events");
+  source = es;
+  connectedAt = Date.now();
+  es.onmessage = e => {
+    let data;
+    try { data = JSON.parse(e.data); } catch { return; }
+    if (!Array.isArray(data.printers)) return;
+    lastOk = Date.now();
+    if (failing) announce("Status updates restored.");
+    failing = false;
+    sync(data.printers);
+    renderHealth();
+  };
+  es.onerror = () => {
+    markFailed("connection lost");
+    if (es.readyState === EventSource.CLOSED && source === es) {
+      source = null;
+      setTimeout(connect, 5000);
+    }
+  };
+}
+function disconnect() {
+  source?.close();
+  source = null;
+}
+
+// Off-screen tiles release their camera connection.
+const observer = new IntersectionObserver(entries => {
+  for (const e of entries) {
+    if (e.isIntersecting) visible.add(e.target.dataset.serial);
+    else visible.delete(e.target.dataset.serial);
+  }
+  allocate();
+}, { threshold: 0.2 });
+
+// Screen wake lock keeps wall displays on. Browsers expose it only on
+// secure origins (HTTPS or localhost); kiosk mode always asks for it.
+let wakeLock = null, wakePending = false;
+const wakeSupported = "wakeLock" in navigator;
+async function syncWakeLock() {
+  const want = wakeSupported && (kiosk || prefs.wake) && !document.hidden;
+  if (want && !wakeLock && !wakePending) {
+    wakePending = true;
+    try {
+      wakeLock = await navigator.wakeLock.request("screen");
+      wakeLock.addEventListener("release", () => { wakeLock = null; });
+    } catch {}
+    wakePending = false;
+  } else if (!want && wakeLock) {
+    wakeLock.release();
+    wakeLock = null;
+  }
+}
+
+// Settings dialog.
+const dlg = document.getElementById("settings");
+const setLive = document.getElementById("set-live"), setSnap = document.getElementById("set-snap");
+function applySize() { document.documentElement.style.setProperty("--tile-min", `${TILE_SIZES[prefs.size]}px`); }
+function syncSettings() {
+  setLive.value = prefs.maxLive;
+  setSnap.value = prefs.snapSec;
+  document.getElementById("out-live").textContent = prefs.maxLive;
+  document.getElementById("out-snap").textContent = `${prefs.snapSec}s`;
+  dlg.querySelector(`input[name="size"][value="${prefs.size}"]`).checked = true;
+  const wake = document.getElementById("set-wake");
+  wake.checked = kiosk || prefs.wake;
+  wake.disabled = !wakeSupported || kiosk;
+  document.getElementById("wake-hint").textContent = !wakeSupported
+    ? "Unavailable here: browsers allow screen wake locks only on HTTPS or localhost pages."
+    : kiosk ? "Always on in kiosk mode." : "";
+}
+function dropParam(name) {
+  if (!params.has(name)) return;
+  params.delete(name);
+  const qs = params.toString();
+  history.replaceState(history.state, "", `${location.pathname}${qs ? `?${qs}` : ""}${location.hash}`);
+}
+document.getElementById("btn-settings").addEventListener("click", () => { syncSettings(); dlg.showModal(); });
+dlg.addEventListener("click", e => { if (e.target === dlg) dlg.close(); });
+setLive.addEventListener("input", () => {
+  prefs.maxLive = limit(setLive.value, LIVE_LIMITS);
+  dropParam("maxLive");
+  savePrefs(); syncSettings(); allocate();
+});
+setSnap.addEventListener("input", () => {
+  prefs.snapSec = limit(setSnap.value, SNAP_LIMITS);
+  dropParam("interval");
+  savePrefs(); syncSettings(); allocate();
+});
+dlg.querySelectorAll('input[name="size"]').forEach(input => input.addEventListener("change", () => {
+  prefs.size = input.value;
+  savePrefs();
+  flip(applySize);
+}));
+dlg.querySelectorAll("[data-all-level]").forEach(btn => btn.addEventListener("click", () => {
+  const level = Number(btn.dataset.allLevel);
+  for (const t of tiles.values()) { t.level = level; prefs.levels[t.serial] = level; applyLevel(t); }
+  savePrefs();
+}));
+document.getElementById("reset-layout").addEventListener("click", () => {
+  prefs.order = [];
+  prefs.levels = {};
+  savePrefs();
+  flip(() => {
+    [...tiles.values()].sort((a, b) => a.serial.localeCompare(b.serial)).forEach(t => {
+      t.level = 1;
+      applyLevel(t);
+      grid.append(t.el);
+    });
+  });
+  announce("Layout reset.");
+  allocate();
+});
+document.getElementById("set-wake").addEventListener("change", e => {
+  prefs.wake = e.target.checked;
+  savePrefs();
+  syncWakeLock();
+});
+document.getElementById("clear-filter").addEventListener("click", clearFilter);
+
+// Full screen where the browser allows it (not iPhone Safari).
+const fsBtn = document.getElementById("btn-fullscreen");
+if (document.fullscreenEnabled) {
+  fsBtn.hidden = false;
+  fsBtn.addEventListener("click", () => {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else document.documentElement.requestFullscreen().catch(() => {});
+  });
+}
+addEventListener("keydown", e => {
+  if (e.key === "Escape" && spotlight && !drag && !dlg.open) toggleSpotlight(tiles.get(spotlight));
+});
+// A hidden page releases every camera connection and the status stream.
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) disconnect(); else connect();
+  allocate();
+  syncWakeLock();
+});
+
+// One-second tick: snapshot cadence, relative-time labels, silent-stream check.
+setInterval(() => {
+  const now = Date.now();
+  for (const t of tiles.values()) {
+    if (t.feed === "snap" && !t.snap.pending && now - t.snap.requested >= prefs.snapSec * 1000) fetchSnapshot(t);
+    renderFeed(t);
+  }
+  if (source && now - Math.max(lastOk, connectedAt) > EVENTS_SILENCE_MS) {
+    markFailed("no updates");
+    disconnect();
+    connect();
+  }
+  renderHealth();
+}, 1000);
+applySize();
+buildFleet();
+connect();
+syncWakeLock();
+</script>
+</body>
+</html>

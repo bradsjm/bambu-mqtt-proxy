@@ -87,14 +87,14 @@ func run() error {
 		if cfg.CameraEnabled() {
 			camera.Register(httpSrv.Mux(), cameras)
 			renderer.RegisterStatus(httpSrv.Mux())
-			// Hold one report interest per printer so the overlay shows
+			// Hold one report interest per printer so the camera wall shows
 			// live state without any downstream MQTT clients. Async on
 			// purpose: HTTP must start while printers are still offline,
 			// and onConnect restores the recorded interests on reconnect.
 			for _, p := range cfg.Printers {
 				pool.SubscribeAsync(p.Serial, fmt.Sprintf("device/%s/report", p.Serial), 1)
 			}
-			logger.Info("camera and overlay endpoints serving", "port", cfg.HTTP.Port)
+			logger.Info("camera endpoints and camera wall serving", "port", cfg.HTTP.Port)
 		}
 		if err := httpSrv.Start(); err != nil {
 			pool.Stop()

@@ -58,7 +58,10 @@ type Auth struct {
 type Printer struct {
 	Serial  string `yaml:"serial"`
 	Address string `yaml:"address"`
-	// Model is the optional printer display name, free-form (P1S, A1MINI,
+	// Name is an optional friendly label shown on the camera wall. It never
+	// affects routing, which is keyed by Serial.
+	Name string `yaml:"name"`
+	// Model is the optional printer model, free-form (P1S, A1MINI,
 	// X1C, ...). Camera capture requires one of P1P, P1S, A1, A1MINI; see
 	// CameraSupported. Any other model still proxies MQTT.
 	Model              string `yaml:"model"`
@@ -86,7 +89,7 @@ type Log struct {
 // HTTP holds the shared health and camera HTTP endpoint configuration.
 type HTTP struct {
 	// Port serves /livez, /readyz, /status, the camera endpoints and the
-	// overlay; 0 disables the endpoint. Unset is represented by the
+	// camera wall; 0 disables the endpoint. Unset is represented by the
 	// PortUnset sentinel until ApplyDefaults fills in the design default.
 	Port int `yaml:"port"`
 }
@@ -96,10 +99,10 @@ type HTTP struct {
 // explicit 0 (disable HTTP) survives defaults untouched.
 const PortUnset = -1
 
-// Camera holds the camera and overlay feature configuration.
+// Camera holds the camera and camera wall feature configuration.
 type Camera struct {
-	// Enabled serves the camera and overlay routes; false removes the
-	// routes, stops camera workers, and skips overlay MQTT interests.
+	// Enabled serves the camera and camera wall routes; false removes the
+	// routes, stops camera workers, and skips camera wall MQTT interests.
 	Enabled *bool `yaml:"enabled"`
 }
 
@@ -198,7 +201,7 @@ func ChamberTemperatureSupported(model, serial string) bool {
 	return ok
 }
 
-// CameraEnabled reports whether the camera and overlay routes should be
+// CameraEnabled reports whether the camera and camera wall routes should be
 // served. Cameras are enabled unless explicitly disabled.
 func (c *Config) CameraEnabled() bool {
 	return c.Camera.Enabled == nil || *c.Camera.Enabled
@@ -284,7 +287,7 @@ func (c *Config) ApplyEnv() (bool, error) {
 
 // parsePrintersEnv parses the BMBPX_PRINTERS format: printer entries
 // separated by ';', each a comma-separated key=value list with keys serial,
-// address, model, password, username, tls, insecure_skip_verify.
+// address, name, model, password, username, tls, insecure_skip_verify.
 func parsePrintersEnv(v string) ([]Printer, error) {
 	var out []Printer
 	for _, entry := range strings.Split(v, ";") {
@@ -318,6 +321,8 @@ func parsePrinterEntry(entry string) (Printer, error) {
 			p.Serial = val
 		case "address":
 			p.Address = val
+		case "name":
+			p.Name = strings.TrimSpace(val)
 		case "model":
 			p.Model = val
 		case "password":

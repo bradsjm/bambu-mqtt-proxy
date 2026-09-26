@@ -1,10 +1,11 @@
 // Package telemetry merges Bambu MQTT report deltas into a small display
-// state per printer for the overlay and camera status endpoints. It reads
+// state per printer for the camera wall and camera status endpoints. It reads
 // upstream reports through the pool observer without changing forwarding.
 package telemetry
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -19,6 +20,7 @@ import (
 // field keeps that distinction, so the UI can show unknown values.
 type State struct {
 	Serial        string
+	Name          string
 	Model         string
 	Connected     bool // last known MQTT upstream connectivity
 	LastReport    time.Time
@@ -33,6 +35,38 @@ type State struct {
 	BedTemp       *float64
 	BedTarget     *float64
 	ChamberTemp   *float64
+	PrintError    int        // print_error; 0 means no error
+	HMS           []HMSAlert // current Health Management System alerts
+}
+
+// HMSAlert is one Bambu Health Management System entry from a report's
+// hms list. Reports replace the list wholesale, so a merged State never
+// mutates a published slice in place.
+type HMSAlert struct {
+	Attr uint32
+	Code uint32
+}
+
+// ID formats the alert in Bambu's published HMS code form,
+// e.g. HMS_0300_0100_0001_0007.
+func (a HMSAlert) ID() string {
+	return fmt.Sprintf("HMS_%04X_%04X_%04X_%04X", a.Attr>>16, a.Attr&0xFFFF, a.Code>>16, a.Code&0xFFFF)
+}
+
+// Severity decodes the severity level carried in the high half of Code.
+func (a HMSAlert) Severity() string {
+	switch a.Code >> 16 {
+	case 1:
+		return "fatal"
+	case 2:
+		return "serious"
+	case 3:
+		return "common"
+	case 4:
+		return "info"
+	default:
+		return "unknown"
+	}
 }
 
 // Cache stores merged state for every configured printer.
@@ -43,11 +77,11 @@ type Cache struct {
 }
 
 // NewCache indexes the configured printers; serials without reports still
-// appear so the overlay can list every printer.
+// appear so the camera wall can list every printer.
 func NewCache(printers []config.Printer, log *slog.Logger) *Cache {
 	states := make(map[string]*State, len(printers))
 	for _, p := range printers {
-		states[p.Serial] = &State{Serial: p.Serial, Model: p.Model}
+		states[p.Serial] = &State{Serial: p.Serial, Name: p.Name, Model: p.Model}
 	}
 	return &Cache{states: states, log: log}
 }
@@ -133,6 +167,26 @@ func mergeReport(st *State, payload []byte) {
 	}
 	if v, ok := numberField(printObj, "chamber_temper"); ok {
 		st.ChamberTemp = &v
+	}
+	if v, ok := intField(printObj, "print_error"); ok {
+		st.PrintError = v
+	}
+	if v, ok := lookup(printObj, "hms"); ok {
+		if list, ok := v.([]any); ok {
+			alerts := make([]HMSAlert, 0, len(list))
+			for _, item := range list {
+				obj, ok := item.(map[string]any)
+				if !ok {
+					continue
+				}
+				attr, okAttr := numberField(obj, "attr")
+				code, okCode := numberField(obj, "code")
+				if okAttr && okCode {
+					alerts = append(alerts, HMSAlert{Attr: uint32(attr), Code: uint32(code)})
+				}
+			}
+			st.HMS = alerts
+		}
 	}
 }
 

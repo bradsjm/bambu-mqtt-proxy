@@ -114,7 +114,7 @@ func (m *Manager) Release(serial string) {
 }
 
 // Latest returns the newest frame for serial without waiting, for callers
-// that render a fallback instead of blocking (the overlay wall).
+// that render a fallback instead of blocking (the camera wall).
 func (m *Manager) Latest(serial string) *Frame {
 	m.mu.Lock()
 	c, ok := m.captures[serial]

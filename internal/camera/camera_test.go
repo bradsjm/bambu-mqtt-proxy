@@ -271,12 +271,13 @@ func TestStreamWritesMultipart(t *testing.T) {
 	}
 }
 
-// TestCamWallAndOverlayRoutesServeEmbeddedWall asserts that both page routes
-// expose the same embedded wall and no-store response headers.
-func TestCamWallAndOverlayRoutesServeEmbeddedWall(t *testing.T) {
+// TestCamWallRoutesServeEmbeddedWall asserts that /camwall serves the
+// embedded wall, /overlay is gone, and /camera/status carries display state.
+func TestCamWallRoutesServeEmbeddedWall(t *testing.T) {
 	printers := []config.Printer{
 		{
 			Serial:   "01S00C351100139",
+			Name:     "Garage",
 			Model:    "P1S",
 			Address:  "127.0.0.1:8883",
 			Username: "bblp",
@@ -292,33 +293,32 @@ func TestCamWallAndOverlayRoutesServeEmbeddedWall(t *testing.T) {
 	}
 	manager := NewManager(printers, discardLogger())
 	state := telemetry.NewCache(printers, discardLogger())
-	state.Observe("01S00C351100139", []byte(`{"print":{"chamber_temper":5.0}}`))
+	state.Observe("01S00C351100139", []byte(`{"print":{"chamber_temper":5.0,"print_error":50348044,"hms":[{"attr":50331904,"code":65543}]}}`))
 	state.Observe("00M09A123456789", []byte(`{"print":{"chamber_temper":24.0}}`))
 	renderer := NewStatusRenderer(manager, state, testConnectivity{})
 	mux := http.NewServeMux()
 	renderer.RegisterStatus(mux)
 
-	pages := make(map[string]string, 2)
-	for _, path := range []string{"/overlay", "/camwall"} {
-		req := httptest.NewRequest(http.MethodGet, path, nil)
-		w := httptest.NewRecorder()
-		mux.ServeHTTP(w, req)
-		if w.Code != http.StatusOK {
-			t.Fatalf("GET %s = %d, want 200", path, w.Code)
-		}
-		if w.Header().Get("Cache-Control") != "no-store" {
-			t.Errorf("GET %s Cache-Control = %q", path, w.Header().Get("Cache-Control"))
-		}
-		if !strings.HasPrefix(w.Header().Get("Content-Type"), "text/html") {
-			t.Errorf("GET %s Content-Type = %q", path, w.Header().Get("Content-Type"))
-		}
-		pages[path] = w.Body.String()
+	wallReq := httptest.NewRequest(http.MethodGet, "/camwall", nil)
+	wallResp := httptest.NewRecorder()
+	mux.ServeHTTP(wallResp, wallReq)
+	if wallResp.Code != http.StatusOK {
+		t.Fatalf("GET /camwall = %d, want 200", wallResp.Code)
 	}
-	if pages["/overlay"] != pages["/camwall"] {
-		t.Fatal("/camwall and /overlay must serve the same wall page")
+	if wallResp.Header().Get("Cache-Control") != "no-store" {
+		t.Errorf("GET /camwall Cache-Control = %q", wallResp.Header().Get("Cache-Control"))
 	}
-	if !strings.Contains(pages["/camwall"], "camera/status") {
-		t.Fatal("embedded wall does not load camera status")
+	if !strings.HasPrefix(wallResp.Header().Get("Content-Type"), "text/html") {
+		t.Errorf("GET /camwall Content-Type = %q", wallResp.Header().Get("Content-Type"))
+	}
+	if !strings.Contains(wallResp.Body.String(), "/camera/events") {
+		t.Fatal("embedded wall does not subscribe to camera status events")
+	}
+
+	overlayResp := httptest.NewRecorder()
+	mux.ServeHTTP(overlayResp, httptest.NewRequest(http.MethodGet, "/overlay", nil))
+	if overlayResp.Code != http.StatusNotFound {
+		t.Fatalf("GET /overlay = %d, want 404 (endpoint removed)", overlayResp.Code)
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/camera/status", nil)
@@ -341,12 +341,67 @@ func TestCamWallAndOverlayRoutesServeEmbeddedWall(t *testing.T) {
 	if !ok || !p1s.CameraOK || p1s.ChamberTemp != nil {
 		t.Fatalf("P1S tile must be camera-supported and omit chamber temp: %+v", p1s)
 	}
+	if p1s.Name != "Garage" || p1s.PrintError != "0300_400C" || p1s.ReportAge == nil ||
+		len(p1s.HMS) != 1 || p1s.HMS[0] != (HMS{Code: "HMS_0300_0100_0001_0007", Severity: "fatal"}) {
+		t.Fatalf("P1S tile name/errors/report age wrong: %+v", p1s)
+	}
 	x1c, ok := tiles["00M09A123456789"]
 	if !ok || x1c.CameraOK || x1c.ChamberTemp == nil || *x1c.ChamberTemp != 24 {
 		t.Fatalf("X1C tile must retain its valid chamber temp: %+v", x1c)
 	}
 	if strings.Contains(w.Body.String(), "secret-test-only") || strings.Contains(w.Body.String(), "another-secret") || strings.Contains(w.Body.String(), "127.0.0.1") {
 		t.Fatal("Cam Wall status leaked credentials or printer address")
+	}
+}
+
+// TestCameraEventsStreamsChanges reads the SSE stream: one event on
+// connect, then another after a report changes display state.
+func TestCameraEventsStreamsChanges(t *testing.T) {
+	printers := []config.Printer{{Serial: "01S00C351100139", Address: "127.0.0.1:8883", Password: "secret-test-only"}}
+	state := telemetry.NewCache(printers, discardLogger())
+	renderer := NewStatusRenderer(NewManager(printers, discardLogger()), state, testConnectivity{})
+	mux := http.NewServeMux()
+	renderer.RegisterStatus(mux)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/camera/events", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /camera/events: %v", err)
+	}
+	defer resp.Body.Close()
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Fatalf("Content-Type = %q", ct)
+	}
+
+	lines := bufio.NewScanner(resp.Body)
+	nextEvent := func() statusPayload {
+		t.Helper()
+		for lines.Scan() {
+			data, ok := strings.CutPrefix(lines.Text(), "data: ")
+			if !ok {
+				continue
+			}
+			var p statusPayload
+			if err := json.Unmarshal([]byte(data), &p); err != nil {
+				t.Fatalf("decode event %q: %v", data, err)
+			}
+			return p
+		}
+		t.Fatalf("stream ended before an event: %v", lines.Err())
+		return statusPayload{}
+	}
+
+	first := nextEvent()
+	if len(first.Printers) != 1 || first.Printers[0].State != "" {
+		t.Fatalf("initial event = %+v", first)
+	}
+	state.Observe("01S00C351100139", []byte(`{"print":{"gcode_state":"RUNNING"}}`))
+	if second := nextEvent(); second.Printers[0].State != "RUNNING" {
+		t.Fatalf("change event = %+v", second)
 	}
 }
 
