@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bambu-mqtt-proxy cameras</title>
+<style>
+  :root { color-scheme: dark; --bg:#101214; --card:#191d21; --line:#2a3138;
+          --text:#e8edf2; --dim:#9fb0bf; --ok:#4ade80; --warn:#fbbf24; --bad:#f87171; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 system-ui, sans-serif; }
+  header { display: flex; align-items: baseline; gap: .6rem;
+           padding: .8rem 1rem; border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 1rem; margin: 0; font-weight: 600; }
+  header span { color: var(--dim); font-size: .8rem; }
+  main { display: grid; gap: 1rem; padding: 1rem;
+         grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
+  .tile { background: var(--card); border: 1px solid var(--line);
+          border-radius: 10px; overflow: hidden; display: flex; flex-direction: column; }
+  .cam { position: relative; aspect-ratio: 16/9; background: #000; }
+  .cam img { position: absolute; inset: 0; width: 100%; height: 100%;
+             object-fit: contain; }
+  .cam .msg { position: absolute; inset: 0; display: flex; align-items: center;
+              justify-content: center; color: var(--dim); font-size: .85rem; }
+  .info { padding: .6rem .75rem; display: grid; gap: .3rem; }
+  .row { display: flex; justify-content: space-between; gap: .75rem; }
+  .name { font-weight: 600; }
+  .sub { color: var(--dim); font-size: .8rem; overflow: hidden;
+         text-overflow: ellipsis; white-space: nowrap; }
+  .bar { height: 6px; border-radius: 3px; background: #0a0c0e; overflow: hidden; }
+  .bar > div { height: 100%; background: var(--ok); width: 0; transition: width .6s; }
+  .temps { display: flex; flex-wrap: wrap; gap: .4rem .9rem; color: var(--dim); font-size: .8rem; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+         margin-right: .35rem; background: var(--dim); }
+  .dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); }
+  .dot.bad { background: var(--bad); }
+</style>
+</head>
+<body>
+<header><h1>bambu-mqtt-proxy</h1><span id="updated"></span></header>
+<main id="grid"></main>
+<script>
+"use strict";
+const POLL_MS = 2000;
+const MAX_LIVE = 4;            // concurrent MJPEG streams; others use snapshots
+let inFlight = false;
+let liveSlots = new Set();     // serials currently allowed a live stream
+
+function fmtTemp(c, t) {
+  if (c == null) return "";
+  return t != null && Math.abs(t - c) > 0.5 ? `${Math.round(c)} / ${Math.round(t)}°` : `${Math.round(c)}°`;
+}
+function fmtTime(min) {
+  if (!min || min <= 0) return "";
+  const h = Math.floor(min / 60), m = Math.round(min % 60);
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
+}
+function statusBucket(p) {
+  const s = (p.state || "").toUpperCase();
+  if (s === "RUNNING") return ["printing", "ok"];
+  if (s === "PAUSE") return ["paused", "warn"];
+  if (["FINISH", "FAILED"].includes(s)) return [s.toLowerCase(), "bad"];
+  return [(p.connected ? "idle" : "offline"), ""];
+}
+
+function render(p) {
+  const tile = document.createElement("div");
+  tile.className = "tile"; tile.dataset.serial = p.serial;
+  tile.innerHTML = `
+    <div class="cam"><img alt="" hidden><div class="msg"></div></div>
+    <div class="info">
+      <div class="row"><span class="name"></span><span class="sub state"></span></div>
+      <div class="sub file"></div>
+      <div class="bar"><div></div></div>
+      <div class="row"><span class="sub layers"></span><span class="sub remain"></span></div>
+      <div class="temps"></div>
+    </div>`;
+  update(tile, p);
+  return tile;
+}
+
+function update(tile, p) {
+  tile.querySelector(".name").textContent = p.model ? `${p.serial} · ${p.model}` : p.serial;
+  const [label, cls] = statusBucket(p);
+  const stateEl = tile.querySelector(".state");
+  stateEl.textContent = label;
+  const dot = document.createElement("span");
+  dot.className = "dot " + cls;
+  stateEl.prepend(dot);
+
+  tile.querySelector(".file").textContent = p.filename || "";
+  tile.querySelector(".bar > div").style.width = `${Math.round(p.progress || 0)}%`;
+  tile.querySelector(".layers").textContent =
+    p.layer_num != null && p.total_layers ? `layer ${p.layer_num}/${p.total_layers}` : "";
+  tile.querySelector(".remain").textContent = fmtTime(p.remain_min);
+
+  const temps = tile.querySelector(".temps");
+  temps.replaceChildren();
+  const addTemp = (label, cur, target) => {
+    if (cur == null) return;
+    const el = document.createElement("span");
+    el.textContent = `${label} ${fmtTemp(cur, target)}`;
+    temps.appendChild(el);
+  };
+  addTemp("nozzle", p.nozzle_temp, p.nozzle_target);
+  addTemp("bed", p.bed_temp, p.bed_target);
+  addTemp("chamber", p.chamber_temp, null);
+
+  // Camera pane: unsupported models never request images at all.
+  const img = tile.querySelector("img");
+  const msg = tile.querySelector(".msg");
+  if (!p.camera_supported) {
+    img.hidden = true;
+    msg.textContent = p.model ? "camera unsupported" : "printer model not configured";
+    return;
+  }
+  if (liveSlots.has(p.serial)) {
+    img.hidden = false;
+    if (img.dataset.mode !== "live" || !img.src.includes(p.serial)) {
+      img.dataset.mode = "live";
+      img.src = `/camera/${encodeURIComponent(p.serial)}/stream`;
+    }
+    msg.textContent = "";
+    return;
+  }
+  img.hidden = false;
+  msg.textContent = "";
+  // Snapshot refresh: a new bust URL per poll is the cadence. The first
+  // snapshot after a mode change (dataset.mode not yet "snap") also lands
+  // here via the URL check below.
+  const wasSnap = img.dataset.mode === "snap" && img.src.includes(p.serial);
+  const freshEnough = wasSnap && img.dataset.bust &&
+    Date.now() - Number(img.dataset.bust) < POLL_MS;
+  if (!wasSnap || freshEnough) return;
+  img.dataset.mode = "snap";
+  const bust = Date.now();
+  img.dataset.bust = String(bust);
+  img.src = `/camera/${encodeURIComponent(p.serial)}/snapshot?t=${bust}`;
+}
+
+async function poll() {
+  if (inFlight) return;              // never overlap status requests
+  inFlight = true;
+  try {
+    const res = await fetch("/camera/status", { cache: "no-store" });
+    if (!res.ok) return;
+    const data = await res.json();
+    document.getElementById("updated").textContent =
+      new Date().toLocaleTimeString();
+
+    const grid = document.getElementById("grid");
+    const printers = data.printers || [];
+    // Grant the first MAX_LIVE supported+connected printers a live stream;
+    // the rest fall back to periodic snapshots.
+    liveSlots = new Set(
+      printers.filter(p => p.camera_supported && p.connected)
+              .slice(0, MAX_LIVE).map(p => p.serial));
+
+    const bySerial = new Map(printers.map(p => [p.serial, p]));
+    for (const el of [...grid.children]) {
+      if (!bySerial.has(el.dataset.serial)) el.remove();
+    }
+    for (const p of printers) {
+      let el = grid.querySelector(`[data-serial="${CSS.escape(p.serial)}"]`);
+      if (!el) { grid.appendChild(render(p)); continue; }
+      // Update the existing tile in place so the <img> element survives
+      // across polls: replacing it would abort and reopen live MJPEG
+      // streams (and re-fetch snapshots) on every 2s cycle.
+      update(el, p);
+    }
+  } catch { /* transient network error: next tick retries */ }
+  finally { inFlight = false; }
+}
+
+setInterval(poll, POLL_MS);
+poll();
+</script>
+</body>
+</html>

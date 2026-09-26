@@ -30,6 +30,7 @@ type Pool struct {
 	specs    map[string]config.Printer
 	behavior config.Behavior
 	inject   Injector
+	observe  func(serial string, payload []byte)
 	log      *slog.Logger
 }
 
@@ -64,6 +65,15 @@ func (p *Pool) EnsureConnected(serial string, timeout time.Duration) bool {
 // connection, subscribing upstream when connected.
 func (p *Pool) Subscribe(serial, filter string, qos byte) {
 	p.conn(serial).subscribe(filter, qos)
+}
+
+// SubscribeAsync records downstream interest without waiting for upstream
+// connectivity. It engages the connection supervisor and returns at once;
+// onConnect resubscribes the merged filter set from the recorded refs once
+// the printer answers. Use it for long-lived internal interests whose first
+// delivery may wait for a printer that is offline at startup.
+func (p *Pool) SubscribeAsync(serial, filter string, qos byte) {
+	p.conn(serial).subscribeAsync(filter, qos)
 }
 
 // Unsubscribe removes one downstream interest; the last removal unsubscribes
@@ -121,11 +131,19 @@ func (p *Pool) conn(serial string) *Conn {
 	defer p.mu.Unlock()
 	c, ok := p.conns[serial]
 	if !ok {
-		c = newConn(p.specs[serial], p.behavior, p.inject, p.log)
+		c = newConn(p.specs[serial], p.behavior, p.inject, p.observe, p.log)
 		p.conns[serial] = c
 		p.log.Info("upstream state created", "serial", serial, "address", c.spec.Address)
 	}
 	return c
+}
+
+// SetObserver registers a report observer invoked for every upstream report
+// before downstream forwarding. Call it before serving traffic.
+func (p *Pool) SetObserver(observe func(serial string, payload []byte)) {
+	p.mu.Lock()
+	p.observe = observe
+	p.mu.Unlock()
 }
 
 // existing returns an already-created connection or ok=false.
@@ -208,7 +226,10 @@ type Conn struct {
 	backoffMax  time.Duration
 	warmup      []string
 	inject      Injector
-	log         *slog.Logger
+	// observe sees every upstream report before downstream forwarding.
+	// Telemetry registers it; nil on ordinary pools.
+	observe func(serial string, payload []byte)
+	log     *slog.Logger
 
 	stopCh    chan struct{}
 	mu        sync.Mutex
@@ -223,8 +244,9 @@ type Conn struct {
 	lastFailureAt time.Time
 }
 
-// newConn builds the connection state for one printer.
-func newConn(spec config.Printer, behavior config.Behavior, inject Injector, log *slog.Logger) *Conn {
+// newConn builds the connection state for one printer. observe may be nil.
+func newConn(spec config.Printer, behavior config.Behavior, inject Injector,
+	observe func(serial string, payload []byte), log *slog.Logger) *Conn {
 	return &Conn{
 		spec:        spec,
 		keepalive:   time.Duration(behavior.UpstreamKeepaliveSeconds) * time.Second,
@@ -233,6 +255,7 @@ func newConn(spec config.Printer, behavior config.Behavior, inject Injector, log
 		backoffMax:  time.Duration(behavior.UpstreamBackoffMaxSeconds) * time.Second,
 		warmup:      behavior.WarmupCommands,
 		inject:      inject,
+		observe:     observe,
 		log:         log,
 		stopCh:      make(chan struct{}),
 		subs:        newSubRefs(),
@@ -426,6 +449,9 @@ func (c *Conn) onConnectionNotification(_ mqtt.Client, notification mqtt.Connect
 // onMessage forwards an upstream report into the downstream broker; the broker
 // fans it out to every subscribed downstream client.
 func (c *Conn) onMessage(_ mqtt.Client, msg mqtt.Message) {
+	if c.observe != nil {
+		c.observe(c.spec.Serial, msg.Payload())
+	}
 	qos := msg.Qos()
 	if qos > 1 {
 		qos = 1
@@ -479,6 +505,33 @@ func (c *Conn) subscribe(filter string, qos byte) {
 	}
 	// Recorded; onConnect resubscribes after the next recovery.
 	c.log.Warn("upstream subscribe failed", "serial", c.spec.Serial, "filter", filter, "error", errString(tok.Error()))
+}
+
+// subscribeAsync records the filter and engages the connection supervisor
+// without waiting for it. The recorded interest survives printer outages:
+// onConnect resubscribes the whole merged set when the printer returns,
+// which is the same path a subscribe that lost the ensure race relies on.
+func (c *Conn) subscribeAsync(filter string, qos byte) {
+	filter = c.reportFilter(filter)
+	if filter == "" {
+		return
+	}
+	if qos > 1 {
+		qos = 1
+	}
+	c.mu.Lock()
+	first := c.subs.add(filter, qos)
+	alreadyDesired := c.desired || c.stopped
+	if !alreadyDesired {
+		c.desired = true
+		go c.supervise()
+	}
+	c.mu.Unlock()
+	if !first {
+		return
+	}
+	c.log.Info("upstream interest recorded",
+		"serial", c.spec.Serial, "filter", filter, "qos", qos, "mode", "async")
 }
 
 // unsubscribe removes one interest; the last removal unsubscribes upstream.

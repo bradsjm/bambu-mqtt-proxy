@@ -21,7 +21,7 @@ USER proxy
 # (CMD default) overrides these; unset any of them to fall back to file values.
 ENV BMBPX_LISTEN_PORT=8883 \
     BMBPX_LISTEN_TLS=true \
-    BMBPX_HEALTH_PORT=8080
+    BMBPX_HTTP_PORT=8080
 EXPOSE 8883 8080
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD wget -qO- http://127.0.0.1:8080/livez >/dev/null 2>&1 || exit 1

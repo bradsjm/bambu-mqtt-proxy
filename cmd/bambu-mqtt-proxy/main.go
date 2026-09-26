@@ -14,9 +14,12 @@ import (
 	"syscall"
 
 	"bambu-mqtt-proxy/internal/broker"
+	"bambu-mqtt-proxy/internal/camera"
 	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/health"
+	"bambu-mqtt-proxy/internal/httpsrv"
 	"bambu-mqtt-proxy/internal/routing"
+	"bambu-mqtt-proxy/internal/telemetry"
 	"bambu-mqtt-proxy/internal/upstream"
 )
 
@@ -55,6 +58,16 @@ func run() error {
 	table := routing.NewTable(serials)
 	inject := broker.NewInjector(logger)
 	pool := upstream.NewPool(cfg.Printers, inject, cfg.Behavior, logger)
+	// Telemetry observes upstream reports without changing forwarding.
+	state := telemetry.NewCache(cfg.Printers, logger)
+	pool.SetObserver(state.Observe)
+
+	var cameras *camera.Manager
+	var renderer *camera.StatusRenderer
+	if cfg.CameraEnabled() {
+		cameras = camera.NewManager(cfg.Printers, logger)
+		renderer = camera.NewStatusRenderer(cameras, state, pool)
+	}
 	srv, err := broker.New(cfg, table, pool, inject, logger)
 	if err != nil {
 		return err
@@ -67,11 +80,28 @@ func run() error {
 		return fmt.Errorf("broker: %w", err)
 	}
 
-	var healthSrv *health.Server
-	if cfg.Health.Port > 0 {
-		healthSrv = health.New(cfg.Health.Port, pool, logger)
-		healthSrv.Start()
-		logger.Info("health endpoints serving", "port", cfg.Health.Port)
+	var httpSrv *httpsrv.Server
+	if cfg.HTTP.Port > 0 {
+		httpSrv = httpsrv.New(cfg.HTTP.Port, logger)
+		health.Routes(httpSrv.Mux(), pool)
+		if cfg.CameraEnabled() {
+			camera.Register(httpSrv.Mux(), cameras)
+			renderer.RegisterStatus(httpSrv.Mux())
+			// Hold one report interest per printer so the overlay shows
+			// live state without any downstream MQTT clients. Async on
+			// purpose: HTTP must start while printers are still offline,
+			// and onConnect restores the recorded interests on reconnect.
+			for _, p := range cfg.Printers {
+				pool.SubscribeAsync(p.Serial, fmt.Sprintf("device/%s/report", p.Serial), 1)
+			}
+			logger.Info("camera and overlay endpoints serving", "port", cfg.HTTP.Port)
+		}
+		if err := httpSrv.Start(); err != nil {
+			pool.Stop()
+			_ = srv.Close()
+			return fmt.Errorf("http server: %w", err)
+		}
+		logger.Info("http endpoints serving", "port", cfg.HTTP.Port)
 	}
 
 	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -79,9 +109,12 @@ func run() error {
 	<-sigCtx.Done()
 
 	logger.Info("shutting down")
+	if cameras != nil {
+		cameras.Close()
+	}
 	pool.Stop()
-	if healthSrv != nil {
-		healthSrv.Stop()
+	if httpSrv != nil {
+		httpSrv.Stop()
 	}
 	_ = srv.Close()
 	return nil
@@ -94,7 +127,7 @@ func resolveConfig(configPath string) (*config.Config, bool, error) {
 	if configPath == "" {
 		configPath = config.DefaultConfigName()
 	}
-	cfg := &config.Config{}
+	cfg := &config.Config{HTTP: config.HTTP{Port: config.PortUnset}}
 	fileFound := false
 	if _, err := os.Stat(configPath); err == nil {
 		var err error

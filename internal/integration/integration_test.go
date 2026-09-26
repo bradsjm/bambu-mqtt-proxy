@@ -26,6 +26,7 @@ import (
 	"bambu-mqtt-proxy/internal/broker"
 	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/health"
+	"bambu-mqtt-proxy/internal/httpsrv"
 	"bambu-mqtt-proxy/internal/routing"
 	"bambu-mqtt-proxy/internal/tlsutil"
 	"bambu-mqtt-proxy/internal/upstream"
@@ -200,10 +201,13 @@ func startProxy(t *testing.T, printers []config.Printer) *proxy {
 		t.Fatalf("proxy: %v", err)
 	}
 	go func() { _ = srv.Serve() }()
-	healthSrv := health.New(healthPort, pool, logger)
-	healthSrv.Start()
+	httpSrv := httpsrv.New(healthPort, logger)
+	health.Routes(httpSrv.Mux(), pool)
+	if err := httpSrv.Start(); err != nil {
+		t.Fatalf("http server: %v", err)
+	}
 	t.Cleanup(func() {
-		healthSrv.Stop()
+		httpSrv.Stop()
 		pool.Stop()
 		_ = srv.Close()
 	})

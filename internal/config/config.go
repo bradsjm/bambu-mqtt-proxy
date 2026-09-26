@@ -36,7 +36,8 @@ const (
 	EnvKeyFile      = "BMBPX_KEY_FILE"
 	EnvAuthMode     = "BMBPX_AUTH_MODE"
 	EnvLogLevel     = "BMBPX_LOG_LEVEL"
-	EnvHealthPort   = "BMBPX_HEALTH_PORT"
+	EnvHTTPPort     = "BMBPX_HTTP_PORT"
+	EnvCameraEnable = "BMBPX_CAMERA_ENABLED"
 	defaultFileName = "bambu-mqtt-proxy.yaml"
 )
 
@@ -55,8 +56,12 @@ type Auth struct {
 
 // Printer describes one upstream Bambu printer MQTT endpoint.
 type Printer struct {
-	Serial             string `yaml:"serial"`
-	Address            string `yaml:"address"`
+	Serial  string `yaml:"serial"`
+	Address string `yaml:"address"`
+	// Model is the optional printer display name, free-form (P1S, A1MINI,
+	// X1C, ...). Camera capture requires one of P1P, P1S, A1, A1MINI; see
+	// CameraSupported. Any other model still proxies MQTT.
+	Model              string `yaml:"model"`
 	TLS                bool   `yaml:"tls"`
 	InsecureSkipVerify bool   `yaml:"insecure_skip_verify"`
 	Username           string `yaml:"username"`
@@ -78,10 +83,24 @@ type Log struct {
 	Level string `yaml:"level"`
 }
 
-// Health holds health endpoint configuration.
-type Health struct {
-	// Port serves /livez, /readyz and /status; 0 disables the endpoint.
+// HTTP holds the shared health and camera HTTP endpoint configuration.
+type HTTP struct {
+	// Port serves /livez, /readyz, /status, the camera endpoints and the
+	// overlay; 0 disables the endpoint. Unset is represented by the
+	// PortUnset sentinel until ApplyDefaults fills in the design default.
 	Port int `yaml:"port"`
+}
+
+// PortUnset marks an HTTP port that neither the file nor the environment
+// configured; ApplyDefaults replaces it with the design default. An
+// explicit 0 (disable HTTP) survives defaults untouched.
+const PortUnset = -1
+
+// Camera holds the camera and overlay feature configuration.
+type Camera struct {
+	// Enabled serves the camera and overlay routes; false removes the
+	// routes, stops camera workers, and skips overlay MQTT interests.
+	Enabled *bool `yaml:"enabled"`
 }
 
 // Config is the top-level proxy configuration.
@@ -91,11 +110,41 @@ type Config struct {
 	Printers []Printer  `yaml:"printers"`
 	Behavior Behavior   `yaml:"behavior"`
 	Log      Log        `yaml:"log"`
-	Health   Health     `yaml:"health"`
+	HTTP     HTTP       `yaml:"http"`
+	Camera   Camera     `yaml:"camera"`
 }
 
 // DefaultConfigName is the file probed when no -config flag is given.
 func DefaultConfigName() string { return defaultFileName }
+
+// NormalizeModel maps common printer model spellings to a canonical name.
+// It returns the uppercased trimmed input for unknown models.
+func NormalizeModel(model string) string {
+	m := strings.ToUpper(strings.TrimSpace(model))
+	m = strings.ReplaceAll(m, " ", "")
+	if m == "A1MINI" {
+		return "A1MINI"
+	}
+	return m
+}
+
+// CameraSupported reports whether the printer model uses the Bambu chamber
+// image camera protocol (P1 and A1 series). Unknown or empty models are not
+// supported: camera eligibility requires an explicit model.
+func CameraSupported(model string) bool {
+	switch NormalizeModel(model) {
+	case "P1P", "P1S", "A1", "A1MINI":
+		return true
+	default:
+		return false
+	}
+}
+
+// CameraEnabled reports whether the camera and overlay routes should be
+// served. Cameras are enabled unless explicitly disabled.
+func (c *Config) CameraEnabled() bool {
+	return c.Camera.Enabled == nil || *c.Camera.Enabled
+}
 
 // Load reads and parses the YAML configuration at path. Defaults and
 // validation are applied by the caller after environment overrides.
@@ -104,7 +153,7 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
-	var cfg Config
+	cfg := Config{HTTP: HTTP{Port: PortUnset}}
 	if err := yaml.Unmarshal(raw, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
@@ -158,19 +207,26 @@ func (c *Config) ApplyEnv() (bool, error) {
 	if v, ok := os.LookupEnv(EnvLogLevel); ok && v != "" {
 		c.Log.Level = v
 	}
-	if v, ok := os.LookupEnv(EnvHealthPort); ok && v != "" {
+	if v, ok := os.LookupEnv(EnvHTTPPort); ok && v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 0 || n > 65535 {
-			return false, fmt.Errorf("%s: invalid port %q", EnvHealthPort, v)
+			return false, fmt.Errorf("%s: invalid port %q", EnvHTTPPort, v)
 		}
-		c.Health.Port = n
+		c.HTTP.Port = n
+	}
+	if v, ok := os.LookupEnv(EnvCameraEnable); ok && v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return false, fmt.Errorf("%s: invalid bool %q", EnvCameraEnable, v)
+		}
+		c.Camera.Enabled = &b
 	}
 	return printersFromEnv, nil
 }
 
 // parsePrintersEnv parses the BMBPX_PRINTERS format: printer entries
 // separated by ';', each a comma-separated key=value list with keys serial,
-// address, password, username, tls, insecure_skip_verify.
+// address, model, password, username, tls, insecure_skip_verify.
 func parsePrintersEnv(v string) ([]Printer, error) {
 	var out []Printer
 	for _, entry := range strings.Split(v, ";") {
@@ -204,6 +260,8 @@ func parsePrinterEntry(entry string) (Printer, error) {
 			p.Serial = val
 		case "address":
 			p.Address = val
+		case "model":
+			p.Model = val
 		case "password":
 			p.Password = val
 		case "username":
@@ -248,6 +306,9 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.Log.Level == "" {
 		c.Log.Level = "info"
+	}
+	if c.HTTP.Port == PortUnset {
+		c.HTTP.Port = 8080
 	}
 	for i := range c.Printers {
 		if c.Printers[i].Username == "" {
@@ -302,8 +363,9 @@ func (c *Config) Validate() error {
 		c.Behavior.UpstreamBackoffMaxSeconds < c.Behavior.UpstreamBackoffInitialSeconds {
 		return fmt.Errorf("behavior: upstream timeouts and backoff must be positive with max >= initial")
 	}
-	if c.Health.Port < 0 || c.Health.Port > 65535 {
-		return fmt.Errorf("health: port %d out of range (0 disables)", c.Health.Port)
+	// PortUnset is valid pre-defaults; explicit 0 disables HTTP.
+	if (c.HTTP.Port < 0 && c.HTTP.Port != PortUnset) || c.HTTP.Port > 65535 {
+		return fmt.Errorf("http: port %d out of range (0 disables)", c.HTTP.Port)
 	}
 	return nil
 }

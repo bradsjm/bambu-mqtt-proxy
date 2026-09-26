@@ -13,7 +13,8 @@ func TestApplyEnvFullConfig(t *testing.T) {
 	t.Setenv(EnvListenTLS, "false")
 	t.Setenv(EnvAuthMode, "accept_all")
 	t.Setenv(EnvLogLevel, "warn")
-	t.Setenv(EnvHealthPort, "9090")
+	t.Setenv(EnvHTTPPort, "9090")
+	t.Setenv(EnvCameraEnable, "false")
 
 	cfg := &Config{}
 	fromEnv, err := cfg.ApplyEnv()
@@ -31,8 +32,11 @@ func TestApplyEnvFullConfig(t *testing.T) {
 	if len(cfg.Listen) != 1 || cfg.Listen[0].Port != 9999 || cfg.Listen[0].TLS {
 		t.Fatalf("listen = %+v, want single listener 9999/TLS-off", cfg.Listen)
 	}
-	if cfg.Auth.Mode != AuthModeAcceptAll || cfg.Log.Level != "warn" || cfg.Health.Port != 9090 {
-		t.Fatalf("auth/log/health = %s/%s/%d", cfg.Auth.Mode, cfg.Log.Level, cfg.Health.Port)
+	if cfg.Auth.Mode != AuthModeAcceptAll || cfg.Log.Level != "warn" || cfg.HTTP.Port != 9090 {
+		t.Fatalf("auth/log/http = %s/%s/%d", cfg.Auth.Mode, cfg.Log.Level, cfg.HTTP.Port)
+	}
+	if cfg.CameraEnabled() {
+		t.Fatal("BMBPX_CAMERA_ENABLED=false must disable cameras")
 	}
 	if len(cfg.Printers) != 2 {
 		t.Fatalf("printers = %d, want 2", len(cfg.Printers))

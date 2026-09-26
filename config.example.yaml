@@ -23,6 +23,7 @@ auth:
 # device/{serial}/report and device/{serial}/request.
 printers:
   - serial: "01P00A123456789"
+    model: "P1S" # optional; required for camera capture (P1P, P1S, A1, A1MINI)
     address: "192.168.1.42:8883"
     tls: true
     insecure_skip_verify: true
@@ -34,6 +35,15 @@ printers:
   #   tls: false
   #   username: "bblp"
   #   password: "87654321"
+
+http:
+  # Shared health + camera HTTP port; 0 disables the HTTP server entirely.
+  port: 8080
+
+camera:
+  # Enabled by default; false removes the camera routes, the overlay wall,
+  # and the overlay's own MQTT report subscriptions.
+  # enabled: false
 
 behavior:
   qos_max: 1

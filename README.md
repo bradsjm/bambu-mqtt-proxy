@@ -48,6 +48,9 @@ a single upstream connection per printer.
   takeover, auth refusal, retain stripping.
 - **Health endpoints** — `/livez`, `/readyz`, and `/status` (per-printer
   upstream connectivity JSON) for Docker/Kubernetes supervision.
+- **P1/A1 camera + overlay wall** — serial-addressed JPEG snapshots and live
+  MJPEG streams from the printer's chamber camera, plus a browser page that
+  layers live print state (progress, layers, temps) over every camera tile.
 - **Stateless** — no database, no volumes required. Config from a YAML file,
   environment variables, or both.
 - **Multi-arch** — `linux/amd64` and `linux/arm64` images published automatically.
@@ -95,7 +98,7 @@ go build -o bambu-mqtt-proxy ./cmd/bambu-mqtt-proxy
 
 A YAML file and `BMBPX_*` environment variables may be combined (env overrides
 file per field). See [`config.example.yaml`](config.example.yaml) and
-[DESIGN.md §14](DESIGN.md) for the full reference.
+[DESIGN.md §15](DESIGN.md) for the full reference.
 
 ```yaml
 listen:
@@ -107,6 +110,7 @@ auth:
   mode: printer                    # require bblp + a configured access code
 printers:
   - serial: "01P00A123456789"
+    model: "P1S"                     # required for camera capture (P1P, P1S, A1, A1MINI)
     address: "192.168.1.42:8883"
     tls: true
     insecure_skip_verify: true
@@ -116,19 +120,24 @@ behavior:
   qos_max: 1
   warmup_commands:
     - '{"pushing":{"sequence_id":"0","command":"pushall"}}'
+http:
+  port: 8080                         # 0 disables the HTTP server entirely
+camera:
+  enabled: true                      # false removes camera routes and overlay
 log:
   level: info
 ```
 
 | Environment variable | Default | Meaning |
 |---|---|---|
-| `BMBPX_PRINTERS` | — | Semicolon-separated printers: `serial=…,address=…,password=…[,username=…][,tls=…][,insecure_skip_verify=…]` |
+| `BMBPX_PRINTERS` | — | Semicolon-separated printers: `serial=…,address=…,password=…[,model=…][,username=…][,tls=…][,insecure_skip_verify=…]` |
 | `BMBPX_LISTEN_PORT` | `8883` | Downstream MQTT port |
 | `BMBPX_LISTEN_TLS` | `true` | TLS on the downstream listener |
 | `BMBPX_CERT_FILE` / `BMBPX_KEY_FILE` | *(empty)* | Empty = ephemeral in-memory self-signed certificate |
 | `BMBPX_AUTH_MODE` | `printer` | `printer` or `accept_all` |
 | `BMBPX_LOG_LEVEL` | `info` | `info` logs client/upstream state, subscriptions, retries, and backoffs; `debug` adds per-packet routing |
-| `BMBPX_HEALTH_PORT` | `8080` in image, `0` elsewhere | Health endpoint port |
+| `BMBPX_HTTP_PORT` | `8080` | Shared health + camera HTTP port; `0` disables HTTP |
+| `BMBPX_CAMERA_ENABLED` | `true` | `false` removes the camera routes, the overlay wall, and their MQTT report subscriptions |
 
 At the default `info` level, logs identify downstream clients by MQTT client ID
 and remote address, show which configured printers each client subscribes to,
@@ -136,12 +145,28 @@ and report upstream connection attempts, recovery, merged subscriptions,
 warmup commands, retries, and measured reconnect delays. Use `debug` when
 per-packet request routing is also required.
 
-## Health
+## Health and camera HTTP
+
+Health and camera endpoints share one HTTP listener (`BMBPX_HTTP_PORT`,
+YAML `http.port`). When cameras are disabled only the health endpoints are
+served; with `http.port: 0` no HTTP server starts at all.
 
 | Endpoint | Meaning |
 |---|---|
 | `/livez`, `/readyz` | `200 ok` once serving (printer state deliberately excluded — clients stay connected while printers recover) |
 | `/status` | JSON: `{"status":"ok","upstreams":{"<serial>":true\|false}}` |
+| `/camera/{serial}/snapshot` | Single JPEG frame (P1/A1 camera protocol, port 6000) |
+| `/camera/{serial}/stream` | Live multipart MJPEG stream |
+| `/camera/status` | Display state for every printer (no credentials) |
+| `/overlay` | Browser wall: camera images layered with live printer state |
+
+Camera capture is restricted to models that use the Bambu chamber image
+protocol: `P1P`, `P1S`, `A1`, and `A1MINI`. The printer's `model` must be
+configured; ineligible serials answer `404` (unknown) or `422` (unsupported
+or missing model) without ever opening a camera socket. Camera and overlay
+endpoints are unauthenticated by design — anyone who can reach the HTTP port
+can view cameras and telemetry, and the state endpoint never includes
+credentials.
 
 ## Security notes
 

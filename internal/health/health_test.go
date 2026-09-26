@@ -2,8 +2,8 @@ package health
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
-	"log/slog"
 	"net"
 	"net/http"
 	"strconv"
@@ -25,11 +25,15 @@ func TestEndpoints(t *testing.T) {
 	port := l.Addr().(*net.TCPAddr).Port
 	l.Close()
 
-	base := "http://127.0.0.1:8080"
-	_ = base
-	s := New(port, fakeSource{status: map[string]bool{"S1": true, "S2": false}}, discardLogger())
-	s.Start()
-	t.Cleanup(s.Stop)
+	mux := http.NewServeMux()
+	Routes(mux, fakeSource{status: map[string]bool{"S1": true, "S2": false}})
+	srv := &http.Server{Addr: fmt.Sprintf("127.0.0.1:%d", port), Handler: mux}
+	ln, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
 
 	client := &http.Client{Timeout: 2 * time.Second}
 	waitFor(t, 5*time.Second, func() bool {
@@ -72,10 +76,6 @@ func TestEndpoints(t *testing.T) {
 
 func liveURL(port int, path string) string {
 	return "http://127.0.0.1:" + strconv.Itoa(port) + path
-}
-
-func discardLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
 func waitFor(t *testing.T, timeout time.Duration, fn func() bool) {
