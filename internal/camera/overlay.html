@@ -418,14 +418,17 @@ function settleSnapshot(event) {
   }
 }
 
-// Assign limited live slots, then use snapshots for other visible cameras.
+// Assign limited live slots to active prints; idle tiles always use snapshots.
 function updateModes() {
   const eligible = wallPrinters.filter(p => visibleSerials.has(p.serial) && p.connected && p.camera_supported);
   const eligibleSerials = new Set(eligible.map(p => p.serial));
-  const nextLive = new Set([...liveSlots].filter(serial => eligibleSerials.has(serial)).slice(0, maxLive));
   const active = p => ["RUNNING", "PAUSE"].includes((p.state || "").toUpperCase());
-  // Keep current eligible streams first; use free slots for active prints, then wall order.
-  for (const p of [...eligible.filter(active), ...eligible.filter(p => !active(p))]) {
+  // Keep active streams first to avoid restarts; fill free slots with active prints in wall order.
+  const nextLive = new Set([...liveSlots].filter(serial => {
+    const holder = wallPrinters.find(p => p.serial === serial);
+    return holder && eligibleSerials.has(serial) && active(holder);
+  }).slice(0, maxLive));
+  for (const p of eligible.filter(active)) {
     if (nextLive.size >= maxLive) break;
     nextLive.add(p.serial);
   }

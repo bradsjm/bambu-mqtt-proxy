@@ -167,9 +167,10 @@ served; with `http.port: 0` no HTTP server starts at all.
 | `/overlay` | Streaming overlay wall |
 | `/camwall` | Multi-printer camera wall with status chips and live/snapshot/off modes |
 
-The Cam Wall polls printer state every 5 seconds. It streams up to four visible,
-connected printer cameras at a time; other visible tiles use snapshots, while
-off-screen and disconnected tiles do not hold camera connections. The toolbar
+The Cam Wall polls printer state every 5 seconds. Active prints (running or
+paused) hold the live streams — up to four visible, connected printers at a
+time. Idle printers and other visible tiles use snapshots, and off-screen or
+disconnected tiles hold no camera connection. The toolbar
 sets the live-stream cap (1–16), snapshot refresh interval (2–60 seconds), and
 status overlay (`off`, `compact`, or `full`). Settings persist in that browser.
 `full` mode adds the filename, progress, layer count, remaining time, and

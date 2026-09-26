@@ -171,9 +171,10 @@ HTTP surface (all on the shared `http.port` listener, unauthenticated by design)
 | `GET /overlay` | Full-screen streaming overlay; composites camera images with telemetry in the browser |
 | `GET /camwall` | Multi-printer camera wall with status chips and live/snapshot/off modes |
 
-The Cam Wall polls status every 5 s. It uses a stable printer-ordered live
-budget (default 4, configurable 1–16), snapshots for other visible eligible
-printers, and no camera connection for off-screen or disconnected tiles.
+The Cam Wall polls status every 5 s. It gives the live budget (default 4,
+configurable 1–16) to active prints (RUNNING or PAUSE) in stable printer order,
+snapshots for other visible eligible printers including idle ones, and no
+camera connection for off-screen or disconnected tiles.
 Snapshot refresh defaults to 8 s and is configurable from 2–60 s. The status
 overlay supports `off`, `compact`, and `full` modes. Settings persist in the
 browser's local storage. There is no token-authenticated kiosk mode: the proxy
