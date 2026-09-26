@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"bambu-mqtt-proxy/internal/config"
@@ -37,6 +38,22 @@ type State struct {
 	ChamberTemp   *float64
 	PrintError    int        // print_error; 0 means no error
 	HMS           []HMSAlert // current Health Management System alerts
+
+	// Detection session bookkeeping. Not display state: these fields track
+	// the current print session for the optional OctoEverywhere detection
+	// worker. Guarded by the Cache mutex like every other field.
+	projectID        string    // raw project_id; "0" is a valid local print
+	taskID           string    // raw task_id
+	cookie           string    // projectID-taskID-subtaskName identity cookie
+	completeIdentity bool      // every identity part has been reported
+	sessionActive    bool      // a print session is in progress
+	sessionGen       uint64    // bumps only when a genuinely new print session starts
+	epoch            uint64    // bumps at every state boundary or identity change
+	stateGen         uint64    // upstream generation of the last gcode_state report
+	obs              uint64    // real print reports merged (ACKs excluded)
+	obsGen           uint64    // upstream connection generation of the last report
+	obsAt            time.Time // time of the last real report
+	lastSeq          uint64    // paho delivery order token of the last merge
 }
 
 // HMSAlert is one Bambu Health Management System entry from a report's
@@ -73,6 +90,8 @@ func (a HMSAlert) Severity() string {
 type Cache struct {
 	mu     sync.Mutex
 	states map[string]*State
+	watch  map[string]chan struct{}
+	seq    atomic.Uint64
 	log    *slog.Logger
 }
 
@@ -83,17 +102,125 @@ func NewCache(printers []config.Printer, log *slog.Logger) *Cache {
 	for _, p := range printers {
 		states[p.Serial] = &State{Serial: p.Serial, Name: p.Name, Model: p.Model}
 	}
-	return &Cache{states: states, log: log}
+	return &Cache{states: states, watch: make(map[string]chan struct{}), log: log}
 }
+
+// obsSeqBase starts the cache-assigned sequence space far above the pool's
+// per-connection counters so legacy Observe calls can never collide with
+// pool-ordered reports.
+const obsSeqBase = 1 << 62
 
 // Observe is the pool observer hook: merge one raw report payload.
 func (c *Cache) Observe(serial string, payload []byte) {
+	c.ObserveReport(serial, 0, 0, payload)
+}
+
+// ObserveReport merges one upstream report with detection bookkeeping. Seq
+// is the per-connection paho delivery token assigned when the message
+// handler was entered (0 lets the cache assign one); paho dispatches
+// concurrently, so an older report that arrives after a newer one is
+// dropped instead of regressing the merged state. Gen is the upstream
+// connection generation the report arrived on, read before the merge so
+// cached state is never newer than the connection it came from.
+func (c *Cache) ObserveReport(serial string, seq, gen uint64, payload []byte) {
+	if seq == 0 {
+		seq = obsSeqBase + c.seq.Add(1)
+	}
 	c.mu.Lock()
 	if st, ok := c.states[serial]; ok {
-		mergeReport(st, payload)
+		if seq < st.lastSeq {
+			// Wire ordering limitation: paho handler entry order approximates
+			// but cannot prove wire order. Dropping the straggler keeps the
+			// merged session state conservative; boundary epochs invalidate
+			// any action window that spanned the overlap.
+			c.mu.Unlock()
+			return
+		}
+		st.lastSeq = seq
+		real := mergeReport(st, gen, payload)
 		st.LastReport = time.Now()
+		defer func() {
+			if real {
+				c.notify(serial)
+			}
+		}()
 	}
 	c.mu.Unlock()
+	return
+}
+
+// notify wakes detection watchers, coalescing bursts into one token.
+func (c *Cache) notify(serial string) {
+	c.mu.Lock()
+	ch := c.watch[serial]
+	c.mu.Unlock()
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
+// WatchDetection returns a level-triggered wake channel for one serial:
+// every merged real report leaves at most one pending token.
+func (c *Cache) WatchDetection(serial string) <-chan struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ch, ok := c.watch[serial]
+	if !ok {
+		ch = make(chan struct{}, 1)
+		c.watch[serial] = ch
+	}
+	return ch
+}
+
+// SessionView is the detection-facing projection of one printer's report
+// state. It carries the session identity and freshness evidence the
+// detection worker needs; it never carries credentials.
+type SessionView struct {
+	Serial   string
+	Active   bool   // a print session is in progress
+	State    string // merged gcode_state
+	Cookie   string // project_id-task_id-subtask_name identity cookie
+	Complete bool   // every identity part has been reported
+	// SessionGen bumps only when a genuinely new print session starts (a
+	// control state entered from outside a session, or a new print identity
+	// while a session is active). Epoch keeps bumping at every state
+	// boundary, including ordinary PAUSE-to-RUNNING, so in-flight results
+	// and pauses are invalidated without resetting the session context.
+	SessionGen uint64
+	Epoch      uint64 // bumps at every state boundary or identity change
+	StateGen   uint64 // upstream generation of the last gcode_state report
+	Obs        uint64 // real print reports merged
+	ObsAt      time.Time
+	ObsGen     uint64 // upstream generation of the last report
+	LayerNum   *int
+}
+
+// Session returns the detection view for one serial.
+func (c *Cache) Session(serial string) (SessionView, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	st, ok := c.states[serial]
+	if !ok {
+		return SessionView{}, false
+	}
+	return SessionView{
+		Serial:     st.Serial,
+		Active:     st.sessionActive,
+		State:      st.PrintingState,
+		Cookie:     st.cookie,
+		Complete:   st.completeIdentity,
+		SessionGen: st.sessionGen,
+		Epoch:      st.epoch,
+		StateGen:   st.stateGen,
+		Obs:        st.obs,
+		ObsAt:      st.obsAt,
+		ObsGen:     st.obsGen,
+		LayerNum:   st.LayerNum,
+	}, true
 }
 
 // SetConnected records upstream connectivity from the pool status.
@@ -119,28 +246,31 @@ func (c *Cache) Snapshot() []State {
 	return out
 }
 
-// mergeReport applies one report payload onto st. Bambu reports nest under a
-// type key ("print"); values change type between prints (number or string),
-// so extraction goes through generic maps instead of a fixed struct.
-func mergeReport(st *State, payload []byte) {
+// mergeReport applies one report payload onto st and reports whether the
+// payload carried real print state. Bambu reports nest under a type key
+// ("print"); values change type between prints (number or string), so
+// extraction goes through generic maps instead of a fixed struct.
+func mergeReport(st *State, gen uint64, payload []byte) bool {
 	var report map[string]json.RawMessage
 	if err := json.Unmarshal(payload, &report); err != nil {
-		return // not a JSON report (health probes, tests); ignore
+		return false // not a JSON report (health probes, tests); ignore
 	}
 	raw, ok := report["print"]
 	if !ok {
-		return
+		return false
 	}
 	var printObj map[string]any
 	if err := json.Unmarshal(raw, &printObj); err != nil {
-		return
+		return false
 	}
-	if s, ok := stringField(printObj, "gcode_state"); ok {
-		st.PrintingState = s
+	if !isRealPrintReport(printObj) {
+		// Command ACK objects (sequence_id/command/result) and other control
+		// payloads carry no print state. Ignoring them entirely keeps them
+		// from refreshing the action freshness the detection worker relies
+		// on; only genuine print state reports may authorize actions.
+		return false
 	}
-	if s, ok := stringField(printObj, "subtask_name"); ok && s != "" {
-		st.Filename = s
-	}
+	st.trackSession(printObj, gen)
 	if v, ok := numberField(printObj, "mc_percent"); ok {
 		st.Progress = v
 	}
@@ -188,6 +318,121 @@ func mergeReport(st *State, payload []byte) {
 			st.HMS = alerts
 		}
 	}
+	return true
+}
+
+// printStateMarkers are the report keys that mark a "print" object as real
+// print state. Any presence of one makes the payload a state report.
+var printStateMarkers = []string{
+	"gcode_state", "mc_percent", "subtask_name", "project_id", "task_id",
+	"layer_num", "total_layer_num", "mc_remaining_time", "print_error", "hms",
+	"nozzle_temper", "nozzle_target_temper", "bed_temper", "bed_target_temper",
+	"chamber_temper",
+}
+
+// isRealPrintReport reports whether the print object carries print state.
+func isRealPrintReport(obj map[string]any) bool {
+	for _, k := range printStateMarkers {
+		if _, ok := lookup(obj, k); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// isControlState reports whether gcode_state keeps a print session alive.
+func isControlState(s string) bool {
+	return s == "RUNNING" || s == "PAUSE" || s == "PAUSED"
+}
+
+// isRunningState reports whether gcode_state means the printer is executing.
+func isRunningState(s string) bool {
+	return s == "RUNNING"
+}
+
+// idField extracts project_id/task_id. Bambu reports them as number or
+// string; "0" is a valid local-print project id, not a missing value.
+func idField(obj map[string]any, key string) (string, bool) {
+	v, ok := lookup(obj, key)
+	if !ok {
+		return "", false
+	}
+	switch n := v.(type) {
+	case string:
+		if n == "" {
+			return "", false
+		}
+		return n, true
+	case float64:
+		return strconv.FormatInt(int64(n), 10), true
+	}
+	return "", false
+}
+
+// trackSession maintains detection session bookkeeping: boundaries are
+// captured BEFORE the coalesced display merge so short state transitions
+// are never lost, and identity follows the OctoEverywhere Bambu model
+// (cookie project_id-task_id-subtask_name; "0" is a valid local id; missing
+// parts leave a sticky incomplete cookie until the print ends).
+//
+// stateGen is stamped only when the report carries gcode_state, so a
+// temperature-only delta on a new connection can never make a pre-reconnect
+// RUNNING look current-generation. sessionGen bumps only at real print
+// session starts; epoch keeps marking every boundary for in-flight checks.
+func (st *State) trackSession(printObj map[string]any, gen uint64) {
+	if s, ok := stringField(printObj, "gcode_state"); ok {
+		st.stateGen = gen
+		prev := st.PrintingState
+		switch {
+		case prev != "" && s != prev:
+			st.epoch++
+			if isControlState(s) {
+				st.sessionActive = true
+				if !isControlState(prev) {
+					// A control state entered from outside a session
+					// (idle, finish, failed) is a genuinely new print.
+					st.sessionGen++
+				}
+			} else {
+				st.resetSession()
+			}
+		case prev == "" && isControlState(s):
+			st.sessionActive = true
+			st.sessionGen++
+		}
+		st.PrintingState = s
+	}
+	if v, ok := idField(printObj, "project_id"); ok {
+		st.projectID = v
+	}
+	if v, ok := idField(printObj, "task_id"); ok {
+		st.taskID = v
+	}
+	if s, ok := stringField(printObj, "subtask_name"); ok && s != "" {
+		st.Filename = s
+	}
+	cookie := st.projectID + "-" + st.taskID + "-" + st.Filename
+	if st.cookie != "" && cookie != st.cookie && st.completeIdentity && st.sessionActive {
+		// A genuinely new print identity while a session is active starts a
+		// new session; incomplete cookies stay sticky until the print ends.
+		st.epoch++
+		st.sessionGen++
+	}
+	st.cookie = cookie
+	st.completeIdentity = st.projectID != "" && st.taskID != "" && st.Filename != ""
+	st.obs++
+	st.obsGen = gen
+	st.obsAt = time.Now()
+}
+
+// resetSession clears session identity after a print ends. The display
+// filename is kept for the camera wall.
+func (st *State) resetSession() {
+	st.sessionActive = false
+	st.cookie = ""
+	st.projectID = ""
+	st.taskID = ""
+	st.completeIdentity = false
 }
 
 // lookup finds the first present key, case-insensitively: some printers

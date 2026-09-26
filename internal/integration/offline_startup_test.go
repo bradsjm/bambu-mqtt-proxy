@@ -55,7 +55,7 @@ func TestHTTPStartsBeforeOfflinePrinters(t *testing.T) {
 
 	httpPort := freePort(t)
 	httpSrv := httpsrv.New(httpPort, logger)
-	health.Routes(httpSrv.Mux(), pool)
+	health.Routes(httpSrv.Mux(), pool, nil)
 	started := time.Now()
 	if err := httpSrv.Start(); err != nil {
 		t.Fatalf("http server: %v", err)

@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -103,5 +104,25 @@ func TestParsePrinterEntryUnknownKey(t *testing.T) {
 	}
 	if _, err := parsePrinterEntry("serial=S,address=a:1"); err == nil {
 		t.Fatal("missing password should error")
+	}
+}
+
+func TestApplyEnvOctoEverywhereKey(t *testing.T) {
+	cfg := &Config{}
+	if cfg.DetectionEnabled() {
+		t.Fatal("detection must be disabled without the key")
+	}
+	t.Setenv(EnvOctoEverywhereAPIKey, "prod_key_from_env")
+	if _, err := cfg.ApplyEnv(); err != nil {
+		t.Fatalf("ApplyEnv: %v", err)
+	}
+	if cfg.OctoEverywhereAPIKey != "prod_key_from_env" || !cfg.DetectionEnabled() {
+		t.Fatalf("key = %q, enabled = %v", cfg.OctoEverywhereAPIKey, cfg.DetectionEnabled())
+	}
+
+	// The field carries yaml:"-" so a file cannot set or read it.
+	typ := reflect.TypeOf(Config{})
+	if f, ok := typ.FieldByName("OctoEverywhereAPIKey"); !ok || f.Tag.Get("yaml") != "-" {
+		t.Fatal("OctoEverywhereAPIKey must be tagged yaml:\"-\"")
 	}
 }

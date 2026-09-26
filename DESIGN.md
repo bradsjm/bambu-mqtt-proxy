@@ -200,6 +200,161 @@ P1P/P1S and A1/A1 MINI do not have this sensor, and their reported
 Only known chamber-sensor models expose it. Unknown model capability defaults
 to hidden rather than displaying a possibly invalid reading.
 
+### 6.1 Gadget AI failure detection (optional, key-only)
+
+An optional integration with OctoEverywhere's Gadget AI failure detection
+(developer docs: https://docs.octoeverywhere.com/ai-failure-detection-apis/developer-docs/overview/)
+adds automatic print-failure monitoring on top of the camera pipeline. The
+feature has exactly one configuration input: the `BMBPX_OCTOEVERYWHERE_API_KEY`
+environment variable. There is no YAML field, no threshold settings, and no
+quota bookkeeping — the proxy stays stateless and the key-only surface keeps
+the opt-in unambiguous. An unset key means the feature is completely off: no
+context creation, no uploads, no automatic pauses.
+
+Setting the key is the operator's documented consent for two things: camera
+snapshots leave the LAN for OctoEverywhere's servers, and the proxy may pause
+a print autonomously when the service recommends it. The provider states that
+images submitted through the public Gadget API are not used for AI model
+training.
+
+- **Trigger and pacing.** While telemetry shows an active print session with
+  `gcode_state` RUNNING on a camera-eligible printer, a single worker per
+  printer (max one request in flight) POSTs the latest captured JPEG to the
+  context's `ProcessRequestUrl` as `multipart/form-data` field `image`
+  (filename `print.jpg`) with the `X-API-Key` header. Frames above the API's
+  6 MiB cap are never downscaled: the inspection is skipped and retried after
+  backoff (P1/A1 chamber frames sit far below the cap in practice). The
+  inspection timer fires on schedule regardless of report churn; each
+  inspection fetches a frame captured within the last 5 s and unique to
+  that inspection (sequence strictly greater than the previous one),
+  waiting up to 15 s for one. The first inspection of a fresh session fires
+  immediately; afterwards the pace is dynamic and provider-directed: each
+  response sets the interval to
+  `max(NextProcessIntervalSec.Recommended, NextProcessIntervalSec.Minimum)`,
+  and the service may direct 5 s. A fixed 20 s applies only between
+  attempts while a context has not yet produced a successful response. The
+  provider's pricing and free-allowance math (180 calls per print-hour)
+  assume the 20-second cadence; faster directed intervals consume the
+  allowance proportionally faster (about 125 print hours at 5 s).
+- **Context lifecycle (session freshness).** Sessions derive from telemetry
+  via the print identity cookie `project_id-task_id-subtask_name` (ids
+  normalized to strings; `0` is a valid local-print value; an incomplete
+  cookie — missing parts — is sticky for the session rather than abandoning
+  the context). One Gadget context covers one print session: a genuinely new
+  identity, a print end plus a new print, or a coalesced FINISH→RUNNING
+  transition while RUNNING resets to a new context via the Create Context
+  API (`{}` body, default confidence levels 3; the call is free), which
+  returns `ContextId`, `ProcessRequestUrl`, and
+  `FallbackProcessRequestUrl` — held in memory only. A pause decision is
+  action-fresh only while telemetry is fresh (≤ 15 s), carries `gcode_state`
+  on the current upstream connection generation, still says RUNNING, and
+  the analyzed frame was captured at most 30 s before the decision — a
+  temperature-only delta on a new connection can never make a
+  pre-reconnect RUNNING look current. Telemetry keeps three counters: the
+  session generation identifies the print and resets the context whenever
+  it changes (a control state entered from outside a session, a new
+  identity while a session is active, or a coalesced FINISH→RUNNING with no
+  idle gap); the epoch marks every state boundary and invalidates in-flight
+  results; the observation generation anchors the connection. The provider
+  expires contexts after 14 days; a proxy restart always starts fresh
+  contexts.
+  Detection keeps no history: nothing about an inspection survives a
+  restart, and quality/age readings start empty with each new context.
+- **Actions on results.** Per-printer detection state, `PrintQuality` (1–10),
+  and `WarningSuggested` surface in status only (see Status below).
+  `PauseSuggested = true` triggers a pause only if, at decision time,
+  telemetry still shows RUNNING on fresh, current-generation reports, the
+  session epoch is unchanged since the inspected frame, and the frame is
+  still recent — an inspected result authorizes a pause for at most 30 s
+  after the inspection returns. The proxy then sends exactly one `{"print":{"sequence_id":
+  "0","command":"pause"}}` to `device/{serial}/request` on the exact upstream
+  connection generation the decision was validated against (§7.2), subject to
+  the same firmware constraints as any client (2025+ signed `print.*`
+  firmware may reject unsigned commands). It then waits up to 30 s for a
+  fresh PAUSE report; RUNNING reports during that window do not cut the
+  wait short — a printer may react late. The state becomes `unconfirmed`
+  only when the 30 s pass without a PAUSE report, the guarded publish
+  fails, or the in-flight suggestion fails re-validation. Pauses are never
+  retried or replayed, prints are never resumed automatically, and pausing
+  re-arms only after a later clear result (no warning and no pause
+  suggestion). The attempt is visible as `pause_state` `pending` inside the
+  window and `confirmed` or `unconfirmed` afterwards (see Status below).
+  `Score` (raw 0–100) is ignored.
+- **Error taxonomy.** Temporary errors — network errors and timeouts, HTTP
+  5xx, `OE_INTERNAL_ERROR`, `OE_BACKEND_THROTTLED`, `OE_CONTEXT_RATE_LIMITED`,
+  `OE_IMAGE_DECODE_FAILED`, `OE_BAD_ARGS`, `OE_ARGS_PARSE_FAILED` — back off
+  exponentially (20 s initial, 10-minute cap, ±20% jitter; rate limiting
+  raises the delay, reset on success) while the last good result stays
+  visible as a sticky fallback with growing age and the printer's state
+  shows `degraded` with reason `api_retrying` (or `camera_unavailable` when
+  capture fails). On transport failure, `OE_INTERNAL_ERROR`, or an unknown
+  error with a 5xx status the worker switches to `FallbackProcessRequestUrl`
+  and keeps it for that context's lifetime, per the provider's retry
+  guidance; throttling, invalid-request, and account errors never switch
+  URLs. Account errors suspend ALL detection account-wide until process
+  restart — `OE_INVALID_API_KEY`,
+  `OE_API_KEY_DISABLED`, `OE_API_KEY_BLOCKED_PAYMENT_FAILED`,
+  `OE_API_KEY_IP_RESTRICTED` (never retried, never switched to the fallback
+  URL), and `OE_FREE_USAGE_LIMIT_REACHED` (the proxy tracks no billing
+  periods, so it cannot know when a free allowance resets) — releasing camera
+  holds and keeping the last per-printer status visible. Gadget failures
+  never affect MQTT proxying, camera serving, or a print in progress.
+- **Gates.** Detection requires the API key and the camera feature
+  (`camera.enabled`, default on). With the key set but cameras explicitly
+  disabled nothing runs — zero API or camera activity, plus a startup
+  warning — and every printer's `detection` object is still served with
+  state `blocked` (reason `camera_disabled`), so the configuration is
+  visible rather than silent. With no key the proxy behaves exactly as
+  before, byte-for-byte, down to which MQTT report interests are
+  subscribed. The HTTP listener is not required: with `http.port: 0`,
+  detection, inspection, and pausing all run; only the status/SSE endpoints
+  are absent.
+- **No quota tracking.** The proxy keeps no counters and renders no usage
+  forecasts. The provider enforces the allowance server-side: 90,000 free
+  inspection calls per monthly billing period (≈ 500 print hours at the
+  pricing-assumption 20 s cadence, ≈ 125 at 5 s), shared across the whole
+  account, with **Free Usage Only** enabled by default so inspections stop
+  at the allowance instead of billing.
+- **Status.** On `/camera/status` and the `/camera/events` SSE feed
+  (identical payload), every printer tile carries a `detection` object
+  (omitted entirely when the feature is off): `state` — `starting`, `idle`,
+  `monitoring`, `attention`, `paused`, `degraded`, `unsupported`, or
+  `blocked` — and `pause_state` (`none`, `pending`, `confirmed`, or
+  `unconfirmed`) are always present, and the omitempty fields `quality`,
+  `warning`, `age_seconds` (seconds since the last result; relative age
+  only, no absolute timestamp), `next_check_seconds`,
+  `last_inspected_layer`, `faster_inspection`, `camera_lost`,
+  `using_fallback`, `suspended`, `reason` (a short machine code such as
+  `camera_disabled`, `camera_unsupported`, `awaiting_reports`,
+  `awaiting_fresh_telemetry`, `camera_unavailable`, `api_retrying`,
+  `pause_unconfirmed`, or `pause_command_failed`), and `message` appear when
+  set. `paused` is the print state, while `pause_state` tracks a Gadget
+  pause attempt: `pending` inside the 30 s confirmation window, `confirmed`
+  once the printer's PAUSE report lands, `unconfirmed` when the window
+  expires, the publish fails, or the print resumes without confirmation.
+  `last_inspected_layer` is the layer observed when the inspected frame was
+  captured (the snapshot is taken at inspection start), not after upload.
+  `degraded` marks a temporary failure with the sticky last result (reason
+  `camera_unavailable` or `api_retrying`); `unsupported` marks non-camera
+  printer models. While an account-level suspension is active, the object
+  carries `"suspended": true`, and on `/camera/status` and `/camera/events`
+  the payload adds top-level `detection_suspended` and `detection_message`.
+  The health `/status` payload gains a top-level `detection` map keyed by
+  serial, holding the same complete per-printer object for every configured
+  printer; the field is present only when the API key is configured —
+  omitted entirely, no empty map, when the feature is off, so the no-key
+  `/status` payload stays byte-compatible — and suspension shows only
+  inside each serial's object. There is no separate endpoint.
+- **Security.** The key exists only in the environment: never logged, never
+  exposed in any JSON endpoint, never written to disk, and never present in
+  YAML examples. Uploads go only to the two URLs returned by Create Context
+  over TLS; both URLs are validated at creation (HTTPS, vendor host,
+  no userinfo, fragment, or non-default port), redirects are disabled, every
+  request is bounded by a 15 s timeout and a 64 KiB response cap, responses
+  must satisfy the documented contract (quality in 1–10, required warning
+  and pause booleans, intervals clamped to the documented floors), and error
+  details are sanitized — no provider text, raw URLs, or response bodies
+  reach logs or status.
 ## 7. Routing model (core)
 
 Topic grammar: `device/{serial}/report` and `device/{serial}/request`. The serial is the second level. Any other topic shape is denied/dropped and logged.
@@ -368,6 +523,9 @@ Dependencies: `github.com/mochi-mqtt/server/v2`, `github.com/eclipse/paho.mqtt.g
 | Tools that pin the printer TLS certificate | The self-signed proxy cert fails pinning | Load a custom cert/key via config, or disable pinning (clients must already skip verify against the real printer) |
 | Downstream QoS 1 command while printer offline | PUBACK was already issued; command does not reach the printer | App-level retry, identical to a direct-connection drop |
 | Malicious/buggy client publishes to `/report` | Denied by ACL | QoS 0 silently dropped; QoS ≥ 1 client disconnected; other clients never see injected state |
+| Gadget API unreachable or transiently failing (optional integration) | Inspection backs off exponentially (20 s → 10 min cap, jittered); last good result stays visible; context switches to the fallback URL on connection/server failure | Detection lags; printing, MQTT proxying, and camera serving are unaffected |
+| Gadget account error: invalid/disabled key, billing failure, IP restriction, or free allowance exhausted | Detection suspends until proxy restart, with the reason logged | Warnings and automatic pauses stop; everything else is unaffected |
+| Gadget-triggered pause rejected or lost (printer offline, signed firmware) | One pause command per suggestion (§7.2); up to 30 s wait for a confirming PAUSE report; no retry, no auto-resume | Pause failure is logged; the print continues; pausing re-arms after a later clear result |
 
 ## 12. Alternatives considered
 
@@ -384,6 +542,7 @@ Dependencies: `github.com/mochi-mqtt/server/v2`, `github.com/eclipse/paho.mqtt.g
 3. **Camera unit/integration** (fake TLS camera on :6000): auth payload shape (80 bytes, 0x40/0x3000, `bblp` at 16, code at 48); frame header parsing, length bounds, JPEG SOI/EOI validation; eligibility gates (unknown serial → 404, unsupported/missing model → 422, no socket opened); snapshot freshness and shared-buffer reuse; MJPEG framing and slow-client isolation; concurrent consumers sharing one upstream session; HTTP startup while printers are offline (non-blocking interests).
 4. **Smoke (manual, performed)**: real P1S in LAN Mode at `10.10.20.141` — MQTT upstream connected on first attempt with `pushall` warmup; snapshot returned a valid 1280×720 JPEG (~87 KB); 4-second stream sample contained 3 complete multipart JPEG parts; 404/422 gates answered without opening a camera socket; overlay served. This smoke run caught and fixed a real defect: the camera endpoint derived from the MQTT port instead of always using 6000.
 5. **Smoke (manual, remaining)**: Bambu Studio and Home Assistant connected through the proxy on `:8883` with the printer's access code, observing `pushall` warmup and delta flow in debug logs.
+6. **Gadget integration (optional feature)**: designed coverage — unit and integration tests against a fake Gadget HTTP server for create-context URL validation, response contract enforcement (quality bounds, required flags, interval clamping), error taxonomy (terminal account suspension vs transient backoff vs fallback-URL switch), local 6 MiB frame rejection, backoff reset on success, and status-object shape. No real-printer smoke and no live-API call back the detection feature, and no real printer report fixtures are available; hardware behavior is unverified.
 
 ## 14. Future work (explicitly out of scope for v1)
 
@@ -410,6 +569,7 @@ Configuration comes from a YAML file, environment variables, or both; environmen
 | `BMBPX_LOG_LEVEL` | `info` | `debug` logs routing decisions |
 | `BMBPX_HTTP_PORT` | `8080` | Shared health + camera HTTP port (0 off) |
 | `BMBPX_CAMERA_ENABLED` | `true` | Camera and camera wall endpoints |
+| `BMBPX_OCTOEVERYWHERE_API_KEY` | empty | Empty = off; set to an OctoEverywhere Gadget API key to enable AI failure detection (consents to external snapshot upload and automatic pause; see §6.1) |
 
 Behavior tuning (`behavior:` in YAML) has no environment surface — its defaults match the design.
 

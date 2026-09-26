@@ -1,7 +1,9 @@
 # Secrets and local state
 /bambu-mqtt-proxy.yaml
+/compose.yaml
 /certs/
 .smoke/
+.env
 
 # Build output
 /bambu-mqtt-proxy

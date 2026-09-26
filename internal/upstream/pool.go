@@ -9,6 +9,7 @@ import (
 	"math/rand/v2"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
@@ -22,6 +23,15 @@ type Injector interface {
 	PublishDownstream(topic string, payload []byte, qos byte)
 }
 
+// ObserveFunc receives every upstream report. Seq is the per-connection
+// delivery token assigned when the paho message handler was entered; paho
+// runs handlers concurrently (SetOrderMatters is false), so the token lets
+// observers order merges conservatively. Gen is the upstream connection
+// generation captured under the connection lock at the same moment: a
+// report delivered on a dying connection can never be stamped with the
+// generation of the connection that replaced it.
+type ObserveFunc func(serial string, seq, gen uint64, payload []byte)
+
 // Pool owns one Conn per configured printer and merges downstream
 // subscriptions onto each printer's single upstream connection.
 type Pool struct {
@@ -30,7 +40,7 @@ type Pool struct {
 	specs    map[string]config.Printer
 	behavior config.Behavior
 	inject   Injector
-	observe  func(serial string, payload []byte)
+	observe  ObserveFunc
 	log      *slog.Logger
 }
 
@@ -140,10 +150,75 @@ func (p *Pool) conn(serial string) *Conn {
 
 // SetObserver registers a report observer invoked for every upstream report
 // before downstream forwarding. Call it before serving traffic.
-func (p *Pool) SetObserver(observe func(serial string, payload []byte)) {
+func (p *Pool) SetObserver(observe ObserveFunc) {
 	p.mu.Lock()
 	p.observe = observe
 	p.mu.Unlock()
+}
+
+// Generation returns the printer's current upstream connection generation.
+// Every connect and every loss changes the value; 0 means no connection
+// state exists yet.
+func (p *Pool) Generation(serial string) uint64 {
+	c, ok := p.existing(serial)
+	if !ok {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.generation
+}
+
+// PausePrint sends the pause command upstream. It fails unless the printer
+// is connected on exactly the generation the caller validated against, so a
+// decision made before a reconnect can never act on the new connection.
+// QoS 0 and the generation guard together make a replay across a reconnect
+// impossible; callers own retry policy and the proxy never retries.
+func (p *Pool) PausePrint(serial string, generation uint64) error {
+	c, ok := p.existing(serial)
+	if !ok {
+		return fmt.Errorf("pause %s: no upstream connection", serial)
+	}
+	return c.pause(generation)
+}
+
+// pausePayload is the Bambu pause command published to the request topic.
+func pausePayload() string {
+	return `{"print":{"sequence_id":"0","command":"pause"}}`
+}
+
+// pause publishes the pause command after re-checking the connection
+// generation under the lock, and re-checks the connection again after the
+// publish: paho silently drops QoS 0 messages while reconnecting, so a
+// connection that changed during the publish means the command may never
+// have reached the printer. All rejection paths are errors; nothing is ever
+// republished.
+func (c *Conn) pause(generation uint64) error {
+	c.mu.Lock()
+	gen, client, connected := c.generation, c.client, c.connectedLocked()
+	c.mu.Unlock()
+	if client == nil || !connected {
+		return fmt.Errorf("pause %s: upstream is not connected", c.spec.Serial)
+	}
+	if gen != generation {
+		return fmt.Errorf("pause %s: connection generation changed (have %d, want %d)",
+			c.spec.Serial, gen, generation)
+	}
+	tok := client.Publish(c.requestTopic(), 0, false, []byte(pausePayload()))
+	if !tok.WaitTimeout(c.connectTO) {
+		return fmt.Errorf("pause %s: publish timed out after %s", c.spec.Serial, c.connectTO)
+	}
+	if err := tok.Error(); err != nil {
+		return fmt.Errorf("pause %s: %w", c.spec.Serial, err)
+	}
+	c.mu.Lock()
+	genNow, clientNow, connectedNow := c.generation, c.client, c.connectedLocked()
+	c.mu.Unlock()
+	if clientNow != client || !connectedNow || genNow != gen {
+		return fmt.Errorf("pause %s: connection changed during publish", c.spec.Serial)
+	}
+	c.log.Info("pause command published", "serial", c.spec.Serial, "generation", gen)
+	return nil
 }
 
 // existing returns an already-created connection or ok=false.
@@ -228,7 +303,7 @@ type Conn struct {
 	inject      Injector
 	// observe sees every upstream report before downstream forwarding.
 	// Telemetry registers it; nil on ordinary pools.
-	observe func(serial string, payload []byte)
+	observe ObserveFunc
 	log     *slog.Logger
 
 	stopCh    chan struct{}
@@ -240,13 +315,27 @@ type Conn struct {
 	backoffN  int
 	nextRetry time.Time
 	connCh    chan struct{} // closed (and replaced) on every successful connect
+	// generation changes on every connect and loss; the detection engine's
+	// pause guard compares it to the generation a decision was validated on.
+	generation uint64
 	// lastFailureAt records the latest paho failure for reconnect delay logging.
 	lastFailureAt time.Time
+	// reportSeq hands each observed report its handler-entry order token.
+	reportSeq atomic.Uint64
+}
+
+// bumpGeneration advances the connection generation under the lock. Every
+// connect and loss calls it, so any transition changes the value the
+// detection engine validated a decision against.
+func (c *Conn) bumpGeneration() {
+	c.mu.Lock()
+	c.generation++
+	c.mu.Unlock()
 }
 
 // newConn builds the connection state for one printer. observe may be nil.
 func newConn(spec config.Printer, behavior config.Behavior, inject Injector,
-	observe func(serial string, payload []byte), log *slog.Logger) *Conn {
+	observe ObserveFunc, log *slog.Logger) *Conn {
 	return &Conn{
 		spec:        spec,
 		keepalive:   time.Duration(behavior.UpstreamKeepaliveSeconds) * time.Second,
@@ -359,6 +448,7 @@ func (c *Conn) supervise() {
 // onConnect is the paho OnConnect callback: re-issue the merged subscription
 // set and send the warmup commands so clients converge to full state.
 func (c *Conn) onConnect(_ mqtt.Client) {
+	c.bumpGeneration()
 	c.mu.Lock()
 	subs := c.subs.snapshot()
 	client := c.client
@@ -403,6 +493,7 @@ func (c *Conn) onConnect(_ mqtt.Client) {
 
 // onLost is the paho ConnectionLost callback.
 func (c *Conn) onLost(_ mqtt.Client, err error) {
+	c.bumpGeneration()
 	c.mu.Lock()
 	c.lastFailureAt = time.Now()
 	c.mu.Unlock()
@@ -450,7 +541,16 @@ func (c *Conn) onConnectionNotification(_ mqtt.Client, notification mqtt.Connect
 // fans it out to every subscribed downstream client.
 func (c *Conn) onMessage(_ mqtt.Client, msg mqtt.Message) {
 	if c.observe != nil {
-		c.observe(c.spec.Serial, msg.Payload())
+		// Assign the ordering token and capture the connection generation
+		// at handler entry, before any waiting: entry order approximates
+		// wire order under paho's concurrent dispatch, observers drop
+		// stragglers from older reports, and the entry-time generation
+		// proves the report belongs to the connection it arrived on.
+		c.mu.Lock()
+		seq := c.reportSeq.Add(1)
+		gen := c.generation
+		c.mu.Unlock()
+		c.observe(c.spec.Serial, seq, gen, msg.Payload())
 	}
 	qos := msg.Qos()
 	if qos > 1 {

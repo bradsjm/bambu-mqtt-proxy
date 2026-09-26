@@ -202,7 +202,7 @@ func startProxy(t *testing.T, printers []config.Printer) *proxy {
 	}
 	go func() { _ = srv.Serve() }()
 	httpSrv := httpsrv.New(healthPort, logger)
-	health.Routes(httpSrv.Mux(), pool)
+	health.Routes(httpSrv.Mux(), pool, nil)
 	if err := httpSrv.Start(); err != nil {
 		t.Fatalf("http server: %v", err)
 	}

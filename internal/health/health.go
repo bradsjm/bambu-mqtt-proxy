@@ -15,11 +15,20 @@ type StatusSource interface {
 	Status() map[string]bool
 }
 
-// Routes registers /livez, /readyz and /status on the shared mux.
-func Routes(mux *http.ServeMux, source StatusSource) {
+// DetectionSource provides the optional per-serial OctoEverywhere detection
+// status map served on /status. nil disables the field.
+type DetectionSource interface {
+	// DetectionMap returns serial -> detection status object.
+	DetectionMap() map[string]any
+}
+
+// Routes registers /livez, /readyz and /status on the shared mux. The
+// detection source may be nil when the feature is not configured; the
+// /status payload then stays byte-compatible with the previous shape.
+func Routes(mux *http.ServeMux, source StatusSource, detection DetectionSource) {
 	mux.HandleFunc("GET /livez", ok)
 	mux.HandleFunc("GET /readyz", ok)
-	mux.HandleFunc("GET /status", status(source))
+	mux.HandleFunc("GET /status", status(source, detection))
 }
 
 // ok answers 200 for liveness and readiness probes.
@@ -30,12 +39,16 @@ func ok(w http.ResponseWriter, _ *http.Request) {
 }
 
 // status answers with upstream connectivity JSON.
-func status(source StatusSource) http.HandlerFunc {
+func status(source StatusSource, detection DetectionSource) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
+		out := map[string]any{
 			"status":    "ok",
 			"upstreams": source.Status(),
-		})
+		}
+		if detection != nil {
+			out["detection"] = detection.DetectionMap()
+		}
+		_ = json.NewEncoder(w).Encode(out)
 	}
 }

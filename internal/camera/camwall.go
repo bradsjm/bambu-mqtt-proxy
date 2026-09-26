@@ -51,9 +51,12 @@ type Tile struct {
 	ChamberTemp  *float64 `json:"chamber_temp,omitempty"`
 	PrintError   string   `json:"print_error,omitempty"`
 	HMS          []HMS    `json:"hms,omitempty"`
-	ReportAge    *float64 `json:"report_age_seconds,omitempty"`
-	FrameAge     float64  `json:"frame_age_seconds,omitempty"`
-	FrameSeq     uint64   `json:"frame_seq,omitempty"`
+	// Detection is the optional OctoEverywhere detection status object,
+	// omitted when the feature is not configured.
+	Detection any      `json:"detection,omitempty"`
+	ReportAge *float64 `json:"report_age_seconds,omitempty"`
+	FrameAge  float64  `json:"frame_age_seconds,omitempty"`
+	FrameSeq  uint64   `json:"frame_seq,omitempty"`
 }
 
 // HMS is one Health Management System alert in display form.
@@ -65,18 +68,35 @@ type HMS struct {
 // statusPayload is the shared /camera/status and /camera/events body.
 type statusPayload struct {
 	Printers []Tile `json:"printers"`
+	// DetectionSuspended and DetectionMessage appear only while the
+	// OctoEverywhere account-level suspension is active.
+	DetectionSuspended bool   `json:"detection_suspended,omitempty"`
+	DetectionMessage   string `json:"detection_message,omitempty"`
 }
 
 // NewStatusRenderer pairs the camera manager with the telemetry cache.
 type StatusRenderer struct {
-	cameras *Manager
-	state   *telemetry.Cache
-	status  connectivitySource
+	cameras   *Manager
+	state     *telemetry.Cache
+	status    connectivitySource
+	detection detectionSource
 }
 
 // NewStatusRenderer builds the /camera/status payload renderer.
 func NewStatusRenderer(cameras *Manager, state *telemetry.Cache, status connectivitySource) *StatusRenderer {
 	return &StatusRenderer{cameras: cameras, state: state, status: status}
+}
+
+// detectionSource is the narrow, optional detection contract the renderer
+// consumes: one status object per serial plus the account suspension state.
+type detectionSource interface {
+	DetectionStatus(serial string) any
+	AccountSuspended() (suspended bool, message string)
+}
+
+// SetDetection attaches the optional detection engine after construction.
+func (r *StatusRenderer) SetDetection(d detectionSource) {
+	r.detection = d
 }
 
 // connectivitySource reports upstream MQTT connectivity per serial, so the
@@ -135,10 +155,23 @@ func (r *StatusRenderer) Tiles() []Tile {
 			t.FrameAge = time.Since(f.Captured).Seconds()
 			t.FrameSeq = f.Seq
 		}
+		if r.detection != nil {
+			t.Detection = r.detection.DetectionStatus(st.Serial)
+		}
 		tiles = append(tiles, t)
 	}
 	sort.Slice(tiles, func(i, j int) bool { return tiles[i].Serial < tiles[j].Serial })
 	return tiles
+}
+
+// payload assembles the shared status body, including the account-level
+// detection suspension when active.
+func (r *StatusRenderer) payload(tiles []Tile) statusPayload {
+	p := statusPayload{Printers: tiles}
+	if r.detection != nil {
+		p.DetectionSuspended, p.DetectionMessage = r.detection.AccountSuspended()
+	}
+	return p
 }
 
 // changeKey serializes tiles without their continuously aging fields, so
@@ -147,6 +180,11 @@ func changeKey(tiles []Tile) ([]byte, error) {
 	stable := make([]Tile, len(tiles))
 	for i, t := range tiles {
 		t.ReportAge, t.FrameAge, t.FrameSeq = nil, 0, 0
+		// Detection ages (age_seconds, next_check_seconds) are continuously
+		// changing; the detection object carries a stable projection.
+		if d, ok := t.Detection.(interface{ StableKey() any }); ok {
+			t.Detection = d.StableKey()
+		}
 		stable[i] = t
 	}
 	return json.Marshal(stable)
@@ -177,7 +215,7 @@ func (r *StatusRenderer) handleEvents(w http.ResponseWriter, req *http.Request) 
 		tiles := r.Tiles()
 		key, err := changeKey(tiles)
 		if err == nil && (!bytes.Equal(key, lastKey) || time.Since(lastSent) >= eventsKeepalive) {
-			payload, err := json.Marshal(statusPayload{Printers: tiles})
+			payload, err := json.Marshal(r.payload(tiles))
 			if err != nil {
 				return
 			}
@@ -204,7 +242,7 @@ func (r *StatusRenderer) RegisterStatus(mux *http.ServeMux) {
 	mux.HandleFunc("GET /camera/status", func(w http.ResponseWriter, _ *http.Request) {
 		noStore(w)
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(statusPayload{Printers: r.Tiles()})
+		_ = json.NewEncoder(w).Encode(r.payload(r.Tiles()))
 	})
 	mux.HandleFunc("GET /camera/events", r.handleEvents)
 	mux.HandleFunc("GET /camwall", func(w http.ResponseWriter, _ *http.Request) {

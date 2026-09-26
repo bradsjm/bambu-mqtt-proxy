@@ -51,6 +51,9 @@ a single upstream connection per printer.
 - **P1/A1 camera wall** — serial-addressed JPEG snapshots and live MJPEG
   streams from the printer's chamber camera, plus a dashboard page that pairs
   every camera with color-coded print state, progress, and temperatures.
+- **Optional Gadget AI failure detection** — with an OctoEverywhere API key,
+  snapshots from active prints are analyzed by the Gadget service and the proxy
+  pauses the print on a likely failure. No key, no uploads, no automatic pauses.
 - **Stateless** — no database, no volumes required. Config from a YAML file,
   environment variables, or both.
 - **Multi-arch** — `linux/amd64` and `linux/arm64` images published automatically.
@@ -145,6 +148,7 @@ log:
 | `BMBPX_LOG_LEVEL` | `info` | `info` logs client/upstream state, subscriptions, retries, and backoffs; `debug` adds per-packet routing |
 | `BMBPX_HTTP_PORT` | `8080` | Shared health + camera HTTP port; `0` disables HTTP |
 | `BMBPX_CAMERA_ENABLED` | `true` | `false` removes the camera routes, the camera wall, and their MQTT report subscriptions |
+| `BMBPX_OCTOEVERYWHERE_API_KEY` | *(empty)* | OctoEverywhere Gadget API key; empty = detection off. Setting it consents to external snapshot uploads and automatic pauses — see [Gadget AI failure detection](#gadget-ai-failure-detection-optional) |
 
 At the default `info` level, logs identify downstream clients by MQTT client ID
 and remote address, show which configured printers each client subscribes to,
@@ -161,7 +165,7 @@ served; with `http.port: 0` no HTTP server starts at all.
 | Endpoint | Meaning |
 |---|---|
 | `/livez`, `/readyz` | `200 ok` once serving (printer state deliberately excluded — clients stay connected while printers recover) |
-| `/status` | JSON: `{"status":"ok","upstreams":{"<serial>":true\|false}}` |
+| `/status` | JSON: `{"status":"ok","upstreams":{"<serial>":true\|false}}`, plus a `detection` map per printer when the OctoEverywhere key is set |
 | `/camera/{serial}/snapshot` | Single JPEG frame (P1/A1 camera protocol, port 6000) |
 | `/camera/{serial}/stream` | Live multipart MJPEG stream |
 | `/camera/status` | Display state for every printer (no credentials) |
@@ -177,10 +181,18 @@ progress edge on the camera, and a headline progress/time-left figure. Print
 errors and HMS alerts appear on every tile as a severity-colored banner, with
 the full list and last report age in the full detail level. Click or tap a tile's details panel to
 step through compact, vitals (progress, layers, finish time, nozzle/bed/chamber
-temperature gauges), and full details. Click a camera to focus it full-width.
+temperature gauges), and full details.
+With an OctoEverywhere key, each tile also carries a compact AI-inspection
+badge with the current quality score; inspection findings join the alert rows
+at the same severity scale, higher detail levels add inspection facts, and
+important transitions (a pause sent or confirmed, a raised warning, a lost
+camera view, suspension) are announced to assistive technology. Without a key
+none of these elements exist and the wall is unchanged.
+Click a camera to focus it full-width.
 Drag the grip (or focus it and use the arrow keys) to reorder tiles. The
 fleet chips in the top bar count printers per state and double as filters;
-"needs attention" collects failed, paused, stale, and serious-alert printers.
+"needs attention" collects failed, paused, stale, and serious-alert printers,
+plus detection warnings or pause attempts when the Gadget integration is on.
 
 Focused cameras and active prints (running or paused) hold the live streams,
 up to four visible, connected printers by default. Other visible tiles use
@@ -208,6 +220,75 @@ Chamber temperature is shown only for models known to have a physical chamber
 sensor (including X1/X2/P2/H2 models). P1 and A1 models omit the chamber
 reading even if their MQTT report contains `chamber_temper`.
 
+### Gadget AI failure detection (optional)
+
+Setting `BMBPX_OCTOEVERYWHERE_API_KEY` to an
+[OctoEverywhere Gadget API key](https://octoeverywhere.com/gadgetapi) enables AI
+print-failure detection. The key is the only setting — there is no YAML field
+and no usage bookkeeping; the proxy stays stateless. While a print is active on
+a camera-capable printer, the proxy uploads the current camera snapshot to
+OctoEverywhere's Gadget service at whatever pace each response directs — the
+interval is dynamic and provider-controlled, never below the 5-second minimum
+and possibly well under 20 seconds — and receives a print-quality score (1–10)
+plus warning and pause recommendations. Warnings are
+surfaced per printer as a `detection` object on `/camera/status`,
+`/camera/events`, and `/status`; a pause recommendation makes the proxy send a
+single LAN `pause` command to the printer. Each object's `state` — starting,
+idle, monitoring, attention, paused, degraded, unsupported, or blocked — shows
+at a glance what detection is doing for that printer.
+
+**Consent.** Adding the key is an explicit opt-in to both halves of the
+service: camera snapshots leave your LAN for OctoEverywhere's servers, and the
+proxy is authorized to pause prints without asking. Leave the key unset to keep
+every image local and automatic pauses impossible. OctoEverywhere documents
+that images submitted through the public Gadget API are not used for AI model
+training.
+
+**Eligibility and gates.** Detection rides on the camera pipeline, so it covers
+exactly the camera-capable models (P1P, P1S, A1, A1MINI), only while telemetry
+shows a print actively running. It requires the camera feature
+(`BMBPX_CAMERA_ENABLED`, default on): with cameras disabled there are no frames
+to analyze; with the key set, nothing runs and every printer's `detection`
+object reports `blocked`. It does not require the HTTP listener — detection
+keeps running with `BMBPX_HTTP_PORT=0`; only its status endpoints are then
+absent.
+
+**Usage and allowance.** The proxy tracks no quota and offers no usage
+forecasts; allowance enforcement lives entirely on OctoEverywhere's side. Each
+account includes 90,000 free inspection calls per monthly billing period —
+about 500 print hours at the 20-second cadence the pricing assumes, but only
+about 125 hours if the service directs 5-second inspections — and the
+allowance is shared across the whole account: the same key in any other
+printer, tool, or proxy instance consumes the same budget. Accounts default to
+**Free Usage Only**, so inspections stop at the allowance instead of incurring
+charges.
+
+**Account errors suspend until restart.** An invalid or disabled key, a billing
+failure, an IP restriction (another key claimed the account's public IP), or an
+exhausted free allowance suspends detection for the rest of the proxy run, with
+the reason logged. Fix the account issue and restart the proxy to resume.
+Transient failures — network errors, timeouts, server errors, rate limiting —
+are retried with capped backoff and never affect printing or camera serving;
+when the primary upload URL fails at the connection or server level, the
+context switches to the API's documented fallback URL. While suspended, the
+last detection state stays visible, flagged with a suspension message.
+
+**Limitations.** Monitoring is per-print and advisory. The proxy pauses only
+when Gadget's confidence reaches the recommendation threshold, and the pause is
+a normal LAN command — it needs a printer that accepts LAN commands (Developer
+Mode on 2025+ signed firmware, as for any client) and a reachable printer.
+Each recommendation pauses at most once; the proxy expects the printer to
+confirm the pause in its reports and never retries a pause or resumes the
+print automatically. Sessions are keyed to print identity and kept fresh
+deliberately: each detected print session opens one analysis context, and it is
+invalidated whenever its inputs go stale (old reports, stale camera frames, or
+state-transition churn), so Gadget's temporal model is never fed history from a
+different print.
+Detection is stateless like the rest of the proxy: it keeps no inspection
+history, and a restart clears every status and context. The feature follows
+OctoEverywhere's documented API; its verification scope is described in
+DESIGN.md §13.
+
 ## Security notes
 
 - Runs as a non-root user in the container; the config file and environment
@@ -215,6 +296,10 @@ reading even if their MQTT report contains `chamber_temper`.
   `bambu-mqtt-proxy.yaml`).
 - TLS certificates are unverified on both hops, matching Bambu's own LAN
   protocol; the proxy is intended for trusted home LANs.
+- The optional OctoEverywhere key is a secret: keep it in your environment
+  (`.env` is git-ignored) and share the account with caution — setting it
+  authorizes external upload of camera snapshots and automatic print pauses,
+  and usage is billed/limited per OctoEverywhere account, not per proxy.
 
 ## Development
 

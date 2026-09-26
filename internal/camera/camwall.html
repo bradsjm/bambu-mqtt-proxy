@@ -134,6 +134,15 @@ body.kiosk .bar { display: none; }
 .pill.feed[data-mode="live"] .dot { display: block; width: .5rem; height: .5rem; border-radius: 50%; background: #fff;
                                    animation: pulse 1.6s infinite; }
 .pill.feed[data-mode="error"], .pill.feed.stale { color: var(--paused); }
+.pill.detect { top: auto; left: .55rem; bottom: .6rem; max-width: calc(100% - 1.1rem); color: var(--tone, var(--dim));
+               border: 1px solid color-mix(in srgb, var(--tone, var(--dim)) 45%, transparent); }
+.pill.detect[data-tone="info"] { --tone: var(--preparing); }
+.pill.detect[data-tone="warn"] { --tone: var(--paused); }
+.pill.detect[data-tone="error"] { --tone: var(--failed); }
+.pill.detect .q { color: var(--text); font-variant-numeric: tabular-nums; }
+.pill.detect .q:empty { display: none; }
+.pill.detect .label { overflow: hidden; text-overflow: ellipsis; }
+.pill.detect[data-old="true"] { opacity: .72; }
 .cam-progress { position: absolute; z-index: 4; left: 0; right: 0; bottom: 0; height: 4px;
                 background: rgb(255 255 255 / .12); pointer-events: none; }
 .cam-progress > div { height: 100%; width: var(--pct, 0%); background: var(--accent);
@@ -185,6 +194,13 @@ code { font: .74rem ui-monospace, SFMono-Regular, Menlo, monospace; }
 .progress-row { display: flex; align-items: center; gap: .6rem; font-size: .8rem; color: var(--dim);
                 font-variant-numeric: tabular-nums; }
 .progress-row[hidden] { display: none; }
+.detect-l2 { --tone: var(--dim); display: flex; align-items: center; gap: .45rem; font-size: .8rem;
+             color: var(--dim); font-variant-numeric: tabular-nums; }
+.detect-l2 .ic { color: var(--tone); font-size: 1rem; }
+.detect-l2 .d-q { font-weight: 650; color: var(--tone); }
+.detect-l2[data-tone="info"] { --tone: var(--preparing); }
+.detect-l2[data-tone="warn"] { --tone: var(--paused); }
+.detect-l2[data-tone="error"] { --tone: var(--failed); }
 .meter { flex: 1 1 auto; height: 8px; border-radius: 4px; background: var(--panel-2); overflow: hidden; }
 .meter > div { height: 100%; width: var(--pct, 0%); background: var(--accent); border-radius: inherit;
                transition: width .8s var(--ease); }
@@ -215,6 +231,8 @@ code { font: .74rem ui-monospace, SFMono-Regular, Menlo, monospace; }
 
 @container tile (width < 300px) {
   .pill .label, .serial { display: none; }
+  /* The detection badge is the only place this state lives, so its label survives narrow tiles. */
+  .pill.detect .label { display: initial; }
   .temps { grid-template-columns: 1fr; }
 }
 @container tile (width > 560px) {
@@ -341,6 +359,7 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
       <button class="cam-hit" type="button" aria-pressed="false"></button>
       <span class="pill state"><svg class="ic" aria-hidden="true"><use/></svg><span class="label"></span></span>
       <span class="pill feed" hidden><span class="dot" aria-hidden="true"></span><svg class="ic" aria-hidden="true"><use href="#i-camera"/></svg><span class="feed-label"></span></span>
+      <span class="pill detect" hidden><svg class="ic" aria-hidden="true"><use/></svg><span class="label"></span><span class="q"></span></span>
       <div class="cam-progress" hidden><div></div></div>
     </div>
     <div class="details">
@@ -357,6 +376,7 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
           <span class="stat layers"><svg class="ic" aria-hidden="true"><use href="#i-layers"/></svg><span></span></span>
           <span class="stat eta"><svg class="ic" aria-hidden="true"><use href="#i-flag"/></svg><span></span></span>
         </div>
+        <div class="detect-l2" hidden><svg class="ic" aria-hidden="true"><use href="#i-camera"/></svg><b class="d-q"></b><span class="d-text"></span></div>
         <div class="temps"></div>
       </div></div></div>
       <div class="more l3"><div><div class="pad">
@@ -364,6 +384,7 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
           <dt><svg class="ic" aria-hidden="true"><use href="#i-file"/></svg>File</dt><dd class="f-file"></dd>
           <dt><svg class="ic" aria-hidden="true"><use href="#i-clock"/></svg>Remaining</dt><dd class="f-remain"></dd>
           <dt><svg class="ic" aria-hidden="true"><use href="#i-camera"/></svg>Camera</dt><dd class="f-camera"></dd>
+          <dt class="dt-detect" hidden><svg class="ic" aria-hidden="true"><use href="#i-camera"/></svg>Inspection</dt><dd class="f-detect" hidden></dd>
           <dt><svg class="ic" aria-hidden="true"><use href="#i-bell"/></svg>Alerts</dt><dd class="f-alerts"></dd>
           <dt><svg class="ic" aria-hidden="true"><use href="#i-clock-alert"/></svg>Last report</dt><dd class="f-report"></dd>
           <dt><svg class="ic" aria-hidden="true"><use href="#i-tag"/></svg>Serial</dt><dd class="f-serial"></dd>
@@ -406,6 +427,8 @@ const tiles = new Map();
 let visible = new Set();
 let spotlight = null;
 let lastOk = 0, connectedAt = 0, failing = false, drag = null, source = null;
+// Account-level AI suspension arrives on the payload, outside any tile.
+let detSuspended = false, detMessage = "";
 
 if (kiosk) document.body.classList.add("kiosk");
 
@@ -465,19 +488,192 @@ function bucket(p) {
 const isActive = b => b === "printing" || b === "paused";
 const showsProgress = (b, p) => isActive(b) || b === "finished" || b === "failed" || (b === "stale" && p.progress > 0);
 const nameOf = t => t.data.name || `${t.data.model || "Printer"} ${t.serial}`;
-// Print errors and HMS alerts, most severe first.
+// OctoEverywhere AI failure detection, normalized to the backend contract.
+// The backend adds a `detection` object to a tile only when an API key is
+// configured; without it detectOf returns null and every detection path stays
+// out of the UI, leaving the wall exactly as before. quality is 1..10 (10
+// best) and is never shown as a percentage or probability. pause_state keeps
+// pending (sent, inside the confirmation window), unconfirmed (window expired,
+// publish failed, or print resumed), and confirmed (printer PAUSE report seen)
+// explicitly distinct.
+const DETECT_OLD_SEC = 120;
+function detectOf(p) {
+  const d = p.detection;
+  if (!d || typeof d !== "object") return null;
+  const num = v => (Number.isFinite(v) ? v : null);
+  return {
+    state: typeof d.state === "string" ? d.state : "",
+    pauseState: d.pause_state === "pending" || d.pause_state === "confirmed" || d.pause_state === "unconfirmed"
+      ? d.pause_state : "none",
+    reason: typeof d.reason === "string" ? d.reason : "",
+    quality: num(d.quality),
+    warning: d.warning === true,
+    cameraLost: d.camera_lost === true,
+    suspended: d.suspended === true,
+    age: num(d.age_seconds),
+    nextCheck: num(d.next_check_seconds),
+    faster: d.faster_inspection === true,
+    fallback: d.using_fallback === true,
+    layerNum: num(d.last_inspected_layer),
+    message: typeof d.message === "string" ? d.message.trim() : "",
+  };
+}
+const detectPausePending = d => !!d && d.pauseState === "pending";
+const detectPauseUnconfirmed = d => !!d && d.pauseState === "unconfirmed";
+const detectPauseConfirmed = d => !!d && d.pauseState === "confirmed";
+// Stable backend reason codes, in words the wall explains at a glance.
+const DETECT_REASONS = {
+  camera_disabled: "camera disabled",
+  camera_unsupported: "camera unsupported",
+  awaiting_reports: "awaiting printer reports",
+  awaiting_fresh_telemetry: "awaiting fresh telemetry",
+  camera_unavailable: "camera unavailable",
+  api_retrying: "API retrying",
+  pause_unconfirmed: "pause not confirmed by printer",
+  pause_command_failed: "pause command failed",
+};
+const reasonWords = d => (d.reason ? DETECT_REASONS[d.reason] || d.reason : "");
+function qualityWord(q) {
+  if (q == null) return "";
+  return q <= 1 ? "failure" : q === 2 ? "probable failure" : q === 3 ? "possible failure"
+    : q <= 5 ? "watching" : q <= 7 ? "good" : q <= 9 ? "great" : "perfect";
+}
+function qualityTone(q) {
+  // Quality colors stay factual and never reach alert red; the approved
+  // flags (warning, pause) own the strong tones.
+  return q == null ? null : q <= 3 ? "warn" : q <= 5 ? "info" : "calm";
+}
+// While inspection is running, a result older than a fixed 120 s baseline is
+// history. next_check_seconds counts down to the next inspection, so it never
+// feeds staleness; server state and age decide. Suspended or ended sessions
+// freeze the last result, so its age is expected, not stale.
+function detectOld(d) {
+  if (d.age == null || (d.state !== "monitoring" && d.state !== "attention")) return false;
+  return d.age > DETECT_OLD_SEC;
+}
+// One compact verdict for the stage badge. Visible while a print session is
+// active — normal monitoring stays recognizable as a quiet gray "AI 8/10" —
+// and hidden when the session is idle. The printer's own state pill always
+// stays authoritative; this badge only adds what the AI saw.
+function detectBadge(d, b) {
+  if (!d || d.state === "idle") return null;
+  if (detectPausePending(d)) return { icon: "i-pause", tone: "error", label: "Pause pending" };
+  if (detectPauseUnconfirmed(d)) return { icon: "i-pause", tone: "error", label: "Pause unconfirmed" };
+  if (detectPauseConfirmed(d)) return { icon: "i-pause", tone: "warn", label: "Pause confirmed" };
+  if (d.warning) return { icon: "i-alert", tone: "warn", label: "AI warning" };
+  if (d.suspended) return { icon: "i-camera-off", tone: "warn", label: "AI off · account" };
+  if (d.state === "degraded") {
+    return d.cameraLost || reasonWords(d).startsWith("camera")
+      ? { icon: "i-camera-off", tone: "warn", label: "AI view lost" }
+      : { icon: "i-loader", tone: "warn", label: "AI retrying" };
+  }
+  if (d.cameraLost && isActive(b)) return { icon: "i-camera-off", tone: "warn", label: "AI view lost" };
+  if (d.state === "attention") return { icon: "i-alert", tone: "warn", label: "AI attention" };
+  if (d.state === "unsupported") return { icon: "i-camera-off", tone: "calm", label: "AI unsupported" };
+  if (d.state === "blocked") return { icon: "i-camera-off", tone: "calm", label: "AI blocked" };
+  if (d.state === "starting") return { icon: "i-loader", tone: "calm", label: "AI starting" };
+  // Quality bands color the rating but never raise an alert; the approved
+  // flags above drive attention.
+  if (d.quality != null && d.quality <= 5) {
+    return d.quality <= 3 ? { icon: "i-camera", tone: "warn", label: "AI" }
+      : { icon: "i-camera", tone: "info", label: "AI watching" };
+  }
+  return { icon: "i-camera", tone: "calm", label: "AI" };
+}
+// Detection findings as alert-row entries. The text carries the meaning;
+// severity reuses the HMS scale for color, and prio keeps printer-reported
+// HMS alerts and print errors ahead of detection findings on equal severity.
+function detectAlerts(d, b) {
+  const items = [];
+  const old = detectOld(d) ? ` · result ${fmtAgo(Math.round(d.age))} old` : "";
+  if (detectPausePending(d)) items.push({ severity: "error", prio: 1, sevHidden: true,
+    text: `AI pause pending · printer not yet paused${d.message ? ` · ${d.message}` : ""}` });
+  else if (detectPauseUnconfirmed(d)) items.push({ severity: "error", prio: 1, sevHidden: true,
+    text: `AI pause unconfirmed${reasonWords(d) ? ` · ${reasonWords(d)}` : ""}${d.message ? ` · ${d.message}` : ""}` });
+  else if (detectPauseConfirmed(d)) items.push({ severity: "common", prio: 1, sevHidden: true,
+    text: "Printer paused after AI request" });
+  if (d.warning) items.push({ severity: "common", prio: 1, sevHidden: true,
+    text: `AI warning · quality ${d.quality ?? "?"}/10${old}` });
+  if (d.cameraLost && isActive(b)) items.push({ severity: "common", prio: 2, sevHidden: true,
+    text: "AI lost camera view · inspection degraded" });
+  if (d.suspended) items.push({ severity: "info", prio: 1, sevHidden: true,
+    text: "AI inspection suspended · account error" });
+  // Attention with no specific flag means the backend has a condition worth
+  // surfacing (for example a failed pause attempt) and explains the reason.
+  if (!items.length && d.state === "attention" && (reasonWords(d) || d.message)) items.push({
+    severity: "common", prio: 1, sevHidden: true, text: `AI attention · ${reasonWords(d) || d.message}` });
+  return items;
+}
+// Print errors and HMS alerts, most severe first, with detection findings in
+// the same row without masking severe HMS.
 function alertsOf(p) {
-  const list = (p.hms || []).map(h => ({ code: h.code, severity: h.severity, label: "HMS alert" }));
-  if (p.print_error) list.push({ code: p.print_error, severity: "error", label: "Print error" });
-  return list.sort((a, b) => (SEVERITY_RANK[b.severity] || 0) - (SEVERITY_RANK[a.severity] || 0));
+  const list = (p.hms || []).map(h => ({ code: h.code, severity: h.severity, prio: 0, label: "HMS alert" }));
+  if (p.print_error) list.push({ code: p.print_error, severity: "error", prio: 0, label: "Print error" });
+  const d = detectOf(p);
+  if (d) list.push(...detectAlerts(d, bucket(p)));
+  return list.sort((a, b) => (SEVERITY_RANK[b.severity] || 0) - (SEVERITY_RANK[a.severity] || 0) ||
+    (a.prio || 0) - (b.prio || 0));
 }
 const highAlert = p => alertsOf(p).some(a => (SEVERITY_RANK[a.severity] || 0) >= 3);
 function needsAttention(p) {
   const b = bucket(p);
-  return b === "failed" || b === "paused" || b === "stale" || highAlert(p);
+  if (b === "failed" || b === "paused" || b === "stale" || highAlert(p)) return true;
+  // An AI warning or any pause activity counts; low quality alone does not.
+  // Losing oversight of an active print counts too: degradation, camera loss,
+  // or account suspension all leave the wall watching blind.
+  const d = detectOf(p);
+  if (!d) return false;
+  if (d.warning || d.pauseState !== "none") return true;
+  const active = b === "printing" || b === "preparing" || b === "stale";
+  return active && (d.suspended || d.cameraLost || d.state === "degraded");
 }
 function matchesFilter(p) {
   return filter.size === 0 || filter.has(bucket(p)) || (filter.has("attention") && needsAttention(p));
+}
+// Announce only important detection transitions — a sent or confirmed pause, a
+// raised warning, lost camera view, or suspension — never quality ticks.
+function detSig(d, b) {
+  if (!d) return "";
+  return [detectPausePending(d) && "pause", detectPauseUnconfirmed(d) && "unconf",
+    detectPauseConfirmed(d) && "cpause", d.warning && "warn",
+    d.cameraLost && isActive(b) && "view", d.suspended && "susp"].filter(Boolean).join(",");
+}
+function announceDetect(t, prev, next) {
+  const had = prev.split(",").filter(Boolean);
+  const name = nameOf(t);
+  const has = token => next.split(",").includes(token);
+  if (has("unconf") && !had.includes("unconf")) announce(`${name}: AI pause was not confirmed by the printer.`);
+  else if (has("cpause") && !had.includes("cpause")) announce(`${name}: AI pause confirmed by the printer.`);
+  else if (has("pause") && !had.includes("pause")) announce(`${name}: AI is pausing the print.`);
+  else if (next.includes("warn") && !had.includes("warn")) announce(`${name}: AI warns about a possible print issue.`);
+  else if (next.includes("view") && !had.includes("view")) announce(`${name}: AI lost camera view.`);
+  else if (next.includes("susp") && !had.includes("susp")) announce(`${name}: AI inspection suspended.`);
+}
+
+function detectFact(d, b) {
+  const bits = [];
+  if (d.suspended) {
+    bits.push("inspection unavailable");
+    if (d.age != null) bits.push(`last checked ${fmtAgo(Math.round(d.age))}`);
+    if (d.quality != null) bits.push(`last result ${d.quality}/10 ${qualityWord(d.quality)}`);
+    bits.push("suspended · account error");
+    if (d.message) bits.push(d.message);
+    return bits.join(" · ");
+  }
+  bits.push(d.quality != null ? `${d.quality}/10 ${qualityWord(d.quality)}` : "no result yet");
+  if (d.layerNum != null) bits.push(`layer ${d.layerNum} at inspection`);
+  if (detectPausePending(d)) bits.push("pause pending · printer not yet paused");
+  if (detectPauseUnconfirmed(d)) bits.push("pause unconfirmed");
+  if (detectPauseConfirmed(d)) bits.push("pause confirmed by printer");
+  if (d.warning) bits.push("warning suggested");
+  if (d.cameraLost) bits.push("camera view lost");
+  if (d.faster) bits.push("closer monitoring requested");
+  if (d.fallback) bits.push("fallback URL in use");
+  if (d.age != null) bits.push(`checked ${fmtAgo(Math.round(d.age))}${detectOld(d) ? " · old" : ""}`);
+  if (d.suspended) bits.push("suspended · account error");
+  if (reasonWords(d)) bits.push(reasonWords(d));
+  if (d.message) bits.push(d.message);
+  return bits.join(" · ");
 }
 function icon(id) {
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -542,6 +738,9 @@ function createTile(p) {
       alertRow: q(".alert-row"), alertText: q(".alert-text"),
       l2: q(".l2"), l3: q(".l3"), progressRow: q(".progress-row"), meter: q(".meter"),
       layers: q(".layers span"), eta: q(".eta span"), temps: q(".temps"),
+      detect: q(".pill.detect"), detectUse: q(".pill.detect use"), detectLabel: q(".pill.detect .label"),
+      detectQ: q(".pill.detect .q"), d2: q(".detect-l2"), d2q: q(".detect-l2 .d-q"),
+      d2text: q(".detect-l2 .d-text"), fDetectDt: q(".dt-detect"), fDetect: q(".f-detect"),
       fFile: q(".f-file"), fRemain: q(".f-remain"), fCamera: q(".f-camera"), fAlerts: q(".f-alerts"),
       fReport: q(".f-report"), fSerial: q(".f-serial"), open: q(".open"),
     },
@@ -638,9 +837,11 @@ function renderTile(t) {
   const pct = Math.max(0, Math.min(100, Math.round(p.progress || 0)));
   const progress = showsProgress(b, p);
   const alerts = alertsOf(p);
+  const d = detectOf(p), bd = detectBadge(d, b);
   t.el.dataset.state = b;
   t.el.dataset.alert = highAlert(p) ? "high" : alerts.length ? "low" : "none";
   t.el.setAttribute("aria-label", `${nameOf(t)}, ${s.label}${progress ? `, ${pct}%` : ""}` +
+    `${bd ? `, AI ${bd.label.toLowerCase().replace(/^ai /, "")}` : ""}` +
     `${alerts.length ? `, ${alerts.length} alert${alerts.length > 1 ? "s" : ""}` : ""}`);
   r.stateUse.setAttribute("href", `#${s.icon}`);
   r.stateLabel.textContent = s.label;
@@ -664,10 +865,48 @@ function renderTile(t) {
   if (alerts.length) {
     const top = alerts[0];
     r.alertRow.dataset.sev = top.severity;
-    r.alertText.textContent = `${top.label} ${top.code}` +
-      `${top.severity !== "error" ? ` · ${top.severity}` : ""}${alerts.length > 1 ? ` · +${alerts.length - 1} more` : ""}`;
-    r.alertRow.title = alerts.map(a => `${a.label} ${a.code} (${a.severity})`).join("\n");
+    r.alertText.textContent = (top.text ?? `${top.label} ${top.code}`) +
+      `${top.sevHidden || top.severity === "error" ? "" : ` · ${top.severity}`}` +
+      `${alerts.length > 1 ? ` · +${alerts.length - 1} more` : ""}`;
+    r.alertRow.title = alerts.map(a => a.text ?? `${a.label} ${a.code} (${a.severity})`).join("\n");
   }
+
+  // Detection rendering: a compact badge on the stage, inspection details at
+  // level 2, facts at level 3, and a transition announcement. Without a
+  // detection object (no API key) every element above stays hidden.
+  r.detect.hidden = !bd;
+  if (bd) {
+    r.detect.dataset.tone = bd.tone;
+    r.detect.dataset.old = String(detectOld(d));
+    r.detectUse.setAttribute("href", `#${bd.icon}`);
+    r.detectLabel.textContent = bd.label;
+    // A suspended result is history; never dress it up as current quality.
+    r.detectQ.textContent = !d.suspended && d.quality != null ? `${d.quality}/10` : "";
+
+  }
+  r.d2.hidden = !d || d.state === "idle";
+  if (d && d.state !== "idle") {
+    r.d2.dataset.tone = detectPausePending(d) || detectPauseUnconfirmed(d) ? "error"
+      : detectPauseConfirmed(d) || d.warning || d.suspended ? "warn" : qualityTone(d.quality) || "";
+    if (d.suspended) {
+      r.d2q.textContent = "";
+      const gone = ["inspection unavailable"];
+      if (d.age != null) gone.push(`last checked ${fmtAgo(Math.round(d.age))}`);
+      r.d2text.textContent = gone.join(" · ");
+    } else {
+      r.d2q.textContent = d.quality != null ? `${d.quality}/10` : "";
+      const bits = [d.quality != null ? qualityWord(d.quality) : "no result yet"];
+      if (d.layerNum != null) bits.push(`layer ${d.layerNum}`);
+      if (d.age != null) bits.push(`checked ${fmtAgo(Math.round(d.age))}${detectOld(d) ? " · old" : ""}`);
+      if (d.quality == null) bits.push(reasonWords(d) || d.message);
+      r.d2text.textContent = bits.join(" · ");
+    }
+  }
+  r.fDetectDt.hidden = r.fDetect.hidden = !d || d.state === "idle";
+  if (d && d.state !== "idle") r.fDetect.textContent = detectFact(d, b);
+  const sig = detSig(d, b);
+  if (t.detSig === undefined) t.detSig = sig;
+  else if (sig !== t.detSig) { announceDetect(t, t.detSig, sig); t.detSig = sig; }
 
   t.el.style.setProperty("--pct", `${pct}%`);
   r.camBar.hidden = !progress;
@@ -702,9 +941,9 @@ function renderTile(t) {
       const li = document.createElement("li");
       li.dataset.sev = a.severity;
       const code = document.createElement("code");
-      code.textContent = a.code;
+      code.textContent = a.text ?? a.code;
       const note = document.createElement("small");
-      note.textContent = a.severity === "error" ? a.label.toLowerCase() : a.severity;
+      if (!a.text) note.textContent = a.severity === "error" ? a.label.toLowerCase() : a.severity;
       li.append(code, note);
       list.append(li);
     }
@@ -987,10 +1226,12 @@ function renderHealth() {
   const age = lastOk ? Math.round((Date.now() - lastOk) / 1000) : 0;
   const quiet = age * 1000 > EVENTS_SILENCE_MS - 5000;
   el.dataset.health = failing ? "down" : !lastOk ? "wait" : quiet ? "stale" : "ok";
-  document.getElementById("health-text").textContent = failing
+  const base = failing
     ? (lastOk ? `Reconnecting · updated ${fmtAgo(age)}` : "Proxy unreachable")
     : !lastOk ? "Connecting…" : quiet ? `Updated ${fmtAgo(age)}` : "Live";
-  el.title = lastOk ? `Last status update ${new Date(lastOk).toLocaleTimeString()}` : "";
+  document.getElementById("health-text").textContent = detSuspended ? `${base} · AI off` : base;
+  el.title = (lastOk ? `Last status update ${new Date(lastOk).toLocaleTimeString()}` : "") +
+    (detSuspended && detMessage ? ` · AI: ${detMessage}` : "");
 }
 
 // Status updates keep tile nodes (and their streams) stable.
@@ -1047,6 +1288,14 @@ function connect() {
     lastOk = Date.now();
     if (failing) announce("Status updates restored.");
     failing = false;
+    const sus = data.detection_suspended === true;
+    if (sus !== detSuspended) {
+      detSuspended = sus;
+      detMessage = typeof data.detection_message === "string" ? data.detection_message.trim() : "";
+      announce(sus
+        ? `AI inspection suspended: ${detMessage || "account error"}. It stays off until the proxy restarts.`
+        : "AI inspection can run again.");
+    }
     sync(data.printers);
     renderHealth();
   };

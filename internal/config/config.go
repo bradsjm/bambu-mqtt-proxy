@@ -38,7 +38,12 @@ const (
 	EnvLogLevel     = "BMBPX_LOG_LEVEL"
 	EnvHTTPPort     = "BMBPX_HTTP_PORT"
 	EnvCameraEnable = "BMBPX_CAMERA_ENABLED"
-	defaultFileName = "bambu-mqtt-proxy.yaml"
+	// EnvOctoEverywhereAPIKey enables the optional OctoEverywhere Gadget AI
+	// print failure detection. The key is environment-only: there is no YAML
+	// field, no other setting, and an empty or unset value keeps the proxy
+	// fully unchanged.
+	EnvOctoEverywhereAPIKey = "BMBPX_OCTOEVERYWHERE_API_KEY"
+	defaultFileName         = "bambu-mqtt-proxy.yaml"
 )
 
 // Listener describes one downstream MQTT listener.
@@ -108,13 +113,17 @@ type Camera struct {
 
 // Config is the top-level proxy configuration.
 type Config struct {
-	Listen   []Listener `yaml:"listen"`
-	Auth     Auth       `yaml:"auth"`
-	Printers []Printer  `yaml:"printers"`
-	Behavior Behavior   `yaml:"behavior"`
-	Log      Log        `yaml:"log"`
-	HTTP     HTTP       `yaml:"http"`
-	Camera   Camera     `yaml:"camera"`
+	Listen []Listener `yaml:"listen"`
+	Auth   Auth       `yaml:"auth"`
+	// Printers is the upstream printer list.
+	Printers []Printer `yaml:"printers"`
+	Behavior Behavior  `yaml:"behavior"`
+	Log      Log       `yaml:"log"`
+	HTTP     HTTP      `yaml:"http"`
+	Camera   Camera    `yaml:"camera"`
+	// OctoEverywhereAPIKey is the Gadget API key applied from
+	// BMBPX_OCTOEVERYWHERE_API_KEY only; yaml:"-" keeps it out of files.
+	OctoEverywhereAPIKey string `yaml:"-"`
 }
 
 // DefaultConfigName is the file probed when no -config flag is given.
@@ -207,6 +216,13 @@ func (c *Config) CameraEnabled() bool {
 	return c.Camera.Enabled == nil || *c.Camera.Enabled
 }
 
+// DetectionEnabled reports whether the OctoEverywhere Gadget detection
+// feature is configured. The key exists only in the environment; an empty
+// value keeps every pre-existing behavior unchanged.
+func (c *Config) DetectionEnabled() bool {
+	return c.OctoEverywhereAPIKey != ""
+}
+
 // Load reads and parses the YAML configuration at path. Defaults and
 // validation are applied by the caller after environment overrides.
 func Load(path string) (*Config, error) {
@@ -281,6 +297,9 @@ func (c *Config) ApplyEnv() (bool, error) {
 			return false, fmt.Errorf("%s: invalid bool %q", EnvCameraEnable, v)
 		}
 		c.Camera.Enabled = &b
+	}
+	if v, ok := os.LookupEnv(EnvOctoEverywhereAPIKey); ok {
+		c.OctoEverywhereAPIKey = strings.TrimSpace(v)
 	}
 	return printersFromEnv, nil
 }

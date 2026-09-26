@@ -6,9 +6,12 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"testing"
 	"time"
+
+	"bambu-mqtt-proxy/internal/detection"
 )
 
 type fakeSource struct {
@@ -26,7 +29,7 @@ func TestEndpoints(t *testing.T) {
 	l.Close()
 
 	mux := http.NewServeMux()
-	Routes(mux, fakeSource{status: map[string]bool{"S1": true, "S2": false}})
+	Routes(mux, fakeSource{status: map[string]bool{"S1": true, "S2": false}}, nil)
 	srv := &http.Server{Addr: fmt.Sprintf("127.0.0.1:%d", port), Handler: mux}
 	ln, err := net.Listen("tcp", srv.Addr)
 	if err != nil {
@@ -76,6 +79,66 @@ func TestEndpoints(t *testing.T) {
 
 func liveURL(port int, path string) string {
 	return "http://127.0.0.1:" + strconv.Itoa(port) + path
+}
+
+type fakeDetection struct {
+	suspended bool
+}
+
+func (f fakeDetection) DetectionMap() map[string]any {
+	// Serve a real detection.Status so the JSON keys asserted below come
+	// from the production struct tags, not from hardcoded literals here.
+	return map[string]any{"S1": &detection.Status{
+		State:      detection.StateMonitoring,
+		PauseState: detection.PauseNone,
+	}}
+}
+
+func TestStatusDetectionContract(t *testing.T) {
+	mk := func(detection DetectionSource) *httptest.Server {
+		mux := http.NewServeMux()
+		Routes(mux, fakeSource{status: map[string]bool{"S1": true}}, detection)
+		return httptest.NewServer(mux)
+	}
+
+	// Without detection configured, the payload must not carry the field at
+	// all: the no-key behavior stays byte-compatible with the old shape.
+	without := mk(nil)
+	defer without.Close()
+	resp, err := http.Get(without.URL + "/status")
+	if err != nil {
+		t.Fatalf("GET /status: %v", err)
+	}
+	var raw map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	resp.Body.Close()
+	if _, present := raw["detection"]; present {
+		t.Fatalf("detection field present without a source: %v", raw)
+	}
+
+	// With detection configured, every serial's status object is served.
+	with := mk(fakeDetection{})
+	defer with.Close()
+	resp, err = http.Get(with.URL + "/status")
+	if err != nil {
+		t.Fatalf("GET /status: %v", err)
+	}
+	var decoded struct {
+		Detection map[string]struct {
+			State      string `json:"state"`
+			PauseState string `json:"pause_state"`
+		} `json:"detection"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	resp.Body.Close()
+	d := decoded.Detection["S1"]
+	if d.State != "monitoring" || d.PauseState != "none" {
+		t.Fatalf("detection[S1] = %+v, want the UI contract fields", d)
+	}
 }
 
 func waitFor(t *testing.T, timeout time.Duration, fn func() bool) {
