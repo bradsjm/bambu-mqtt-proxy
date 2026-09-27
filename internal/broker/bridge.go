@@ -117,8 +117,11 @@ func (b *Bridge) OnACLCheck(cl *mqtt.Client, topic string, write bool) bool {
 	return true
 }
 
-// OnSubscribed records the client's granted filters and merges the
-// subscription upstream (refcounted per printer and filter).
+// OnSubscribed records the client's granted filters and merges each new
+// interest upstream (refcounted per printer and filter). A filter the client
+// already holds must not merge again: upstream interests count one per
+// client filter, so repeated SUBSCRIBEs stay refcount-neutral; a higher
+// requested QoS still raises the stored maximum for reconnect restores.
 func (b *Bridge) OnSubscribed(cl *mqtt.Client, pk packets.Packet, reasonCodes []byte) {
 	if cl.Net.Inline {
 		return
@@ -127,8 +130,13 @@ func (b *Bridge) OnSubscribed(cl *mqtt.Client, pk packets.Packet, reasonCodes []
 		if i >= len(reasonCodes) || reasonCodes[i] >= 0x80 {
 			continue
 		}
+		if !b.recordFilter(cl, sub.Filter, true) {
+			for _, serial := range b.table.PrintersFor(sub.Filter) {
+				b.pool.RaiseQoS(serial, sub.Filter, sub.Qos)
+			}
+			continue
+		}
 		printers := b.table.PrintersFor(sub.Filter)
-		b.recordFilter(cl, sub.Filter, true)
 		for _, serial := range printers {
 			b.pool.Subscribe(serial, sub.Filter, sub.Qos)
 		}

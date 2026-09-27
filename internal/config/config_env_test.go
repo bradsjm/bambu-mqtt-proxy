@@ -126,3 +126,136 @@ func TestApplyEnvOctoEverywhereKey(t *testing.T) {
 		t.Fatal("OctoEverywhereAPIKey must be tagged yaml:\"-\"")
 	}
 }
+
+// unsetEnvForTest clears inherited BMBPX_* values that would skew an
+// isolated fixture. t.Setenv records the original value and restores it at
+// cleanup; os.Unsetenv then removes the variable so LookupEnv reports
+// absence. Setting "" alone would not do: an empty BMBPX_LISTEN_PORT still
+// triggers listener replacement.
+func unsetEnvForTest(t *testing.T, keys ...string) {
+	t.Helper()
+	for _, k := range keys {
+		t.Setenv(k, "")
+		if err := os.Unsetenv(k); err != nil {
+			t.Fatalf("unset %s: %v", k, err)
+		}
+	}
+}
+
+// allEnvKeys is the full BMBPX_* surface. Focused fixtures unset every one
+// so ambient values cannot alter the input a test means to establish.
+var allEnvKeys = []string{
+	EnvPrinters,
+	EnvListenPort,
+	EnvListenTLS,
+	EnvCertFile,
+	EnvKeyFile,
+	EnvAuthMode,
+	EnvLogLevel,
+	EnvHTTPPort,
+	EnvCameraEnable,
+	EnvMCPEnable,
+	EnvOctoEverywhereAPIKey,
+}
+
+// TestApplyEnvDefaultListener pins the env-only startup path used when the
+// container runs without a config file: with printers but no listen
+// variables, defaults must produce the TLS 8883 endpoint instead of failing
+// validation.
+func TestApplyEnvDefaultListener(t *testing.T) {
+	unsetEnvForTest(t, allEnvKeys...)
+	t.Setenv(EnvPrinters, "serial=S1,address=10.0.0.1:8883,password=1111")
+	cfg := &Config{HTTP: HTTP{Port: PortUnset}}
+	if _, err := cfg.ApplyEnv(); err != nil {
+		t.Fatalf("ApplyEnv: %v", err)
+	}
+	cfg.ApplyDefaults()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if len(cfg.Listen) != 1 || cfg.Listen[0].Port != 8883 || !cfg.Listen[0].TLS {
+		t.Fatalf("listen = %+v, want the default TLS 8883 listener", cfg.Listen)
+	}
+	if cfg.Listen[0].CertFile != "" || cfg.Listen[0].KeyFile != "" {
+		t.Fatalf("default listener must use a generated certificate, got %+v", cfg.Listen[0])
+	}
+}
+
+// TestFileConfigSurvivesWithoutEnvDefaults pins the container regression:
+// a mounted YAML keeps its listeners and HTTP port when the image sets no
+// BMBPX_* environment defaults. The disabled-HTTP case matters most: the
+// old image default BMBPX_HTTP_PORT=8080 overrode a mounted http.port 0.
+func TestFileConfigSurvivesWithoutEnvDefaults(t *testing.T) {
+	unsetEnvForTest(t, allEnvKeys...)
+	cases := []struct {
+		name     string
+		yamlDoc  string
+		want     []Listener
+		wantHTTP int
+	}{
+		{
+			name: "custom listener and http port",
+			yamlDoc: `
+listen:
+  - port: 1884
+    tls: false
+http:
+  port: 9090
+printers:
+  - serial: "FILEP"
+    address: "file-host:8883"
+    password: "filecode"
+`,
+			want:     []Listener{{Port: 1884}},
+			wantHTTP: 9090,
+		},
+		{
+			name: "multiple listeners with cert paths and http disabled",
+			yamlDoc: `
+listen:
+  - port: 8883
+    tls: true
+    cert_file: "/certs/proxy.crt"
+    key_file: "/certs/proxy.key"
+  - port: 1883
+    tls: false
+http:
+  port: 0
+printers:
+  - serial: "FILEP"
+    address: "file-host:8883"
+    password: "filecode"
+`,
+			want: []Listener{
+				{Port: 8883, TLS: true, CertFile: "/certs/proxy.crt", KeyFile: "/certs/proxy.key"},
+				{Port: 1883},
+			},
+			wantHTTP: 0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			file := filepath.Join(t.TempDir(), "cfg.yaml")
+			if err := os.WriteFile(file, []byte(tc.yamlDoc), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(file)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if _, err := cfg.ApplyEnv(); err != nil {
+				t.Fatalf("ApplyEnv: %v", err)
+			}
+			cfg.ApplyDefaults()
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("Validate: %v", err)
+			}
+			if !reflect.DeepEqual(cfg.Listen, tc.want) {
+				t.Fatalf("listen = %+v, want %+v", cfg.Listen, tc.want)
+			}
+			if cfg.HTTP.Port != tc.wantHTTP {
+				t.Fatalf("http.port = %d, want %d", cfg.HTTP.Port, tc.wantHTTP)
+			}
+		})
+	}
+}

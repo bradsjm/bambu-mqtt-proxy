@@ -81,3 +81,33 @@ func TestSubRefTransitions(t *testing.T) {
 		t.Fatal("filter should be deleted at zero count")
 	}
 }
+
+func TestRaiseQoS(t *testing.T) {
+	c := &Conn{spec: config.Printer{Serial: "S1"}, subs: newSubRefs()}
+	c.subs.add("device/S1/report", 0)
+
+	// A repeated interest raises the stored maximum without adding a
+	// refcount.
+	c.raiseQoS("device/S1/report", 1)
+	refs := c.subs.snapshot()
+	if len(refs) != 1 || refs["device/S1/report"] != 1 {
+		t.Fatalf("snapshot after raise = %v, want device/S1/report at qos 1", refs)
+	}
+	if got := c.subs.count("device/S1/report"); got != 1 {
+		t.Fatalf("count after raise = %d, want unchanged 1", got)
+	}
+
+	// Lower or equal requests keep the stored maximum.
+	c.raiseQoS("device/S1/report", 0)
+	if got := c.subs.snapshot()["device/S1/report"]; got != 1 {
+		t.Fatalf("qos after lower raise = %d, want 1", got)
+	}
+
+	// Request-only filters have no upstream interest to raise, and absent
+	// filters stay absent.
+	c.raiseQoS("device/S1/request", 1)
+	c.raiseQoS("device/S2/report", 1)
+	if got := c.subs.snapshot(); len(got) != 1 {
+		t.Fatalf("snapshot after ignored raises = %v, want only device/S1/report", got)
+	}
+}

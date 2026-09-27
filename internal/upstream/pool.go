@@ -76,7 +76,9 @@ func (p *Pool) EnsureConnected(serial string, timeout time.Duration) bool {
 }
 
 // Subscribe records downstream interest in filter on the printer's upstream
-// connection, subscribing upstream when connected.
+// connection, subscribing upstream when connected. Each new downstream
+// interest on a connected printer also requests the configured warmup, so
+// the newest subscriber converges to full state.
 func (p *Pool) Subscribe(serial, filter string, qos byte) {
 	p.conn(serial).subscribe(filter, qos)
 }
@@ -95,6 +97,16 @@ func (p *Pool) SubscribeAsync(serial, filter string, qos byte) {
 func (p *Pool) Unsubscribe(serial, filter string) {
 	if c, ok := p.existing(serial); ok {
 		c.unsubscribe(filter)
+	}
+}
+
+// RaiseQoS merges a repeated downstream interest's QoS into the stored
+// maximum for an existing connection without changing refcounts or
+// re-issuing the upstream subscription; reconnects restore the merged set at
+// the highest stored request. Unknown connections create no interest.
+func (p *Pool) RaiseQoS(serial, filter string, qos byte) {
+	if c, ok := p.existing(serial); ok {
+		c.raiseQoS(filter, qos)
 	}
 }
 
@@ -285,6 +297,16 @@ func (s *subRefs) remove(filter string) bool {
 	}
 	s.refs[filter] = prev
 	return false
+}
+
+// raise merges a higher requested QoS into an existing interest without
+// changing its refcount; absent filters stay absent.
+func (s *subRefs) raise(filter string, qos byte) {
+	prev, have := s.refs[filter]
+	if !have || qos <= prev.qos {
+		return
+	}
+	s.refs[filter] = subRef{count: prev.count, qos: qos}
 }
 
 // snapshot returns a copy of the merged filter set for resubscription.
@@ -494,6 +516,20 @@ func (c *Conn) onConnect(_ mqtt.Client) {
 			"restored", restored,
 			"pending", pending)
 	}
+	c.sendWarmup()
+}
+
+// sendWarmup publishes the configured warmup commands so the printer pushes
+// its full state and every subscriber converges without client action. It is
+// a no-op while the upstream is disconnected: onConnect warms up on every
+// successful (re)connect, which covers interests recorded during an outage.
+func (c *Conn) sendWarmup() {
+	c.mu.Lock()
+	client, connected := c.client, c.connectedLocked()
+	c.mu.Unlock()
+	if client == nil || !connected {
+		return
+	}
 	warmupSent := 0
 	for _, cmd := range c.warmup {
 		tok := client.Publish(c.requestTopic(), 0, false, []byte(cmd))
@@ -588,7 +624,11 @@ func (c *Conn) reportFilter(filter string) string {
 	return fmt.Sprintf("device/%s/report", c.spec.Serial)
 }
 
-// subscribe records the filter and subscribes upstream when connected.
+// subscribe records the filter and subscribes upstream when connected. A new
+// downstream interest on a connected printer also requests the configured
+// warmup, so late subscribers converge to full state. At a fresh connect the
+// restore pass and this path can both issue the SUBSCRIBE and a warmup; the
+// printer treats both as idempotent.
 func (c *Conn) subscribe(filter string, qos byte) {
 	// Upstream subscriptions cover report-leaf filters only. Subscribing to
 	// request filters upstream would make the printer broker echo proxied
@@ -605,22 +645,32 @@ func (c *Conn) subscribe(filter string, qos byte) {
 	c.mu.Unlock()
 
 	if !first {
+		// The interest is already merged upstream, but the new subscriber
+		// still needs full state. The first-interest path or onConnect
+		// warms again once the subscription is ready, covering subscribers
+		// registered meanwhile.
+		c.sendWarmup()
 		return
 	}
 	if !c.ensure(c.connectTO) {
 		// Recorded; paho resubscribes from the merged set in onConnect once
-		// the printer returns.
+		// the printer returns, and onConnect sends the warmup.
 		return
 	}
 	c.mu.Lock()
 	client := c.client
 	c.mu.Unlock()
+
 	tok := client.Subscribe(filter, qos, c.onMessage)
 	if tok.WaitTimeout(c.connectTO) && tok.Error() == nil {
 		c.mu.Lock()
 		refs := c.subs.count(filter)
 		c.mu.Unlock()
 		c.log.Info("upstream subscribed", "serial", c.spec.Serial, "filter", filter, "refs", refs, "qos", qos)
+		// Report subscription is ready: request full state for this
+		// subscriber. At a fresh connect this can duplicate onConnect's own
+		// warmup; repeated pushall is an idempotent state snapshot.
+		c.sendWarmup()
 		return
 	}
 	// Recorded; onConnect resubscribes after the next recovery.
@@ -673,6 +723,22 @@ func (c *Conn) unsubscribe(filter string) {
 		}
 		c.log.Warn("upstream unsubscribe failed", "serial", c.spec.Serial, "filter", filter, "error", errString(tok.Error()))
 	}
+}
+
+// raiseQoS merges a repeated interest's QoS into the stored maximum without
+// changing refcounts, so a reconnect restores the merged set at the highest
+// downstream request. Request-only filters have no upstream interest.
+func (c *Conn) raiseQoS(filter string, qos byte) {
+	filter = c.reportFilter(filter)
+	if filter == "" {
+		return
+	}
+	if qos > 1 {
+		qos = 1
+	}
+	c.mu.Lock()
+	c.subs.raise(filter, qos)
+	c.mu.Unlock()
 }
 
 // publish forwards a client request upstream, fire-and-forget.

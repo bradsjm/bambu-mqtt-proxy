@@ -38,11 +38,15 @@ const (
 	serial2    = "01P00A000000002"
 )
 
-// recorder is a fake-printer hook that records publishes to request topics.
+// recorder is a fake-printer hook that records publishes to request topics
+// and the proxy's upstream subscription lifecycle.
 type recorder struct {
 	mochi.HookBase
-	mu   sync.Mutex
-	seen map[string]recItem
+	mu       sync.Mutex
+	seen     map[string]recItem
+	subs     map[string]int
+	unsubs   map[string]int
+	onWarmup func() // optional full-state response to a warmup pushall
 }
 
 // recItem is one recorded request payload.
@@ -56,21 +60,45 @@ func (r *recorder) ID() string { return "recorder" }
 
 // Provides declares the implemented hook points.
 func (r *recorder) Provides(k byte) bool {
-	return bytes.Contains([]byte{mochi.OnPublish}, []byte{k})
+	return bytes.Contains([]byte{mochi.OnPublish, mochi.OnSubscribed, mochi.OnUnsubscribed}, []byte{k})
 }
 
-// OnPublish records request-topic publishes and passes them through.
+// OnPublish records request-topic publishes and passes them through. A warmup
+// pushall additionally triggers the responder, modeling a printer that pushes
+// full state only on request.
 func (r *recorder) OnPublish(_ *mochi.Client, pk packets.Packet) (packets.Packet, error) {
 	if strings.HasSuffix(pk.TopicName, "/request") {
-		key := pk.TopicName + "|" + string(pk.Payload)
 		r.mu.Lock()
+		key := pk.TopicName + "|" + string(pk.Payload)
 		item := r.seen[key]
 		item.count++
 		item.retain = pk.FixedHeader.Retain
 		r.seen[key] = item
+		respond := r.onWarmup
 		r.mu.Unlock()
+		if string(pk.Payload) == config.DefaultWarmupPushall && respond != nil {
+			go respond()
+		}
 	}
 	return pk, nil
+}
+
+// OnSubscribed counts the proxy's upstream subscriptions per filter.
+func (r *recorder) OnSubscribed(_ *mochi.Client, pk packets.Packet, _ []byte) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, f := range pk.Filters {
+		r.subs[f.Filter]++
+	}
+}
+
+// OnUnsubscribed counts the proxy's upstream unsubscribe removals per filter.
+func (r *recorder) OnUnsubscribed(_ *mochi.Client, pk packets.Packet) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, f := range pk.Filters {
+		r.unsubs[f.Filter]++
+	}
 }
 
 // count returns how many times topic+payload was recorded.
@@ -85,6 +113,27 @@ func (r *recorder) retainFlag(topic, payload string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.seen[topic+"|"+payload].retain
+}
+
+// subCount reports how often the proxy subscribed filter upstream.
+func (r *recorder) subCount(filter string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.subs[filter]
+}
+
+// unsubCount reports how often the proxy removed filter upstream.
+func (r *recorder) unsubCount(filter string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.unsubs[filter]
+}
+
+// setWarmupResponder installs the callback fired for every warmup pushall.
+func (r *recorder) setWarmupResponder(fn func()) {
+	r.mu.Lock()
+	r.onWarmup = fn
+	r.mu.Unlock()
 }
 
 // fakePrinter is a stand-in Bambu printer: a mochi broker with TLS on a fixed
@@ -103,7 +152,11 @@ func newFakePrinter(t *testing.T, port int) *fakePrinter {
 	if err := srv.AddHook(new(auth.AllowHook), nil); err != nil {
 		t.Fatalf("printer auth hook: %v", err)
 	}
-	rec := &recorder{seen: make(map[string]recItem)}
+	rec := &recorder{
+		seen:   make(map[string]recItem),
+		subs:   make(map[string]int),
+		unsubs: make(map[string]int),
+	}
 	if err := srv.AddHook(rec, nil); err != nil {
 		t.Fatalf("printer recorder hook: %v", err)
 	}
@@ -134,6 +187,14 @@ func newFakePrinter(t *testing.T, port int) *fakePrinter {
 // idempotent).
 func (f *fakePrinter) stop() {
 	f.stopOnce.Do(func() { _ = f.srv.Close() })
+}
+
+// respondToWarmup makes the fake printer answer each warmup pushall with a
+// full-state report on topic, the way a P1 pushes full state only on pushall.
+func (f *fakePrinter) respondToWarmup(topic, payload string) {
+	f.rec.setWarmupResponder(func() {
+		_ = f.srv.Publish(topic, []byte(payload), false, 1)
+	})
 }
 
 // publish pushes a report as if from the printer.
@@ -360,7 +421,7 @@ func TestSubscribeUnknownSerialDenied(t *testing.T) {
 	}
 }
 
-func TestMergedSubscriptionOneWarmupAndFanout(t *testing.T) {
+func TestMergedSubscriptionWarmupAndFanout(t *testing.T) {
 	p1 := newFakePrinter(t, freePort(t))
 	p := startProxy(t, []config.Printer{printerSpec(p1.port, serial1)})
 	cA := connect(t, p, "cA", "bblp", accessCode, true)
@@ -373,14 +434,99 @@ func TestMergedSubscriptionOneWarmupAndFanout(t *testing.T) {
 		t.Fatalf("granted qos %#x, want <= 1", got)
 	}
 
-	// Exactly one warmup pushall despite two subscribers (merged upstream).
+	// The upstream connect warms at least once, and the second subscriber
+	// joining an already-connected printer warms again. At a fresh connect
+	// the restore pass and the first interest can both subscribe and warm;
+	// those wire duplicates are idempotent, so only lower bounds hold: both
+	// interests share one merged upstream subscription.
 	waitFor(t, 5*time.Second, func() bool {
-		return p1.rec.count(requestTopic(serial1), warmupPayload()) == 1
+		return p1.rec.count(requestTopic(serial1), warmupPayload()) >= 2
+	})
+	waitFor(t, 5*time.Second, func() bool {
+		return p1.rec.subCount(reportTopic(serial1)) >= 1
 	})
 
 	p1.publish(t, reportTopic(serial1), "state-v1")
 	waitFor(t, 5*time.Second, func() bool {
 		return cA.box.has(reportTopic(serial1), "state-v1") && cB.box.has(reportTopic(serial1), "state-v1")
+	})
+}
+
+// TestRepeatedSubscribeDoesNotLeakRefcount pins refcount neutrality: a
+// repeated SUBSCRIBE for a held filter adds no upstream interest and
+// re-requests no warmup, and the client's disconnect removes the single
+// interest instead of leaking a refcount.
+func TestRepeatedSubscribeDoesNotLeakRefcount(t *testing.T) {
+	p1 := newFakePrinter(t, freePort(t))
+	p := startProxy(t, []config.Printer{printerSpec(p1.port, serial1)})
+	c := connect(t, p, "c1", "bblp", accessCode, true)
+	filter := reportTopic(serial1)
+
+	if got := c.subscribe(t, filter, 1); got > 1 {
+		t.Fatalf("granted qos %#x, want <= 1", got)
+	}
+	// Let the connect-time subscribe and warmup burst settle, then record
+	// the baseline (a fresh connect may subscribe and warm idempotently
+	// more than once).
+	waitFor(t, 5*time.Second, func() bool {
+		return p1.rec.subCount(filter) >= 1 &&
+			p1.rec.count(requestTopic(serial1), warmupPayload()) >= 1
+	})
+	time.Sleep(300 * time.Millisecond)
+	baselineSubs := p1.rec.subCount(filter)
+	baselineWarmups := p1.rec.count(requestTopic(serial1), warmupPayload())
+
+	// The same client subscribes to the same filter again.
+	if got := c.subscribe(t, filter, 1); got > 1 {
+		t.Fatalf("granted qos %#x, want <= 1", got)
+	}
+	time.Sleep(500 * time.Millisecond) // duplicate-merge window
+	if got := p1.rec.subCount(filter); got != baselineSubs {
+		t.Fatalf("repeated subscribe changed upstream subscriptions to %d, baseline %d", got, baselineSubs)
+	}
+	if got := p1.rec.count(requestTopic(serial1), warmupPayload()); got != baselineWarmups {
+		t.Fatalf("repeated subscribe changed warmups to %d, baseline %d", got, baselineWarmups)
+	}
+
+	// Disconnect releases the interest: the proxy unsubscribes upstream.
+	c.cl.Disconnect(100)
+	waitFor(t, 5*time.Second, func() bool {
+		return p1.rec.unsubCount(filter) == 1
+	})
+}
+
+// TestLateSubscriberReceivesFullState models P1 pushall semantics: the fake
+// printer answers each warmup with the full-state report. A subscriber that
+// joins late on an already-connected printer must trigger its own warmup and
+// receive full state.
+func TestLateSubscriberReceivesFullState(t *testing.T) {
+	p1 := newFakePrinter(t, freePort(t))
+	p1.respondToWarmup(reportTopic(serial1), "full-state-v1")
+	p := startProxy(t, []config.Printer{printerSpec(p1.port, serial1)})
+
+	cA := connect(t, p, "cA", "bblp", accessCode, true)
+	if got := cA.subscribe(t, reportTopic(serial1), 1); got > 1 {
+		t.Fatalf("granted qos %#x, want <= 1", got)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		return cA.box.has(reportTopic(serial1), "full-state-v1")
+	})
+	baselineWarmups := p1.rec.count(requestTopic(serial1), warmupPayload())
+
+	// The late joiner missed the first full state: its new interest on the
+	// connected printer requests warmup once the report subscription is
+	// ready, and the printer's full-state response reaches it.
+	cB := connect(t, p, "cB", "bblp", accessCode, true)
+	if got := cB.subscribe(t, reportTopic(serial1), 1); got > 1 {
+		t.Fatalf("granted qos %#x, want <= 1", got)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		return cB.box.has(reportTopic(serial1), "full-state-v1")
+	})
+	// The late joiner's own interest requested the warmup that delivered
+	// its full state.
+	waitFor(t, 5*time.Second, func() bool {
+		return p1.rec.count(requestTopic(serial1), warmupPayload()) > baselineWarmups
 	})
 }
 
@@ -498,8 +644,10 @@ func TestOutageLifecycle(t *testing.T) {
 	if got := c.subscribe(t, reportTopic(serial1), 1); got > 1 {
 		t.Fatalf("granted qos %#x, want <= 1", got)
 	}
+	// The connect warms at least once; the restore pass and the first
+	// interest can both warm idempotently, so only the lower bound holds.
 	waitFor(t, 5*time.Second, func() bool {
-		return p1.rec.count(requestTopic(serial1), warmupPayload()) == 1
+		return p1.rec.count(requestTopic(serial1), warmupPayload()) >= 1
 	})
 	p1.publish(t, reportTopic(serial1), "before-outage")
 	waitFor(t, 5*time.Second, func() bool {

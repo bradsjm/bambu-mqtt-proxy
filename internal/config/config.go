@@ -50,6 +50,12 @@ const (
 	defaultFileName         = "bambu-mqtt-proxy.yaml"
 )
 
+// defaultListenPort is the design-default downstream MQTT port. ApplyDefaults
+// pairs it with TLS and a generated self-signed certificate when neither the
+// file nor the environment configures a listener, and ApplyEnv starts its
+// replacement listener from the same base.
+const defaultListenPort = 8883
+
 // Listener describes one downstream MQTT listener.
 type Listener struct {
 	Port     int    `yaml:"port"`
@@ -146,11 +152,7 @@ func DefaultConfigName() string { return defaultFileName }
 // It returns the uppercased trimmed input for unknown models.
 func NormalizeModel(model string) string {
 	m := strings.ToUpper(strings.TrimSpace(model))
-	m = strings.ReplaceAll(m, " ", "")
-	if m == "A1MINI" {
-		return "A1MINI"
-	}
-	return m
+	return strings.ReplaceAll(m, " ", "")
 }
 
 // CameraSupported reports whether the printer model uses the Bambu chamber
@@ -280,7 +282,7 @@ func (c *Config) ApplyEnv() (bool, error) {
 	_, keySet := os.LookupEnv(EnvKeyFile)
 	if portSet || tlsSet || certSet || keySet {
 		ln := Listener{
-			Port:     8883,
+			Port:     defaultListenPort,
 			TLS:      true,
 			CertFile: os.Getenv(EnvCertFile),
 			KeyFile:  os.Getenv(EnvKeyFile),
@@ -419,6 +421,12 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.Log.Level == "" {
 		c.Log.Level = "info"
+	}
+	// No listener from the file or the environment: serve the design default
+	// endpoint; tlsutil generates a self-signed certificate when cert_file
+	// and key_file are empty.
+	if len(c.Listen) == 0 {
+		c.Listen = []Listener{{Port: defaultListenPort, TLS: true}}
 	}
 	if c.HTTP.Port == PortUnset {
 		c.HTTP.Port = 8080
