@@ -60,6 +60,12 @@ a single upstream connection per printer.
 - **Optional Gadget AI failure detection** — with an OctoEverywhere API key,
   snapshots from active prints are analyzed by the Gadget service and the proxy
   pauses the print on a likely failure. No key, no uploads, no automatic pauses.
+- **Read-only MCP endpoint** — `/mcp` on the shared HTTP port (protocol
+  2026-07-28 over Streamable HTTP): `list_printers`, `get_printer_state`,
+  `get_camera_snapshot`, and `watch_printer` tools, plus a subscribable
+  `bambu://printers/{serial}/state` resource. On by default; disable with
+  `BMBPX_MCP_ENABLED=false`. The endpoint can read state only; it exposes no
+  printer control methods and never learns printer credentials.
 - **Stateless** — no database, no volumes required. Config from a YAML file,
   environment variables, or both.
 - **Multi-arch** — `linux/amd64` and `linux/arm64` images published automatically.
@@ -146,6 +152,8 @@ http:
   port: 8080                         # 0 disables the HTTP server entirely
 camera:
   enabled: true                      # false removes camera routes, the camera wall, and the raw camera listener on port 6000
+mcp:
+  enabled: true                      # default; set false to remove the read-only MCP endpoint at /mcp
 log:
   level: info
 ```
@@ -160,6 +168,7 @@ log:
 | `BMBPX_LOG_LEVEL` | `info` | `info` logs client/upstream state, subscriptions, retries, and backoffs; `debug` adds per-packet routing |
 | `BMBPX_HTTP_PORT` | `8080` | Shared health + camera HTTP port; `0` disables HTTP (the raw camera listener on 6000 keeps serving while cameras are enabled) |
 | `BMBPX_CAMERA_ENABLED` | `true` | `false` removes the camera routes, the camera wall, and their MQTT report subscriptions, plus the raw camera listener on port 6000 |
+| `BMBPX_MCP_ENABLED` | `true` | `false` removes the read-only MCP endpoint at `/mcp`; the endpoint is also off when `http.port` is `0` |
 | `BMBPX_OCTOEVERYWHERE_API_KEY` | *(empty)* | OctoEverywhere Gadget API key; empty = detection off. Setting it consents to external snapshot uploads and automatic pauses — see [Gadget AI failure detection](#gadget-ai-failure-detection-optional) |
 
 At the default `info` level, logs identify downstream clients by MQTT client ID
@@ -171,9 +180,10 @@ per-packet request routing is also required.
 ## Health and camera HTTP
 
 Health and camera endpoints share one HTTP listener (`BMBPX_HTTP_PORT`,
-YAML `http.port`). When cameras are disabled only the health endpoints are
-served; with `http.port: 0` no HTTP server starts at all. The raw camera
-endpoint is separate: it listens on TLS port 6000 whenever cameras are enabled
+YAML `http.port`). When cameras are disabled only the health endpoints (and
+the MCP endpoint, unless disabled) are served; with `http.port: 0` no HTTP
+server starts at all. The raw camera endpoint is separate: it listens on
+TLS port 6000 whenever cameras are enabled
 — including with `http.port: 0` — and never starts when they are disabled.
 
 | Endpoint | Meaning |
@@ -188,6 +198,7 @@ endpoint is separate: it listens on TLS port 6000 whenever cameras are enabled
 | `/camera/events` | The same display state as server-sent events: on connect, on change, and at least every 10 s |
 | `/camwall` | Multi-printer camera wall dashboard |
 | `/favicon.ico`, `/apple-touch-icon.png` | Camera wall browser-tab, bookmark, and home-screen icons |
+| `/mcp` | Read-only Model Context Protocol endpoint: the four observation tools and the subscribable `bambu://printers/{serial}/state` resource (MCP 2026-07-28 over Streamable HTTP); off when `BMBPX_MCP_ENABLED=false` or `http.port` is `0` |
 
 The camera wall receives printer state over `/camera/events` and sizes its tiles to the
 window width, from one column on phones to a full grid on wall displays. Each
@@ -330,6 +341,11 @@ DESIGN.md §13.
   protocol; the proxy is intended for trusted home LANs.
 - The raw camera endpoint on port 6000 authenticates with `bblp` plus a
   configured printer access code; the code selects the printer.
+- The `/mcp` endpoint is on by default and, like the camera endpoints,
+  unauthenticated: anyone who can reach the HTTP port can read printer state
+  and fetch camera snapshots through it. It has no control methods and never
+  outputs printer credentials; set `BMBPX_MCP_ENABLED=false` if your LAN is
+  not fully trusted.
 - The optional OctoEverywhere key is a secret: keep it in your environment
   (`.env` is git-ignored) and share the account with caution — setting it
   authorizes external upload of camera snapshots and automatic print pauses,

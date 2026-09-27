@@ -38,6 +38,10 @@ const (
 	EnvLogLevel     = "BMBPX_LOG_LEVEL"
 	EnvHTTPPort     = "BMBPX_HTTP_PORT"
 	EnvCameraEnable = "BMBPX_CAMERA_ENABLED"
+	// EnvMCPEnable controls the Model Context Protocol endpoint on the
+	// shared HTTP port. MCP is enabled by default; an explicit false
+	// disables it.
+	EnvMCPEnable = "BMBPX_MCP_ENABLED"
 	// EnvOctoEverywhereAPIKey enables the optional OctoEverywhere Gadget AI
 	// print failure detection. The key is environment-only: there is no YAML
 	// field, no other setting, and an empty or unset value keeps the proxy
@@ -111,6 +115,14 @@ type Camera struct {
 	Enabled *bool `yaml:"enabled"`
 }
 
+// MCP holds the Model Context Protocol endpoint configuration. The endpoint
+// serves only read-only tools and resources on the shared HTTP listener; it
+// never exposes printer control. Enabled defaults to on: nil means enabled,
+// and an explicit false disables the endpoint.
+type MCP struct {
+	Enabled *bool `yaml:"enabled"`
+}
+
 // Config is the top-level proxy configuration.
 type Config struct {
 	Listen []Listener `yaml:"listen"`
@@ -121,6 +133,7 @@ type Config struct {
 	Log      Log       `yaml:"log"`
 	HTTP     HTTP      `yaml:"http"`
 	Camera   Camera    `yaml:"camera"`
+	MCP      MCP       `yaml:"mcp"`
 	// OctoEverywhereAPIKey is the Gadget API key applied from
 	// BMBPX_OCTOEVERYWHERE_API_KEY only; yaml:"-" keeps it out of files.
 	OctoEverywhereAPIKey string `yaml:"-"`
@@ -223,6 +236,17 @@ func (c *Config) DetectionEnabled() bool {
 	return c.OctoEverywhereAPIKey != ""
 }
 
+// MCPEnabled reports whether the read-only MCP endpoint should be served on
+// the shared HTTP listener. It defaults to on; an explicit false disables
+// it, and it cannot serve without the shared HTTP listener, so http.port 0
+// keeps it off regardless.
+func (c *Config) MCPEnabled() bool {
+	if c.HTTP.Port <= 0 {
+		return false
+	}
+	return c.MCP.Enabled == nil || *c.MCP.Enabled
+}
+
 // Load reads and parses the YAML configuration at path. Defaults and
 // validation are applied by the caller after environment overrides.
 func Load(path string) (*Config, error) {
@@ -297,6 +321,13 @@ func (c *Config) ApplyEnv() (bool, error) {
 			return false, fmt.Errorf("%s: invalid bool %q", EnvCameraEnable, v)
 		}
 		c.Camera.Enabled = &b
+	}
+	if v, ok := os.LookupEnv(EnvMCPEnable); ok && v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return false, fmt.Errorf("%s: invalid bool %q", EnvMCPEnable, v)
+		}
+		c.MCP.Enabled = &b
 	}
 	if v, ok := os.LookupEnv(EnvOctoEverywhereAPIKey); ok {
 		c.OctoEverywhereAPIKey = strings.TrimSpace(v)

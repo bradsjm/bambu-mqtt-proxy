@@ -30,15 +30,21 @@ type State struct {
 	Filename      string  // subtask_name
 	Progress      float64 // mc_percent
 	RemainMin     float64 // mc_remaining_time, minutes
-	LayerNum      *int
-	TotalLayers   *int
-	NozzleTemp    *float64
-	NozzleTarget  *float64
-	BedTemp       *float64
-	BedTarget     *float64
-	ChamberTemp   *float64
-	PrintError    int        // print_error; 0 means no error
-	HMS           []HMSAlert // current Health Management System alerts
+	// progressSeen and remainSeen record that the printer actually reported
+	// the scalar at least once. The merged values carry no unknown marker of
+	// their own, so consumers that must distinguish a reported 0 from
+	// "never reported" read these flags (see SessionView).
+	progressSeen bool
+	remainSeen   bool
+	LayerNum     *int
+	TotalLayers  *int
+	NozzleTemp   *float64
+	NozzleTarget *float64
+	BedTemp      *float64
+	BedTarget    *float64
+	ChamberTemp  *float64
+	PrintError   int        // print_error; 0 means no error
+	HMS          []HMSAlert // current Health Management System alerts
 
 	// Detection session bookkeeping. Not display state: these fields track
 	// the current print session for the optional OctoEverywhere detection
@@ -307,7 +313,12 @@ type SessionView struct {
 	Obs        uint64 // real print reports merged
 	ObsAt      time.Time
 	ObsGen     uint64 // upstream generation of the last report
-	LayerNum   *int
+	// Progress and RemainingMin carry the merged scalar with presence: nil
+	// means the printer never reported the field, so consumers can keep the
+	// value unknown instead of showing a meaningless 0.
+	Progress     *float64
+	RemainingMin *float64
+	LayerNum     *int
 }
 
 // Session returns the detection view for one serial.
@@ -318,7 +329,7 @@ func (c *Cache) Session(serial string) (SessionView, bool) {
 	if !ok {
 		return SessionView{}, false
 	}
-	return SessionView{
+	view := SessionView{
 		Serial:     st.Serial,
 		Active:     st.sessionActive,
 		State:      st.PrintingState,
@@ -330,8 +341,17 @@ func (c *Cache) Session(serial string) (SessionView, bool) {
 		Obs:        st.obs,
 		ObsAt:      st.obsAt,
 		ObsGen:     st.obsGen,
-		LayerNum:   st.LayerNum,
-	}, true
+	}
+	if st.progressSeen {
+		v := st.Progress
+		view.Progress = &v
+	}
+	if st.remainSeen {
+		v := st.RemainMin
+		view.RemainingMin = &v
+	}
+	view.LayerNum = st.LayerNum
+	return view, true
 }
 
 // SetConnected records upstream connectivity from the pool status.
@@ -355,6 +375,18 @@ func (c *Cache) Snapshot() []State {
 		out = append(out, *st)
 	}
 	return out
+}
+
+// State returns a copy of one printer's display state. The second result is
+// false for serials outside the configured set.
+func (c *Cache) State(serial string) (State, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	st, ok := c.states[serial]
+	if !ok {
+		return State{}, false
+	}
+	return *st, true
 }
 
 // mergeReport applies one report payload onto st and reports whether the
@@ -384,9 +416,11 @@ func mergeReport(st *State, gen uint64, payload []byte) bool {
 	st.trackSession(printObj, gen)
 	if v, ok := numberField(printObj, "mc_percent"); ok {
 		st.Progress = v
+		st.progressSeen = true
 	}
 	if v, ok := numberField(printObj, "mc_remaining_time"); ok {
 		st.RemainMin = v
+		st.remainSeen = true
 	}
 	if v, ok := intField(printObj, "layer_num"); ok {
 		st.LayerNum = &v

@@ -49,6 +49,14 @@ camera:
   # listener on port 6000.
   # enabled: false
 
+mcp:
+  # Read-only MCP (Model Context Protocol) endpoint on the shared HTTP port
+  # at /mcp: observation tools, the per-printer state resource, and
+  # subscriptions. It can read printer state but has no control methods.
+  # On by default; set false to disable, and it is not served when
+  # http.port is 0.
+  # enabled: false
+
 behavior:
   qos_max: 1
   warmup_commands:

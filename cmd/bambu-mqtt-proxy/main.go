@@ -21,6 +21,7 @@ import (
 	"bambu-mqtt-proxy/internal/detection"
 	"bambu-mqtt-proxy/internal/health"
 	"bambu-mqtt-proxy/internal/httpsrv"
+	"bambu-mqtt-proxy/internal/mcpserver"
 	"bambu-mqtt-proxy/internal/routing"
 	"bambu-mqtt-proxy/internal/telemetry"
 	"bambu-mqtt-proxy/internal/upstream"
@@ -86,7 +87,6 @@ func run() error {
 		renderer = camera.NewStatusRenderer(cameras, state, pool)
 		renderer.SetActivity(activities)
 	}
-
 	// Optional OctoEverywhere Gadget detection. The key is env-only; with a
 	// key but the camera feature disabled the engine stays visible in the
 	// blocked state and performs no camera or API activity.
@@ -108,6 +108,29 @@ func run() error {
 	}
 	if renderer != nil && detector != nil {
 		renderer.SetDetection(detector)
+	}
+	// Read-only MCP endpoint on the shared HTTP listener, on by default and
+	// disabled with mcp.enabled: false / BMBPX_MCP_ENABLED=false. Its
+	// sampler reads cached state for every configured printer, and it never
+	// writes to or controls a printer. Disabled features must leave the
+	// Deps interface fields truly nil: a typed nil would pass the nil check
+	// and panic on first use.
+	var mcpsrv *mcpserver.Server
+	if cfg.MCPEnabled() {
+		deps := mcpserver.Deps{
+			Printers:     cfg.Printers,
+			State:        state,
+			Connectivity: pool,
+			Generations:  pool,
+			Log:          logger,
+		}
+		if cameras != nil {
+			deps.Cameras = cameras
+		}
+		if detector != nil {
+			deps.Detector = detector
+		}
+		mcpsrv = mcpserver.New(deps)
 	}
 
 	srv, err := broker.New(cfg, table, pool, inject, logger)
@@ -135,6 +158,9 @@ func run() error {
 		logger.Info("shutting down")
 		if detector != nil {
 			detector.Close()
+		}
+		if mcpsrv != nil {
+			mcpsrv.Close()
 		}
 		if raw != nil {
 			raw.Close()
@@ -171,8 +197,9 @@ func run() error {
 	// Hold one report interest per printer when anything consumes live
 	// state: the camera wall (HTTP on) or detection. Async on purpose: the
 	// interest is recorded while printers may still be offline, and
-	// onConnect restores the recorded interests on reconnect.
-	if cfg.CameraEnabled() && (cfg.HTTP.Port > 0 || detector != nil) {
+	// onConnect restores the recorded interests on reconnect. MCP counts
+	// as a live-state consumer even with cameras disabled.
+	if (cfg.CameraEnabled() && (cfg.HTTP.Port > 0 || detector != nil)) || cfg.MCPEnabled() {
 		for _, p := range cfg.Printers {
 			pool.SubscribeAsync(p.Serial, fmt.Sprintf("device/%s/report", p.Serial), 1)
 		}
@@ -182,6 +209,11 @@ func run() error {
 		httpSrv = httpsrv.New(cfg.HTTP.Port, logger)
 		activities.Register(httpSrv.Mux())
 		health.Routes(httpSrv.Mux(), pool, detectionSource(detector))
+		if mcpsrv != nil {
+			mcpsrv.Register(httpSrv.Mux())
+			mcpsrv.Start()
+			logger.Info("mcp endpoint serving", "path", "/mcp")
+		}
 		if cfg.CameraEnabled() {
 			camera.Register(httpSrv.Mux(), cameras)
 			renderer.RegisterStatus(httpSrv.Mux())
