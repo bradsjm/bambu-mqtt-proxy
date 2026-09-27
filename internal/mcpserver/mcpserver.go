@@ -470,13 +470,17 @@ func (s *Server) cameraState(serial string) string {
 // detectionView projects the optional detection worker.
 func (s *Server) detectionView(serial string) DetectionView {
 	if s.det == nil {
-		return DetectionView{State: "disabled"}
+		return DetectionView{State: "disabled", PauseState: detection.PauseNone}
 	}
 	suspended, reason := s.det.AccountSuspended()
-	view := DetectionView{Suspended: suspended, SuspendedReason: reason}
+	view := DetectionView{Suspended: suspended, SuspendedReason: reason, PauseState: detection.PauseNone}
 	if st, ok := s.det.DetectionStatus(serial).(*detection.Status); ok && st != nil {
 		view.State = st.State
 		view.Reason = st.Reason
+		view.Enabled = st.Enabled
+		view.DisabledUntil = st.DisabledUntil
+		view.SessionID = st.SessionID
+		view.PauseState = st.PauseState
 		if st.Quality != 0 {
 			q := st.Quality
 			view.Quality = &q

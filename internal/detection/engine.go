@@ -8,10 +8,13 @@ package detection
 
 import (
 	"context"
+	crand "crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"strconv"
 	"sync"
 	"time"
 
@@ -80,6 +83,32 @@ const (
 	ReasonPauseFailed       = "pause_command_failed"
 )
 
+// Per-print user override values for Status.State, Status.Reason, and
+// Status.DisabledUntil: they mark a print the user excluded from inspection
+// and explain that the override lives in process memory only, until the
+// print ends or the proxy restarts.
+const (
+	StateDisabled         = "disabled"
+	ReasonUserDisabled    = "user_disabled"
+	DisabledUntilPrintEnd = "print_end_or_restart"
+)
+
+// Control errors from SetDetectionEnabled. The HTTP endpoint maps
+// ErrUnknownPrinter to 404 and the rest to 409.
+var (
+	// ErrUnknownPrinter reports a serial that is not configured.
+	ErrUnknownPrinter = errors.New("unknown printer")
+	// ErrNoPrintSession reports that no print is currently active, so
+	// there is nothing to disable.
+	ErrNoPrintSession = errors.New("no active print session")
+	// ErrStaleSession reports a session token that does not match the
+	// current print.
+	ErrStaleSession = errors.New("session token does not match the current print")
+	// ErrDetectionUnavailable reports that detection cannot run for this
+	// printer at all: the feature is blocked or the model is unsupported.
+	ErrDetectionUnavailable = errors.New("detection is not available for this printer")
+)
+
 // Status is one printer's detection display state. It is the JSON object
 // served as Tile.detection on the camera endpoints and as the values of the
 // /status detection map. Only State and PauseState are always present.
@@ -88,9 +117,18 @@ type Status struct {
 	Reason  string `json:"reason,omitempty"`
 	Quality int    `json:"quality,omitempty"`
 	// Processing is true only while the image-analysis request is in flight.
-	Processing         bool    `json:"processing,omitempty"`
-	Warning            bool    `json:"warning,omitempty"`
-	PauseState         string  `json:"pause_state"`
+	Processing bool   `json:"processing,omitempty"`
+	Warning    bool   `json:"warning,omitempty"`
+	PauseState string `json:"pause_state"`
+	// Enabled reports permission, not activity: false only while the
+	// per-print user override is in force for the current print session.
+	Enabled bool `json:"enabled"`
+	// DisabledUntil explains the override's lifetime; set only while
+	// Enabled is false.
+	DisabledUntil string `json:"disabled_until,omitempty"`
+	// SessionID is the opaque token of the active print session; clients
+	// send it back to disable detection for that print.
+	SessionID          string  `json:"session_id,omitempty"`
 	LastInspectedLayer *int    `json:"last_inspected_layer,omitempty"`
 	AgeSeconds         float64 `json:"age_seconds,omitempty"`
 	NextCheckSeconds   float64 `json:"next_check_seconds,omitempty"`
@@ -161,6 +199,10 @@ type Engine struct {
 
 	specs   map[string]config.Printer
 	blocked string // non-empty: feature blocked; the value is the reason
+	// nonce prefixes every session token this engine issues, so tokens
+	// from a previous proxy process can never match a new print that
+	// restarted the session generations from a low value.
+	nonce string
 	// now returns the current time. It defaults to time.Now and is
 	// overridable by package tests only, so lifecycle tests can drive the
 	// worker deterministically without real sleeps.
@@ -199,6 +241,7 @@ func New(printers []config.Printer, client gadgetClient, frames FrameSource,
 		log:             log,
 		specs:           specs,
 		now:             time.Now,
+		nonce:           newSessionNonce(),
 		suspendCh:       make(chan struct{}),
 		workers:         workers,
 		kConfirmWait:    confirmWait,
@@ -325,8 +368,25 @@ type worker struct {
 	resultAt time.Time
 	nextDue  time.Time
 
+	// Control plane for the per-print user override (PUT /detection).
+	// controlMu serializes override transitions against the final pause
+	// dispatch in onResult, so a disable either cancels a pause before it
+	// is sent or observes one already sent; lock order is controlMu before
+	// mu. workGen invalidates in-flight inspection artifacts on every
+	// override change, workCtx carries that cancellation into the camera
+	// wait and the API calls, and controlWake wakes the loop afterwards.
+	controlMu   sync.Mutex
+	controlWake chan struct{}
+
+	// Shared loop state, guarded by mu. camHeld is also released by the
+	// control path when a disable lands mid-inspection.
+	camHeld     bool
+	overrideGen uint64 // 0 = no override
+	workGen     uint64 // bumped on every override change
+	workCtx     context.Context
+	workCancel  context.CancelFunc
+
 	// Loop state, owned by the worker goroutine only.
-	camHeld       bool
 	lastSeq       uint64
 	session       Session
 	haveSession   bool
@@ -341,10 +401,149 @@ type worker struct {
 
 func newWorker(e *Engine, serial string) *worker {
 	return &worker{
-		e:          e,
-		serial:     serial,
-		log:        e.log.With("serial", serial),
-		pauseState: PauseNone,
+		e:           e,
+		serial:      serial,
+		log:         e.log.With("serial", serial),
+		controlWake: make(chan struct{}, 1),
+		pauseState:  PauseNone,
+	}
+}
+
+// clearOverrideForSession drops the per-print override only when fresh
+// telemetry confirms that the print it applies to is no longer the current
+// active session. The decision re-reads telemetry inside controlMu — the
+// lock the recording path holds — instead of trusting the snapshot that
+// triggered the clear, so a worker processing a stale snapshot can never
+// erase a disable that was just recorded for the new current session.
+func (w *worker) clearOverrideForSession() {
+	w.controlMu.Lock()
+	var cur telemetry.SessionView
+	if w.e.sessions != nil {
+		cur, _ = w.e.sessions.Session(w.serial)
+	}
+	w.mu.Lock()
+	if w.overrideGen != 0 && (!cur.Active || cur.SessionGen != w.overrideGen) {
+		w.overrideGen = 0
+	}
+	w.mu.Unlock()
+	w.controlMu.Unlock()
+}
+
+// SetDetectionEnabled applies the user's per-print AI toggle and returns
+// the authoritative status. enabled=false requires the opaque token of the
+// current print session; without an active session, or with a stale token,
+// it fails with ErrNoPrintSession or ErrStaleSession. The override lives in
+// process memory for the current print only: it survives pause/resume,
+// stale telemetry, and printer reconnects, and it clears when the print
+// ends, a new print session starts, or the proxy restarts.
+func (e *Engine) SetDetectionEnabled(serial string, enabled bool, sessionID string) (any, error) {
+	w, ok := e.workers[serial]
+	if !ok {
+		return nil, ErrUnknownPrinter
+	}
+	return w.setEnabled(enabled, sessionID)
+}
+
+// newSessionNonce draws the per-process prefix for session tokens: 16
+// random bytes, hex-encoded, distinct across restarts in practice. On the
+// module's Go version crypto/rand.Read always fills the slice or panics,
+// so there is no error path.
+func newSessionNonce() string {
+	var b [16]byte
+	crand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
+
+// sessionToken renders a print session as the opaque token clients echo
+// back to disable detection for that print: the engine's per-process
+// nonce plus the session generation. The generation changes only when a
+// genuinely new print session starts, and the nonce makes tokens issued
+// by a previous proxy process unmatchable, so a stale browser cannot
+// disable a new print that reused a low generation.
+func (e *Engine) sessionToken(gen uint64) string {
+	return e.nonce + "-" + strconv.FormatUint(gen, 10)
+}
+
+// setEnabled applies one toggle request. Disabling validates the session
+// token against fresh telemetry, records the override for the current
+// session generation, invalidates in-flight inspection work, cancels its
+// camera wait and API calls, and drops the detection camera hold. The
+// supersede and pause-dispatch serialization lives in onResult under the
+// same controlMu. Re-enabling only clears the override; the loop then
+// resumes with normal eligibility.
+func (w *worker) setEnabled(enabled bool, sessionID string) (any, error) {
+	if enabled {
+		w.controlMu.Lock()
+		w.mu.Lock()
+		had := w.overrideGen != 0
+		w.overrideGen = 0
+		if had {
+			w.workGen++
+		}
+		w.mu.Unlock()
+		w.controlMu.Unlock()
+		if had {
+			w.recomputeState()
+			w.nudge()
+		}
+		return w.view(), nil
+	}
+	if w.e.blocked != "" {
+		return nil, ErrDetectionUnavailable
+	}
+	if spec, ok := w.e.specs[w.serial]; !ok || !config.CameraEligible(spec.Model, spec.Serial) {
+		return nil, ErrDetectionUnavailable
+	}
+	var snap telemetry.SessionView
+	ok := false
+	if w.e.sessions != nil {
+		snap, ok = w.e.sessions.Session(w.serial)
+	}
+	if !ok || !snap.Active || snap.SessionGen == 0 {
+		return nil, ErrNoPrintSession
+	}
+	if sessionID != w.e.sessionToken(snap.SessionGen) {
+		return nil, ErrStaleSession
+	}
+	w.controlMu.Lock()
+	w.mu.Lock()
+	changed := w.overrideGen != snap.SessionGen
+	w.overrideGen = snap.SessionGen
+	if changed {
+		// Invalidate any in-flight inspection and cancel its camera wait
+		// and API calls; the result can never publish or pause afterwards.
+		w.workGen++
+	}
+	cancel := w.workCancel
+	w.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if changed {
+		w.releaseCamera()
+	}
+	w.controlMu.Unlock()
+	if changed {
+		w.nudge()
+	}
+	return w.view(), nil
+}
+
+// nudge wakes the worker loop so it re-evaluates after a control change.
+func (w *worker) nudge() {
+	select {
+	case w.controlWake <- struct{}{}:
+	default:
+	}
+}
+
+// cancelWork cancels the current inspection scope, if one exists.
+func (w *worker) cancelWork() {
+	w.mu.Lock()
+	cancel := w.workCancel
+	w.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 }
 
@@ -355,14 +554,29 @@ func (w *worker) publish(fn func(st *Status)) {
 	w.mu.Unlock()
 }
 
-// view snapshots the published status with computed ages.
+// view snapshots the published status with computed ages. It derives the
+// per-print override projection: while the user's disable matches the
+// current print session the display reports state disabled with the
+// override's lifetime, and every active print carries the session token
+// clients echo back to disable.
 func (w *worker) view() *Status {
+	// Engines wired without a telemetry source (feature-visible wiring
+	// probes) still project a valid status.
+	var snap telemetry.SessionView
+	if w.e.sessions != nil {
+		snap, _ = w.e.sessions.Session(w.serial)
+	}
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	s := w.st
 	// PauseState lives only in the loop state; the display copy is derived
 	// so the two can never disagree.
 	s.PauseState = w.pauseState
+	overridden := w.overrideGen != 0 && snap.Active && w.overrideGen == snap.SessionGen
+	if snap.Active && snap.SessionGen != 0 {
+		s.SessionID = w.e.sessionToken(snap.SessionGen)
+	} else {
+		s.SessionID = ""
+	}
 	if !w.resultAt.IsZero() {
 		s.AgeSeconds = w.e.now().Sub(w.resultAt).Seconds()
 	}
@@ -379,6 +593,24 @@ func (w *worker) view() *Status {
 	if w.e.isSuspended() {
 		s.Suspended = true
 	}
+	w.mu.Unlock()
+	// Enabled is permission, not activity: false only while the user's
+	// override is in force for this exact print session. The disabled
+	// projection also refuses to present an in-flight request, a countdown,
+	// or camera loss as current.
+	if overridden {
+		s.Enabled = false
+		s.State = StateDisabled
+		s.Reason = ReasonUserDisabled
+		s.DisabledUntil = DisabledUntilPrintEnd
+		s.Processing = false
+		s.NextCheckSeconds = 0
+		s.CameraLost = false
+		s.Message = "AI inspections are off for this print; they return with the next print or after a proxy restart"
+	} else {
+		s.Enabled = true
+		s.DisabledUntil = ""
+	}
 	return &s
 }
 
@@ -386,6 +618,7 @@ func (w *worker) view() *Status {
 // loop serially enforces one request in flight per printer.
 func (w *worker) run(ctx context.Context) {
 	defer w.releaseCamera()
+	defer w.cancelWork()
 	if w.e.blocked != "" {
 		w.park(ctx, Status{State: StateBlocked, Reason: w.e.blocked, Message: "detection requires the camera feature"})
 		return
@@ -449,6 +682,11 @@ func (w *worker) step(ctx context.Context) time.Duration {
 		w.onIdle()
 		return w.e.kIdlePoll
 
+	case w.overrideActive(snap):
+		// The user disabled detection for this exact print: park without
+		// camera or API activity until it ends or a new print starts.
+		return w.onDisabled(snap)
+
 	case !isRunning(snap.State):
 		return w.onPauseHold(snap)
 
@@ -457,12 +695,23 @@ func (w *worker) step(ctx context.Context) time.Duration {
 	}
 }
 
+// overrideActive reports whether the user's disable override is in force
+// for the print session in snap.
+func (w *worker) overrideActive(snap telemetry.SessionView) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.overrideGen != 0 && w.overrideGen == snap.SessionGen
+}
+
 // isRunning reports whether the merged state means the printer is executing.
 func isRunning(state string) bool { return state == "RUNNING" }
 
 // onIdle resets session-scoped state when no print session is active.
 func (w *worker) onIdle() {
 	w.releaseCamera()
+	// The session view that routed here may be stale; clear the override
+	// only if fresh telemetry agrees its print is gone.
+	w.clearOverrideForSession()
 	w.mu.Lock()
 	hadSession := w.haveSession || w.pauseState != PauseNone
 	w.haveSession = false
@@ -531,6 +780,24 @@ func (w *worker) onPauseHold(snap telemetry.SessionView) time.Duration {
 	}
 }
 
+// onDisabled parks a print whose detection the user disabled: no camera
+// hold, no inspections, no API calls. Pause outcomes dispatched before the
+// override keep updating through the same lifecycle rules as active
+// monitoring, so the display never hides a sent pause; the disabled
+// display projection is derived in view over anything those rules publish.
+func (w *worker) onDisabled(snap telemetry.SessionView) time.Duration {
+	w.releaseCamera()
+	w.mu.Lock()
+	w.nextDue = time.Time{}
+	w.mu.Unlock()
+	if isRunning(snap.State) {
+		w.guardPauseOnRunning()
+	} else {
+		w.onPauseHold(snap)
+	}
+	return w.e.kIdlePoll
+}
+
 // isPauseState reports whether the report state means the printer is paused.
 func isPauseState(state string) bool {
 	return state == "PAUSE" || state == "PAUSED"
@@ -539,11 +806,21 @@ func isPauseState(state string) bool {
 // onRunning handles an active, running session: hold the camera, respect the
 // schedule, and run at most one inspection per due tick.
 func (w *worker) onRunning(ctx context.Context, snap telemetry.SessionView) time.Duration {
-	if !w.camHeld {
+	if w.overrideActive(snap) {
+		// The override landed while this iteration was starting: park
+		// before acquiring the camera or doing any work.
+		return w.onDisabled(snap)
+	}
+	w.mu.Lock()
+	held := w.camHeld
+	w.mu.Unlock()
+	if !held {
 		if !w.e.frames.Acquire(w.serial) {
 			return w.degrade(ReasonCameraLost, "camera frames are unavailable", w.e.kCameraRetry, true)
 		}
+		w.mu.Lock()
 		w.camHeld = true
+		w.mu.Unlock()
 	}
 	if w.sessionEpochChanged(snap) {
 		w.resetForNewSession(snap.SessionGen)
@@ -589,6 +866,10 @@ func (w *worker) sessionEpochChanged(snap telemetry.SessionView) bool {
 // inspection creates a fresh context and fires immediately. sessionGen is
 // the new session's generation, anchored so the reset fires only once.
 func (w *worker) resetForNewSession(sessionGen uint64) {
+	// A new print never inherits the previous print's override, but a
+	// disable recorded for the incoming session must survive this reset;
+	// the helper re-validates against fresh telemetry.
+	w.clearOverrideForSession()
 	w.mu.Lock()
 	w.session = Session{}
 	w.haveSession = false
@@ -641,7 +922,9 @@ func (w *worker) guardPauseOnRunning() {
 }
 
 // inspect runs exactly one inspection attempt: authorize, capture a fresh
-// unique frame, ensure a context, upload, and act on the result.
+// unique frame, ensure a context, upload, and act on the result. The
+// camera wait and both API calls run on the cancellable work context, so a
+// control change aborts the attempt instead of letting it finish unnoticed.
 func (w *worker) inspect(ctx context.Context, snap telemetry.SessionView) time.Duration {
 	gen := w.e.gens.Generation(w.serial)
 	if !w.authorized(snap, gen) {
@@ -653,7 +936,28 @@ func (w *worker) inspect(ctx context.Context, snap telemetry.SessionView) time.D
 		})
 		return w.e.kStalePoll
 	}
-	frame, ok := w.e.frames.WaitFrame(w.serial, ctx, w.lastSeq, w.e.kFrameWait)
+	// Snapshot this attempt's work scope: startGen is the marker onResult
+	// compares against, and wctx carries control-path cancellation into the
+	// camera wait and the API calls below. The scope is created here, not
+	// only in run, so every attempt — including one after a control change
+	// cancelled the previous scope — has a live one; scopes are reused
+	// until something cancels them.
+	w.mu.Lock()
+	if w.workCtx == nil || w.workCtx.Err() != nil {
+		w.workCtx, w.workCancel = context.WithCancel(ctx)
+	}
+	startGen, wctx := w.workGen, w.workCtx
+	overridden := w.overrideGen != 0
+	w.mu.Unlock()
+	if overridden {
+		return w.e.kIdlePoll
+	}
+	frame, ok := w.e.frames.WaitFrame(w.serial, wctx, w.lastSeq, w.e.kFrameWait)
+	if wctx.Err() != nil {
+		// Superseded by a control change: re-evaluate instead of recording
+		// a camera failure.
+		return w.e.kStalePoll
+	}
 	if !ok || w.e.now().Sub(frame.Captured) > w.e.kFrameFreshMax {
 		return w.degrade(ReasonCameraLost, "no fresh camera frame for inspection", w.e.kCameraRetry, true)
 	}
@@ -671,10 +975,16 @@ func (w *worker) inspect(ctx context.Context, snap telemetry.SessionView) time.D
 	w.mu.Unlock()
 
 	if !w.hasSession() {
-		rctx, cancel := context.WithTimeout(ctx, requestTimeout)
+		rctx, cancel := context.WithTimeout(wctx, requestTimeout)
 		session, err := w.e.client.CreateContext(rctx)
 		cancel()
 		if err != nil {
+			if ctx.Err() != nil {
+				return -1
+			}
+			if wctx.Err() != nil {
+				return w.e.kStalePoll
+			}
 			return w.handleFailure(err, false)
 		}
 		w.mu.Lock()
@@ -687,7 +997,7 @@ func (w *worker) inspect(ctx context.Context, snap telemetry.SessionView) time.D
 	}
 
 	url := w.sessionURL()
-	rctx, cancel := context.WithTimeout(ctx, requestTimeout)
+	rctx, cancel := context.WithTimeout(wctx, requestTimeout)
 	w.publish(func(s *Status) { s.Processing = true })
 	res, err := w.e.client.Process(rctx, url, frame.JPEG)
 	cancel()
@@ -696,9 +1006,13 @@ func (w *worker) inspect(ctx context.Context, snap telemetry.SessionView) time.D
 		if ctx.Err() != nil {
 			return -1
 		}
+		if wctx.Err() != nil {
+			// Superseded by a control change: never an API failure.
+			return w.e.kStalePoll
+		}
 		return w.handleFailure(err, true)
 	}
-	if !w.onResult(snap, gen, frame, res, layer) {
+	if !w.onResult(snap, gen, frame, res, layer, startGen) {
 		// The session ended or changed while the request was in flight: the
 		// stale result is never published or acted on. Re-evaluate promptly.
 		w.mu.Lock()
@@ -744,11 +1058,13 @@ func (w *worker) sessionURL() string {
 }
 
 // onResult publishes a successful analysis and enforces the pause policy.
-// It first re-validates session continuity: a result computed for a print
-// that has since ended or changed is discarded entirely, so it can never
-// publish stale layers or rearm the pause latch for the next print. It
-// returns false when the result was discarded.
-func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, res Result, layer *int) bool {
+// It first re-validates continuity: a result computed for a print that has
+// since ended or changed is discarded entirely, so it can never publish
+// stale layers or rearm the pause latch for the next print, and a result
+// whose work scope was invalidated by an override change is discarded even
+// across a disable/re-enable pair. It returns false when the result was
+// discarded.
+func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, res Result, layer *int, workGen uint64) bool {
 	if current, ok := w.e.sessions.Session(w.serial); !ok || !current.Active || current.Epoch != snap.Epoch {
 		w.log.Info("inspection result discarded; print session changed during upload")
 		return false
@@ -761,6 +1077,19 @@ func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, r
 	pauseWanted := res.PauseSuggested && !w.awaitingClear
 	w.mu.Unlock()
 
+	// The supersede check and the final pause dispatch share controlMu, so
+	// a disable that lands during the upload either cancels the pause
+	// before it is sent or observes it already sent in the disable
+	// response; the two can never interleave halfway.
+	w.controlMu.Lock()
+	w.mu.Lock()
+	superseded := workGen != w.workGen || w.overrideGen != 0
+	w.mu.Unlock()
+	if superseded {
+		w.controlMu.Unlock()
+		w.log.Info("inspection result discarded; detection availability changed during upload")
+		return false
+	}
 	pauseState := ""
 	message := ""
 	reason := ""
@@ -788,7 +1117,9 @@ func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, r
 			w.log.Info("pause suggestion discarded; print state changed during inspection")
 		}
 	}
-
+	// The pause outcome moves into loop state while controlMu is still
+	// held, so a disable acknowledgment taken after this section can never
+	// report pause_state=none for a pause that was already sent.
 	w.mu.Lock()
 	clear := !res.WarningSuggested && !res.PauseSuggested
 	if attempted {
@@ -807,6 +1138,7 @@ func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, r
 	}
 	w.resultAt = w.e.now()
 	w.mu.Unlock()
+	w.controlMu.Unlock()
 
 	w.publish(func(s *Status) {
 		s.Quality = res.PrintQuality
@@ -971,8 +1303,11 @@ func (w *worker) recomputeState() {
 
 // releaseCamera drops the camera hold exactly once per acquisition.
 func (w *worker) releaseCamera() {
-	if w.camHeld {
-		w.camHeld = false
+	w.mu.Lock()
+	held := w.camHeld
+	w.camHeld = false
+	w.mu.Unlock()
+	if held {
 		w.e.frames.Release(w.serial)
 	}
 }
@@ -992,6 +1327,9 @@ func (w *worker) sleep(ctx context.Context, timer *time.Timer, d time.Duration) 
 		case <-w.e.suspendCh:
 			stopTimer(timer)
 			return true
+		case <-w.controlWake:
+			stopTimer(timer)
+			return true
 		case <-timer.C:
 			return true
 		}
@@ -1004,6 +1342,9 @@ func (w *worker) sleep(ctx context.Context, timer *time.Timer, d time.Duration) 
 		stopTimer(timer)
 		return true
 	case <-w.wake:
+		stopTimer(timer)
+		return true
+	case <-w.controlWake:
 		stopTimer(timer)
 		return true
 	case <-timer.C:

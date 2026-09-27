@@ -149,6 +149,7 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	}
 	if renderer != nil && detector != nil {
 		renderer.SetDetection(detector)
+		renderer.SetDetectionControl(detector)
 	}
 	// Read-only MCP endpoint on the shared HTTP listener, on by default and
 	// disabled with mcp.enabled: false / BMBPX_MCP_ENABLED=false. Its

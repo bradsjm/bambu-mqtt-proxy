@@ -8,6 +8,7 @@ import (
 	"bytes"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -16,6 +17,7 @@ import (
 
 	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/config"
+	"bambu-mqtt-proxy/internal/detection"
 	"bambu-mqtt-proxy/internal/hmscodes"
 	"bambu-mqtt-proxy/internal/telemetry"
 )
@@ -41,6 +43,9 @@ const (
 	eventsInterval  = time.Second
 	eventsKeepalive = 10 * time.Second
 )
+
+// detectionPutMaxBody bounds the toggle request body: two small fields.
+const detectionPutMaxBody = 4 << 10
 
 // Tile is one printer's entry in /camera/status. It carries only display
 // state: never serial-derived credentials or raw configuration.
@@ -116,6 +121,7 @@ type StatusRenderer struct {
 	state     *telemetry.Cache
 	status    connectivitySource
 	detection detectionSource
+	control   detectionControl
 	activity  *activity.Log // optional recent-event source
 }
 
@@ -131,9 +137,22 @@ type detectionSource interface {
 	AccountSuspended() (suspended bool, message string)
 }
 
+// detectionControl is the optional write contract behind PUT /detection/
+// {serial}: apply the per-print override and return the authoritative
+// state. It is satisfied by *detection.Engine and stays nil when detection
+// is not configured, which keeps the write endpoint absent.
+type detectionControl interface {
+	SetDetectionEnabled(serial string, enabled bool, sessionID string) (any, error)
+}
+
 // SetDetection attaches the optional detection engine after construction.
 func (r *StatusRenderer) SetDetection(d detectionSource) {
 	r.detection = d
+}
+
+// SetDetectionControl attaches the optional per-print AI toggle backend.
+func (r *StatusRenderer) SetDetectionControl(c detectionControl) {
+	r.control = c
 }
 
 // SetActivity attaches the recent activity log shown in printer tiles.
@@ -309,6 +328,10 @@ func (r *StatusRenderer) RegisterStatus(mux *http.ServeMux) {
 		_ = json.NewEncoder(w).Encode(r.payload(r.Tiles()))
 	})
 	mux.HandleFunc("GET /camera/events", r.handleEvents)
+	// The per-print AI toggle is the wall's only write endpoint; it is
+	// protected against cross-origin browser writes like /config/api.
+	protection := http.NewCrossOriginProtection()
+	mux.Handle("PUT /detection/{serial}", protection.Handler(http.HandlerFunc(r.handleDetectionPut)))
 	mux.HandleFunc("GET /camwall", func(w http.ResponseWriter, _ *http.Request) {
 		noStore(w)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -325,4 +348,51 @@ func staticAsset(contentType string, body []byte) http.HandlerFunc {
 		w.Header().Set("Cache-Control", "public, max-age=86400")
 		_, _ = w.Write(body)
 	}
+}
+
+// handleDetectionPut applies the per-print AI detection toggle: PUT JSON
+// {"enabled":bool,"session_id":string}. Disabling requires the opaque
+// token of the current print; a stale token or no active print answers
+// 409. Every success returns the authoritative detection state.
+func (r *StatusRenderer) handleDetectionPut(w http.ResponseWriter, req *http.Request) {
+	noStore(w)
+	if r.control == nil {
+		writeJSONError(w, http.StatusNotFound, "detection is not configured")
+		return
+	}
+	var in struct {
+		Enabled   *bool  `json:"enabled"`
+		SessionID string `json:"session_id"`
+	}
+	dec := json.NewDecoder(http.MaxBytesReader(w, req.Body, detectionPutMaxBody))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&in); err != nil || in.Enabled == nil {
+		writeJSONError(w, http.StatusBadRequest, "body must be a JSON object with an enabled boolean")
+		return
+	}
+	st, err := r.control.SetDetectionEnabled(req.PathValue("serial"), *in.Enabled, in.SessionID)
+	if err != nil {
+		var code int
+		switch {
+		case errors.Is(err, detection.ErrUnknownPrinter):
+			code = http.StatusNotFound
+		case errors.Is(err, detection.ErrNoPrintSession),
+			errors.Is(err, detection.ErrStaleSession),
+			errors.Is(err, detection.ErrDetectionUnavailable):
+			code = http.StatusConflict
+		default:
+			code = http.StatusInternalServerError
+		}
+		writeJSONError(w, code, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(st)
+}
+
+// writeJSONError renders one operational error as a JSON object.
+func writeJSONError(w http.ResponseWriter, code int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
 }

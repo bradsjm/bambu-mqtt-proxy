@@ -22,14 +22,15 @@ type ListPrintersIn struct {
 
 // PrinterSummary is one row of list_printers.
 type PrinterSummary struct {
-	Serial     string  `json:"serial"`
-	Name       string  `json:"name"`
-	Model      string  `json:"model"`
-	Connected  bool    `json:"connected"`
-	PrintState *string `json:"print_state"`
-	Printing   bool    `json:"printing"`
-	Fresh      bool    `json:"fresh"`
-	Revision   string  `json:"revision"`
+	Serial     string        `json:"serial"`
+	Name       string        `json:"name"`
+	Model      string        `json:"model"`
+	Connected  bool          `json:"connected"`
+	PrintState *string       `json:"print_state"`
+	Printing   bool          `json:"printing"`
+	Fresh      bool          `json:"fresh"`
+	Detection  DetectionView `json:"detection"`
+	Revision   string        `json:"revision"`
 }
 
 // ListPrintersOut is one page; NextCursor is empty after the last page.
@@ -163,6 +164,7 @@ func (s *Server) summarize(serial string, now time.Time) PrinterSummary {
 				s.generation(serial) == sv.ObsGen
 		}
 	}
+	summary.Detection = s.detectionView(serial)
 	summary.Revision = s.token(rev)
 	return summary
 }

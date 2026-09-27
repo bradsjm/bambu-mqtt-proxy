@@ -52,15 +52,31 @@ type Freshness struct {
 }
 
 // DetectionView is the projection of the optional OctoEverywhere detection
-// worker. The disabled state is explicit, never omitted.
+// worker. The disabled state is explicit, never omitted, and the per-print
+// user override surfaces as its own permission state.
 type DetectionView struct {
 	// State mirrors the detection display state, or "disabled" when the
 	// feature is not configured.
 	State string `json:"state"`
-	// Reason explains blocked or starting states; empty otherwise.
+	// Reason explains blocked, starting, or user-disabled states; empty
+	// otherwise.
 	Reason string `json:"reason,omitempty"`
 	// Quality is the reported detection quality 0-100, when reported.
 	Quality *int `json:"quality,omitempty"`
+	// Enabled reports permission, not activity: false while the user's
+	// per-print override is in force, and also when the feature is not
+	// configured at all.
+	Enabled bool `json:"enabled"`
+	// DisabledUntil explains the override's lifetime and is set only while
+	// Enabled is false because of a user override.
+	DisabledUntil string `json:"disabled_until,omitempty"`
+	// SessionID is the opaque token of the active print session. It is
+	// informational here: the MCP endpoint itself stays read-only, and
+	// disabling goes through the proxy's HTTP endpoint.
+	SessionID string `json:"session_id,omitempty"`
+	// PauseState mirrors the pause lifecycle: none, pending, confirmed, or
+	// unconfirmed. It is preserved while a user override is active.
+	PauseState string `json:"pause_state"`
 	// Suspended reports a Gadget account-level suspension.
 	Suspended bool `json:"suspended,omitempty"`
 	// SuspendedReason carries the suspension message when suspended.
