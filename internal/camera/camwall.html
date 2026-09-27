@@ -164,6 +164,7 @@ body.kiosk .bar { display: none; }
 .model { font-weight: 650; font-size: 1rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .serial { font: .72rem/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--dim);
           white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stage { font-size: .74rem; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .kpi { display: flex; flex-direction: column; align-items: flex-end; text-align: right; white-space: nowrap; }
 .kpi-main { font-size: 1.3rem; font-size: clamp(1.1rem, .75rem + 3.2cqi, 1.75rem); font-weight: 700;
             line-height: 1.1; font-variant-numeric: tabular-nums; color: var(--accent); }
@@ -196,6 +197,25 @@ code { font: .74rem ui-monospace, SFMono-Regular, Menlo, monospace; }
 .act-msg { min-width: 0; overflow-wrap: anywhere; }
 .act-ago { flex: none; margin-left: auto; color: var(--faint); font-size: .7rem; }
 .act-empty { margin: 0; color: var(--dim); font-size: .78rem; }
+/* Filament overview (full detail only): one row per AMS unit with its four
+   slot cells, plus the external spool row. The active slot is marked with
+   an outline and visible text, never color alone. */
+.ams h3 { margin: 0 0 .3rem; color: var(--dim); font-size: .8rem; font-weight: 650; }
+.ams-rows { display: grid; gap: .5rem; }
+.ams-unit-head { display: flex; align-items: baseline; gap: .5rem; font-size: .74rem; color: var(--dim); }
+.ams-unit-name { font-weight: 650; color: var(--text); }
+.ams-slots { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .3rem; margin-top: .25rem; }
+.slot { display: flex; flex-wrap: wrap; align-items: center; gap: .2rem .3rem; min-width: 0;
+        padding: .3rem .4rem; border-radius: 8px; background: var(--panel-2); border: 1px solid var(--line);
+        font-size: .74rem; font-variant-numeric: tabular-nums; }
+.slot.on { border-color: var(--printing); }
+.slot .swatch { flex: none; width: .85rem; height: .85rem; border-radius: 4px;
+                border: 1px solid var(--line); background: var(--sw, transparent); }
+.slot b { font-weight: 650; }
+.slot .mat { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.slot .left { color: var(--faint); }
+.slot .on-text { flex-basis: 100%; font-size: .68rem; font-weight: 650; color: var(--printing); }
+.ams-note { margin: .35rem 0 0; color: var(--faint); font-size: .74rem; }
 .level { display: inline-flex; align-items: flex-end; gap: 2px; width: 2rem; height: 2.5rem; padding: 0 .45rem .8rem;
          margin-right: -.35rem; border: 0; border-radius: 8px; background: none; cursor: pointer; }
 .level:hover { background: var(--panel-2); }
@@ -252,6 +272,7 @@ code { font: .74rem ui-monospace, SFMono-Regular, Menlo, monospace; }
   /* The detection badge is the only place this state lives, so its label survives narrow tiles. */
   .pill.detect .label { display: initial; }
   .temps { grid-template-columns: 1fr; }
+  .ams-slots { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @container tile (width > 560px) {
   .pill { font-size: .8rem; }
@@ -387,7 +408,7 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
     <div class="details">
       <div class="head">
         <button class="grip" type="button"><svg class="ic" aria-hidden="true"><use href="#i-grip"/></svg></button>
-        <div class="ident"><span class="model"></span><span class="serial"></span></div>
+        <div class="ident"><span class="model"></span><span class="serial"></span><span class="stage" hidden></span></div>
         <div class="kpi"><span class="kpi-main"></span><span class="kpi-sub"></span></div>
         <button class="level" type="button"><i></i><i></i><i></i></button>
       </div>
@@ -411,6 +432,11 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
           <dt><svg class="ic" aria-hidden="true"><use href="#i-clock-alert"/></svg>Last report</dt><dd class="f-report"></dd>
           <dt><svg class="ic" aria-hidden="true"><use href="#i-tag"/></svg>Serial</dt><dd class="f-serial"></dd>
         </dl>
+        <section class="ams" aria-label="Filament" hidden>
+          <h3>Filament</h3>
+          <div class="ams-rows"></div>
+          <p class="ams-note" hidden></p>
+        </section>
         <section class="activity" aria-label="Recent activity">
           <h3>Recent activity</h3>
           <ol class="act-list"></ol>
@@ -775,6 +801,7 @@ function createTile(p) {
       d2text: q(".detect-l2 .d-text"), fDetectDt: q(".dt-detect"), fDetect: q(".f-detect"),
       fFile: q(".f-file"), fRemain: q(".f-remain"), fCamera: q(".f-camera"), fAlerts: q(".f-alerts"),
       fReport: q(".f-report"), fSerial: q(".f-serial"), open: q(".open"),
+      stage: q(".stage"), amsSec: q(".ams"), amsRows: q(".ams-rows"), amsNote: q(".ams-note"),
       actList: q(".act-list"), actEmpty: q(".act-empty"),
     },
   };
@@ -797,7 +824,9 @@ function createTile(p) {
   });
   hit.addEventListener("click", () => toggleSpotlight(t));
   details.addEventListener("click", e => {
-    if (e.target.closest("a, .grip, .activity") || getSelection()?.toString()) return;
+    // The activity and filament sections stay readable, so clicks there
+    // must not cycle the detail level.
+    if (e.target.closest("a, .grip, .activity, .ams") || getSelection()?.toString()) return;
     t.level = t.level % 3 + 1;
     prefs.levels[t.serial] = t.level;
     savePrefs();
@@ -835,6 +864,104 @@ function renderActivity(t) {
     return li;
   });
   t.r.actList.replaceChildren(...rows);
+}
+// Stage slugs arrive as protocol names ("changing_filament"); the wall
+// shows them as words next to the identity. Stage is secondary information:
+// it never replaces the state pill, and an offline or stale printer's last
+// stage may be outdated, so it hides for those states.
+const stageWords = s => {
+  if (typeof s !== "string" || !s) return "";
+  const words = s.replaceAll("_", " ");
+  return words.charAt(0).toUpperCase() + words.slice(1);
+};
+// Filament overview (full detail): one row per conventional AMS unit with
+// its four slot cells, then the external spool row. Occupancy labels stay
+// honest: "Empty" only for a resolved-empty slot, "Unknown" for a slot the
+// printer never reported or loaded without reported material. Offline and
+// stale printers keep showing their last known spools, so the section
+// notes that. Pure rendering: no interaction, no animation.
+function renderAMS(t) {
+  const p = t.data;
+  const units = Array.isArray(p.ams) ? p.ams : [];
+  const ext = p.ext_spool && typeof p.ext_spool === "object" ? p.ext_spool : null;
+  const b = bucket(p);
+  const note = units.length || ext
+    ? b === "offline" ? "Last known · printer offline"
+      : b === "stale" ? "Last known · no recent data" : ""
+    : "";
+  const key = JSON.stringify([units, ext, note]);
+  if (key === t.amsKey) return;
+  t.amsKey = key;
+  const rows = [];
+  for (const u of units) {
+    const cells = (Array.isArray(u.slots) ? u.slots : []).map(s => slotCell(s, (s?.id ?? 0) + 1));
+    rows.push(amsRow(`AMS ${typeof u.id === "number" ? u.id + 1 : ""}`, u.humidity ?? null, cells));
+  }
+  if (ext) rows.push(amsRow("External spool", null, [slotCell(ext, null)]));
+  t.r.amsSec.hidden = !rows.length;
+  t.r.amsRows.replaceChildren(...rows);
+  t.r.amsNote.hidden = !note;
+  t.r.amsNote.textContent = note;
+}
+// One filament slot cell: the color swatch, the slot number outside the
+// swatch, the material, a labelled remaining estimate, and the active
+// selection as an outline plus visible text.
+function slotCell(s, num) {
+  s = s && typeof s === "object" ? s : {};
+  const cell = document.createElement("span");
+  cell.className = "slot";
+  const swatch = document.createElement("i");
+  swatch.className = "swatch";
+  if (typeof s.color === "string" && /^[0-9a-fA-F]{8}$/.test(s.color)) {
+    swatch.style.setProperty("--sw", `#${s.color}`);
+    swatch.title = `#${s.color}`;
+  }
+  cell.append(swatch);
+  if (num != null) {
+    const n = document.createElement("b");
+    n.textContent = num;
+    cell.append(n);
+  }
+  const mat = document.createElement("span");
+  mat.className = "mat";
+  mat.textContent = s.loaded === false ? "Empty" : s.material || "Unknown";
+  cell.append(mat);
+  if (Number.isFinite(s.remain)) {
+    const left = document.createElement("span");
+    left.className = "left";
+    left.textContent = `~${s.remain}% left`;
+    left.title = `Estimated ${s.remain}% remaining`;
+    cell.append(left);
+  }
+  if (s.active === true) {
+    cell.classList.add("on");
+    const on = document.createElement("span");
+    on.className = "on-text";
+    on.textContent = "Active";
+    cell.append(on);
+  }
+  return cell;
+}
+// One AMS overview row: the heading line and the slot cells under it.
+function amsRow(name, humidity, cells) {
+  const row = document.createElement("div");
+  row.className = "ams-unit";
+  const head = document.createElement("div");
+  head.className = "ams-unit-head";
+  const label = document.createElement("span");
+  label.className = "ams-unit-name";
+  label.textContent = name;
+  head.append(label);
+  if (humidity != null) {
+    const h = document.createElement("span");
+    h.textContent = `Humidity ${humidity}%`;
+    head.append(h);
+  }
+  const slots = document.createElement("div");
+  slots.className = "ams-slots";
+  slots.append(...cells);
+  row.append(head, slots);
+  return row;
 }
 function applyLevel(t) {
   const names = ["compact", "vitals", "full details"];
@@ -908,6 +1035,14 @@ function renderTile(t) {
   r.stateLabel.textContent = s.label;
   r.model.textContent = p.name || p.model || "Printer";
   r.serial.textContent = p.name ? `${p.model ? `${p.model} · ` : ""}${p.serial}` : p.serial;
+  // Stage is secondary: it never replaces the state pill, and it hides
+  // where it could be outdated — offline or stale printers may have
+  // stopped mid-action, and finished or idle printers have ended the print
+  // the stage described.
+  const stage = stageWords(p.stage);
+  r.stage.hidden = !stage || b === "offline" || b === "stale" ||
+    b === "finished" || b === "idle";
+  r.stage.textContent = stage;
   r.grip.setAttribute("aria-label", `Reorder ${nameOf(t)}. Drag, or use arrow keys.`);
   r.hit.setAttribute("aria-label", `${t.serial === spotlight ? "Exit focus view for" : "Focus camera of"} ${nameOf(t)}`);
   r.hit.setAttribute("aria-pressed", String(t.serial === spotlight));
@@ -1048,6 +1183,7 @@ function renderTile(t) {
     r.fAlerts.textContent = "None";
   }
   renderActivity(t);
+  renderAMS(t);
   r.fReport.textContent = reportAge == null ? "No report yet" : reportAge < 2 ? "Just now" : fmtAgo(reportAge);
   r.fSerial.textContent = p.serial;
   const frameAge = Math.round(Number(p.frame_age_seconds || 0));

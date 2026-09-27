@@ -453,6 +453,112 @@ func TestCameraEventsStreamsChanges(t *testing.T) {
 	}
 }
 
+// TestCameraStatusProjectsFilamentAndStage pins the optional wire contract
+// on /camera/status: known stages map with the idle sentinel absent, AMS
+// units sort by id with stable slots, occupancy stays honest, the active
+// selection carries only supported encodings, and the external spool is
+// its own object.
+func TestCameraStatusProjectsFilamentAndStage(t *testing.T) {
+	printers := []config.Printer{{Serial: "01S00C351100139", Address: "127.0.0.1:8883", Password: "secret-test-only"}}
+	state := telemetry.NewCache(printers, discardLogger())
+	renderer := NewStatusRenderer(NewManager(printers, discardLogger()), state, testConnectivity{})
+	state.Observe("01S00C351100139", []byte(`{"print":{"stg_cur":4,"ams":{"tray_now":"0","ams":[
+		{"id":"1","tray":[{"id":"3","tray_type":"PETG","tray_color":"FF8000FF","remain":25,"state":3}]},
+		{"id":"0","humidity_raw":12,"tray":[{"id":"0","tray_type":"PLA","tray_color":"FFFF00FF","remain":64,"state":3}]}]},
+		"vt_tray":{"id":"254","tray_type":"ABS","tray_color":"000000FF"}}}`))
+	mux := http.NewServeMux()
+	renderer.RegisterStatus(mux)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	getTile := func() Tile {
+		t.Helper()
+		resp, err := http.Get(srv.URL + "/camera/status")
+		if err != nil {
+			t.Fatalf("GET /camera/status: %v", err)
+		}
+		defer resp.Body.Close()
+		var payload statusPayload
+		if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode /camera/status: %v", err)
+		}
+		if len(payload.Printers) != 1 {
+			t.Fatalf("printers = %+v", payload.Printers)
+		}
+		return payload.Printers[0]
+	}
+
+	tile := getTile()
+	if tile.Stage != "changing_filament" {
+		t.Fatalf("stage = %q, want the mapped stg_cur 4", tile.Stage)
+	}
+	if len(tile.AMS) != 2 || tile.AMS[0].ID != 0 || tile.AMS[1].ID != 1 {
+		t.Fatalf("ams units = %+v, want ids 0 then 1", tile.AMS)
+	}
+	unit := tile.AMS[0]
+	if unit.Humidity == nil || *unit.Humidity != 12 {
+		t.Fatalf("humidity = %v, want 12", unit.Humidity)
+	}
+	slot := unit.Slots[0]
+	if slot.Loaded == nil || !*slot.Loaded || slot.Material != "PLA" || slot.Color != "FFFF00FF" ||
+		slot.Remain == nil || *slot.Remain != 64 || !slot.Active {
+		t.Fatalf("selected slot = %+v, want active PLA 64%%", slot)
+	}
+	other := tile.AMS[1].Slots[3]
+	if other.Loaded == nil || !*other.Loaded || other.Material != "PETG" || *other.Remain != 25 || other.Active {
+		t.Fatalf("unselected slot = %+v, want loaded PETG without selection", other)
+	}
+	if tile.ExtSpool == nil || tile.ExtSpool.Loaded == nil || !*tile.ExtSpool.Loaded ||
+		tile.ExtSpool.Material != "ABS" || tile.ExtSpool.Active {
+		t.Fatalf("external spool = %+v, want loaded and unselected", tile.ExtSpool)
+	}
+
+	// The wire shape itself: optional keys carry the documented names and
+	// stay absent when there is nothing to say.
+	var raw struct {
+		Printers []map[string]any `json:"printers"`
+	}
+	resp, err := http.Get(srv.URL + "/camera/status")
+	if err != nil {
+		t.Fatalf("GET /camera/status: %v", err)
+	}
+	err = json.NewDecoder(resp.Body).Decode(&raw)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatalf("decode raw status: %v", err)
+	}
+	wire := raw.Printers[0]
+	units, _ := wire["ams"].([]any)
+	unitWire, _ := units[0].(map[string]any)
+	for _, key := range []string{"id", "humidity", "slots"} {
+		if _, ok := unitWire[key]; !ok {
+			t.Fatalf("ams unit missing %q: %v", key, unitWire)
+		}
+	}
+	slots, _ := unitWire["slots"].([]any)
+	slotWire, _ := slots[0].(map[string]any)
+	for _, key := range []string{"id", "loaded", "active", "material", "color", "remain"} {
+		if _, ok := slotWire[key]; !ok {
+			t.Fatalf("slot missing %q: %v", key, slotWire)
+		}
+	}
+	extWire, ok := wire["ext_spool"].(map[string]any)
+	if !ok || extWire["material"] != "ABS" {
+		t.Fatalf("ext_spool = %v, want the loaded spool object", wire["ext_spool"])
+	}
+
+	// The idle sentinel and unknown stage ids leave stage out, so
+	// consumers keep the printer state.
+	state.Observe("01S00C351100139", []byte(`{"print":{"stg_cur":255}}`))
+	if tile = getTile(); tile.Stage != "" {
+		t.Fatalf("idle sentinel stage = %q, want empty", tile.Stage)
+	}
+	state.Observe("01S00C351100139", []byte(`{"print":{"stg_cur":99}}`))
+	if tile = getTile(); tile.Stage != "" {
+		t.Fatalf("unknown stage = %q, want empty", tile.Stage)
+	}
+}
+
 // streamingRecorder is an httptest.ResponseRecorder with Flush and a
 // controllable client-gone state.
 type streamingRecorder struct {

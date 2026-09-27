@@ -171,7 +171,7 @@ HTTP surface (all on the shared `http.port` listener, unauthenticated by design)
 |---|---|
 | `GET /camera/{serial}/snapshot` | Freshest frame younger than 5 s from the shared buffer; otherwise waits up to 15 s for a new frame; 503 if none arrives |
 | `GET /camera/{serial}/stream` | Multipart MJPEG; complete parts flushed per frame; survives printer outages while the client stays connected |
-| `GET /camera/status` | Display state for every printer (name, state, filename, progress, layers, temperatures, print error, HMS alerts, report and frame age). No credentials, no addresses |
+| `GET /camera/status` | Display state for every printer (name, state, stage, filename, progress, layers, temperatures, print error, HMS alerts, AMS filament slots with the external spool, report and frame age). No credentials, no addresses |
 | `GET /camera/events` | Server-sent events carrying the `/camera/status` payload: on connect, when display state changes (checked every 1 s), and at least every 10 s |
 | `GET /activity` | Recent events for every configured printer, newest first |
 | `GET /activity/{serial}` | Recent events for one configured printer; 404 for an unknown serial |
@@ -203,7 +203,7 @@ Eligibility is checked before any camera socket is opened, with no operator conf
 
 The MCP endpoint (`internal/mcpserver`, official `github.com/modelcontextprotocol/go-sdk`, protocol 2026-07-28, stateless Streamable HTTP) serves exactly four read-only tools and one resource; there are no control methods, no sampling, no MCP Tasks, and no path from a tool call to an MQTT publish or a Gadget upload. `watch_printer` long-parks up to 30 s on a single shared one-second sampler that diffs a notification-relevant fingerprint per printer (state transitions, job changes, connectivity, real-report freshness, detection health; progress mode adds 5-point milestones) — it never consumes the detection engine's `WatchDetection` channel. Revision tokens are epoch-stamped counters captured before state reads, so a change landing mid-read leaves the token stale and forces `resync_required` instead of being silently consumed. Resource subscriptions ride `subscriptions/listen`; legacy-protocol subscribe requests are refused before touching the bounded 32-slot ceiling. Waits (32), subscriptions (32), bodies (64 KiB), and per-printer snapshot slots are capped; camera Acquire/Release balance on every path; the endpoint never outputs credentials, addresses, or raw MQTT payloads. `http.port: 0` keeps the endpoint off without failing validation.
 
-Telemetry for `/camera/status` comes from a delta-merging cache that observes upstream reports through the pool observer hook. Merges apply only fields present in each report; P1 `pushall` warmup supplies the initial full state. The cache never feeds back into MQTT forwarding.
+Telemetry for `/camera/status` comes from a delta-merging cache that observes upstream reports through the pool observer hook. Merges apply only fields present in each report; P1 `pushall` warmup supplies the initial full state. The display-only AMS, external-spool, and stage fields merge before the real-print report gate and never touch detection freshness. The cache never feeds back into MQTT forwarding.
 
 The in-memory activity log keeps the 50 newest events per configured printer
 and clears on restart. It records print state changes, changes to HMS alerts

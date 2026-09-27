@@ -45,6 +45,20 @@ type State struct {
 	ChamberTemp  *float64
 	PrintError   int        // print_error; 0 means no error
 	HMS          []HMSAlert // current Health Management System alerts
+	// Stage is the raw stg_cur stage id; nil means never reported. The
+	// camera projection maps known ids to names and leaves idle sentinels
+	// and unknown ids unmapped, so the printer state stays the headline.
+	Stage *int
+	// AMS and ExtSpool are the display-only filament projection: the
+	// conventional four-slot AMS units sorted by unit id, and the single
+	// external spool (the report's vt_tray object, legacy id 254). They are
+	// merged before the real-print report gate and read by nothing but the
+	// camera status endpoints, so they never touch session bookkeeping or
+	// detection freshness. Nested values follow copy-on-write: merges
+	// replace slices and slot values wholesale instead of editing them in
+	// place, so a published State or Snapshot never changes under a reader.
+	AMS      []AMSUnit
+	ExtSpool *AMSSlot
 
 	// Detection session bookkeeping. Not display state: these fields track
 	// the current print session for the optional OctoEverywhere detection
@@ -57,6 +71,7 @@ type State struct {
 	sessionGen       uint64    // bumps only when a genuinely new print session starts
 	epoch            uint64    // bumps at every state boundary or identity change
 	stateGen         uint64    // upstream generation of the last gcode_state report
+	trayNow          *int      // raw tray_now selection value; nil = not reported
 	obs              uint64    // real print reports merged (ACKs excluded)
 	obsGen           uint64    // upstream connection generation of the last report
 	obsAt            time.Time // time of the last real report
@@ -406,6 +421,11 @@ func mergeReport(st *State, gen uint64, payload []byte) bool {
 	if err := json.Unmarshal(raw, &printObj); err != nil {
 		return false
 	}
+	// Display-only extras merge before the real-print gate: stage and AMS
+	// deltas arrive in payloads whose print object the gate must keep
+	// rejecting for detection. Merging first changes neither the marker
+	// list nor the gate's freshness decisions.
+	mergeDisplay(st, printObj)
 	if !isRealPrintReport(printObj) {
 		// Command ACK objects (sequence_id/command/result) and other control
 		// payloads carry no print state. Ignoring them entirely keeps them

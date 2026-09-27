@@ -62,6 +62,17 @@ type Tile struct {
 	BedTarget    *float64 `json:"bed_target,omitempty"`
 	ChamberTemp  *float64 `json:"chamber_temp,omitempty"`
 	PrintError   string   `json:"print_error,omitempty"`
+	// Stage is the printer's current action mapped from stg_cur, e.g.
+	// "changing_filament". It stays empty for the idle sentinels and for
+	// unknown stage ids, so consumers keep state as the headline.
+	Stage string `json:"stage,omitempty"`
+	// AMS lists the printer's conventional four-slot AMS units sorted by
+	// unit id with slots 0-3, and ExtSpool the single external spool. Both
+	// stay omitted until the printer reports them; the values alias the
+	// telemetry cache's copy-on-write projection, which merges never
+	// mutate in place.
+	AMS      []telemetry.AMSUnit `json:"ams,omitempty"`
+	ExtSpool *telemetry.AMSSlot  `json:"ext_spool,omitempty"`
 	// PrintErrorText, PrintErrorSeverity, and PrintErrorFix carry the
 	// error-code dataset's description of PrintError and stay empty for
 	// codes it does not cover. PrintErrorURL always links to Printara3D.
@@ -171,6 +182,9 @@ func (r *StatusRenderer) Tiles() []Tile {
 			BedTemp:      st.BedTemp,
 			BedTarget:    st.BedTarget,
 			ChamberTemp:  chamberTemp,
+			Stage:        stageLabel(st.Stage),
+			AMS:          st.AMS,
+			ExtSpool:     st.ExtSpool,
 		}
 		if st.PrintError != 0 {
 			v := uint32(st.PrintError)

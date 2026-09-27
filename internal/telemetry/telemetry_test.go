@@ -268,3 +268,233 @@ func TestWatchDetectionWakesOncePerReport(t *testing.T) {
 		t.Fatal("no wake token after the second report")
 	}
 }
+
+// TestAMSMergePreservesOmittedFields pins the delta merge by unit and slot
+// id: fields a report omits keep their merged values, and the selection
+// persists until a new tray_now arrives.
+func TestAMSMergePreservesOmittedFields(t *testing.T) {
+	c := NewCache([]config.Printer{{Serial: "S1", Name: "Shop"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	c.Observe("S1", []byte(`{"print":{"ams":{"tray_now":"0","ams":[{"id":"0","humidity_raw":12,
+		"tray":[{"id":"0","tray_info_idx":"GFL99","tray_type":"PLA","tray_color":"FFFF00FF","remain":64,"state":3}]}]}}}`))
+	st := c.Snapshot()[0]
+	if len(st.AMS) != 1 || st.AMS[0].ID != 0 {
+		t.Fatalf("ams units = %+v, want unit 0", st.AMS)
+	}
+	if st.AMS[0].Humidity == nil || *st.AMS[0].Humidity != 12 {
+		t.Fatalf("humidity = %v, want 12", st.AMS[0].Humidity)
+	}
+	slot := st.AMS[0].Slots[0]
+	if slot.Loaded == nil || !*slot.Loaded || slot.Material != "PLA" || slot.Color != "FFFF00FF" ||
+		slot.Remain == nil || *slot.Remain != 64 || !slot.Active {
+		t.Fatalf("slot 0 = %+v, want loaded PLA with 64 percent selected", slot)
+	}
+	for i := 1; i < 4; i++ {
+		if st.AMS[0].Slots[i].Loaded != nil {
+			t.Fatalf("slot %d loaded = %v, want never-reported", i, *st.AMS[0].Slots[i].Loaded)
+		}
+	}
+
+	// A color-only delta preserves material, remain, humidity, and the
+	// selection from earlier reports.
+	c.Observe("S1", []byte(`{"print":{"ams":{"ams":[{"id":"0","tray":[{"id":"0","tray_color":"00FF00FF"}]}]}}}`))
+	st = c.Snapshot()[0]
+	slot = st.AMS[0].Slots[0]
+	if st.AMS[0].Humidity == nil || *st.AMS[0].Humidity != 12 || slot.Material != "PLA" ||
+		slot.Color != "00FF00FF" || slot.Remain == nil || *slot.Remain != 64 || !slot.Active {
+		t.Fatalf("delta merge lost preserved fields: %+v", slot)
+	}
+
+	// AMS-only deltas merge display state but must never refresh the
+	// detection evidence the real-print gate guards.
+	v, _ := c.Session("S1")
+	if v.Obs != 0 || !v.ObsAt.IsZero() || v.Epoch != 0 || v.Active || v.ObsGen != 0 {
+		t.Fatalf("AMS-only delta refreshed detection evidence: %+v", v)
+	}
+}
+
+// TestAMSSlotClearingOnBitfield pins that only the state bitfield clears a
+// loaded slot's filament data, and that a metadata-only refresh updates
+// state without touching stored metadata.
+func TestAMSSlotClearingOnBitfield(t *testing.T) {
+	c := NewCache([]config.Printer{{Serial: "S1", Name: "Shop"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	c.Observe("S1", []byte(`{"print":{"ams":{"ams":[{"id":"0","tray":[{"id":"2",
+		"tray_info_idx":"GFC99","tray_type":"PETG","tray_color":"FF8000FF","remain":40,"state":3}]}]}}}`))
+	if slot := c.Snapshot()[0].AMS[0].Slots[2]; slot.Loaded == nil || !*slot.Loaded {
+		t.Fatalf("slot = %+v, want loaded", slot)
+	}
+	// State 2 (metadata without a spool) is removal evidence.
+	c.Observe("S1", []byte(`{"print":{"ams":{"ams":[{"id":"0","tray":[{"id":"2","state":2}]}]}}}`))
+	slot := c.Snapshot()[0].AMS[0].Slots[2]
+	if slot.Loaded == nil || *slot.Loaded || slot.Material != "" || slot.Color != "" || slot.Remain != nil {
+		t.Fatalf("slot after removal = %+v, want cleared", slot)
+	}
+	// A metadata-only refresh carries state only; it loads the bitfield
+	// slot again without resurrecting metadata.
+	c.Observe("S1", []byte(`{"print":{"ams":{"ams":[{"id":"0","tray":[{"id":"2","state":3}]}]}}}`))
+	slot = c.Snapshot()[0].AMS[0].Slots[2]
+	if slot.Loaded == nil || !*slot.Loaded || slot.Material != "" || slot.Color != "" {
+		t.Fatalf("slot after refresh = %+v, want loaded with metadata still cleared", slot)
+	}
+}
+
+// TestAMSUnknownVersusZero pins the honest distinctions: a reported zero
+// remain stays zero, bogus power-on humidity stays unknown, an explicit
+// "Empty" material is not a spool, and a loaded slot without material is
+// unknown, not empty.
+func TestAMSUnknownVersusZero(t *testing.T) {
+	c := NewCache([]config.Printer{{Serial: "S1", Name: "Shop"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	c.Observe("S1", []byte(`{"print":{"ams":{"ams":[{"id":"0","humidity_raw":0,
+		"tray":[{"id":"0","tray_type":"PLA","remain":0,"state":3},
+			{"id":"1","tray_type":"Empty"},
+			{"id":"2","tray_info_idx":"GFB99","state":3}]}]}}}`))
+	unit := c.Snapshot()[0].AMS[0]
+	if unit.Humidity != nil {
+		t.Fatalf("humidity = %v, want unknown for the bogus zero", unit.Humidity)
+	}
+	zero := unit.Slots[0]
+	if zero.Remain == nil || *zero.Remain != 0 {
+		t.Fatalf("remain = %v, want reported zero", zero.Remain)
+	}
+	if empty := unit.Slots[1]; empty.Loaded == nil || *empty.Loaded {
+		t.Fatalf(`"Empty" material loaded = %v, want resolved empty`, empty.Loaded)
+	}
+	unknown := unit.Slots[2]
+	if unknown.Loaded == nil || !*unknown.Loaded || unknown.Material != "" {
+		t.Fatalf("loaded slot without material = %+v, want loaded and unknown material", unknown)
+	}
+}
+
+// TestSelectionOnlyForSupportedEncodings pins the selection rules: legacy
+// 255 selects nothing, 254 selects the external spool, values below 80 map
+// to unit>>2 / slot&3, AMS HT targets and unknown unit ids select nothing
+// and never create guessed units.
+func TestSelectionOnlyForSupportedEncodings(t *testing.T) {
+	c := NewCache([]config.Printer{{Serial: "S1", Name: "Shop"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	units := `{"id":"0","tray":[{"id":"1","tray_type":"PLA","state":3}]},` +
+		`{"id":"1","tray":[{"id":"1","tray_type":"PLA","state":3}]},` +
+		`{"id":"128","tray":[{"id":"0","tray_type":"PLA","state":3}]}`
+	observe := func(trayNow string) {
+		t.Helper()
+		c.Observe("S1", []byte(`{"print":{"ams":{"tray_now":"`+trayNow+`","ams":[`+units+`]}}}`))
+	}
+	observe("255")
+	st := c.Snapshot()[0]
+	if len(st.AMS) != 2 {
+		t.Fatalf("units = %+v, want the conventional two (id 128 is AMS HT)", st.AMS)
+	}
+	if anyActive(st.AMS) || (st.ExtSpool != nil && st.ExtSpool.Active) {
+		t.Fatal("tray_now 255 must select nothing")
+	}
+	c.Observe("S1", []byte(`{"print":{"ams":{"tray_now":"254","ams":[]},"vt_tray":{"id":"254","tray_type":"PETG","state":0}}}`))
+	if st = c.Snapshot()[0]; st.ExtSpool == nil || !st.ExtSpool.Active || anyActive(st.AMS) {
+		t.Fatalf("tray_now 254 selection wrong: ext %+v", st.ExtSpool)
+	}
+	observe("5")
+	st = c.Snapshot()[0]
+	if !st.AMS[1].Slots[1].Active || anyActiveExcept(st.AMS, 1, 1) {
+		t.Fatalf("tray_now 5 must select unit 1 slot 1: %+v", st.AMS)
+	}
+	observe("80")
+	st = c.Snapshot()[0]
+	if anyActive(st.AMS) || (st.ExtSpool != nil && st.ExtSpool.Active) {
+		t.Fatal("an AMS HT target must not mark a selection")
+	}
+}
+
+// anyActive reports whether any merged slot is marked selected.
+func anyActive(units []AMSUnit) bool {
+	return anyActiveExcept(units, -1, -1)
+}
+
+// anyActiveExcept reports whether any slot other than unit/slot is marked.
+func anyActiveExcept(units []AMSUnit, unitID, slotID int) bool {
+	for _, u := range units {
+		for _, s := range u.Slots {
+			if s.Active && !(u.ID == unitID && s.ID == slotID) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// TestExternalSpoolLifecycle pins the single external spool: metadata-only
+// occupancy with explicit removal evidence, and no remain estimate even
+// when the hardware reports a placeholder.
+func TestExternalSpoolLifecycle(t *testing.T) {
+	c := NewCache([]config.Printer{{Serial: "S1", Name: "Shop"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	c.Observe("S1", []byte(`{"print":{"vt_tray":{"id":"254","tray_info_idx":"GFA01","tray_type":"ABS",
+		"tray_color":"000000FF","remain":99}}}`))
+	ext := c.Snapshot()[0].ExtSpool
+	if ext == nil || ext.Loaded == nil || !*ext.Loaded || ext.Material != "ABS" || ext.Color != "000000FF" {
+		t.Fatalf("external spool = %+v, want loaded ABS", ext)
+	}
+	if ext.Remain != nil {
+		t.Fatalf("external spool remain = %v, want no estimate", ext.Remain)
+	}
+	// A metadata-only vt_tray delta is the explicit removal evidence.
+	c.Observe("S1", []byte(`{"print":{"vt_tray":{"id":"254","state":0}}}`))
+	ext = c.Snapshot()[0].ExtSpool
+	if ext.Loaded == nil || *ext.Loaded || ext.Material != "" || ext.Color != "" {
+		t.Fatalf("external spool after removal = %+v, want cleared", ext)
+	}
+	// Later reports without vt_tray keep it cleared.
+	c.Observe("S1", []byte(`{"print":{"gcode_state":"RUNNING"}}`))
+	if ext = c.Snapshot()[0].ExtSpool; ext.Loaded == nil || *ext.Loaded {
+		t.Fatalf("external spool resurrected: %+v", ext)
+	}
+}
+
+// TestStageMergeIsDisplayOnly pins that stg_cur merges into display state
+// without refreshing detection evidence, and that the raw value including
+// the idle sentinel is stored for the camera projection to map.
+func TestStageMergeIsDisplayOnly(t *testing.T) {
+	c := NewCache([]config.Printer{{Serial: "S1", Name: "Shop"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	wake := c.WatchDetection("S1")
+	c.Observe("S1", []byte(`{"print":{"stg_cur":4}}`))
+	st := c.Snapshot()[0]
+	if st.Stage == nil || *st.Stage != 4 {
+		t.Fatalf("stage = %v, want 4", st.Stage)
+	}
+	if v, _ := c.Session("S1"); v.Obs != 0 || !v.ObsAt.IsZero() {
+		t.Fatalf("stage delta refreshed detection evidence: %+v", v)
+	}
+	select {
+	case <-wake:
+		t.Fatal("a stage-only delta must not wake detection")
+	default:
+	}
+	c.Observe("S1", []byte(`{"print":{"gcode_state":"RUNNING"}}`))
+	if st = c.Snapshot()[0]; st.Stage == nil || *st.Stage != 4 {
+		t.Fatalf("stage lost after a real report: %v", st.Stage)
+	}
+	c.Observe("S1", []byte(`{"print":{"stg_cur":255}}`))
+	if st = c.Snapshot()[0]; st.Stage == nil || *st.Stage != 255 {
+		t.Fatalf("idle sentinel = %v, want the raw 255 kept for projection", st.Stage)
+	}
+}
+
+// TestSnapshotImmutableAcrossMerges pins copy-on-write: a published
+// snapshot keeps its nested filament values even after later merges change
+// or clear them.
+func TestSnapshotImmutableAcrossMerges(t *testing.T) {
+	c := NewCache([]config.Printer{{Serial: "S1", Name: "Shop"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	c.Observe("S1", []byte(`{"print":{"ams":{"tray_now":"0","ams":[{"id":"0",
+		"tray":[{"id":"0","tray_type":"PLA","tray_color":"FFFF00FF","remain":64,"state":3}]}]}}}`))
+	snap := c.Snapshot()
+	// The next report changes the color and the selection.
+	c.Observe("S1", []byte(`{"print":{"ams":{"tray_now":"254","ams":[{"id":"0",
+		"tray":[{"id":"0","tray_color":"00FF00FF"}]}]},"vt_tray":{"id":"254","tray_type":"ABS","state":0}}}`))
+	fresh := c.Snapshot()
+	old := snap[0].AMS[0].Slots[0]
+	now := fresh[0].AMS[0].Slots[0]
+	if old.Color != "FFFF00FF" || old.Remain == nil || *old.Remain != 64 || !old.Active {
+		t.Fatalf("published snapshot mutated: %+v", old)
+	}
+	if now.Color != "00FF00FF" || now.Active {
+		t.Fatalf("fresh snapshot missed the merge: %+v", now)
+	}
+	if fresh[0].ExtSpool == nil || !fresh[0].ExtSpool.Active {
+		t.Fatalf("fresh selection missing: %+v", fresh[0].ExtSpool)
+	}
+}
