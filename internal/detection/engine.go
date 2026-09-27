@@ -43,11 +43,18 @@ const (
 	// tempBackoffInitial and tempBackoffMax bound temporary-failure retries.
 	tempBackoffInitial = 20 * time.Second
 	tempBackoffMax     = 10 * time.Minute
+	// intensivePeriod holds inspection at the minimum interval after a
+	// print starts, resumes, or recovers from unavailable monitoring.
+	intensivePeriod = 2 * time.Minute
+	// intensiveClearCount and intensiveClearSpan define clear evidence for
+	// leaving a risk-triggered intensive period.
+	intensiveClearCount = 3
+	intensiveClearSpan  = 30 * time.Second
 	// idlePoll paces parked workers; stalePoll re-checks authorization while
 	// waiting for fresh current-generation telemetry; cameraRetry paces
 	// retries while the camera cannot serve a fresh frame.
 	idlePoll    = 5 * time.Second
-	stalePoll   = 2 * time.Second
+	stalePoll   = 5 * time.Second
 	cameraRetry = 10 * time.Second
 )
 
@@ -81,6 +88,7 @@ const (
 	ReasonAPIRetrying       = "api_retrying"
 	ReasonPauseUnconfirmed  = "pause_unconfirmed"
 	ReasonPauseFailed       = "pause_command_failed"
+	ReasonRequestInvalid    = "request_invalid"
 )
 
 // Per-print user override values for Status.State, Status.Reason, and
@@ -133,6 +141,7 @@ type Status struct {
 	AgeSeconds         float64 `json:"age_seconds,omitempty"`
 	NextCheckSeconds   float64 `json:"next_check_seconds,omitempty"`
 	FasterInspection   bool    `json:"faster_inspection,omitempty"`
+	Intensive          bool    `json:"intensive,omitempty"`
 	CameraLost         bool    `json:"camera_lost,omitempty"`
 	UsingFallback      bool    `json:"using_fallback,omitempty"`
 	Suspended          bool    `json:"suspended,omitempty"`
@@ -169,10 +178,11 @@ type sessionSource interface {
 	Session(serial string) (telemetry.SessionView, bool)
 }
 
-// Pauser sends the guarded upstream pause; it must fail rather than act on a
-// connection older than generation.
-type Pauser interface {
+// PrinterControl sends guarded upstream print commands; each action must fail
+// rather than act on a connection older than generation.
+type PrinterControl interface {
 	PausePrint(serial string, generation uint64) error
+	SetSpeedProfile(serial string, generation uint64, profile int) error
 }
 
 // GenerationSource reports the printer's current upstream connection
@@ -192,7 +202,7 @@ type Engine struct {
 	client   gadgetClient
 	frames   FrameSource
 	sessions sessionSource
-	pauser   Pauser
+	control  PrinterControl
 	gens     GenerationSource
 	log      *slog.Logger
 	activity *activity.Log // optional recent-event log
@@ -229,14 +239,14 @@ type Engine struct {
 
 // New builds the engine; Start spawns the workers.
 func New(printers []config.Printer, client gadgetClient, frames FrameSource,
-	sessions sessionSource, pauser Pauser, gens GenerationSource, log *slog.Logger) *Engine {
+	sessions sessionSource, control PrinterControl, gens GenerationSource, log *slog.Logger) *Engine {
 	specs := make(map[string]config.Printer, len(printers))
 	workers := make(map[string]*worker, len(printers))
 	e := &Engine{
 		client:          client,
 		frames:          frames,
 		sessions:        sessions,
-		pauser:          pauser,
+		control:         control,
 		gens:            gens,
 		log:             log,
 		specs:           specs,
@@ -397,6 +407,31 @@ type worker struct {
 	pauseDeadline time.Time
 	degraded      string
 	tempAttempts  int
+	// Policy state stays within one print. latestIntervals governs cadence
+	// and retries; nextDue survives pause/resume and override transitions.
+	latestIntervals IntervalSec
+	haveIntervals   bool
+	intensiveUntil  time.Time
+	riskActive      bool
+	clearCount      int
+	clearSince      time.Time
+	lastLayer       *int
+	wasPaused       bool
+	blockedReason   string
+	lastFailure     string
+
+	// Speed ownership and warning episode state are guarded by controlMu.
+	// One warning episode sends at most one slowdown and restores only a
+	// profile the proxy owns.
+	warningEpisode  bool
+	speedAttempted  bool
+	speedPrior      *int
+	speedPrintGen   uint64
+	speedCommandGen uint64
+	speedCommandObs uint64
+	speedAckObs     uint64
+	speedPending    bool
+	speedOwned      bool
 }
 
 func newWorker(e *Engine, serial string) *worker {
@@ -593,6 +628,8 @@ func (w *worker) view() *Status {
 	if w.e.isSuspended() {
 		s.Suspended = true
 	}
+	s.Intensive = w.intensiveLocked(w.e.now())
+	s.UsingFallback = w.useFallback
 	w.mu.Unlock()
 	// Enabled is permission, not activity: false only while the user's
 	// override is in force for this exact print session. The disabled
@@ -667,6 +704,18 @@ func (w *worker) parkSuspended(ctx context.Context, message string) {
 // step runs one loop decision and returns the next sleep duration, or -1 on
 // shutdown.
 func (w *worker) step(ctx context.Context) time.Duration {
+	w.mu.Lock()
+	blocked := w.blockedReason
+	w.mu.Unlock()
+	if blocked != "" {
+		w.releaseCamera()
+		w.publish(func(s *Status) {
+			s.State, s.Reason, s.Message = StateBlocked, ReasonRequestInvalid, blocked
+			s.Processing = false
+			s.NextCheckSeconds = 0
+		})
+		return w.e.kIdlePoll
+	}
 	snap, ok := w.e.sessions.Session(w.serial)
 	switch {
 	case !ok || snap.ObsAt.IsZero():
@@ -682,15 +731,23 @@ func (w *worker) step(ctx context.Context) time.Duration {
 		w.onIdle()
 		return w.e.kIdlePoll
 
-	case w.overrideActive(snap):
-		// The user disabled detection for this exact print: park without
-		// camera or API activity until it ends or a new print starts.
-		return w.onDisabled(snap)
-
-	case !isRunning(snap.State):
-		return w.onPauseHold(snap)
-
 	default:
+		// Session ownership follows real print generations. Never restore an
+		// old print's profile when a new session or a detection disable lands.
+		w.controlMu.Lock()
+		w.ensureSpeedSession(snap)
+		if !w.overrideActive(snap) {
+			w.reconcileSpeed(snap)
+		}
+		w.controlMu.Unlock()
+		if w.overrideActive(snap) {
+			// The user disabled detection for this exact print: park without
+			// camera or API activity until it ends or a new print starts.
+			return w.onDisabled(snap)
+		}
+		if !isRunning(snap.State) {
+			return w.onPauseHold(snap)
+		}
 		return w.onRunning(ctx, snap)
 	}
 }
@@ -712,6 +769,7 @@ func (w *worker) onIdle() {
 	// The session view that routed here may be stale; clear the override
 	// only if fresh telemetry agrees its print is gone.
 	w.clearOverrideForSession()
+	w.controlMu.Lock()
 	w.mu.Lock()
 	hadSession := w.haveSession || w.pauseState != PauseNone
 	w.haveSession = false
@@ -719,12 +777,23 @@ func (w *worker) onIdle() {
 	w.lastSeq = 0
 	w.sessionGen = 0
 	w.awaitingClear = false
+	w.resetSpeedState(0)
 	w.pauseState = PauseNone
 	w.pauseDeadline = time.Time{}
 	w.degraded = ""
 	w.tempAttempts = 0
 	w.nextDue = time.Time{}
+	w.latestIntervals = IntervalSec{}
+	w.haveIntervals = false
+	w.intensiveUntil = time.Time{}
+	w.riskActive = false
+	w.clearCount = 0
+	w.clearSince = time.Time{}
+	w.lastLayer = nil
+	w.wasPaused = false
+	w.lastFailure = ""
 	w.mu.Unlock()
+	w.controlMu.Unlock()
 	if hadSession {
 		w.publish(func(s *Status) {
 			*s = Status{State: StateIdle}
@@ -742,6 +811,9 @@ func (w *worker) onIdle() {
 func (w *worker) onPauseHold(snap telemetry.SessionView) time.Duration {
 	w.releaseCamera()
 	w.mu.Lock()
+	if isPauseState(snap.State) {
+		w.wasPaused = true
+	}
 	switch {
 	case w.pauseState == PausePending && isPauseState(snap.State):
 		// The printer report confirmed the pause.
@@ -787,10 +859,8 @@ func (w *worker) onPauseHold(snap telemetry.SessionView) time.Duration {
 // display projection is derived in view over anything those rules publish.
 func (w *worker) onDisabled(snap telemetry.SessionView) time.Duration {
 	w.releaseCamera()
-	w.mu.Lock()
-	w.nextDue = time.Time{}
-	w.mu.Unlock()
 	if isRunning(snap.State) {
+		w.noteRunningTransition()
 		w.guardPauseOnRunning()
 	} else {
 		w.onPauseHold(snap)
@@ -811,24 +881,24 @@ func (w *worker) onRunning(ctx context.Context, snap telemetry.SessionView) time
 		// before acquiring the camera or doing any work.
 		return w.onDisabled(snap)
 	}
-	w.mu.Lock()
-	held := w.camHeld
-	w.mu.Unlock()
-	if !held {
-		if !w.e.frames.Acquire(w.serial) {
-			return w.degrade(ReasonCameraLost, "camera frames are unavailable", w.e.kCameraRetry, true)
-		}
-		w.mu.Lock()
-		w.camHeld = true
-		w.mu.Unlock()
-	}
-	if w.sessionEpochChanged(snap) {
+	if w.sessionEpochChanged(snap) || w.sessionGen == 0 {
 		w.resetForNewSession(snap.SessionGen)
 	}
+	w.noteRunningTransition()
+	w.mu.Lock()
+	w.lastLayer = copyLayer(snap.LayerNum)
+	w.mu.Unlock()
 	w.guardPauseOnRunning()
 
 	now := w.e.now()
+	freshAuthorized := w.authorized(snap, w.e.gens.Generation(w.serial))
 	w.mu.Lock()
+	// A fresh current-generation state observation can arrive before the
+	// stale-telemetry poll expires. No upload was made while authorization was
+	// stale, so do not make the printer wait for that poll after it recovers.
+	if w.degraded == ReasonAwaitingTelemetry && freshAuthorized {
+		w.nextDue = now
+	}
 	due := w.nextDue
 	if due.IsZero() {
 		// A session just became running: the first inspection fires
@@ -846,7 +916,30 @@ func (w *worker) onRunning(ctx context.Context, snap telemetry.SessionView) time
 		})
 		return due.Sub(now)
 	}
+	w.reserveAttempt()
+	w.mu.Lock()
+	held := w.camHeld
+	w.mu.Unlock()
+	if !held {
+		if !w.e.frames.Acquire(w.serial) {
+			return w.degrade(ReasonCameraLost, "camera frames are unavailable; waiting before retry", w.e.kCameraRetry, true)
+		}
+		w.mu.Lock()
+		w.camHeld = true
+		w.mu.Unlock()
+	}
 	return w.inspect(ctx, snap)
+}
+
+// noteRunningTransition starts a two-minute intensive period after a
+// previously observed PAUSE or PAUSED state returns to RUNNING.
+func (w *worker) noteRunningTransition() {
+	w.mu.Lock()
+	if w.wasPaused {
+		w.intensiveUntil = w.e.now().Add(intensivePeriod)
+		w.wasPaused = false
+	}
+	w.mu.Unlock()
 }
 
 // sessionEpochChanged reports whether the current report belongs to a print
@@ -870,11 +963,13 @@ func (w *worker) resetForNewSession(sessionGen uint64) {
 	// disable recorded for the incoming session must survive this reset;
 	// the helper re-validates against fresh telemetry.
 	w.clearOverrideForSession()
+	w.controlMu.Lock()
 	w.mu.Lock()
 	w.session = Session{}
 	w.haveSession = false
 	w.useFallback = false
 	w.sessionGen = sessionGen
+	w.resetSpeedState(sessionGen)
 	w.awaitingClear = false
 	w.pauseState = PauseNone
 	w.pauseDeadline = time.Time{}
@@ -882,7 +977,17 @@ func (w *worker) resetForNewSession(sessionGen uint64) {
 	w.tempAttempts = 0
 	w.nextDue = time.Time{}
 	w.resultAt = time.Time{}
+	w.latestIntervals = IntervalSec{}
+	w.haveIntervals = false
+	w.intensiveUntil = w.e.now().Add(intensivePeriod)
+	w.riskActive = false
+	w.clearCount = 0
+	w.clearSince = time.Time{}
+	w.lastLayer = nil
+	w.wasPaused = false
+	w.lastFailure = ""
 	w.mu.Unlock()
+	w.controlMu.Unlock()
 	w.publish(func(s *Status) { *s = Status{State: StateMonitoring} })
 	w.log.Info("new print session detected; gadget context reset")
 }
@@ -931,10 +1036,7 @@ func (w *worker) inspect(ctx context.Context, snap telemetry.SessionView) time.D
 		// Stale or older-generation telemetry: a reconnect's cached RUNNING
 		// report must never authorize an action before a fresh observation
 		// arrives on the current connection.
-		w.publish(func(s *Status) {
-			s.Reason = ReasonAwaitingTelemetry
-		})
-		return w.e.kStalePoll
+		return w.degrade(ReasonAwaitingTelemetry, "waiting for fresh printer telemetry", w.e.kStalePoll, false)
 	}
 	// Snapshot this attempt's work scope: startGen is the marker onResult
 	// compares against, and wctx carries control-path cancellation into the
@@ -972,6 +1074,7 @@ func (w *worker) inspect(ctx context.Context, snap telemetry.SessionView) time.D
 	}
 	w.mu.Lock()
 	w.sessionGen = snap.SessionGen
+	w.lastLayer = copyLayer(layer)
 	w.mu.Unlock()
 
 	if !w.hasSession() {
@@ -992,7 +1095,7 @@ func (w *worker) inspect(ctx context.Context, snap telemetry.SessionView) time.D
 		w.haveSession = true
 		w.useFallback = false
 		w.mu.Unlock()
-		w.log.Info("gadget context created")
+		w.log.Info("gadget operation completed", "operation", "create", "using_fallback", false)
 		w.e.activity.Record(w.serial, "ai_monitoring", activity.Info, "AI inspection started")
 	}
 
@@ -1000,6 +1103,9 @@ func (w *worker) inspect(ctx context.Context, snap telemetry.SessionView) time.D
 	rctx, cancel := context.WithTimeout(wctx, requestTimeout)
 	w.publish(func(s *Status) { s.Processing = true })
 	res, err := w.e.client.Process(rctx, url, frame.JPEG)
+	if validIntervals(res.Intervals) {
+		w.rememberIntervals(res.Intervals)
+	}
 	cancel()
 	w.publish(func(s *Status) { s.Processing = false })
 	if err != nil {
@@ -1012,19 +1118,136 @@ func (w *worker) inspect(ctx context.Context, snap telemetry.SessionView) time.D
 		}
 		return w.handleFailure(err, true)
 	}
-	if !w.onResult(snap, gen, frame, res, layer, startGen) {
-		// The session ended or changed while the request was in flight: the
-		// stale result is never published or acted on. Re-evaluate promptly.
-		w.mu.Lock()
-		w.nextDue = w.e.now().Add(w.e.kStalePoll)
-		w.mu.Unlock()
-		return w.e.kStalePoll
+	w.log.Debug("gadget operation completed", "operation", "process", "using_fallback", w.usingFallback())
+	// The session ended or changed while the request was in flight: onResult
+	// discards the stale result, but valid response timing still paces this
+	// same print context.
+	w.onResult(snap, gen, frame, res, layer, startGen)
+	return w.scheduleResponse(res.Intervals)
+}
+
+// copyLayer snapshots a telemetry layer pointer for status and cadence.
+func copyLayer(layer *int) *int {
+	if layer == nil {
+		return nil
+	}
+	v := *layer
+	return &v
+}
+
+// validIntervals accepts positive guidance that fits a time.Duration.
+func validIntervals(v IntervalSec) bool {
+	return v.Minimum > 0 && v.Recommended > 0 &&
+		int64(v.Minimum) <= maxIntervalSeconds && int64(v.Recommended) <= maxIntervalSeconds
+}
+
+// rememberIntervals stores valid same-context provider timing.
+func (w *worker) rememberIntervals(v IntervalSec) {
+	if !validIntervals(v) {
+		return
 	}
 	w.mu.Lock()
-	delay := w.nextDelay(res)
+	w.latestIntervals = v
+	w.haveIntervals = true
+	w.mu.Unlock()
+}
+
+// usingFallback reports the active Process URL mode for diagnostics.
+func (w *worker) usingFallback() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.useFallback
+}
+
+// scheduleResponse stores a due time from the latest response guidance.
+func (w *worker) scheduleResponse(intervals IntervalSec) time.Duration {
+	w.rememberIntervals(intervals)
+	w.mu.Lock()
+	delay := w.nextDelayLocked()
 	w.nextDue = w.e.now().Add(delay)
 	w.mu.Unlock()
 	return delay
+}
+
+// reserveAttempt preserves a safe retry floor if a control change cancels
+// the attempt before a provider response supplies newer timing.
+func (w *worker) reserveAttempt() {
+	w.mu.Lock()
+	// Reserve a safe next due time for an attempt that may be canceled, but
+	// count backoff only when the attempt actually fails.
+	delay := w.backoffDelayLocked(w.tempAttempts)
+	w.nextDue = w.e.now().Add(delay)
+	w.mu.Unlock()
+}
+
+// requiredFloorLocked returns the max(Minimum, Recommended) provider retry floor.
+func (w *worker) requiredFloorLocked() time.Duration {
+	providerFloor := time.Duration(0)
+	if w.haveIntervals {
+		minimum := time.Duration(w.latestIntervals.Minimum) * time.Second
+		recommended := time.Duration(w.latestIntervals.Recommended) * time.Second
+		providerFloor = max(minimum, recommended)
+	}
+	return max(tempBackoffInitial, providerFloor)
+}
+
+// nextDelayLocked applies the normal or protection-first success cadence.
+func (w *worker) nextDelayLocked() time.Duration {
+	if !w.haveIntervals {
+		return tempBackoffInitial
+	}
+	minimum := time.Duration(w.latestIntervals.Minimum) * time.Second
+	if w.intensiveLocked(w.e.now()) {
+		return minimum
+	}
+	recommended := time.Duration(w.latestIntervals.Recommended) * time.Second
+	if recommended > minimum {
+		return recommended
+	}
+	return minimum
+}
+
+// retryDelayLocked applies bounded jitter without dropping below provider
+// timing or exceeding ten minutes unless the required provider floor does.
+func (w *worker) retryDelayLocked() time.Duration {
+	n := w.tempAttempts
+	w.tempAttempts++
+	return w.backoffDelayLocked(n)
+}
+
+// backoffDelayLocked calculates one jittered retry delay without changing the
+// failure count. max(Minimum, Recommended) is always a floor, even in intensive mode.
+func (w *worker) backoffDelayLocked(n int) time.Duration {
+	d := tempBackoffInitial
+	for range n {
+		if d >= tempBackoffMax/2 {
+			d = tempBackoffMax
+			break
+		}
+		d *= 2
+	}
+	if d > tempBackoffMax {
+		d = tempBackoffMax
+	}
+	d = time.Duration(float64(d) * (1 + (rand.Float64()*0.4 - 0.2)))
+	floor := w.requiredFloorLocked()
+	if d < floor {
+		d = floor
+	}
+	cap := tempBackoffMax
+	if floor > cap {
+		cap = floor
+	}
+	if d > cap {
+		d = cap
+	}
+	return d
+}
+
+// intensiveLocked reports the timed, layer-based, or risk-based fast mode.
+func (w *worker) intensiveLocked(now time.Time) bool {
+	return (!w.intensiveUntil.IsZero() && now.Before(w.intensiveUntil)) ||
+		(w.lastLayer != nil && *w.lastLayer > 0 && *w.lastLayer <= 3) || w.riskActive
 }
 
 // authorized reports whether fresh telemetry on the current connection
@@ -1037,6 +1260,179 @@ func (w *worker) authorized(snap telemetry.SessionView, gen uint64) bool {
 		snap.StateGen == gen &&
 		w.e.now().Sub(snap.ObsAt) <= w.e.kReportFreshMax &&
 		isRunning(snap.State)
+}
+
+// resetSpeedState drops every profile decision tied to one print.
+func (w *worker) resetSpeedState(sessionGen uint64) {
+	w.warningEpisode = false
+	w.speedAttempted = false
+	w.speedPrior = nil
+	w.speedPrintGen = sessionGen
+	w.speedCommandGen = 0
+	w.speedCommandObs = 0
+	w.speedAckObs = 0
+	w.speedPending = false
+	w.speedOwned = false
+}
+
+// ensureSpeedSession drops ownership at a print boundary. A saved profile is
+// never carried into another print.
+func (w *worker) ensureSpeedSession(snap telemetry.SessionView) {
+	if w.speedPrintGen != snap.SessionGen {
+		w.resetSpeedState(snap.SessionGen)
+	}
+}
+
+// freshSpeed reports a profile that belongs to this active print and the
+// current connection, rather than a cached value from an earlier session.
+func (w *worker) freshSpeed(snap telemetry.SessionView, gen uint64) bool {
+	return gen != 0 && snap.Active && snap.SessionGen != 0 &&
+		snap.SpeedProfile != nil && snap.SpeedSessionGen == snap.SessionGen &&
+		snap.SpeedGen == gen && !snap.SpeedAt.IsZero() &&
+		w.e.now().Sub(snap.SpeedAt) <= w.e.kReportFreshMax
+}
+
+// speedAuthorized rechecks the same print, state, connection, and result
+// freshness required for a printer action, plus a current speed report.
+func (w *worker) speedAuthorized(snap telemetry.SessionView, gen uint64, frame Frame) (telemetry.SessionView, bool) {
+	if !w.pauseAuthorized(snap, gen, frame) {
+		return telemetry.SessionView{}, false
+	}
+	current, ok := w.e.sessions.Session(w.serial)
+	if !ok || !w.freshSpeed(current, gen) || current.Epoch != snap.Epoch {
+		return telemetry.SessionView{}, false
+	}
+	return current, true
+}
+
+// reconcileSpeed confirms the proxy's Silent command only from a newer
+// report. It also relinquishes ownership when a later report shows a manual
+// profile change, and performs a deferred restore when its guards are met.
+// The caller holds controlMu.
+func (w *worker) reconcileSpeed(snap telemetry.SessionView) {
+	// Re-read under the ownership lock boundary so a report that arrived
+	// after the step snapshot can confirm Silent or release ownership.
+	current, ok := w.e.sessions.Session(w.serial)
+	if !ok || !current.Active || current.SessionGen != snap.SessionGen {
+		return
+	}
+	snap = current
+	gen := w.e.gens.Generation(w.serial)
+	if !w.freshSpeed(snap, gen) {
+		return
+	}
+	profile := *snap.SpeedProfile
+	if w.speedPending {
+		if gen != w.speedCommandGen {
+			w.relinquishSpeed("upstream connection changed before confirmation")
+			return
+		}
+		if snap.SpeedObs > w.speedCommandObs {
+			if profile == 1 {
+				w.speedPending = false
+				w.speedOwned = true
+				w.speedAckObs = snap.SpeedObs
+				w.log.Info("warning speed override confirmed", "profile", 1)
+			}
+		}
+	}
+	if w.speedOwned && snap.SpeedObs > w.speedAckObs && profile != 1 {
+		w.relinquishSpeed("printer reported a manual profile change")
+		return
+	}
+	if w.warningEpisode || !w.speedOwned || profile != 1 || !isRunning(snap.State) {
+		return
+	}
+	w.mu.Lock()
+	pausePending := w.pauseState == PausePending
+	w.mu.Unlock()
+	if pausePending || w.speedPrior == nil || w.speedPrintGen != snap.SessionGen ||
+		gen == 0 || snap.ObsGen != gen || snap.StateGen != gen ||
+		w.e.now().Sub(snap.ObsAt) > w.e.kReportFreshMax {
+		return
+	}
+	prior := *w.speedPrior
+	if err := w.e.control.SetSpeedProfile(w.serial, gen, prior); err != nil {
+		w.log.Warn("warning speed restore failed; not retrying", "reason",
+			"guarded print-speed command was rejected; check LAN control and the current printer connection")
+	} else {
+		w.log.Info("warning speed profile restored", "profile", prior)
+	}
+	w.resetSpeedState(snap.SessionGen)
+}
+
+// relinquishSpeed drops the saved profile after the printer reports a
+// profile the proxy did not set. The warning episode stays single-shot.
+func (w *worker) relinquishSpeed(reason string) {
+	w.speedPrior = nil
+	w.speedPending = false
+	w.speedOwned = false
+	w.speedAttempted = true
+	w.log.Info("warning speed override released", "reason", reason)
+}
+
+// applyWarningSpeed starts or clears a warning episode and issues at most
+// one Silent command in that episode. Pause suggestions take precedence.
+// The caller holds controlMu after accepting the result.
+func (w *worker) applyWarningSpeed(snap telemetry.SessionView, gen uint64, frame Frame, res Result) {
+	w.ensureSpeedSession(snap)
+	if res.WarningSuggested {
+		if !w.warningEpisode {
+			w.warningEpisode = true
+			if !w.speedPending && !w.speedOwned {
+				w.speedAttempted = false
+				w.speedPrior = nil
+			}
+		}
+		if res.PauseSuggested {
+			w.speedAttempted = true
+			return
+		}
+		if w.speedAttempted || w.speedPending || w.speedOwned {
+			return
+		}
+		w.mu.Lock()
+		pauseActive := w.pauseState == PausePending || w.pauseState == PauseConfirmed
+		w.mu.Unlock()
+		if pauseActive {
+			w.speedAttempted = true
+			return
+		}
+		current, ok := w.speedAuthorized(snap, gen, frame)
+		if !ok {
+			return
+		}
+		profile := *current.SpeedProfile
+		w.speedAttempted = true
+		if profile == 1 {
+			w.speedPrior = nil
+			return
+		}
+		w.speedPrior = &profile
+		w.speedPrintGen = current.SessionGen
+		w.speedCommandGen = gen
+		w.speedCommandObs = current.SpeedObs
+		if err := w.e.control.SetSpeedProfile(w.serial, gen, 1); err != nil {
+			w.speedPrior = nil
+			w.log.Warn("warning speed override failed; not retrying this warning episode", "reason",
+				"guarded print-speed command was rejected; check LAN control and the current printer connection")
+			return
+		}
+		w.speedPending = true
+		w.log.Warn("warning speed override sent; waiting for printer confirmation", "profile", 1)
+		return
+	}
+
+	w.warningEpisode = false
+	if w.speedPending || w.speedOwned {
+		// A current Silent report may have arrived without a worker turn to
+		// process it as a separate acknowledgement. Reconcile it now so a
+		// clear result can restore in this same result transition.
+		w.reconcileSpeed(snap)
+		return
+	}
+	w.speedAttempted = false
+	w.speedPrior = nil
 }
 
 // hasSession reports whether the current print has a Gadget context.
@@ -1069,14 +1465,6 @@ func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, r
 		w.log.Info("inspection result discarded; print session changed during upload")
 		return false
 	}
-	w.mu.Lock()
-	w.tempAttempts = 0
-	wasDegraded := w.degraded != ""
-	w.degraded = ""
-	wasWarning := w.st.Warning
-	pauseWanted := res.PauseSuggested && !w.awaitingClear
-	w.mu.Unlock()
-
 	// The supersede check and the final pause dispatch share controlMu, so
 	// a disable that lands during the upload either cancels the pause
 	// before it is sent or observes it already sent in the disable
@@ -1090,6 +1478,45 @@ func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, r
 		w.log.Info("inspection result discarded; detection availability changed during upload")
 		return false
 	}
+	// Recheck continuity after acquiring the control lock. A result that became
+	// stale while waiting for the lock must not alter policy or pause state.
+	if current, ok := w.e.sessions.Session(w.serial); !ok || !current.Active || current.Epoch != snap.Epoch {
+		w.controlMu.Unlock()
+		w.log.Info("inspection result discarded; print session changed during upload")
+		return false
+	}
+	w.mu.Lock()
+	w.tempAttempts = 0
+	wasDegraded := w.degraded != ""
+	w.degraded = ""
+	wasWarning := w.st.Warning
+	newRisk := res.FasterInspectionSuggested || res.WarningSuggested || res.PauseSuggested || res.PrintQuality <= 5
+	if newRisk {
+		w.riskActive = true
+		w.clearCount = 0
+		w.clearSince = time.Time{}
+		w.intensiveUntil = w.e.now().Add(intensivePeriod)
+	} else if res.PrintQuality >= 6 {
+		if w.clearCount == 0 {
+			w.clearSince = w.e.now()
+		}
+		w.clearCount++
+		if w.clearCount >= intensiveClearCount && w.e.now().Sub(w.clearSince) >= intensiveClearSpan {
+			w.riskActive = false
+			w.clearCount = 0
+			w.clearSince = time.Time{}
+		}
+	} else {
+		w.clearCount = 0
+		w.clearSince = time.Time{}
+	}
+	if wasDegraded {
+		w.intensiveUntil = w.e.now().Add(intensivePeriod)
+		w.clearCount = 0
+		w.clearSince = time.Time{}
+	}
+	pauseWanted := res.PauseSuggested && !w.awaitingClear
+	w.mu.Unlock()
 	pauseState := ""
 	message := ""
 	reason := ""
@@ -1098,7 +1525,7 @@ func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, r
 	if pauseWanted {
 		pauseAuthorized = w.pauseAuthorized(snap, gen, frame)
 		if pauseAuthorized {
-			err := w.e.pauser.PausePrint(w.serial, gen)
+			err := w.e.control.PausePrint(w.serial, gen)
 			attempted = true
 			if err != nil {
 				// Guarded and final: never retried, never replayed.
@@ -1138,6 +1565,7 @@ func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, r
 	}
 	w.resultAt = w.e.now()
 	w.mu.Unlock()
+	w.applyWarningSpeed(snap, gen, frame, res)
 	w.controlMu.Unlock()
 
 	w.publish(func(s *Status) {
@@ -1145,7 +1573,7 @@ func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, r
 		s.Warning = res.WarningSuggested
 		s.FasterInspection = res.FasterInspectionSuggested
 		s.CameraLost = false
-		s.LastInspectedLayer = layer
+		s.LastInspectedLayer = copyLayer(layer)
 		s.Reason = reason
 		s.Message = message
 		if clear && pauseState == "" {
@@ -1158,7 +1586,7 @@ func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, r
 	if res.WarningSuggested && !wasWarning {
 		w.e.activity.Record(w.serial, "ai_warning", activity.Warning,
 			fmt.Sprintf("Possible print failure · quality %d/10", res.PrintQuality))
-	} else if !res.WarningSuggested && wasWarning {
+	} else if clear && wasWarning {
 		w.e.activity.Record(w.serial, "ai_warning_cleared", activity.Info, "AI warning cleared")
 	}
 	if attempted {
@@ -1194,73 +1622,183 @@ func (w *worker) pauseAuthorized(snap telemetry.SessionView, gen uint64, frame F
 		w.e.now().Sub(current.ObsAt) <= w.e.kReportFreshMax
 }
 
-// nextDelay computes the next inspection interval from the server's timing
-// guidance, never below its minimum; the client applies the documented
-// interval floors when a response omits them.
-func (w *worker) nextDelay(res Result) time.Duration {
-	d := time.Duration(res.Intervals.Recommended) * time.Second
-	if min := time.Duration(res.Intervals.Minimum) * time.Second; min > d {
-		d = min
-	}
-	return d
-}
-
 // handleFailure classifies an API or transport failure: terminal account
 // errors suspend detection account-wide; everything else backs off with the
 // last result left in place (sticky fallback) and, for connection or server
 // failures, switches to the context's fallback URL.
 func (w *worker) handleFailure(err error, processCall bool) time.Duration {
 	var apiErr *APIError
+	operation := "create"
+	if processCall {
+		operation = "process"
+	}
+	httpStatus := 0
+	if errors.As(err, &apiErr) {
+		httpStatus = apiErr.Status
+	}
+	class := failureClass(err)
+	typeName := class
+	if errors.As(err, &apiErr) {
+		typeName = safeAPIErrorType(apiErr)
+	}
+	reason := failureReason(err)
+	level := slog.LevelWarn
+	delay := time.Duration(0)
 	switch {
 	case errors.As(err, &apiErr) && apiErr.AccountTerminal():
-		w.e.suspend(apiErr.Error())
-		return -1
+		level = slog.LevelError
+		w.e.suspend(reason)
+		delay = -1
+	case errors.As(err, &apiErr) && apiErr.WorkerTerminal():
+		level = slog.LevelError
+		w.blockWorker(reason)
+		w.e.activity.Record(w.serial, "ai_blocked", activity.Error, reason)
+		delay = w.e.kIdlePoll
+	case isLocalRequestError(err):
+		level = slog.LevelError
+		w.blockWorker(reason)
+		w.e.activity.Record(w.serial, "ai_blocked", activity.Error, reason)
+		delay = w.e.kIdlePoll
 	case IsFrameTooLarge(err):
 		// Locally rejected before any request; the next fresh frame will
 		// likely also exceed the cap, so back off without URL changes.
-		return w.degrade(ReasonAPIRetrying, err.Error(), w.tempBackoff(), false)
+		delay = w.tempBackoff()
+		return w.logTemporaryFailure(operation, httpStatus, typeName, class, reason, delay)
 	default:
 		delay := w.tempBackoff()
 		if processCall {
-			var apiErr *APIError
-			isAPI := errors.As(err, &apiErr)
 			switch {
-			case isAPI && apiErr.SwitchToFallback():
+			case errors.As(err, &apiErr) && apiErr.SwitchToFallback():
 				w.mu.Lock()
 				if !w.useFallback {
 					w.useFallback = true
-					w.log.Info("switching to fallback process URL for this context")
 				}
 				w.mu.Unlock()
-			case !isAPI:
-				// Transport-level failure: switch for this context.
+			case isTransportError(err):
 				w.mu.Lock()
 				if !w.useFallback {
 					w.useFallback = true
-					w.log.Info("switching to fallback process URL after transport failure")
 				}
 				w.mu.Unlock()
 			}
 		}
-		return w.degrade(ReasonAPIRetrying, "inspection temporarily failing; will retry", delay, false)
+		return w.logTemporaryFailure(operation, httpStatus, typeName, class, reason, delay)
 	}
+	fallback := w.usingFallback()
+	w.log.Log(context.Background(), level, "Gadget inspection failed",
+		"operation", operation, "status", httpStatus, "type", typeName,
+		"class", class, "retry_seconds", 0, "fallback", fallback, "reason", reason)
+	return delay
+}
+
+// logTemporaryFailure records a retryable failure and publishes its safe
+// diagnostic reason to status and activity.
+func (w *worker) logTemporaryFailure(operation string, httpStatus int, typeName, class, reason string, delay time.Duration) time.Duration {
+	w.log.Warn("Gadget inspection failed",
+		"operation", operation, "status", httpStatus, "type", typeName,
+		"class", class, "retry_seconds", delay.Seconds(),
+		"fallback", w.usingFallback(), "reason", reason)
+	return w.degrade(ReasonAPIRetrying, reason, delay, false)
 }
 
 // tempBackoff returns the bounded exponential retry delay for temporary
 // failures: 20s doubling to a 10m cap with +-20% jitter, reset on success.
 func (w *worker) tempBackoff() time.Duration {
 	w.mu.Lock()
-	n := w.tempAttempts
-	w.tempAttempts++
+	delay := w.retryDelayLocked()
 	w.mu.Unlock()
-	d := tempBackoffInitial
-	for i := 0; i < n && d < tempBackoffMax; i++ {
-		d *= 2
+	return delay
+}
+
+// blockWorker stops inspection for this printer and publishes its terminal reason.
+func (w *worker) blockWorker(message string) {
+	w.releaseCamera()
+	w.mu.Lock()
+	w.blockedReason = message
+	w.degraded = ""
+	w.mu.Unlock()
+	w.publish(func(s *Status) {
+		s.State = StateBlocked
+		s.Reason = ReasonRequestInvalid
+		s.Message = message
+		s.Processing = false
+		s.NextCheckSeconds = 0
+	})
+}
+
+// safeAPIErrorType returns an allowlisted provider error type or its fixed unknown token.
+func safeAPIErrorType(err *APIError) string {
+	if err == nil {
+		return errTypeUnknown
 	}
-	if d > tempBackoffMax {
-		d = tempBackoffMax
+	if knownErrTypes[err.Type] {
+		return err.Type
 	}
-	return time.Duration(float64(d) * (1 + (rand.Float64()*0.4 - 0.2)))
+	return errTypeUnknown
+}
+
+// isTransportError reports whether err has the client's sanitized transport type.
+func isTransportError(err error) bool {
+	var target *TransportError
+	return errors.As(err, &target)
+}
+
+// isLocalRequestError reports whether err is a locally rejected request.
+func isLocalRequestError(err error) bool {
+	var target *localRequestError
+	return errors.As(err, &target)
+}
+
+// failureClass returns the stable diagnostic category without exposing err text.
+func failureClass(err error) string {
+	var apiErr *APIError
+	switch {
+	case errors.As(err, &apiErr):
+		return "provider_api_" + safeAPIErrorType(apiErr)
+	case isTransportError(err):
+		return "transport"
+	case isLocalRequestError(err):
+		return "local_request"
+	case IsFrameTooLarge(err):
+		return "frame_too_large"
+	default:
+		var responseErr *responseValidationError
+		if errors.As(err, &responseErr) {
+			return "response_validation"
+		}
+		return "unknown"
+	}
+}
+
+// errorsFrameSize returns the rejected frame size, or zero for other errors.
+func errorsFrameSize(err error) int {
+	var target *frameTooLargeError
+	if errors.As(err, &target) {
+		return target.size
+	}
+	return 0
+}
+
+// failureReason returns a safe actionable message for status and activity.
+func failureReason(err error) string {
+	var apiErr *APIError
+	var transportErr *TransportError
+	var responseErr *responseValidationError
+	var localErr *localRequestError
+	switch {
+	case errors.As(err, &apiErr):
+		return fmt.Sprintf("Gadget API request failed (HTTP %d, %s)", apiErr.Status, safeAPIErrorType(apiErr))
+	case errors.As(err, &transportErr):
+		return transportErr.message
+	case errors.As(err, &responseErr):
+		return responseErr.message
+	case errors.As(err, &localErr):
+		return localErr.message
+	case IsFrameTooLarge(err):
+		return fmt.Sprintf("camera frame is too large (%d bytes; limit %d bytes)", errorsFrameSize(err), maxImageBytes)
+	default:
+		return "Gadget request failed for an unknown reason"
+	}
 }
 
 // degrade records a degraded condition with the sticky result preserved.

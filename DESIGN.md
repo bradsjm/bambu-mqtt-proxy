@@ -251,14 +251,32 @@ training.
   inspection fetches a frame captured within the last 5 s and unique to
   that inspection (sequence strictly greater than the previous one),
   waiting up to 15 s for one. The first inspection of a fresh session fires
-  immediately; afterwards the pace is dynamic and provider-directed: each
-  response sets the interval to
-  `max(NextProcessIntervalSec.Recommended, NextProcessIntervalSec.Minimum)`,
-  and the service may direct 5 s. A fixed 20 s applies only between
-  attempts while a context has not yet produced a successful response. The
-  provider's pricing and free-allowance math (180 calls per print-hour)
-  assume the 20-second cadence; faster directed intervals consume the
-  allowance proportionally faster (about 125 print hours at 5 s).
+  immediately. Normal monitoring uses
+  `max(NextProcessIntervalSec.Minimum, NextProcessIntervalSec.Recommended)`.
+  Intensive monitoring uses `NextProcessIntervalSec.Minimum`, which is
+  currently often 5 s but is not a fixed floor. The initial monitoring period
+  starts at the first active print observation and lasts at least 2 minutes.
+  Layers 1–3 keep
+  it active regardless of elapsed time; if the layer is unknown, the timed
+  window alone applies. A PAUSE/PAUSED→RUNNING observation starts another
+  2-minute window. Monitoring recovery starts one only after monitoring was
+  unavailable. `FasterInspectionSuggested`, `WarningSuggested`,
+  `PauseSuggested`, or quality ≤5 activates risk-intensive monitoring. It
+  ends only after the timed and layer conditions end and three consecutive
+  successful results, each with quality ≥6 and
+  `FasterInspectionSuggested`, `WarningSuggested`, and `PauseSuggested` false,
+  span at least 30 s. These are heuristics, not a guarantee of failure detection.
+  Missing, failed, stale, and discarded analyses do not count as clear
+  results. The context retains timing across discarded analyses, detection
+  off/on toggles, and cadence changes. It also retains valid same-context API
+  intervals from a discarded analysis. Before a context's first successful
+  analysis, a retry waits at least 20 s or the latest provider interval,
+  whichever is longer. After success, a retry waits at least
+  `max(Minimum, Recommended)`, including in intensive mode. Exponential
+  backoff has a 10-minute cap unless that provider interval is longer. The provider's
+  pricing and free-allowance math (180 calls per print-hour) assumes the
+  20-second cadence; faster intervals consume the allowance proportionally
+  faster (about 125 print hours at 5 s).
 - **Context lifecycle (session freshness).** Sessions derive from telemetry
   via the print identity cookie `project_id-task_id-subtask_name` (ids
   normalized to strings; `0` is a valid local-print value; an incomplete
@@ -281,8 +299,8 @@ training.
   results; the observation generation anchors the connection. The provider
   expires contexts after 14 days; a proxy restart always starts fresh
   contexts.
-  Detection keeps no history: nothing about an inspection survives a
-  restart, and quality/age readings start empty with each new context.
+  Detection keeps results and policy timing in memory only. A restart clears
+  them, and quality/age readings start empty with each new context.
 - **Actions on results.** Per-printer detection state, `PrintQuality` (1–10),
   and `WarningSuggested` surface in status only (see Status below).
   `PauseSuggested = true` triggers a pause only if, at decision time,
@@ -305,23 +323,30 @@ training.
   `Score` (raw 0–100) is ignored.
 - **Error taxonomy.** Temporary errors — network errors and timeouts, HTTP
   5xx, `OE_INTERNAL_ERROR`, `OE_BACKEND_THROTTLED`, `OE_CONTEXT_RATE_LIMITED`,
-  `OE_IMAGE_DECODE_FAILED`, `OE_BAD_ARGS`, `OE_ARGS_PARSE_FAILED` — back off
-  exponentially (20 s initial, 10-minute cap, ±20% jitter; rate limiting
-  raises the delay, reset on success) while the last good result stays
-  visible as a sticky fallback with growing age and the printer's state
-  shows `degraded` with reason `api_retrying` (or `camera_unavailable` when
-  capture fails). On transport failure, `OE_INTERNAL_ERROR`, or an unknown
-  error with a 5xx status the worker switches to `FallbackProcessRequestUrl`
-  and keeps it for that context's lifetime, per the provider's retry
-  guidance; throttling, invalid-request, and account errors never switch
-  URLs. Account errors suspend ALL detection account-wide until process
+  and `OE_IMAGE_DECODE_FAILED` — retry with exponential backoff while the
+  last good result stays visible as a sticky fallback with growing age and
+  the printer's state shows `degraded` with reason `api_retrying` (or
+  `camera_unavailable` when capture fails). Backoff has a 10-minute cap unless
+  max(Minimum, Recommended) is longer than 10 minutes; rate limiting
+  can raise the delay, and success resets backoff. Before the first successful
+  analysis in a context, a retry waits at least 20 s. After success, a retry
+  waits at least max(Minimum, Recommended), including in intensive mode. `OE_BAD_ARGS`
+  and `OE_ARGS_PARSE_FAILED` block further detection for that printer until
+  process restart; neither error is retried. On transport failure,
+  `OE_INTERNAL_ERROR`, or an unknown error with a 5xx status, the worker
+  switches to `FallbackProcessRequestUrl` and keeps it for that context's
+  lifetime, per the provider's retry guidance; throttling, invalid-request,
+  and account errors never switch URLs. Account errors suspend ALL detection
+  account-wide until process
   restart — `OE_INVALID_API_KEY`,
   `OE_API_KEY_DISABLED`, `OE_API_KEY_BLOCKED_PAYMENT_FAILED`,
   `OE_API_KEY_IP_RESTRICTED` (never retried, never switched to the fallback
   URL), and `OE_FREE_USAGE_LIMIT_REACHED` (the proxy tracks no billing
   periods, so it cannot know when a free allowance resets) — releasing camera
-  holds and keeping the last per-printer status visible. Gadget failures
-  never affect MQTT proxying, camera serving, or a print in progress.
+  holds and keeping the last per-printer status visible. Logs and status show
+  only safe, structured local reasons, not provider error text, response
+  bodies, or raw URLs. Gadget failures never affect MQTT proxying, camera
+  serving, or a print in progress.
 - **Gates.** Detection requires the API key and the camera feature
   (`camera.enabled`, default on). With the key set but cameras explicitly
   disabled nothing runs — zero API or camera activity, plus a startup
@@ -375,7 +400,7 @@ training.
   no userinfo, fragment, or non-default port), redirects are disabled, every
   request is bounded by a 15 s timeout and a 64 KiB response cap, responses
   must satisfy the documented contract (quality in 1–10, required warning
-  and pause booleans, intervals clamped to the documented floors), and error
+  and pause booleans, positive intervals retained as provider timing floors), and error
   details are sanitized — no provider text, raw URLs, or response bodies
   reach logs or status.
 ## 7. Routing model (core)
@@ -550,8 +575,9 @@ Dependencies: `github.com/mochi-mqtt/server/v2`, `github.com/eclipse/paho.mqtt.g
 | Tools that pin the printer TLS certificate | The self-signed proxy cert fails pinning | Load a custom cert/key via config, or disable pinning (clients must already skip verify against the real printer) |
 | Downstream QoS 1 command while printer offline | PUBACK was already issued; command does not reach the printer | App-level retry, identical to a direct-connection drop |
 | Malicious/buggy client publishes to `/report` | Denied by ACL | QoS 0 silently dropped; QoS ≥ 1 client disconnected; other clients never see injected state |
-| Gadget API unreachable or transiently failing (optional integration) | Inspection backs off exponentially (20 s → 10 min cap, jittered); last good result stays visible; context switches to the fallback URL on connection/server failure | Detection lags; printing, MQTT proxying, and camera serving are unaffected |
-| Gadget account error: invalid/disabled key, billing failure, IP restriction, or free allowance exhausted | Detection suspends until proxy restart, with the reason logged | Warnings and automatic pauses stop; everything else is unaffected |
+| Gadget API unreachable or transiently failing (optional integration) | Inspection retries use exponential backoff (20 s initial, 10 min cap, jittered), with the latest provider interval as a floor; the last good result stays visible; the context switches to the fallback URL on connection/server failure | Detection lags; printing, MQTT proxying, and camera serving are unaffected |
+| Gadget bad-arguments error (`OE_BAD_ARGS`, `OE_ARGS_PARSE_FAILED`) | Detection for that printer is blocked until proxy restart | Inspection and automatic pauses stop for that printer; other printers are unaffected |
+| Gadget account error: invalid/disabled key, billing failure, IP restriction, or free allowance exhausted | Detection suspends account-wide until proxy restart; logs use safe structured reasons | Warnings and automatic pauses stop; everything else is unaffected |
 | Gadget-triggered pause rejected or lost (printer offline, signed firmware) | One pause command per suggestion (§7.2); up to 30 s wait for a confirming PAUSE report; no retry, no auto-resume | Pause failure is logged; the print continues; pausing re-arms after a later clear result |
 
 ## 12. Alternatives considered
@@ -569,7 +595,7 @@ Dependencies: `github.com/mochi-mqtt/server/v2`, `github.com/eclipse/paho.mqtt.g
 3. **Camera unit/integration** (fake TLS camera on :6000): auth payload shape (80 bytes, 0x40/0x3000, `bblp` at 16, code at 48); frame header parsing, length bounds, JPEG SOI/EOI validation; eligibility gates (unknown serial → 404, unsupported/missing model → 422, no socket opened); snapshot freshness and shared-buffer reuse; MJPEG framing and slow-client isolation; concurrent consumers sharing one upstream session; HTTP startup while printers are offline (non-blocking interests).
 4. **Smoke (manual, performed)**: real P1S in LAN Mode at `10.10.20.141` — MQTT upstream connected on first attempt with `pushall` warmup; snapshot returned a valid 1280×720 JPEG (~87 KB); 4-second stream sample contained 3 complete multipart JPEG parts; 404/422 gates answered without opening a camera socket; overlay served. This smoke run caught and fixed a real defect: the camera endpoint derived from the MQTT port instead of always using 6000.
 5. **Smoke (manual, remaining)**: Bambu Studio and Home Assistant connected through the proxy on `:8883` with the printer's access code, observing `pushall` warmup and delta flow in debug logs.
-6. **Gadget integration (optional feature)**: designed coverage — unit and integration tests against a fake Gadget HTTP server for create-context URL validation, response contract enforcement (quality bounds, required flags, interval clamping), error taxonomy (terminal account suspension vs transient backoff vs fallback-URL switch), local 6 MiB frame rejection, backoff reset on success, and status-object shape. No real-printer smoke and no live-API call back the detection feature, and no real printer report fixtures are available; hardware behavior is unverified.
+6. **Gadget integration (optional feature)**: designed coverage — unit and integration tests against a fake Gadget HTTP server for create-context URL validation, response contract enforcement (quality bounds, required flags, and positive interval validation), error taxonomy (per-printer bad-arguments blocking, account-wide suspension, transient backoff, and fallback-URL switch), local 6 MiB frame rejection, policy timing and interval retention across discarded analysis and detection toggles, backoff reset on success, and status-object shape. No real-printer smoke and no live-API call back the detection feature, and no real printer report fixtures are available; hardware behavior is unverified.
 7. **Cmd wiring** (subprocess, real `run()`): cameras enabled with `BMBPX_HTTP_PORT=0` must answer a TLS handshake on 127.0.0.1:6000 and exit cleanly on SIGTERM; `BMBPX_CAMERA_ENABLED=false` must serve health while port 6000 is held, proving it never binds; a pre-held port 6000 must fail startup with the wrapped `raw camera endpoint` error.
 8. **MCP unit/wire acceptance** (`internal/mcpserver`): tool discovery and typed calls against the SDK client and raw HTTP; subscription acknowledge/update/cancel over `subscriptions/listen`; legacy-protocol subscribe refusal (2025-06-18, 2025-11-25, headerless, and current-header-without-`_meta` shapes) with zero slot usage; revision-before-state ordering with deterministic mid-read injection; camera acquire/release balance; freshness ACK exclusion; cancellation releasing waits and camera interests; body/origin/limit rejections.
 

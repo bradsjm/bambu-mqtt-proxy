@@ -85,6 +85,31 @@ type APIError struct {
 	Status int
 }
 
+// TransportError marks a request or response-body transport failure. Its
+// message is a fixed, sanitized classification and never includes the URL.
+type TransportError struct {
+	message string // safe classification shown in logs
+}
+
+// Error returns the sanitized transport classification.
+func (e *TransportError) Error() string { return e.message }
+
+// responseValidationError marks a malformed or contract-invalid response.
+type responseValidationError struct {
+	message string // safe validation reason shown in logs
+}
+
+// Error returns the sanitized response-validation reason.
+func (e *responseValidationError) Error() string { return e.message }
+
+// localRequestError marks a request rejected before a provider response.
+type localRequestError struct {
+	message string // safe local request reason shown in logs
+}
+
+// Error returns the sanitized local request reason.
+func (e *localRequestError) Error() string { return e.message }
+
 // Error renders the status and the sanitized error type. It never contains
 // credentials, URLs, context ids, or provider detail text.
 func (e *APIError) Error() string {
@@ -150,6 +175,12 @@ func (e *APIError) SwitchToFallback() bool {
 		return e.Status >= 500
 	}
 	return false
+}
+
+// WorkerTerminal reports provider request errors that cannot be fixed by
+// retrying the same request for this printer.
+func (e *APIError) WorkerTerminal() bool {
+	return e.Type == errTypeBadArgs || e.Type == errTypeArgsParse
 }
 
 // frameTooLargeError marks an image rejected locally before any request.
@@ -230,11 +261,24 @@ func decodeJSON(kind string, body []byte, v any) error {
 	if err := json.Unmarshal(body, v); err != nil {
 		var typeErr *json.UnmarshalTypeError
 		if errors.As(err, &typeErr) {
-			return fmt.Errorf("gadget %s: unexpected json value types", kind)
+			return &responseValidationError{message: fmt.Sprintf("gadget %s: unexpected json value types", kind)}
 		}
-		return fmt.Errorf("gadget %s: malformed json response", kind)
+		return &responseValidationError{message: fmt.Sprintf("gadget %s: malformed json response", kind)}
 	}
 	return nil
+}
+
+// decodeField parses one known response field without including provider data.
+func decodeField[T any](fields map[string]json.RawMessage, name string) (*T, error) {
+	raw, ok := fields[name]
+	if !ok {
+		return nil, nil
+	}
+	var value T
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return nil, &responseValidationError{message: "gadget process response: invalid " + name}
+	}
+	return &value, nil
 }
 
 // CreateContext starts one print context. The response carries the context
@@ -243,7 +287,7 @@ func decodeJSON(kind string, body []byte, v any) error {
 func (c *Client) CreateContext(ctx context.Context) (Session, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.createURL, bytes.NewReader([]byte("{}")))
 	if err != nil {
-		return Session{}, fmt.Errorf("gadget create context request: %w", err)
+		return Session{}, &localRequestError{message: "gadget create context request could not be built"}
 	}
 	req.Header.Set("X-API-Key", c.apiKey)
 	req.Header.Set("Content-Type", "application/json")
@@ -260,13 +304,13 @@ func (c *Client) CreateContext(ctx context.Context) (Session, error) {
 		return Session{}, err
 	}
 	if out.ContextID == "" || out.ProcessRequestURL == "" || out.FallbackProcessRequestURL == "" {
-		return Session{}, errors.New("gadget create context response missing fields")
+		return Session{}, &responseValidationError{message: "gadget create context response missing fields"}
 	}
 	if err := validVendorURL(out.ProcessRequestURL); err != nil {
-		return Session{}, fmt.Errorf("gadget create context: primary process url rejected: %w", err)
+		return Session{}, &responseValidationError{message: "gadget create context response has an invalid primary process url"}
 	}
 	if err := validVendorURL(out.FallbackProcessRequestURL); err != nil {
-		return Session{}, fmt.Errorf("gadget create context: fallback process url rejected: %w", err)
+		return Session{}, &responseValidationError{message: "gadget create context response has an invalid fallback process url"}
 	}
 	return Session{
 		ContextID:   out.ContextID,
@@ -280,16 +324,16 @@ func (c *Client) CreateContext(ctx context.Context) (Session, error) {
 // 6 MiB image cap are rejected locally without a request. The response must
 // satisfy the required contract: PrintQuality within 1..10, both
 // WarningSuggested and PauseSuggested present, and both NextProcessIntervalSec
-// values present and positive. Valid intervals pass through verbatim — they
-// are never floored or capped, so the vendor keeps full control of the
-// inspection cadence. FasterInspectionSuggested is optional and defaults to
-// false.
+// values present and positive. Valid intervals pass through verbatim — the
+// engine applies its protection-first timing policy. FasterInspectionSuggested
+// is optional and defaults to false. A validation error may return valid
+// timing intervals with the partial Result, so the engine can retain them.
 func (c *Client) Process(ctx context.Context, url string, jpeg []byte) (Result, error) {
 	if len(jpeg) > maxImageBytes {
 		return Result{}, &frameTooLargeError{size: len(jpeg)}
 	}
 	if err := validVendorURL(url); err != nil {
-		return Result{}, err
+		return Result{}, &localRequestError{message: err.Error()}
 	}
 	body := &bytes.Buffer{}
 	mw := multipart.NewWriter(body)
@@ -298,17 +342,17 @@ func (c *Client) Process(ctx context.Context, url string, jpeg []byte) (Result, 
 	h.Set("Content-Type", "image/jpeg")
 	part, err := mw.CreatePart(h)
 	if err != nil {
-		return Result{}, fmt.Errorf("gadget process form: %w", err)
+		return Result{}, &localRequestError{message: "gadget process form could not be built"}
 	}
 	if _, err := part.Write(jpeg); err != nil {
-		return Result{}, fmt.Errorf("gadget process form: %w", err)
+		return Result{}, &localRequestError{message: "gadget process form could not be built"}
 	}
 	if err := mw.Close(); err != nil {
-		return Result{}, fmt.Errorf("gadget process form: %w", err)
+		return Result{}, &localRequestError{message: "gadget process form could not be built"}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, body)
 	if err != nil {
-		return Result{}, fmt.Errorf("gadget process request: %w", err)
+		return Result{}, &localRequestError{message: "gadget process request could not be built"}
 	}
 	req.Header.Set("X-API-Key", c.apiKey)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
@@ -316,46 +360,60 @@ func (c *Client) Process(ctx context.Context, url string, jpeg []byte) (Result, 
 	if err != nil {
 		return Result{}, err
 	}
-	var parsed struct {
-		Intervals struct {
-			Minimum     *int `json:"Minimum"`
-			Recommended *int `json:"Recommended"`
-		} `json:"NextProcessIntervalSec"`
-		FasterInspection *bool `json:"FasterInspectionSuggested"`
-		PrintQuality     *int  `json:"PrintQuality"`
-		WarningSuggested *bool `json:"WarningSuggested"`
-		PauseSuggested   *bool `json:"PauseSuggested"`
-		Score            *int  `json:"Score"`
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
+		return Result{}, &responseValidationError{message: "gadget process response: malformed json response"}
 	}
-	if err := decodeJSON("process response", raw, &parsed); err != nil {
-		return Result{}, err
+	var res Result
+	var intervals struct {
+		Minimum     *int `json:"Minimum"`
+		Recommended *int `json:"Recommended"`
 	}
-	if parsed.PrintQuality == nil {
-		return Result{}, errors.New("gadget process response: missing required PrintQuality")
+	if intervalBody, ok := fields["NextProcessIntervalSec"]; ok &&
+		json.Unmarshal(intervalBody, &intervals) == nil &&
+		intervals.Minimum != nil && intervals.Recommended != nil &&
+		*intervals.Minimum > 0 && *intervals.Recommended > 0 &&
+		*intervals.Minimum <= maxIntervalSeconds && *intervals.Recommended <= maxIntervalSeconds {
+		res.Intervals = IntervalSec{Minimum: *intervals.Minimum, Recommended: *intervals.Recommended}
 	}
-	if *parsed.PrintQuality < 1 || *parsed.PrintQuality > 10 {
-		return Result{}, errors.New("gadget process response: PrintQuality outside 1..10")
+	quality, err := decodeField[int](fields, "PrintQuality")
+	if err != nil {
+		return res, err
 	}
-	if parsed.WarningSuggested == nil || parsed.PauseSuggested == nil {
-		return Result{}, errors.New("gadget process response: missing required WarningSuggested or PauseSuggested")
+	if quality == nil {
+		return res, &responseValidationError{message: "gadget process response: missing required PrintQuality"}
 	}
-	if parsed.Intervals.Minimum == nil || parsed.Intervals.Recommended == nil ||
-		*parsed.Intervals.Minimum < 1 || *parsed.Intervals.Recommended < 1 ||
-		*parsed.Intervals.Minimum > maxIntervalSeconds || *parsed.Intervals.Recommended > maxIntervalSeconds {
-		return Result{}, errors.New("gadget process response: NextProcessIntervalSec Minimum and Recommended must be present, positive, and within duration range")
+	if *quality < 1 || *quality > 10 {
+		return res, &responseValidationError{message: "gadget process response: PrintQuality outside 1..10"}
 	}
-	res := Result{
-		Intervals: IntervalSec{
-			Minimum:     *parsed.Intervals.Minimum,
-			Recommended: *parsed.Intervals.Recommended,
-		},
-		PrintQuality:              *parsed.PrintQuality,
-		WarningSuggested:          *parsed.WarningSuggested,
-		PauseSuggested:            *parsed.PauseSuggested,
-		FasterInspectionSuggested: parsed.FasterInspection != nil && *parsed.FasterInspection,
+	warning, err := decodeField[bool](fields, "WarningSuggested")
+	if err != nil {
+		return res, err
 	}
-	if parsed.Score != nil {
-		res.Score = *parsed.Score
+	pause, err := decodeField[bool](fields, "PauseSuggested")
+	if err != nil {
+		return res, err
+	}
+	if warning == nil || pause == nil {
+		return res, &responseValidationError{message: "gadget process response: missing required WarningSuggested or PauseSuggested"}
+	}
+	if res.Intervals.Minimum == 0 || res.Intervals.Recommended == 0 {
+		return res, &responseValidationError{message: "gadget process response: invalid NextProcessIntervalSec"}
+	}
+	faster, err := decodeField[bool](fields, "FasterInspectionSuggested")
+	if err != nil {
+		return res, err
+	}
+	score, err := decodeField[int](fields, "Score")
+	if err != nil {
+		return res, err
+	}
+	res.PrintQuality = *quality
+	res.WarningSuggested = *warning
+	res.PauseSuggested = *pause
+	res.FasterInspectionSuggested = faster != nil && *faster
+	if score != nil {
+		res.Score = *score
 	}
 	return res, nil
 }
@@ -370,19 +428,19 @@ func (c *Client) do(req *http.Request) ([]byte, error) {
 	if err != nil {
 		switch {
 		case errors.Is(err, context.Canceled):
-			return nil, errors.New("gadget request canceled")
+			return nil, &TransportError{message: "gadget request canceled"}
 		case errors.Is(err, context.DeadlineExceeded):
-			return nil, errors.New("gadget request timed out")
+			return nil, &TransportError{message: "gadget request timed out"}
 		}
-		return nil, errors.New("gadget request failed")
+		return nil, &TransportError{message: "gadget request failed"}
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
-		return nil, errors.New("gadget response read failed")
+		return nil, &TransportError{message: "gadget response read failed"}
 	}
 	if len(body) > maxResponseBytes {
-		return nil, fmt.Errorf("gadget response exceeds %d bytes", maxResponseBytes)
+		return nil, &responseValidationError{message: "gadget response exceeds the supported size limit"}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		apiErr := &APIError{Type: errTypeUnknown, Status: resp.StatusCode}

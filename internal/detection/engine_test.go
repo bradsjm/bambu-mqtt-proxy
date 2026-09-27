@@ -1,11 +1,14 @@
 package detection
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -184,6 +187,8 @@ func (p *etPauser) PausePrint(_ string, gen uint64) error {
 	return p.err
 }
 
+func (p *etPauser) SetSpeedProfile(string, uint64, int) error { return p.err }
+
 func (p *etPauser) calls() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -290,11 +295,11 @@ func (w *etWorld) status() *Status {
 }
 
 func etClearResult() Result {
-	return Result{Intervals: IntervalSec{Minimum: 5, Recommended: 20}}
+	return Result{Intervals: IntervalSec{Minimum: 5, Recommended: 20}, PrintQuality: 8}
 }
 
 func etPauseResult() Result {
-	return Result{Intervals: IntervalSec{Minimum: 5, Recommended: 20}, PauseSuggested: true}
+	return Result{Intervals: IntervalSec{Minimum: 5, Recommended: 20}, PrintQuality: 8, PauseSuggested: true}
 }
 
 func intPtr(v int) *int { return &v }
@@ -307,8 +312,8 @@ func TestEngineFirstInspectionFiresImmediately(t *testing.T) {
 	w.client.queue(etClearResult())
 
 	delay := w.worker.step(context.Background())
-	if delay != 20*time.Second {
-		t.Fatalf("delay after first inspection = %v, want the server recommended 20s", delay)
+	if delay != 5*time.Second {
+		t.Fatalf("delay after first inspection = %v, want intensive Minimum 5s", delay)
 	}
 	creates, processes := w.client.counts()
 	if creates != 1 || processes != 1 {
@@ -350,20 +355,55 @@ func TestEngineSecondInspectionWaitsForSchedule(t *testing.T) {
 	w.worker.step(context.Background())
 
 	// Not yet due: no new upload, and the returned delay is the remainder.
-	w.clock.Advance(5 * time.Second)
+	w.clock.Advance(2 * time.Second)
 	delay := w.worker.step(context.Background())
-	if delay != 15*time.Second {
-		t.Fatalf("delay = %v, want the 15s remainder", delay)
+	if delay != 3*time.Second {
+		t.Fatalf("delay = %v, want the 3s intensive-schedule remainder", delay)
 	}
 	if _, processes := w.client.counts(); processes != 1 {
 		t.Fatalf("processes = %d, want the schedule to gate the second upload", processes)
 	}
 
-	w.clock.Advance(15 * time.Second)
+	w.clock.Advance(3 * time.Second)
 	w.sessions.running(w.clock, 1, 1, "RUNNING")
 	w.worker.step(context.Background())
 	if _, processes := w.client.counts(); processes != 2 {
 		t.Fatalf("processes = %d, want the second upload once due", processes)
+	}
+	if delay := w.worker.nextDue.Sub(w.clock.Now()); delay != 5*time.Second {
+		t.Fatalf("second upload schedule = %v, want the intensive 5s Minimum", delay)
+	}
+}
+
+func TestEnginePauseLatchRearmsWhenPauseAndWarningFlagsClear(t *testing.T) {
+	w := newEtWorld(t)
+	w.startSession(1, 1)
+	w.client.queue(etPauseResult())
+	w.worker.step(context.Background())
+	if calls := w.pauser.calls(); calls != 1 {
+		t.Fatalf("pause calls = %d, want one initial pause", calls)
+	}
+
+	w.clock.Advance(5 * time.Second)
+	w.sessions.running(w.clock, 2, 1, "RUNNING")
+	w.client.queue(Result{
+		Intervals:    IntervalSec{Minimum: 5, Recommended: 40},
+		PrintQuality: 8, FasterInspectionSuggested: true,
+	})
+	w.worker.step(context.Background())
+	if w.worker.awaitingClear {
+		t.Fatal("pause latch stayed armed after both warning and pause flags cleared")
+	}
+	if got := w.status().FasterInspection; !got {
+		t.Fatal("status did not preserve FasterInspectionSuggested")
+	}
+
+	w.clock.Advance(5 * time.Second)
+	w.sessions.running(w.clock, 3, 1, "RUNNING")
+	w.client.queue(etPauseResult())
+	w.worker.step(context.Background())
+	if calls := w.pauser.calls(); calls != 2 {
+		t.Fatalf("pause calls = %d, want the clear flags to rearm despite faster/quality cadence", calls)
 	}
 }
 
@@ -685,6 +725,75 @@ func TestEngineTemporaryErrorKeepsMonitoring(t *testing.T) {
 	w.worker.step(context.Background())
 	if _, processes := w.client.counts(); processes != 2 {
 		t.Fatalf("processes = %d, want the retry to proceed after backoff", processes)
+	}
+}
+
+func TestEngineFailureDiagnosticsSanitizeUnknownError(t *testing.T) {
+	w := newEtWorld(t)
+	activities := activity.New([]config.Printer{{Serial: "S1"}})
+	w.engine.SetActivity(activities)
+	var logs bytes.Buffer
+	w.worker.log = slog.New(slog.NewTextHandler(&logs, nil)).With("serial", "S1")
+
+	w.worker.handleFailure(errors.New("secret context and provider detail"), false)
+	const reason = "Gadget request failed for an unknown reason"
+	if got := w.status().Message; got != reason {
+		t.Fatalf("status message = %q, want %q", got, reason)
+	}
+	events := activities.Recent("S1")
+	if len(events) == 0 || events[0].Message != reason {
+		t.Fatalf("activity = %+v, want the same safe failure reason", events)
+	}
+	log := logs.String()
+	for _, field := range []string{"operation=create", "status=0", "type=unknown", "class=unknown", "retry_seconds=", "fallback=false", reason} {
+		if !strings.Contains(log, field) {
+			t.Errorf("log %q does not contain %q", log, field)
+		}
+	}
+	if strings.Contains(log, "secret context") {
+		t.Fatalf("log exposed the unknown error: %q", log)
+	}
+}
+
+func TestEngineFrameSizeFailureReasonIsActionable(t *testing.T) {
+	w := newEtWorld(t)
+	activities := activity.New([]config.Printer{{Serial: "S1"}})
+	w.engine.SetActivity(activities)
+	w.worker.handleFailure(&frameTooLargeError{size: maxImageBytes + 17}, true)
+	want := fmt.Sprintf("camera frame is too large (%d bytes; limit %d bytes)", maxImageBytes+17, maxImageBytes)
+	if got := w.status().Message; got != want {
+		t.Fatalf("status message = %q, want %q", got, want)
+	}
+	events := activities.Recent("S1")
+	if len(events) == 0 || events[0].Message != want {
+		t.Fatalf("activity = %+v, want the same frame-size reason", events)
+	}
+}
+
+func TestEngineMonitoringRecoveryStartsIntensiveWindow(t *testing.T) {
+	w := newEtWorld(t)
+	w.startSession(1, 1)
+	snap, _ := w.sessions.Session("S1")
+	w.worker.mu.Lock()
+	w.worker.intensiveUntil = time.Time{}
+	w.worker.clearCount = intensiveClearCount - 1
+	w.worker.clearSince = w.clock.now.Add(-intensiveClearSpan)
+	w.worker.mu.Unlock()
+	w.worker.degrade(ReasonAPIRetrying, "temporary failure", time.Second, false)
+
+	if !w.worker.onResult(snap, 1, Frame{Seq: 1, Captured: w.clock.now}, etClearResult(), nil, 0) {
+		t.Fatal("recovery result was discarded")
+	}
+	w.worker.mu.Lock()
+	intensive := w.worker.intensiveLocked(w.clock.now)
+	clearCount := w.worker.clearCount
+	clearSince := w.worker.clearSince
+	w.worker.mu.Unlock()
+	if !intensive {
+		t.Fatal("successful recovery did not start an intensive window")
+	}
+	if clearCount != 0 || !clearSince.IsZero() {
+		t.Fatalf("clear sequence = %d since %v, want reset on recovery", clearCount, clearSince)
 	}
 }
 

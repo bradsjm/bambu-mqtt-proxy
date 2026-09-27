@@ -71,6 +71,11 @@ type State struct {
 	sessionGen       uint64    // bumps only when a genuinely new print session starts
 	epoch            uint64    // bumps at every state boundary or identity change
 	stateGen         uint64    // upstream generation of the last gcode_state report
+	speedProfile     *int      // last reported Bambu spd_lvl (1..4)
+	speedGen         uint64    // upstream generation of speedProfile
+	speedSessionGen  uint64    // print session in which speedProfile was reported
+	speedObs         uint64    // increments for each spd_lvl report
+	speedAt          time.Time // time speedProfile was observed
 	trayNow          *int      // raw tray_now selection value; nil = not reported
 	obs              uint64    // real print reports merged (ACKs excluded)
 	obsGen           uint64    // upstream connection generation of the last report
@@ -325,9 +330,16 @@ type SessionView struct {
 	SessionGen uint64
 	Epoch      uint64 // bumps at every state boundary or identity change
 	StateGen   uint64 // upstream generation of the last gcode_state report
-	Obs        uint64 // real print reports merged
-	ObsAt      time.Time
-	ObsGen     uint64 // upstream generation of the last report
+	// SpeedProfile is nil until a supported profile (1..4) is reported.
+	// Its observation evidence prevents use across print sessions or reconnects.
+	SpeedProfile    *int
+	SpeedGen        uint64
+	SpeedSessionGen uint64
+	SpeedObs        uint64
+	SpeedAt         time.Time
+	Obs             uint64 // real print reports merged
+	ObsAt           time.Time
+	ObsGen          uint64 // upstream generation of the last report
 	// Progress and RemainingMin carry the merged scalar with presence: nil
 	// means the printer never reported the field, so consumers can keep the
 	// value unknown instead of showing a meaningless 0.
@@ -345,17 +357,25 @@ func (c *Cache) Session(serial string) (SessionView, bool) {
 		return SessionView{}, false
 	}
 	view := SessionView{
-		Serial:     st.Serial,
-		Active:     st.sessionActive,
-		State:      st.PrintingState,
-		Cookie:     st.cookie,
-		Complete:   st.completeIdentity,
-		SessionGen: st.sessionGen,
-		Epoch:      st.epoch,
-		StateGen:   st.stateGen,
-		Obs:        st.obs,
-		ObsAt:      st.obsAt,
-		ObsGen:     st.obsGen,
+		Serial:          st.Serial,
+		Active:          st.sessionActive,
+		State:           st.PrintingState,
+		Cookie:          st.cookie,
+		Complete:        st.completeIdentity,
+		SessionGen:      st.sessionGen,
+		Epoch:           st.epoch,
+		StateGen:        st.stateGen,
+		SpeedGen:        st.speedGen,
+		SpeedSessionGen: st.speedSessionGen,
+		SpeedObs:        st.speedObs,
+		SpeedAt:         st.speedAt,
+		Obs:             st.obs,
+		ObsAt:           st.obsAt,
+		ObsGen:          st.obsGen,
+	}
+	if st.speedProfile != nil {
+		v := *st.speedProfile
+		view.SpeedProfile = &v
 	}
 	if st.progressSeen {
 		v := st.Progress
@@ -445,6 +465,19 @@ func mergeReport(st *State, gen uint64, payload []byte) bool {
 	if v, ok := intField(printObj, "layer_num"); ok {
 		st.LayerNum = &v
 	}
+	if _, present := lookup(printObj, "spd_lvl"); present {
+		// A reported but unsupported value invalidates an older known
+		// profile. Detection must not act on stale evidence after an
+		// unknown or malformed profile report.
+		st.speedProfile = nil
+		if v, ok := intField(printObj, "spd_lvl"); ok && v >= 1 && v <= 4 {
+			st.speedProfile = &v
+		}
+		st.speedGen = gen
+		st.speedSessionGen = st.sessionGen
+		st.speedObs++
+		st.speedAt = time.Now()
+	}
 	if v, ok := intField(printObj, "total_layer_num"); ok {
 		st.TotalLayers = &v
 	}
@@ -491,6 +524,7 @@ func mergeReport(st *State, gen uint64, payload []byte) bool {
 var printStateMarkers = []string{
 	"gcode_state", "mc_percent", "subtask_name", "project_id", "task_id",
 	"layer_num", "total_layer_num", "mc_remaining_time", "print_error", "hms",
+	"spd_lvl",
 	"nozzle_temper", "nozzle_target_temper", "bed_temper", "bed_target_temper",
 	"chamber_temper",
 }

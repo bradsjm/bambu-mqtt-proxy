@@ -206,9 +206,28 @@ func (p *Pool) PausePrint(serial string, generation uint64) error {
 	return c.pause(generation)
 }
 
+// SetSpeedProfile sends a guarded print-speed command. Profiles use Bambu's
+// numeric values: 1 silent, 2 standard, 3 sport, and 4 ludicrous.
+func (p *Pool) SetSpeedProfile(serial string, generation uint64, profile int) error {
+	if profile < 1 || profile > 4 {
+		return fmt.Errorf("speed profile %s: unsupported profile %d", serial, profile)
+	}
+	c, ok := p.existing(serial)
+	if !ok {
+		return fmt.Errorf("speed profile %s: no upstream connection", serial)
+	}
+	return c.command(generation, "speed profile", speedProfilePayload(profile))
+}
+
 // pausePayload is the Bambu pause command published to the request topic.
 func pausePayload() string {
 	return `{"print":{"sequence_id":"0","command":"pause"}}`
+}
+
+// speedProfilePayload returns Bambu's print_speed command. The parameter is
+// a string on the wire, as required by the printer protocol.
+func speedProfilePayload(profile int) string {
+	return fmt.Sprintf(`{"print":{"sequence_id":"0","command":"print_speed","param":"%d"}}`, profile)
 }
 
 // pause publishes the pause command after re-checking the connection
@@ -218,30 +237,36 @@ func pausePayload() string {
 // have reached the printer. All rejection paths are errors; nothing is ever
 // republished.
 func (c *Conn) pause(generation uint64) error {
+	return c.command(generation, "pause", pausePayload())
+}
+
+// command publishes one guarded QoS 0 print command. The generation and
+// connection checks are shared by pause and speed-profile control.
+func (c *Conn) command(generation uint64, name, payload string) error {
 	c.mu.Lock()
 	gen, client, connected := c.generation, c.client, c.connectedLocked()
 	c.mu.Unlock()
 	if client == nil || !connected {
-		return fmt.Errorf("pause %s: upstream is not connected", c.spec.Serial)
+		return fmt.Errorf("%s %s: upstream is not connected", name, c.spec.Serial)
 	}
 	if gen != generation {
-		return fmt.Errorf("pause %s: connection generation changed (have %d, want %d)",
-			c.spec.Serial, gen, generation)
+		return fmt.Errorf("%s %s: connection generation changed (have %d, want %d)",
+			name, c.spec.Serial, gen, generation)
 	}
-	tok := client.Publish(c.requestTopic(), 0, false, []byte(pausePayload()))
+	tok := client.Publish(c.requestTopic(), 0, false, []byte(payload))
 	if !tok.WaitTimeout(c.connectTO) {
-		return fmt.Errorf("pause %s: publish timed out after %s", c.spec.Serial, c.connectTO)
+		return fmt.Errorf("%s %s: publish timed out after %s", name, c.spec.Serial, c.connectTO)
 	}
 	if err := tok.Error(); err != nil {
-		return fmt.Errorf("pause %s: %w", c.spec.Serial, err)
+		return fmt.Errorf("%s %s: %w", name, c.spec.Serial, err)
 	}
 	c.mu.Lock()
 	genNow, clientNow, connectedNow := c.generation, c.client, c.connectedLocked()
 	c.mu.Unlock()
 	if clientNow != client || !connectedNow || genNow != gen {
-		return fmt.Errorf("pause %s: connection changed during publish", c.spec.Serial)
+		return fmt.Errorf("%s %s: connection changed during publish", name, c.spec.Serial)
 	}
-	c.log.Info("pause command published", "serial", c.spec.Serial, "generation", gen)
+	c.log.Info("printer command published", "serial", c.spec.Serial, "command", name, "generation", gen)
 	return nil
 }
 
