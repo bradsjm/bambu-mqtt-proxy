@@ -1,0 +1,743 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0b0d10">
+<title>Configuration · bambu-mqtt-proxy</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230b0d10'/%3E%3Cg fill='%23dde2e6'%3E%3Crect x='7' y='8' width='2' height='16'/%3E%3Crect x='11' y='8' width='4' height='16'/%3E%3Crect x='17' y='8' width='2' height='16'/%3E%3Crect x='21' y='8' width='4' height='16'/%3E%3C/g%3E%3C/svg%3E">
+<style>
+:root {
+  color-scheme: dark;
+  /* Chrome shares the camera wall palette; printers are printed on label stock. */
+  --bg: #0b0d10; --panel: #14181d; --panel-2: #1b2027; --line: #262d36;
+  --text: #e6ebf0; --dim: #8d9aa8; --faint: #5b6673;
+  --stock: #dde2e6; --stock-2: #cfd5da; --ink: #15181c; --ink-dim: #58616b;
+  --ok: #34d399; --pending: #fbbf24; --error: #f87171; --focus: #60a5fa;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --ease: cubic-bezier(.2, .7, .2, 1);
+  --radius: 12px;
+  accent-color: var(--ok);
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0; min-height: 100dvh; background: var(--bg); color: var(--text);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  padding: 0 env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+}
+button, input, select, textarea { font: inherit; color: inherit; }
+a { color: inherit; }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.ic { width: 1em; height: 1em; flex: none; fill: none; stroke: currentColor; stroke-width: 2;
+      stroke-linecap: round; stroke-linejoin: round; }
+.mono { font-family: var(--mono); }
+
+/* Top bar */
+.bar { position: sticky; top: 0; z-index: 20; display: flex; align-items: center; gap: 1rem;
+       padding: calc(.6rem + env(safe-area-inset-top)) clamp(1rem, 3vw, 2rem) .6rem;
+       background: color-mix(in srgb, var(--bg) 85%, transparent); border-bottom: 1px solid var(--line);
+       -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px); }
+.brand { display: flex; align-items: center; gap: .55rem; font-weight: 650; }
+.brand .ic { font-size: 1.15rem; color: var(--stock); }
+.brand span { color: var(--dim); font-weight: 400; }
+.bar nav { margin-left: auto; }
+.bar nav a { display: inline-flex; align-items: center; gap: .4rem; padding: .45rem .75rem; border-radius: 9px;
+             color: var(--dim); text-decoration: none; border: 1px solid var(--line); font-size: .85rem; }
+.bar nav a:hover { color: var(--text); background: var(--panel); }
+
+main { max-width: 1120px; margin: 0 auto; padding: clamp(1.5rem, 4vw, 2.75rem) clamp(1rem, 3vw, 2rem) 8rem; }
+.intro { display: flex; flex-wrap: wrap; align-items: end; justify-content: space-between; gap: .75rem 2rem;
+         margin-bottom: 1.75rem; }
+h1 { margin: 0; font-size: clamp(1.6rem, 3vw, 2rem); font-weight: 650; letter-spacing: -.015em; }
+.file { margin: .35rem 0 0; color: var(--dim); font-size: .85rem; }
+.file code { font-family: var(--mono); color: var(--text); font-size: .82rem; word-break: break-all; }
+.file .state { white-space: nowrap; }
+.file .state::before { content: ""; display: inline-block; width: .45rem; height: .45rem; margin: 0 .4rem .1rem .6rem;
+                       border-radius: 50%; background: var(--ok); }
+.file .state.none::before { background: var(--pending); }
+
+.notice { display: flex; gap: .7rem; align-items: flex-start; margin: 0 0 1rem; padding: .8rem 1rem;
+          border-radius: 10px; background: var(--panel); border: 1px solid var(--line); color: var(--dim); }
+.notice .ic { margin-top: .15rem; color: var(--pending); }
+.notice.error { border-color: color-mix(in srgb, var(--error) 45%, var(--line)); }
+.notice.error .ic { color: var(--error); }
+.notice strong { color: var(--text); font-weight: 600; }
+.notice p { margin: 0; }
+
+section { margin-top: 2.5rem; }
+.sec-head { display: flex; align-items: baseline; gap: .75rem; margin-bottom: .35rem; }
+h2 { margin: 0; font-size: 1.15rem; font-weight: 650; }
+.count { font-family: var(--mono); font-size: .8rem; color: var(--faint); }
+.sec-lede { margin: 0 0 1.25rem; color: var(--dim); max-width: 62ch; }
+
+/* Printer plates: the rating label on the back of each printer. */
+.plates { display: grid; gap: 1.1rem; grid-template-columns: repeat(auto-fill, minmax(min(100%, 318px), 1fr)); }
+.plate { position: relative; display: flex; flex-direction: column; padding: 1.05rem 1.15rem 1rem;
+         border-radius: 7px; color: var(--ink);
+         background: linear-gradient(170deg, var(--stock), var(--stock-2));
+         box-shadow: 0 1px 0 rgb(255 255 255 / .55) inset, 0 16px 34px -20px #000; }
+.plate::before { content: ""; position: absolute; inset: 6px; border: 1px solid rgb(21 24 28 / .22);
+                 border-radius: 4px; pointer-events: none; }
+.plate-top { display: flex; justify-content: space-between; align-items: center; gap: .5rem;
+             font: 600 .68rem/1 var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--ink-dim); }
+.plate-top .tag { display: inline-flex; align-items: center; gap: .3rem; }
+.plate-top .unsaved { color: #8a5a00; }
+.plate-top .unsaved::before { content: ""; width: .45rem; height: .45rem; border-radius: 50%; background: #d99400; }
+.plate-name { margin: .6rem 0 .7rem; font-size: 1.28rem; font-weight: 700; letter-spacing: -.01em;
+              line-height: 1.2; overflow-wrap: anywhere; }
+.plate-name.unnamed { color: var(--ink-dim); font-weight: 500; }
+.barcode { display: block; width: 100%; height: 42px; color: var(--ink); }
+.sn { display: flex; justify-content: space-between; gap: .75rem; margin: .45rem 0 .9rem;
+      font: 600 1rem/1.2 var(--mono); letter-spacing: .12em; overflow-wrap: anywhere; }
+.sn span { font-size: .68rem; letter-spacing: .14em; color: var(--ink-dim); padding-top: .15rem; }
+.specs { display: grid; grid-template-columns: auto 1fr; gap: .35rem .9rem; margin: 0;
+         padding-top: .8rem; border-top: 1px solid rgb(21 24 28 / .2); font-size: .84rem; }
+.specs dt { font: 600 .66rem/1.9 var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--ink-dim); }
+.specs dd { margin: 0; overflow-wrap: anywhere; }
+.specs .missing { color: #b42318; font-weight: 600; }
+.plate-actions { display: flex; gap: .4rem; margin-top: 1rem; }
+.plate-actions button { padding: .4rem .8rem; border-radius: 7px; cursor: pointer; font-size: .84rem; font-weight: 600;
+                        border: 1px solid rgb(21 24 28 / .28); background: rgb(255 255 255 / .35); color: var(--ink); }
+.plate-actions button:hover { background: rgb(255 255 255 / .7); }
+.plate-actions .remove { margin-left: auto; background: none; border-color: transparent; color: var(--ink-dim); }
+.plate-actions .remove:hover { color: #b42318; background: rgb(180 35 24 / .08); }
+.plate :focus-visible { outline-color: #1d4ed8; }
+
+.add-plate { display: grid; place-content: center; justify-items: center; gap: .5rem; min-height: 15rem;
+             padding: 1.5rem; border-radius: 7px; border: 1.5px dashed var(--line); background: none;
+             color: var(--dim); cursor: pointer; text-align: center; transition: border-color .2s, color .2s; }
+.add-plate:hover { border-color: var(--dim); color: var(--text); }
+.add-plate .ic { font-size: 1.6rem; }
+.add-plate strong { color: var(--text); font-size: 1rem; }
+.add-plate small { max-width: 26ch; font-size: .8rem; }
+
+/* Settings */
+.groups { display: grid; gap: 1rem; }
+.group { margin: 0; padding: 0; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); }
+.group > legend { float: left; width: 100%; padding: 1rem 1.25rem .25rem; font-weight: 650; font-size: .98rem; }
+.group > legend + * { clear: both; }
+.row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 20rem); gap: .5rem 2rem; align-items: center;
+       padding: .9rem 1.25rem; border-top: 1px solid var(--line); }
+.group > legend + .row { border-top: 0; }
+.row label, .row .label { font-weight: 550; }
+.hint { display: block; margin-top: .15rem; color: var(--dim); font-size: .82rem; font-weight: 400; }
+.env { display: block; margin-top: .3rem; color: var(--pending); font-size: .78rem; font-weight: 400; }
+.env code { font-family: var(--mono); }
+.control { display: flex; justify-content: flex-end; gap: .5rem; }
+input[type=text], input[type=number], input[type=password], select, textarea {
+  width: 100%; padding: .5rem .65rem; border-radius: 8px; border: 1px solid var(--line);
+  background: var(--bg); color: var(--text); }
+input[type=number] { font-family: var(--mono); max-width: 9rem; }
+textarea { font: .82rem/1.5 var(--mono); resize: vertical; min-height: 4.5rem; }
+input:hover, select:hover, textarea:hover { border-color: #36404b; }
+main input:user-invalid { border-color: var(--error); }
+.row.wide { grid-template-columns: 1fr; }
+.seg { display: inline-flex; padding: 3px; border-radius: 9px; background: var(--bg); border: 1px solid var(--line); }
+.seg label { position: relative; padding: .35rem .8rem; border-radius: 6px; cursor: pointer; font-weight: 500;
+             color: var(--dim); font-size: .85rem; white-space: nowrap; }
+.seg input { position: absolute; opacity: 0; pointer-events: none; }
+.seg label:has(input:checked) { background: var(--panel-2); color: var(--text); box-shadow: 0 0 0 1px var(--line); }
+.seg label:has(input:focus-visible) { outline: 2px solid var(--focus); outline-offset: 1px; }
+
+.switch { appearance: none; position: relative; width: 2.6rem; height: 1.5rem; margin: 0; border-radius: 999px;
+          background: var(--line); cursor: pointer; transition: background .2s; flex: none; }
+.switch::after { content: ""; position: absolute; top: 3px; left: 3px; width: calc(1.5rem - 6px); aspect-ratio: 1;
+                 border-radius: 50%; background: var(--dim); transition: transform .2s var(--ease), background .2s; }
+.switch:checked { background: color-mix(in srgb, var(--ok) 55%, var(--line)); }
+.switch:checked::after { transform: translateX(1.1rem); background: var(--text); }
+
+.listeners { display: grid; gap: .5rem; margin-top: .6rem; }
+.listener { display: grid; grid-template-columns: 7rem auto 1fr 1fr auto; gap: .5rem; align-items: center;
+            padding: .55rem; border: 1px solid var(--line); border-radius: 9px; background: var(--bg); }
+.listener input[type=number] { max-width: none; }
+.listener .tls { display: inline-flex; align-items: center; gap: .4rem; font-size: .85rem; color: var(--dim); }
+.listener input[type=text]:disabled { opacity: .4; }
+
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: .45rem; padding: .5rem .95rem;
+       border-radius: 9px; border: 1px solid var(--line); background: var(--panel-2); cursor: pointer;
+       font-weight: 600; font-size: .88rem; white-space: nowrap; }
+.btn:hover { background: #232932; }
+.btn.primary { background: var(--stock); color: var(--ink); border-color: var(--stock); }
+.btn.primary:hover { background: #fff; }
+.btn:disabled { opacity: .55; cursor: progress; }
+.btn.quiet { background: none; border-color: transparent; color: var(--dim); }
+.btn.quiet:hover { color: var(--text); background: var(--panel-2); }
+.icon-btn { display: inline-grid; place-items: center; width: 2.25rem; height: 2.25rem; border-radius: 8px;
+            border: 0; background: none; color: var(--dim); cursor: pointer; }
+.icon-btn:hover { color: var(--error); background: var(--panel-2); }
+
+/* Save bar */
+.savebar { position: fixed; z-index: 30; left: 50%; bottom: calc(1rem + env(safe-area-inset-bottom));
+           display: flex; align-items: center; gap: .75rem; width: min(40rem, calc(100% - 2rem));
+           padding: .6rem .6rem .6rem 1rem; border-radius: 12px; background: var(--panel-2);
+           border: 1px solid var(--line); box-shadow: 0 20px 40px -16px #000;
+           transform: translate(-50%, 0); transition: transform .35s var(--ease), opacity .35s; }
+.savebar[data-state="idle"] { transform: translate(-50%, 160%); opacity: 0; pointer-events: none; }
+.savebar .msg { flex: 1; display: flex; align-items: center; gap: .6rem; min-width: 0; }
+.savebar .msg::before { content: ""; width: .55rem; height: .55rem; border-radius: 50%; flex: none; background: var(--pending); }
+.savebar[data-state="busy"] .msg::before { background: var(--focus); animation: pulse 1.2s infinite; }
+.savebar[data-state="done"] .msg::before { background: var(--ok); }
+.savebar[data-state="error"] .msg::before { background: var(--error); }
+.savebar[data-state="error"] { border-color: color-mix(in srgb, var(--error) 50%, var(--line)); }
+.savebar .actions { display: flex; gap: .35rem; }
+@keyframes pulse { 50% { opacity: .35; } }
+
+/* Printer dialog */
+dialog { width: min(34rem, calc(100% - 1.5rem)); max-height: calc(100dvh - 2rem); padding: 0; border-radius: 14px;
+         border: 1px solid var(--line); background: var(--panel); color: var(--text); }
+dialog::backdrop { background: rgb(5 6 8 / .7); -webkit-backdrop-filter: blur(3px); backdrop-filter: blur(3px); }
+dialog form { display: grid; gap: 1rem; padding: 1.25rem; }
+dialog h2 { font-size: 1.1rem; }
+.field { display: grid; gap: .35rem; }
+.field > label { font-weight: 550; }
+.field .hint { margin: 0; }
+.field input.serial { font: 600 1rem var(--mono); letter-spacing: .1em; text-transform: uppercase; }
+.pair { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+.check { display: flex; gap: .6rem; align-items: flex-start; font-weight: 500; }
+.check input { margin-top: .2rem; }
+details { border-top: 1px solid var(--line); padding-top: .85rem; }
+details summary { cursor: pointer; color: var(--dim); font-weight: 550; }
+details[open] summary { margin-bottom: .85rem; }
+details .field + .check, details .check + .check { margin-top: .75rem; }
+.dlg-foot { display: flex; justify-content: flex-end; gap: .5rem; padding-top: .25rem; }
+.dlg-error { margin: 0; color: var(--error); font-size: .85rem; }
+
+@media (max-width: 720px) {
+  .row { grid-template-columns: 1fr; }
+  .control { justify-content: flex-start; }
+  .listener { grid-template-columns: 1fr auto auto; }
+  .listener input[type=text] { grid-column: 1 / -1; }
+  .pair { grid-template-columns: 1fr; }
+  .savebar .msg span { font-size: .85rem; }
+  .bar nav a span { display: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition: none !important; animation: none !important; }
+}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-bars" viewBox="0 0 24 24"><path d="M4 5v14M8 5v14M11 5v14M15 5v14M20 5v14M17.5 5v14"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 3l9.5 17h-19zM12 10v4M12 17h.01"/></symbol>
+  <symbol id="i-wall" viewBox="0 0 24 24"><rect x="3" y="4" width="8" height="7" rx="1.5"/><rect x="13" y="4" width="8" height="7" rx="1.5"/><rect x="3" y="13" width="8" height="7" rx="1.5"/><rect x="13" y="13" width="8" height="7" rx="1.5"/></symbol>
+</svg>
+
+<header class="bar">
+  <div class="brand"><svg class="ic" aria-hidden="true"><use href="#i-bars"/></svg>bambu-mqtt-proxy <span>/ config</span></div>
+  <nav><a href="/camwall"><svg class="ic" aria-hidden="true"><use href="#i-wall"/></svg><span>Camera wall</span></a></nav>
+</header>
+
+<main id="main" aria-busy="true">
+  <div class="intro">
+    <div>
+      <h1>Configuration</h1>
+      <p class="file" id="file">Loading…</p>
+    </div>
+  </div>
+  <div id="notices"></div>
+
+  <section aria-labelledby="printers-h">
+    <div class="sec-head"><h2 id="printers-h">Printers</h2><span class="count" id="printer-count"></span></div>
+    <p class="sec-lede">Apps reach each printer through the proxy by its serial number. Access codes are stored in the config file and never shown here.</p>
+    <div class="plates" id="plates"></div>
+  </section>
+
+  <section aria-labelledby="proxy-h">
+    <div class="sec-head"><h2 id="proxy-h">Proxy</h2></div>
+    <p class="sec-lede">How apps connect to the proxy, which extras it serves, and how it keeps printer connections alive.</p>
+    <div class="groups">
+      <fieldset class="group">
+        <legend>MQTT for your apps</legend>
+        <div class="row wide">
+          <div>
+            <span class="label">Listeners</span>
+            <span class="hint">Ports your apps connect to. Bambu apps expect TLS on 8883. Leave the certificate paths empty to use a generated certificate.</span>
+            <span class="env" data-env="listen" hidden></span>
+            <div class="listeners" id="listeners"></div>
+            <button class="btn quiet" type="button" id="add-listener" style="margin-top:.5rem"><svg class="ic" aria-hidden="true"><use href="#i-plus"/></svg>Add listener</button>
+          </div>
+        </div>
+        <div class="row">
+          <div><span class="label" id="auth-l">App login</span>
+            <span class="hint">Printer access code: apps log in as <code>bblp</code> with any configured printer's code.</span>
+            <span class="env" data-env="auth_mode" hidden></span></div>
+          <div class="control"><div class="seg" role="radiogroup" aria-labelledby="auth-l">
+            <label><input type="radio" name="auth_mode" value="printer" data-field="auth_mode">Printer access code</label>
+            <label><input type="radio" name="auth_mode" value="accept_all" data-field="auth_mode">Anyone</label>
+          </div></div>
+        </div>
+      </fieldset>
+
+      <fieldset class="group">
+        <legend>Web and extras</legend>
+        <div class="row">
+          <div><label for="f-http">HTTP port</label>
+            <span class="hint">Serves this page, health checks, cameras, and MCP. 0 turns HTTP off, including this page.</span>
+            <span class="env" data-env="http_port" hidden></span></div>
+          <div class="control"><input id="f-http" type="number" min="0" max="65535" required data-field="http_port" data-type="int"></div>
+        </div>
+        <div class="row">
+          <div><label for="f-camera">Cameras</label>
+            <span class="hint">Camera wall, snapshots and streams on HTTP, and the raw camera port 6000 for P1 and A1 printers.</span>
+            <span class="env" data-env="camera_enabled" hidden></span></div>
+          <div class="control"><input id="f-camera" class="switch" type="checkbox" role="switch" data-field="camera_enabled"></div>
+        </div>
+        <div class="row">
+          <div><label for="f-mcp">MCP endpoint</label>
+            <span class="hint">Read-only printer state for AI assistants at <code>/mcp</code>. It cannot control printers.</span>
+            <span class="env" data-env="mcp_enabled" hidden></span></div>
+          <div class="control"><input id="f-mcp" class="switch" type="checkbox" role="switch" data-field="mcp_enabled"></div>
+        </div>
+      </fieldset>
+
+      <fieldset class="group">
+        <legend>Printer connections</legend>
+        <div class="row">
+          <div><label for="f-keepalive">Keepalive (seconds)</label>
+            <span class="hint">How often the proxy checks that each printer is still there.</span></div>
+          <div class="control"><input id="f-keepalive" type="number" min="1" required data-field="behavior.keepalive_seconds" data-type="int"></div>
+        </div>
+        <div class="row">
+          <div><label for="f-timeout">Connect timeout (seconds)</label>
+            <span class="hint">How long an app waits for a printer that is not connected yet.</span></div>
+          <div class="control"><input id="f-timeout" type="number" min="1" required data-field="behavior.connect_timeout_seconds" data-type="int"></div>
+        </div>
+        <div class="row">
+          <div><span class="label" id="retry-l">Retry delay (seconds)</span>
+            <span class="hint">First and longest wait between attempts to reach an offline printer.</span></div>
+          <div class="control" role="group" aria-labelledby="retry-l">
+            <input type="number" min="1" required aria-label="First retry delay" data-field="behavior.backoff_initial_seconds" data-type="int">
+            <input type="number" min="1" required aria-label="Longest retry delay" data-field="behavior.backoff_max_seconds" data-type="int">
+          </div>
+        </div>
+        <div class="row">
+          <div><span class="label" id="qos-l">Maximum QoS</span>
+            <span class="hint">Bambu printers use 0 and 1.</span></div>
+          <div class="control"><div class="seg" role="radiogroup" aria-labelledby="qos-l">
+            <label><input type="radio" name="qos" value="0" data-field="behavior.qos_max" data-type="int">0</label>
+            <label><input type="radio" name="qos" value="1" data-field="behavior.qos_max" data-type="int">1</label>
+            <label><input type="radio" name="qos" value="2" data-field="behavior.qos_max" data-type="int">2</label>
+          </div></div>
+        </div>
+        <div class="row wide">
+          <div><label for="f-warmup">Warmup commands</label>
+            <span class="hint">Sent to a printer when it connects, one JSON message per line. The default asks for its full state.</span>
+            <textarea id="f-warmup" rows="2" spellcheck="false" data-field="behavior.warmup_commands" data-type="lines" style="margin-top:.6rem"></textarea></div>
+        </div>
+      </fieldset>
+
+      <fieldset class="group">
+        <legend>Logging</legend>
+        <div class="row">
+          <div><label for="f-log">Log level</label>
+            <span class="hint">Debug adds every routed message.</span>
+            <span class="env" data-env="log_level" hidden></span></div>
+          <div class="control"><select id="f-log" data-field="log_level" style="max-width:9rem">
+            <option value="debug">Debug</option><option value="info">Info</option>
+            <option value="warn">Warn</option><option value="error">Error</option>
+          </select></div>
+        </div>
+      </fieldset>
+    </div>
+  </section>
+</main>
+
+<div class="savebar" id="savebar" data-state="idle" role="status" aria-live="polite">
+  <div class="msg"><span id="save-msg"></span></div>
+  <div class="actions">
+    <button class="btn quiet" type="button" id="discard">Discard</button>
+    <button class="btn primary" type="button" id="save">Save and apply</button>
+  </div>
+</div>
+
+<dialog id="dlg" aria-labelledby="dlg-title">
+  <form id="dlg-form" novalidate>
+    <h2 id="dlg-title">Add printer</h2>
+    <div class="field">
+      <label for="p-serial">Serial number</label>
+      <input id="p-serial" class="serial" type="text" required autocomplete="off" spellcheck="false" autocapitalize="characters" placeholder="01P00A123456789">
+    </div>
+    <div class="pair">
+      <div class="field">
+        <label for="p-name">Name <span class="hint" style="display:inline">(optional)</span></label>
+        <input id="p-name" type="text" autocomplete="off" placeholder="Garage P1S">
+      </div>
+      <div class="field">
+        <label for="p-model">Model</label>
+        <input id="p-model" type="text" list="models" autocomplete="off" spellcheck="false">
+        <datalist id="models"><option value="P1P"><option value="P1S"><option value="A1"><option value="A1MINI"><option value="X1C"><option value="X1E"><option value="P2S"><option value="H2D"><option value="H2S"></datalist>
+      </div>
+    </div>
+    <div class="field">
+      <label for="p-address">Address</label>
+      <input id="p-address" type="text" required autocomplete="off" spellcheck="false" placeholder="192.168.1.42:8883">
+      <p class="hint">The printer's IP address and MQTT port.</p>
+    </div>
+    <div class="field">
+      <label for="p-code">Access code</label>
+      <input id="p-code" type="password" autocomplete="new-password" spellcheck="false">
+      <p class="hint" id="p-code-hint">Shown on the printer's screen with LAN mode.</p>
+    </div>
+    <details id="p-more">
+      <summary>Connection options</summary>
+      <div class="field">
+        <label for="p-user">Username</label>
+        <input id="p-user" type="text" autocomplete="off" spellcheck="false">
+      </div>
+      <label class="check"><input id="p-tls" type="checkbox"><span>Use TLS<span class="hint">Printers require TLS on port 8883.</span></span></label>
+      <label class="check"><input id="p-skip" type="checkbox"><span>Skip certificate check<span class="hint">Printers use self-signed certificates, so this is normally on.</span></span></label>
+    </details>
+    <p class="dlg-error" id="dlg-error" role="alert" hidden></p>
+    <div class="dlg-foot">
+      <button class="btn quiet" type="button" id="dlg-cancel">Cancel</button>
+      <button class="btn primary" type="submit" id="dlg-ok">Add printer</button>
+    </div>
+  </form>
+</dialog>
+
+<script>
+"use strict";
+const $ = (s, el = document) => el.querySelector(s);
+const API = "/config/api";
+
+let cfg = null;        // editable settings
+let meta = null;       // file path, env overrides, apply status
+let baseline = "";     // cfg as last loaded, for change tracking
+let basePrinters = new Map(); // previous_serial -> saved printer JSON
+let editing = -1;      // printer index open in the dialog, -1 for a new one
+
+/* ---- Code 39: the serial rendered as a scannable barcode. ---- */
+const C39 = {};
+"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-. *".split("").forEach((c, i) => C39[c] = [
+  "000110100","100100001","001100001","101100000","000110001","100110000","001110000","000100101","100100100","001100100",
+  "100001001","001001001","101001000","000011001","100011000","001011000","000001101","100001100","001001100","000011100",
+  "100000011","001000011","101000010","000010011","100010010","001010010","000000111","100000110","001000110","000010110",
+  "110000001","011000001","111000000","010010001","110010000","011010000","010000101","110000100","011000100","010010100"][i]);
+
+function barcode(text) {
+  const chars = ("*" + text.toUpperCase().split("").filter(c => c !== "*" && C39[c]).join("") + "*").split("");
+  let x = 0, rects = "";
+  for (const c of chars) {
+    C39[c].split("").forEach((b, i) => {
+      const w = b === "1" ? 3 : 1;
+      if (i % 2 === 0) rects += `<rect x="${x}" width="${w}" height="1"/>`;
+      x += w;
+    });
+    x += 1;
+  }
+  return `<svg class="barcode" viewBox="0 0 ${x - 1} 1" preserveAspectRatio="none" aria-hidden="true" fill="currentColor">${rects}</svg>`;
+}
+
+/* ---- Model and camera detection, mirroring internal/config. ---- */
+const PREFIX = [["01P", "P1P"], ["01S", "P1S"], ["030", "A1MINI"], ["039", "A1"]];
+const modelFor = p => (p.model || "").trim() || (PREFIX.find(([pre]) => p.serial.toUpperCase().startsWith(pre)) || [])[1] || "";
+const norm = m => m.toUpperCase().replace(/\s+/g, "");
+const hasCamera = p => ["P1P", "P1S", "A1", "A1MINI"].includes(norm(modelFor(p)));
+
+const esc = s => String(s).replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+
+/* ---- Rendering ---- */
+function renderFile() {
+  $("#file").innerHTML = `<code>${esc(meta.path)}</code>` + (meta.file_exists
+    ? `<span class="state">Saved</span>`
+    : `<span class="state none">Not created yet</span>`);
+}
+
+function renderNotices() {
+  const n = [];
+  const note = (html, kind = "") => n.push(`<div class="notice ${kind}"><svg class="ic" aria-hidden="true"><use href="#i-${kind ? "alert" : "info"}"/></svg><p>${html}</p></div>`);
+  if (meta.apply_error) note(`<strong>The last save could not start, so the previous settings were restored.</strong> ${esc(meta.apply_error)}`, "error");
+  if (meta.file_error) note(`<strong>The config file could not be read.</strong> ${esc(meta.file_error)} Saving replaces it, so re-enter each printer's access code.`, "error");
+  if (!meta.file_exists && !meta.file_error) note(`<strong>No config file yet.</strong> Add your printers and save to create <code>${esc(meta.path)}</code>.`);
+  if (meta.env_overrides.printers) note(`Printers come from <code>${esc(meta.env_overrides.printers)}</code> while it is set. Printers saved here are written to the file and used once the variable is removed.`);
+  $("#notices").innerHTML = n.join("");
+}
+
+function renderPlates() {
+  const saved = new Set([...basePrinters.keys()]);
+  $("#printer-count").textContent = cfg.printers.length ? String(cfg.printers.length) : "";
+  $("#plates").innerHTML = cfg.printers.map((p, i) => {
+    const model = modelFor(p);
+    const changed = !p.previous_serial || !saved.has(p.previous_serial) ||
+      JSON.stringify(stripLocal(p)) !== basePrinters.get(p.previous_serial);
+    const link = p.tls ? (p.insecure_skip_verify ? "TLS, certificate not checked" : "TLS, certificate checked") : "Plain MQTT, no TLS";
+    const code = p.access_code ? "New code entered" : p.has_access_code ? "Stored" : `<span class="missing">Missing</span>`;
+    return `<article class="plate" aria-label="Printer ${esc(p.serial)}">
+      <div class="plate-top"><span>${esc(model || "Model unknown")}</span>${changed ? `<span class="tag unsaved">Unsaved</span>` : ""}</div>
+      <h3 class="plate-name ${p.name ? "" : "unnamed"}">${esc(p.name || "Unnamed printer")}</h3>
+      ${barcode(p.serial)}
+      <p class="sn"><span>S/N</span>${esc(p.serial)}</p>
+      <dl class="specs">
+        <dt>Address</dt><dd class="mono">${esc(p.address)}</dd>
+        <dt>Link</dt><dd>${link}</dd>
+        <dt>Code</dt><dd>${code}</dd>
+        <dt>Camera</dt><dd>${hasCamera(p) ? "Supported" : "Not supported"}</dd>
+      </dl>
+      <div class="plate-actions">
+        <button type="button" data-edit="${i}">Edit</button>
+        <button type="button" class="remove" data-remove="${i}">Remove</button>
+      </div>
+    </article>`;
+  }).join("") + `<button class="add-plate" type="button" id="add-printer">
+      <svg class="ic" aria-hidden="true"><use href="#i-plus"/></svg>
+      <strong>Add printer</strong>
+      <small>${cfg.printers.length ? "Another printer to route by its serial number." : "You need its serial number, IP address, and LAN access code."}</small>
+    </button>`;
+}
+
+function renderListeners() {
+  $("#listeners").innerHTML = cfg.listen.map((l, i) => `<div class="listener">
+      <input type="number" min="1" max="65535" required value="${l.port}" aria-label="Listener ${i + 1} port" data-l="${i}" data-k="port">
+      <label class="tls"><input type="checkbox" ${l.tls ? "checked" : ""} data-l="${i}" data-k="tls">TLS</label>
+      <input type="text" value="${esc(l.cert_file)}" placeholder="Certificate file" aria-label="Listener ${i + 1} certificate file" data-l="${i}" data-k="cert_file" ${l.tls ? "" : "disabled"}>
+      <input type="text" value="${esc(l.key_file)}" placeholder="Key file" aria-label="Listener ${i + 1} key file" data-l="${i}" data-k="key_file" ${l.tls ? "" : "disabled"}>
+      <button class="icon-btn" type="button" aria-label="Remove listener ${i + 1}" data-drop="${i}" ${cfg.listen.length > 1 ? "" : "disabled hidden"}><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg></button>
+    </div>`).join("");
+}
+
+const getPath = (path) => path.split(".").reduce((o, k) => o[k], cfg);
+function setPath(path, v) {
+  const keys = path.split("."), last = keys.pop();
+  keys.reduce((o, k) => o[k], cfg)[last] = v;
+}
+
+function renderFields() {
+  for (const el of document.querySelectorAll("[data-field]")) {
+    const v = getPath(el.dataset.field);
+    if (el.type === "radio") el.checked = String(v) === el.value;
+    else if (el.type === "checkbox") el.checked = !!v;
+    else if (el.dataset.type === "lines") el.value = (v || []).join("\n");
+    else el.value = v;
+  }
+  for (const el of document.querySelectorAll("[data-env]")) {
+    const env = meta.env_overrides[el.dataset.env];
+    el.hidden = !env;
+    if (env) el.innerHTML = `Set by <code>${esc(env)}</code>, which takes precedence over this value.`;
+  }
+}
+
+function render() {
+  renderFile(); renderNotices(); renderPlates(); renderListeners(); renderFields(); refreshDirty();
+}
+
+/* ---- Change tracking and the save bar ---- */
+const stripLocal = p => { const { access_code, previous_serial, has_access_code, ...rest } = p; return rest; };
+const snapshot = () => JSON.stringify(cfg);
+let barTimer = 0;
+function setBar(state, msg) {
+  clearTimeout(barTimer);
+  const bar = $("#savebar");
+  bar.dataset.state = state;
+  $("#save-msg").textContent = msg;
+  const busy = state === "busy";
+  $("#save").disabled = busy; $("#discard").disabled = busy;
+  $("#save").hidden = state === "done"; $("#discard").hidden = state === "done";
+  if (state === "done") barTimer = setTimeout(() => setBar("idle", ""), 5000);
+}
+function refreshDirty() {
+  const state = $("#savebar").dataset.state;
+  if (state === "busy") return;
+  if (snapshot() !== baseline) setBar("dirty", "You have unsaved changes.");
+  else if (state === "dirty" || state === "error") setBar("idle", "");
+}
+
+/* ---- Loading and saving ---- */
+async function load() {
+  const res = await fetch(API, { cache: "no-store" });
+  if (!res.ok) throw new Error(`The proxy answered ${res.status}.`);
+  const data = await res.json();
+  cfg = data.config; meta = data.meta;
+  basePrinters = new Map();
+  for (const p of cfg.printers) {
+    p.previous_serial = p.serial;
+    basePrinters.set(p.serial, JSON.stringify(stripLocal(p)));
+  }
+  baseline = snapshot();
+  render();
+  $("#main").removeAttribute("aria-busy");
+  return data;
+}
+
+function validateForm() {
+  for (const el of document.querySelectorAll("main input[required], main textarea")) {
+    if (!el.checkValidity()) { el.reportValidity(); return false; }
+  }
+  const bad = cfg.behavior.warmup_commands.findIndex(c => { try { JSON.parse(c); return false; } catch { return true; } });
+  if (bad >= 0) { setBar("error", `Warmup command ${bad + 1} is not valid JSON.`); $("#f-warmup").focus(); return false; }
+  const missing = cfg.printers.find(p => !p.access_code && !p.has_access_code);
+  if (missing) { setBar("error", `Enter the access code for printer ${missing.serial}.`); return false; }
+  return true;
+}
+
+async function save() {
+  if (!validateForm()) return;
+  const oldGen = meta.generation;
+  setBar("busy", "Saving…");
+  let res, body;
+  try {
+    res = await fetch(API, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(cfg) });
+    body = await res.json();
+  } catch {
+    setBar("error", "The proxy could not be reached. Nothing was saved.");
+    return;
+  }
+  if (!res.ok) { setBar("error", body.error || `Saving failed with status ${res.status}.`); return; }
+  baseline = snapshot();
+
+  const port = Number(location.port || (location.protocol === "https:" ? 443 : 80));
+  if (body.http_port === 0) { setBar("done", "Saved. HTTP is now off, so this page is no longer served."); return; }
+  if (body.http_port !== port) {
+    setBar("busy", `Saved. Moving to port ${body.http_port}…`);
+    const url = new URL(location.href); url.port = String(body.http_port);
+    setTimeout(() => location.assign(url), 2500);
+    return;
+  }
+  setBar("busy", "Saved. Restarting the proxy with the new settings…");
+  const deadline = Date.now() + 30000;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 700));
+    try {
+      const data = await fetch(API, { cache: "no-store" }).then(r => r.ok ? r.json() : null);
+      if (!data || data.meta.generation <= oldGen) continue;
+      await load();
+      if (data.meta.apply_error) setBar("error", "The new settings could not start. The previous settings are back.");
+      else setBar("done", "Saved and applied.");
+      return;
+    } catch { /* restarting */ }
+  }
+  setBar("error", "Saved, but the proxy has not come back after 30 seconds. Check its logs.");
+}
+
+function guard(e) { if (snapshot() !== baseline) e.preventDefault(); }
+
+/* ---- Printer dialog ---- */
+const dlg = $("#dlg");
+function openPrinter(i) {
+  editing = i;
+  const p = i >= 0 ? cfg.printers[i] : { serial: "", name: "", model: "", address: "", tls: true, insecure_skip_verify: true, username: "bblp", has_access_code: false };
+  $("#dlg-title").textContent = i >= 0 ? `Edit ${p.name || p.serial}` : "Add printer";
+  $("#dlg-ok").textContent = i >= 0 ? "Update printer" : "Add printer";
+  $("#p-serial").value = p.serial; $("#p-name").value = p.name; $("#p-model").value = p.model;
+  $("#p-address").value = p.address; $("#p-code").value = p.access_code || "";
+  $("#p-user").value = p.username; $("#p-tls").checked = p.tls; $("#p-skip").checked = p.insecure_skip_verify;
+  $("#p-model").placeholder = "Detected from serial";
+  $("#p-more").open = false;
+  $("#dlg-error").hidden = true;
+  codeHint();
+  dlg.showModal();
+  $(i >= 0 ? "#p-name" : "#p-serial").focus();
+}
+
+// A stored code is kept only while the address is unchanged.
+function codeNeeded() {
+  if (editing < 0) return true;
+  const p = cfg.printers[editing];
+  if (!p.has_access_code) return true;
+  const saved = basePrinters.get(p.previous_serial);
+  return !saved || JSON.parse(saved).address !== $("#p-address").value.trim();
+}
+function codeHint() {
+  const needed = codeNeeded();
+  const p = editing >= 0 ? cfg.printers[editing] : null;
+  $("#p-code").placeholder = needed ? "" : "Stored. Leave blank to keep it";
+  $("#p-code").required = needed;
+  $("#p-code-hint").textContent = needed && p && p.has_access_code
+    ? "The address changed, so enter the access code again. A stored code is never sent to a new address."
+    : "Shown on the printer's screen with LAN mode.";
+}
+
+function submitPrinter(e) {
+  e.preventDefault();
+  const fail = (msg, el) => { $("#dlg-error").textContent = msg; $("#dlg-error").hidden = false; el.focus(); };
+  const serial = $("#p-serial").value.trim().toUpperCase();
+  const address = $("#p-address").value.trim();
+  const code = $("#p-code").value;
+  if (!serial) return fail("Enter the printer's serial number.", $("#p-serial"));
+  if (cfg.printers.some((p, i) => i !== editing && p.serial === serial)) return fail(`Printer ${serial} is already on the list.`, $("#p-serial"));
+  if (!address) return fail("Enter the printer's address, for example 192.168.1.42:8883.", $("#p-address"));
+  if (!code && codeNeeded()) return fail("Enter the printer's access code.", $("#p-code"));
+  const prev = editing >= 0 ? cfg.printers[editing] : {};
+  const p = {
+    serial, name: $("#p-name").value.trim(), model: $("#p-model").value.trim(), address,
+    tls: $("#p-tls").checked, insecure_skip_verify: $("#p-skip").checked,
+    username: $("#p-user").value.trim() || "bblp",
+    has_access_code: !!prev.has_access_code,
+  };
+  if (prev.previous_serial) p.previous_serial = prev.previous_serial;
+  if (code) p.access_code = code;
+  if (editing >= 0) cfg.printers[editing] = p; else cfg.printers.push(p);
+  dlg.close();
+  renderPlates(); refreshDirty();
+}
+
+/* ---- Events ---- */
+$("#plates").addEventListener("click", e => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  if (b.id === "add-printer") openPrinter(-1);
+  else if (b.dataset.edit) openPrinter(Number(b.dataset.edit));
+  else if (b.dataset.remove) {
+    cfg.printers.splice(Number(b.dataset.remove), 1);
+    renderPlates(); refreshDirty();
+    ($("#plates .plate-actions button") || $("#add-printer")).focus();
+  }
+});
+$("#dlg-form").addEventListener("submit", submitPrinter);
+$("#dlg-cancel").addEventListener("click", () => dlg.close());
+$("#p-address").addEventListener("input", codeHint);
+
+document.querySelector(".groups").addEventListener("input", e => {
+  const el = e.target;
+  if (el.dataset.field) {
+    const t = el.dataset.type;
+    let v = el.type === "checkbox" ? el.checked : el.value;
+    if (t === "int") v = el.value === "" ? 0 : Number(el.value);
+    if (t === "lines") v = el.value.split("\n").map(s => s.trim()).filter(Boolean);
+    setPath(el.dataset.field, v);
+  } else if (el.dataset.l) {
+    const l = cfg.listen[Number(el.dataset.l)], k = el.dataset.k;
+    l[k] = k === "tls" ? el.checked : k === "port" ? Number(el.value) : el.value;
+    if (k === "tls") renderListeners();
+  }
+  refreshDirty();
+});
+$("#listeners").addEventListener("click", e => {
+  const b = e.target.closest("[data-drop]");
+  if (!b) return;
+  cfg.listen.splice(Number(b.dataset.drop), 1);
+  renderListeners(); refreshDirty();
+  $("#add-listener").focus();
+});
+$("#add-listener").addEventListener("click", () => {
+  const used = new Set(cfg.listen.map(l => l.port));
+  cfg.listen.push({ port: used.has(1883) ? 1884 : 1883, tls: false, cert_file: "", key_file: "" });
+  renderListeners(); refreshDirty();
+  $(`#listeners .listener:last-child input`).focus();
+});
+$("#save").addEventListener("click", save);
+$("#discard").addEventListener("click", () => {
+  cfg = JSON.parse(baseline);
+  render();
+  setBar("idle", "");
+});
+window.addEventListener("beforeunload", guard);
+document.addEventListener("keydown", e => {
+  if ((e.metaKey || e.ctrlKey) && e.key === "s") {
+    e.preventDefault();
+    if (!dlg.open && snapshot() !== baseline) save();
+  }
+});
+
+load().catch(err => {
+  $("#file").textContent = "The settings could not be loaded. " + err.message + " Reload the page to try again.";
+});
+</script>
+</body>
+</html>

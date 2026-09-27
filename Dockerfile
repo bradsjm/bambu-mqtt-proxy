@@ -14,7 +14,8 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 
 FROM alpine:3.22
 RUN addgroup -S proxy && adduser -S -G proxy proxy \
-    && apk add --no-cache ca-certificates
+    && apk add --no-cache ca-certificates \
+    && mkdir /config && chown proxy:proxy /config
 COPY --from=build --chown=proxy:proxy /out/bambu-mqtt-proxy /bambu-mqtt-proxy
 USER proxy
 # No BMBPX_* environment defaults: any listen variable replaces the whole
@@ -25,6 +26,6 @@ EXPOSE 8883 6000 8080
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD wget -qO- http://127.0.0.1:8080/livez >/dev/null 2>&1 || exit 1
 ENTRYPOINT ["/bambu-mqtt-proxy"]
-# The file is optional: when the mount is absent the proxy runs from
-# BMBPX_* environment variables alone.
+# The file is optional: without it the proxy runs from BMBPX_* variables,
+# or serves only the /config page, which creates the file on save.
 CMD ["-config=/config/bambu-mqtt-proxy.yaml"]

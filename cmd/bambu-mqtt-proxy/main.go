@@ -6,9 +6,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -18,6 +20,7 @@ import (
 	"bambu-mqtt-proxy/internal/broker"
 	"bambu-mqtt-proxy/internal/camera"
 	"bambu-mqtt-proxy/internal/config"
+	"bambu-mqtt-proxy/internal/configui"
 	"bambu-mqtt-proxy/internal/detection"
 	"bambu-mqtt-proxy/internal/health"
 	"bambu-mqtt-proxy/internal/httpsrv"
@@ -34,25 +37,63 @@ func main() {
 	}
 }
 
-// run resolves configuration (file, environment, or both), wires routing,
-// the upstream pool, broker, raw camera endpoint, and health server, then
-// serves until an interrupt signal.
+// run resolves configuration (file, environment, or both), serves until an
+// interrupt signal, and restarts every service whenever the /config page
+// saves the file. A saved config that fails to start is rolled back.
 func run() error {
-	configPath := flag.String("config", "", "path to the YAML config file (optional when BMBPX_* env vars are set)")
+	configPath := flag.String("config", "", "path to the YAML config file (optional; the /config page creates it)")
 	logLevel := flag.String("log-level", "", "override log level (debug, info, warn, error)")
 	flag.Parse()
-
-	cfg, fileFound, err := resolveConfig(*configPath)
-	if err != nil {
-		return err
+	path := *configPath
+	if path == "" {
+		path = config.DefaultConfigName()
 	}
 
-	logger, err := newLogger(pick(cfg.Log.Level, *logLevel))
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	store := configui.NewStore(path)
+	var saved *configui.Reload
+	for {
+		next, err := serveOnce(sigCtx, path, *logLevel, store)
+		if err != nil {
+			if saved == nil {
+				return err
+			}
+			// The last save cannot start: restore the previous file and
+			// report the failure on the page once services are back.
+			fmt.Fprintln(os.Stderr, "bambu-mqtt-proxy: saved config failed to start; restoring the previous file:", err)
+			store.Failed(err)
+			if rerr := store.Restore(*saved); rerr != nil {
+				return errors.Join(err, rerr)
+			}
+			saved = nil
+			continue
+		}
+		if next == nil {
+			return nil
+		}
+		saved = next
+	}
+}
+
+// serveOnce builds and serves every service from the current configuration.
+// It returns a reload request when the /config page saved the file, or nil
+// when the process should exit.
+func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.Store) (*configui.Reload, error) {
+	cfg, fileFound, err := resolveConfig(path)
 	if err != nil {
-		return err
+		return nil, err
+	}
+
+	logger, err := newLogger(pick(cfg.Log.Level, logLevel))
+	if err != nil {
+		return nil, err
+	}
+	if len(cfg.Printers) == 0 {
+		return serveSetup(sigCtx, cfg, path, store, logger)
 	}
 	if !fileFound {
-		logger.Info("config file not found; using environment configuration", "path", *configPath)
+		logger.Info("config file not found; using environment configuration", "path", path)
 	}
 
 	serials := make([]string, 0, len(cfg.Printers))
@@ -135,14 +176,14 @@ func run() error {
 
 	srv, err := broker.New(cfg, table, pool, inject, logger)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// Serve is non-blocking: it starts listeners and the event loop, then
 	// returns. Block on signals instead.
 	if err := srv.Serve(); err != nil {
 		pool.Stop()
-		return fmt.Errorf("broker: %w", err)
+		return nil, fmt.Errorf("broker: %w", err)
 	}
 
 	// The broker is up. Defer every teardown from here so both the signal
@@ -155,7 +196,11 @@ func run() error {
 	var httpSrv *httpsrv.Server
 	var raw *camera.RawServer
 	defer func() {
-		logger.Info("shutting down")
+		if sigCtx.Err() != nil {
+			logger.Info("shutting down")
+		} else {
+			logger.Info("restarting with the saved configuration")
+		}
 		if detector != nil {
 			detector.Close()
 		}
@@ -182,7 +227,7 @@ func run() error {
 	if cfg.CameraEnabled() {
 		r := camera.NewRawServer(cameras, logger)
 		if err := r.Start(); err != nil {
-			return fmt.Errorf("raw camera endpoint: %w", err)
+			return nil, fmt.Errorf("raw camera endpoint: %w", err)
 		}
 		raw = r
 		logger.Info("raw camera endpoint serving", "port", camera.Port)
@@ -209,6 +254,7 @@ func run() error {
 		httpSrv = httpsrv.New(cfg.HTTP.Port, logger)
 		activities.Register(httpSrv.Mux())
 		health.Routes(httpSrv.Mux(), pool, detectionSource(detector))
+		store.Register(httpSrv.Mux())
 		if mcpsrv != nil {
 			mcpsrv.Register(httpSrv.Mux())
 			mcpsrv.Start()
@@ -219,16 +265,52 @@ func run() error {
 			renderer.RegisterStatus(httpSrv.Mux())
 			logger.Info("camera endpoints and camera wall serving", "port", cfg.HTTP.Port)
 		}
+		// Root: setup mode sends visitors to the configuration page; with
+		// printers configured the camera wall is the main page. Without
+		// cameras the wall does not exist, so / stays a plain 404.
+		httpSrv.Mux().Handle("GET /{$}", http.RedirectHandler("/camwall", http.StatusFound))
 		if err := httpSrv.Start(); err != nil {
-			return fmt.Errorf("http server: %w", err)
+			return nil, fmt.Errorf("http server: %w", err)
 		}
 		logger.Info("http endpoints serving", "port", cfg.HTTP.Port)
 	}
 
-	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	<-sigCtx.Done()
-	return nil
+	store.Applied()
+	return waitReload(sigCtx, store), nil
+}
+
+// serveSetup serves only the HTTP health and configuration endpoints while
+// no printer is configured, so a first run needs no config file.
+func serveSetup(sigCtx context.Context, cfg *config.Config, path string, store *configui.Store,
+	logger *slog.Logger) (*configui.Reload, error) {
+	if cfg.HTTP.Port == 0 {
+		return nil, fmt.Errorf("no printers configured in %q or %s, and HTTP is disabled (http.port: 0)",
+			path, config.EnvPrinters)
+	}
+	pool := upstream.NewPool(nil, nil, cfg.Behavior, logger)
+	defer pool.Stop()
+	httpSrv := httpsrv.New(cfg.HTTP.Port, logger)
+	health.Routes(httpSrv.Mux(), pool, nil)
+	store.Register(httpSrv.Mux())
+	httpSrv.Mux().Handle("GET /{$}", http.RedirectHandler("/config", http.StatusFound))
+	if err := httpSrv.Start(); err != nil {
+		return nil, fmt.Errorf("http server: %w", err)
+	}
+	defer httpSrv.Stop()
+	logger.Warn("no printers configured; add them on the configuration page",
+		"url", fmt.Sprintf("http://<host>:%d/config", cfg.HTTP.Port), "path", path)
+	store.Applied()
+	return waitReload(sigCtx, store), nil
+}
+
+// waitReload blocks until a signal (nil) or a saved configuration.
+func waitReload(sigCtx context.Context, store *configui.Store) *configui.Reload {
+	select {
+	case <-sigCtx.Done():
+		return nil
+	case r := <-store.Reloads():
+		return &r
+	}
 }
 
 // detectionSource adapts the optional detection engine to the health
@@ -244,12 +326,10 @@ func detectionSource(e *detection.Engine) health.DetectionSource {
 }
 
 // resolveConfig builds the configuration from an optional YAML file with
-// BMBPX_* environment overrides on top. When neither is present it fails with
-// the searched path. It reports whether the file was found.
+// BMBPX_* environment overrides on top. With neither present it returns the
+// defaults with no printers (setup mode). It reports whether the file was
+// found.
 func resolveConfig(configPath string) (*config.Config, bool, error) {
-	if configPath == "" {
-		configPath = config.DefaultConfigName()
-	}
 	cfg := &config.Config{HTTP: config.HTTP{Port: config.PortUnset}}
 	fileFound := false
 	if _, err := os.Stat(configPath); err == nil {
@@ -260,12 +340,8 @@ func resolveConfig(configPath string) (*config.Config, bool, error) {
 		}
 		fileFound = true
 	}
-	printersFromEnv, err := cfg.ApplyEnv()
-	if err != nil {
+	if _, err := cfg.ApplyEnv(); err != nil {
 		return nil, false, err
-	}
-	if !fileFound && !printersFromEnv {
-		return nil, false, fmt.Errorf("no configuration: file %q not found and %s not set", configPath, config.EnvPrinters)
 	}
 	cfg.ApplyDefaults()
 	if err := cfg.Validate(); err != nil {

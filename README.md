@@ -76,6 +76,19 @@ Prerequisite: enable **LAN Mode** on each printer (Settings → Network → LAN
 Mode; Developer Mode is additionally required for control commands on current
 firmware) and note the access code.
 
+### Docker (configure in the browser)
+
+```sh
+docker run -d --name bambu-mqtt-proxy -p 8883:8883 -p 6000:6000 -p 8080:8080 \
+  -v bambu-mqtt-proxy:/config \
+  ghcr.io/bradsjm/bambu-mqtt-proxy:latest
+```
+
+Open `http://<host>:8080/config`, add your printers, and choose **Save and
+apply**. No config file is needed to start: until a printer is configured the
+proxy serves only the HTTP health and configuration endpoints, and saving
+creates `/config/bambu-mqtt-proxy.yaml`.
+
 ### Docker (env only — stateless)
 
 ```sh
@@ -92,9 +105,12 @@ MQTT routing always uses the serial number; the raw camera endpoint on port
 
 ```sh
 docker run -d --name bambu-mqtt-proxy -p 8883:8883 -p 6000:6000 -p 8080:8080 \
-  -v $(pwd)/bambu-mqtt-proxy.yaml:/config/bambu-mqtt-proxy.yaml:ro \
+  -v $(pwd)/config:/config \
   ghcr.io/bradsjm/bambu-mqtt-proxy:latest
 ```
+
+Mount the file read-only (`:ro`) instead to lock the configuration; saving
+from `/config` then fails and leaves the running settings unchanged.
 
 Point your apps at the proxy host, port 8883, username `bblp`, and any
 configured printer's access code. Camera apps that speak the printer's camera
@@ -188,6 +204,7 @@ TLS port 6000 whenever cameras are enabled
 
 | Endpoint | Meaning |
 |---|---|
+| `/` | Redirects to `/config` until a printer is configured, then to `/camwall` (no redirect while cameras are disabled) |
 | `/livez`, `/readyz` | `200 ok` once serving (printer state deliberately excluded — clients stay connected while printers recover) |
 | `/status` | JSON: `{"status":"ok","upstreams":{"<serial>":true\|false}}`, plus a `detection` map per printer when the OctoEverywhere key is set |
 | `/activity` | Recent per-printer event lists (in memory; cleared when the proxy restarts) |
@@ -197,6 +214,8 @@ TLS port 6000 whenever cameras are enabled
 | `/camera/status` | Display state for every printer (no credentials) |
 | `/camera/events` | The same display state as server-sent events: on connect, on change, and at least every 10 s |
 | `/camwall` | Multi-printer camera wall dashboard |
+| `/config` | Configuration page: edit printers and proxy settings, then save and apply |
+| `/config/api` | `GET` the file's settings as JSON (access codes are never returned); `PUT` saves them and restarts the proxy services |
 | `/favicon.ico`, `/apple-touch-icon.png` | Camera wall browser-tab, bookmark, and home-screen icons |
 | `/mcp` | Read-only Model Context Protocol endpoint: the four observation tools and the subscribable `bambu://printers/{serial}/state` resource (MCP 2026-07-28 over Streamable HTTP); off when `BMBPX_MCP_ENABLED=false` or `http.port` is `0` |
 
@@ -332,6 +351,20 @@ history, and a restart clears every status and context. The feature follows
 OctoEverywhere's documented API; its verification scope is described in
 DESIGN.md §13.
 
+## Configuration page
+
+`/config` edits the YAML config file (the `-config` path, default
+`bambu-mqtt-proxy.yaml`). Saving validates the settings, writes the file
+(mode `0600`, created along with its directory when missing), and restarts
+every service in-process with the new settings; MQTT clients reconnect as they
+would after a printer reboot. If the saved settings fail to start (for
+example a port already in use), the previous file is restored and the page
+shows the error. The page shows serial numbers but never access codes: a
+blank code keeps the stored one, and changing a printer's address requires
+entering its code again. `BMBPX_*` variables still override file values; the
+page marks each overridden setting. Saving rewrites the file, so comments in
+it are not kept.
+
 ## Security notes
 
 - Runs as a non-root user in the container; the config file and environment
@@ -346,6 +379,11 @@ DESIGN.md §13.
   and fetch camera snapshots through it. It has no control methods and never
   outputs printer credentials; set `BMBPX_MCP_ENABLED=false` if your LAN is
   not fully trusted.
+- The `/config` page is unauthenticated: anyone who can reach the HTTP port
+  can change the proxy's settings (though not read access codes, or send a
+  stored code to a new address). Browser requests from other sites are
+  rejected. Mount the config file read-only or set `http.port: 0` to prevent
+  changes.
 - The optional OctoEverywhere key is a secret: keep it in your environment
   (`.env` is git-ignored) and share the account with caution — setting it
   authorizes external upload of camera snapshots and automatic print pauses,

@@ -21,7 +21,9 @@ services:
       # BMBPX_CAMERA_ENABLED: "false"  # disable camera endpoints, the camera wall, and the raw camera listener on 6000
       # BMBPX_OCTOEVERYWHERE_API_KEY: ""  # optional: enables OctoEverywhere Gadget AI failure detection
       # BMBPX_LOG_LEVEL: debug
-    # Alternative: mount a YAML config file instead of BMBPX_PRINTERS.
-    # Comment out the environment block above, then uncomment:
+    # Alternative: configure printers at http://<host>:8080/config instead of
+    # BMBPX_PRINTERS. Remove BMBPX_PRINTERS above, then uncomment; saving
+    # creates ./config/bambu-mqtt-proxy.yaml (the directory must be writable
+    # by the container user):
     # volumes:
-    #   - ./bambu-mqtt-proxy.yaml:/config/bambu-mqtt-proxy.yaml:ro
+    #   - ./config:/config

@@ -60,8 +60,8 @@ const defaultListenPort = 8883
 type Listener struct {
 	Port     int    `yaml:"port"`
 	TLS      bool   `yaml:"tls"`
-	CertFile string `yaml:"cert_file"`
-	KeyFile  string `yaml:"key_file"`
+	CertFile string `yaml:"cert_file,omitempty"`
+	KeyFile  string `yaml:"key_file,omitempty"`
 }
 
 // Auth configures downstream CONNECT authentication.
@@ -75,11 +75,11 @@ type Printer struct {
 	Address string `yaml:"address"`
 	// Name is an optional friendly label shown on the camera wall. It never
 	// affects routing, which is keyed by Serial.
-	Name string `yaml:"name"`
+	Name string `yaml:"name,omitempty"`
 	// Model is the optional printer model, free-form (P1S, A1MINI,
 	// X1C, ...). Camera capture requires one of P1P, P1S, A1, A1MINI; see
 	// CameraSupported. Any other model still proxies MQTT.
-	Model              string `yaml:"model"`
+	Model              string `yaml:"model,omitempty"`
 	TLS                bool   `yaml:"tls"`
 	InsecureSkipVerify bool   `yaml:"insecure_skip_verify"`
 	Username           string `yaml:"username"`
@@ -256,6 +256,12 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
+	return Parse(raw)
+}
+
+// Parse decodes YAML configuration bytes. An unset http.port stays
+// PortUnset so ApplyDefaults can tell it apart from an explicit 0.
+func Parse(raw []byte) (*Config, error) {
 	cfg := Config{HTTP: HTTP{Port: PortUnset}}
 	if err := yaml.Unmarshal(raw, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
@@ -438,7 +444,8 @@ func (c *Config) ApplyDefaults() {
 	}
 }
 
-// Validate rejects configurations that cannot run.
+// Validate rejects configurations that cannot run. An empty printer list is
+// accepted; the caller decides how to serve it (setup mode).
 func (c *Config) Validate() error {
 	if len(c.Listen) == 0 {
 		return fmt.Errorf("listen: at least one listener is required")
@@ -456,9 +463,8 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("auth: unknown mode %q", c.Auth.Mode)
 	}
-	if len(c.Printers) == 0 {
-		return fmt.Errorf("printers: at least one printer is required")
-	}
+	// Zero printers is valid: the proxy then runs in setup mode and serves
+	// only the HTTP configuration page.
 	seen := make(map[string]bool, len(c.Printers))
 	for i, p := range c.Printers {
 		if p.Serial == "" {
