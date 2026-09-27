@@ -225,9 +225,9 @@ tile shows its configured `name` (or model and serial), its state with an icon
 and color (printing, paused, preparing, failed, finished, idle, offline, and
 "no recent data" when a busy printer has not reported for 2 minutes), a
 progress edge on the camera, and a headline progress/time-left figure. Print
-errors and HMS alerts appear on every tile as a severity-colored banner, with
-the full list and last report age in the full detail level. Click or tap a tile's details panel to
-step through compact, vitals (progress, layers, finish time, nozzle/bed/chamber
+errors and HMS alerts appear on every tile as a severity-colored banner, which
+expands to every alert with its suggested fix in the full detail level. Click or tap a tile's details panel to
+step through compact, vitals (layer count, finish time, nozzle/bed/chamber
 temperature gauges), and full details. Full details also show the recent
 activity log, with timestamps for print state changes, printer alerts,
 connectivity changes, and AI detection events. The log is held in memory and

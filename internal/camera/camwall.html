@@ -5,11 +5,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark">
 <meta name="theme-color" content="#0b0d10">
-<title>Printer wall · bambu-mqtt-proxy</title>
+<title>Camera wall · bambu-mqtt-proxy</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230b0d10'/%3E%3Cg fill='%2334d399'%3E%3Crect x='6' y='6' width='8.75' height='8.75' rx='2'/%3E%3Crect x='17.25' y='6' width='8.75' height='8.75' rx='2'/%3E%3Crect x='6' y='17.25' width='8.75' height='8.75' rx='2'/%3E%3Crect x='17.25' y='17.25' width='8.75' height='8.75' rx='2'/%3E%3C/g%3E%3C/svg%3E">
 <link rel="icon" href="/favicon.ico" sizes="32x32">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
-<meta name="apple-mobile-web-app-title" content="Printer wall">
+<meta name="apple-mobile-web-app-title" content="Camera wall">
 <style>
 :root {
   color-scheme: dark;
@@ -19,6 +19,7 @@
   --failed: #f87171; --stale: #a78bfa; --idle: #94a3b8; --waiting: #94a3b8; --offline: #64748b;
   --live: #ef4444; --attention: #f87171;
   --heat: #fb923c; --tile-min: 340px; --gap: clamp(.5rem, 1.4vw, 1rem); --radius: 14px;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", "JetBrains Mono", Menlo, Consolas, monospace;
   --ease: cubic-bezier(.2, .7, .2, 1);
   accent-color: var(--printing);
 }
@@ -71,10 +72,20 @@ button.chip[aria-pressed="true"] .chip-label { color: var(--text); }
 .icon-btn { display: inline-grid; place-items: center; width: 2.5rem; height: 2.5rem; border-radius: 10px;
             border: 1px solid var(--line); background: var(--panel); cursor: pointer; font-size: 1.1rem; }
 .icon-btn:hover { background: var(--panel-2); }
+/* Proxy configuration leaves the wall, so it reads as a labelled link, not
+   a second settings icon beside the wall's own settings. */
+.nav-link { display: inline-flex; align-items: center; gap: .4rem; height: 2.5rem; padding: 0 .75rem;
+            border-radius: 10px; border: 1px solid var(--line); color: var(--dim); text-decoration: none;
+            font-size: .85rem; white-space: nowrap; }
+.nav-link:hover { color: var(--text); background: var(--panel); }
+.nav-link .ic { font-size: 1.05rem; }
 body.kiosk .bar { display: none; }
 @media (max-width: 640px) {
   .fleet { order: 3; flex-basis: 100%; }
-  .chip-label, .health span { display: none; }
+  .chip-label, .health span, .nav-link span { display: none; }
+  .nav-link { width: 2.5rem; padding: 0; justify-content: center; }
+  /* One column: a camera-less printer does not need a full 16:9 black stage. */
+  .tile[data-camera="none"] .cam { aspect-ratio: 3 / 1; }
 }
 
 /* Wall grid: tiles stretch to fill the width, wrapping at --tile-min. */
@@ -160,10 +171,16 @@ body.kiosk .bar { display: none; }
         border: 0; border-radius: 8px; background: none; color: var(--faint); cursor: grab;
         touch-action: none; font-size: 1.1rem; }
 .grip:hover, .grip:focus-visible { color: var(--text); background: var(--panel-2); }
+/* With a mouse, the grip appears on hover; touch screens always show it. */
+@media (hover: hover) {
+  .grip { opacity: 0; transition: opacity .2s; }
+  .tile:hover .grip, .grip:focus-visible, .tile.dragging .grip { opacity: 1; }
+}
 .ident { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
 .model { font-weight: 650; font-size: 1rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.serial { font: .72rem/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--dim);
+.serial { font: .72rem/1.2 var(--mono); color: var(--dim); letter-spacing: .04em;
           white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.serial:empty { display: none; }
 .stage { font-size: .74rem; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .kpi { display: flex; flex-direction: column; align-items: flex-end; text-align: right; white-space: nowrap; }
 .kpi-main { font-size: 1.3rem; font-size: clamp(1.1rem, .75rem + 3.2cqi, 1.75rem); font-weight: 700;
@@ -175,20 +192,26 @@ body.kiosk .bar { display: none; }
              border: 1px solid color-mix(in srgb, var(--sev) 40%, transparent); }
 .alert-row .ic { color: var(--sev); font-size: 1rem; }
 .alert-row .alert-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.alert-row .alert-code { color: inherit; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .92em; }
-.alert-row a:hover { text-decoration: underline; }
+.alert-row .alert-code { color: var(--dim); font-family: var(--mono); font-size: .92em; }
+.alert-row a:hover, .alert-full a:hover { color: var(--text); text-decoration: underline; }
+/* Full detail swaps the one-line summary for every alert with its fix. */
+.tile[data-level="3"] .alert-row { display: none; }
+.alert-full { --sev: var(--dim); margin-top: .45rem; padding: .5rem .6rem; border-radius: 8px; font-size: .8rem;
+              background: color-mix(in srgb, var(--sev) 12%, transparent);
+              border: 1px solid color-mix(in srgb, var(--sev) 40%, transparent); }
+.tile:not([data-level="3"]) .alert-full { display: none; }
 [data-sev="fatal"], [data-sev="serious"], [data-sev="error"] { --sev: var(--failed); }
 [data-sev="common"] { --sev: var(--paused); }
 [data-sev="warning"] { --sev: var(--paused); }
 [data-sev="info"] { --sev: var(--preparing); }
-code { font: .74rem ui-monospace, SFMono-Regular, Menlo, monospace; }
-.alert-list { margin: 0; padding: 0; list-style: none; display: grid; gap: .2rem; }
-.alert-list li { display: flex; align-items: center; gap: .4rem; flex-wrap: wrap; }
-.alert-list a { color: inherit; }
-.alert-list .alert-fix { flex-basis: 100%; color: var(--dim); font-size: .78rem; }
-.alert-list li::before { content: ""; width: .5rem; height: .5rem; border-radius: 50%; background: var(--sev, var(--dim)); flex: none; }
-.alert-list small { color: var(--dim); }
-.activity h3 { margin: 0 0 .3rem; color: var(--dim); font-size: .8rem; font-weight: 650; }
+.alert-list { margin: 0; padding: 0; list-style: none; display: grid; gap: .45rem; }
+.alert-list li { display: grid; grid-template-columns: 1rem 1fr; gap: .1rem .45rem; align-items: start; }
+.alert-list li > .ic { color: var(--sev); margin-top: .1rem; }
+.alert-list .alert-fix { grid-column: 2; color: var(--dim); }
+.alert-list .alert-code { grid-column: 2; justify-self: start; color: var(--dim); font: .72rem var(--mono); text-decoration: none; }
+/* Section and fact labels borrow the rating-plate lettering of /config. */
+.activity h3, .ams h3 { margin: 0 0 .35rem; color: var(--dim); font: 600 .66rem/1.4 var(--mono);
+                        letter-spacing: .12em; text-transform: uppercase; }
 .act-list { max-height: 14rem; overflow-y: auto; display: grid; gap: .25rem; margin: 0; padding: 0; list-style: none; }
 .act-list li { display: flex; align-items: baseline; gap: .4rem; font-size: .76rem; }
 .act-list li::before { content: ""; width: .45rem; height: .45rem; margin-top: .2rem; border-radius: 50%;
@@ -200,7 +223,6 @@ code { font: .74rem ui-monospace, SFMono-Regular, Menlo, monospace; }
 /* Filament overview (full detail only): one row per AMS unit with its four
    slot cells, plus the external spool row. The active slot is marked with
    an outline and visible text, never color alone. */
-.ams h3 { margin: 0 0 .3rem; color: var(--dim); font-size: .8rem; font-weight: 650; }
 .ams-rows { display: grid; gap: .5rem; }
 .ams-unit-head { display: flex; align-items: baseline; gap: .5rem; font-size: .74rem; color: var(--dim); }
 .ams-unit-name { font-weight: 650; color: var(--text); }
@@ -216,13 +238,13 @@ code { font: .74rem ui-monospace, SFMono-Regular, Menlo, monospace; }
 .slot .left { color: var(--faint); }
 .slot .on-text { flex-basis: 100%; font-size: .68rem; font-weight: 650; color: var(--printing); }
 .ams-note { margin: .35rem 0 0; color: var(--faint); font-size: .74rem; }
-.level { display: inline-flex; align-items: flex-end; gap: 2px; width: 2rem; height: 2.5rem; padding: 0 .45rem .8rem;
-         margin-right: -.35rem; border: 0; border-radius: 8px; background: none; cursor: pointer; }
-.level:hover { background: var(--panel-2); }
-.level i { width: 4px; border-radius: 1px; background: var(--faint); transition: background .2s; }
-.level i:nth-child(1) { height: 6px; } .level i:nth-child(2) { height: 10px; } .level i:nth-child(3) { height: 14px; }
-.tile[data-level="1"] .level i:nth-child(-n+1), .tile[data-level="2"] .level i:nth-child(-n+2),
-.tile[data-level="3"] .level i { background: var(--text); }
+/* Detail disclosure: the chevron points down while more detail remains and
+   flips up at full detail, where the next press collapses the tile. */
+.level { display: inline-grid; place-items: center; width: 2.25rem; height: 2.5rem; margin-right: -.35rem;
+         border: 0; border-radius: 8px; background: none; color: var(--dim); cursor: pointer; font-size: 1.1rem; }
+.level:hover { background: var(--panel-2); color: var(--text); }
+.level .ic { transition: rotate .3s var(--ease); }
+.tile[data-level="3"] .level .ic { rotate: 180deg; }
 
 /* Smooth expand: rows animate between 0fr and 1fr. */
 .more { display: grid; grid-template-rows: 0fr; opacity: 0;
@@ -230,18 +252,15 @@ code { font: .74rem ui-monospace, SFMono-Regular, Menlo, monospace; }
 .more > div { min-height: 0; overflow: hidden; }
 .tile[data-level="2"] .l2, .tile[data-level="3"] .l2, .tile[data-level="3"] .l3 { grid-template-rows: 1fr; opacity: 1; }
 .pad { padding-top: .6rem; display: grid; gap: .55rem; }
-.progress-row { display: flex; align-items: center; gap: .6rem; font-size: .8rem; color: var(--dim);
+.progress-row { display: flex; align-items: center; gap: 1rem; font-size: .8rem; color: var(--dim);
                 font-variant-numeric: tabular-nums; }
-.progress-row[hidden] { display: none; }
+.stat b { color: var(--text); font-weight: 600; }
 .detect-l2 { --tone: var(--dim); display: flex; align-items: center; gap: .45rem; font-size: .8rem;
              color: var(--dim); font-variant-numeric: tabular-nums; }
 .detect-l2 .ic { color: var(--tone); font-size: 1rem; }
 .detect-l2 .d-q { font-weight: 650; color: var(--tone); }
 .detect-l2[data-tone="info"], .detect-l2[data-tone="warn"] { --tone: var(--paused); }
 .detect-l2[data-tone="error"] { --tone: var(--failed); }
-.meter { flex: 1 1 auto; height: 8px; border-radius: 4px; background: var(--panel-2); overflow: hidden; }
-.meter > div { height: 100%; width: var(--pct, 0%); background: var(--accent); border-radius: inherit;
-               transition: width .8s var(--ease); }
 .stat { display: inline-flex; align-items: center; gap: .3rem; white-space: nowrap; }
 .temps { display: grid; grid-template-columns: repeat(auto-fit, minmax(6.5rem, 1fr)); gap: .4rem; }
 .temp { --t: var(--faint); position: relative; display: flex; align-items: center; gap: .4rem; overflow: hidden;
@@ -256,8 +275,10 @@ code { font: .74rem ui-monospace, SFMono-Regular, Menlo, monospace; }
 .temp.heating { --t: var(--heat); }
 .temp.hot { --t: var(--printing); }
 .temp.cooling { --t: var(--preparing); }
-.facts { display: grid; grid-template-columns: auto 1fr; gap: .25rem .75rem; margin: 0; font-size: .8rem; }
-.facts dt { color: var(--dim); display: flex; align-items: center; gap: .35rem; }
+.facts { display: grid; grid-template-columns: auto 1fr; gap: .3rem .9rem; margin: 0; font-size: .8rem; align-items: baseline; }
+.facts dt { display: flex; align-items: center; gap: .4rem; color: var(--dim);
+            font: 600 .66rem/1.9 var(--mono); letter-spacing: .12em; text-transform: uppercase; }
+.facts dt .ic { font-size: .9rem; }
 .facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 .open { display: inline-flex; align-items: center; gap: .4rem; justify-self: start; padding: .35rem .7rem;
         border-radius: 8px; border: 1px solid var(--line); color: var(--text); text-decoration: none; font-size: .8rem; }
@@ -328,7 +349,7 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
   <symbol id="i-offline" viewBox="0 0 24 24"><path d="m3 3 18 18M8.5 16.4a5 5 0 0 1 7 0M5 12.9a10 10 0 0 1 5-2.7M19 12.9a10 10 0 0 0-2.3-1.7M2 8.8a15 15 0 0 1 3.5-2.4M22 8.8a15 15 0 0 0-11.3-3.7M12 20h.01"/></symbol>
   <symbol id="i-camera" viewBox="0 0 24 24"><path d="M4 7.5h3l2-2.5h6l2 2.5h3a1 1 0 0 1 1 1V19a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V8.5a1 1 0 0 1 1-1z"/><circle cx="12" cy="13.5" r="3.5"/></symbol>
   <symbol id="i-camera-off" viewBox="0 0 24 24"><path d="m3 3 18 18M9.5 5H15l2 2.5h3a1 1 0 0 1 1 1V17M18 20H4a1 1 0 0 1-1-1V8.5a1 1 0 0 1 1-1h3M14.5 16a3.5 3.5 0 0 1-5-5"/></symbol>
-  <symbol id="i-nozzle" viewBox="0 0 24 24"><rect x="6" y="3" width="12" height="6" rx="1"/><path d="M8.5 9h7L13.5 15h-3zM12 18.5v.01M9 21h6"/></symbol>
+  <symbol id="i-nozzle" viewBox="0 0 24 24"><rect x="5" y="3" width="14" height="7" rx="1.5"/><path d="M8.5 10h7l-2.5 5h-2zM12 15v3.5M10 21h4"/></symbol>
   <symbol id="i-bed" viewBox="0 0 24 24"><rect x="3" y="16" width="18" height="4" rx="1"/><path d="M8 13c-1.2-1.5 1.2-2.5 0-4.5M12 13c-1.2-1.5 1.2-2.5 0-4.5M16 13c-1.2-1.5 1.2-2.5 0-4.5"/></symbol>
   <symbol id="i-thermo" viewBox="0 0 24 24"><path d="M14 14.8V5a2 2 0 0 0-4 0v9.8a4 4 0 1 0 4 0zM12 9v7"/></symbol>
   <symbol id="i-layers" viewBox="0 0 24 24"><path d="m12 3 9 5-9 5-9-5zM3 13l9 5 9-5"/></symbol>
@@ -342,18 +363,19 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
   <symbol id="i-fullscreen" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></symbol>
   <symbol id="i-external" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></symbol>
   <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
   <symbol id="i-bell" viewBox="0 0 24 24"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10.3 21a1.94 1.94 0 0 0 3.4 0"/></symbol>
   <symbol id="i-clock-alert" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-9-9M12 7v5l3 2M19 3v4M19 10.5v.01"/></symbol>
 </svg>
 
 <header class="bar">
-  <div class="brand"><svg class="ic" aria-hidden="true"><use href="#i-wall"/></svg><h1>Printer wall</h1></div>
+  <div class="brand"><svg class="ic" aria-hidden="true"><use href="#i-wall"/></svg><h1>Camera wall</h1></div>
   <ul class="fleet" id="fleet" aria-label="Fleet summary and filters"></ul>
   <div class="actions">
     <span class="health" id="health" data-health="wait"><i aria-hidden="true"></i><span id="health-text">Connecting…</span></span>
     <button class="icon-btn" id="btn-fullscreen" type="button" aria-label="Toggle full screen" hidden><svg class="ic" aria-hidden="true"><use href="#i-fullscreen"/></svg></button>
     <button class="icon-btn" id="btn-settings" type="button" aria-label="Wall settings" aria-haspopup="dialog"><svg class="ic" aria-hidden="true"><use href="#i-sliders"/></svg></button>
-    <a class="icon-btn" href="/config" aria-label="Proxy configuration" style="color:inherit"><svg class="ic" aria-hidden="true"><use href="#i-gear"/></svg></a>
+    <a class="nav-link" href="/config" title="Proxy configuration"><svg class="ic" aria-hidden="true"><use href="#i-gear"/></svg><span>Configuration</span></a>
   </div>
 </header>
 
@@ -405,34 +427,32 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
       <span class="pill state"><svg class="ic" aria-hidden="true"><use/></svg><span class="label"></span></span>
       <span class="pill feed" hidden><span class="dot" aria-hidden="true"></span><svg class="ic" aria-hidden="true"><use href="#i-camera"/></svg><span class="feed-label"></span></span>
       <span class="pill detect" hidden><svg class="ic" aria-hidden="true"><use href="#i-ai"/></svg><span class="label"></span><span class="q"></span></span>
-      <div class="cam-progress" hidden><div></div></div>
+      <div class="cam-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" hidden><div></div></div>
     </div>
     <div class="details">
       <div class="head">
         <button class="grip" type="button"><svg class="ic" aria-hidden="true"><use href="#i-grip"/></svg></button>
         <div class="ident"><span class="model"></span><span class="serial"></span><span class="stage" hidden></span></div>
         <div class="kpi"><span class="kpi-main"></span><span class="kpi-sub"></span></div>
-        <button class="level" type="button"><i></i><i></i><i></i></button>
+        <button class="level" type="button"><svg class="ic" aria-hidden="true"><use href="#i-chevron"/></svg></button>
       </div>
       <div class="alert-row" hidden><svg class="ic" aria-hidden="true"><use href="#i-alert"/></svg><span class="alert-text"></span></div>
+      <div class="alert-full" hidden><ul class="alert-list" aria-label="Alerts"></ul></div>
       <div class="more l2"><div><div class="pad">
         <div class="progress-row">
-          <div class="meter" role="progressbar" aria-valuemin="0" aria-valuemax="100"><div></div></div>
-          <span class="stat layers"><svg class="ic" aria-hidden="true"><use href="#i-layers"/></svg><span></span></span>
-          <span class="stat eta"><svg class="ic" aria-hidden="true"><use href="#i-flag"/></svg><span></span></span>
+          <span class="stat layers"><svg class="ic" aria-hidden="true"><use href="#i-layers"/></svg>Layer <b></b></span>
+          <span class="stat eta"><svg class="ic" aria-hidden="true"><use href="#i-flag"/></svg>Done at <b></b></span>
         </div>
-        <div class="detect-l2" hidden><svg class="ic" aria-hidden="true"><use href="#i-camera"/></svg><b class="d-q"></b><span class="d-text"></span></div>
+        <div class="detect-l2" hidden><svg class="ic" aria-hidden="true"><use href="#i-ai"/></svg><b class="d-q"></b><span class="d-text"></span></div>
         <div class="temps"></div>
       </div></div></div>
       <div class="more l3"><div><div class="pad">
         <dl class="facts">
-          <dt><svg class="ic" aria-hidden="true"><use href="#i-file"/></svg>File</dt><dd class="f-file"></dd>
-          <dt><svg class="ic" aria-hidden="true"><use href="#i-clock"/></svg>Remaining</dt><dd class="f-remain"></dd>
-          <dt><svg class="ic" aria-hidden="true"><use href="#i-camera"/></svg>Camera</dt><dd class="f-camera"></dd>
-          <dt class="dt-detect" hidden><svg class="ic" aria-hidden="true"><use href="#i-camera"/></svg>Inspection</dt><dd class="f-detect" hidden></dd>
-          <dt><svg class="ic" aria-hidden="true"><use href="#i-bell"/></svg>Alerts</dt><dd class="f-alerts"></dd>
-          <dt><svg class="ic" aria-hidden="true"><use href="#i-clock-alert"/></svg>Last report</dt><dd class="f-report"></dd>
-          <dt><svg class="ic" aria-hidden="true"><use href="#i-tag"/></svg>Serial</dt><dd class="f-serial"></dd>
+          <dt class="dt-file"><svg class="ic" aria-hidden="true"><use href="#i-file"/></svg>File</dt><dd class="f-file"></dd>
+          <dt class="dt-camera"><svg class="ic" aria-hidden="true"><use href="#i-camera"/></svg>Camera</dt><dd class="f-camera"></dd>
+          <dt class="dt-detect" hidden><svg class="ic" aria-hidden="true"><use href="#i-ai"/></svg>Inspection</dt><dd class="f-detect" hidden></dd>
+          <dt class="dt-report"><svg class="ic" aria-hidden="true"><use href="#i-clock-alert"/></svg>Last report</dt><dd class="f-report"></dd>
+          <dt class="dt-serial"><svg class="ic" aria-hidden="true"><use href="#i-tag"/></svg>Serial</dt><dd class="f-serial"></dd>
         </dl>
         <section class="ams" aria-label="Filament" hidden>
           <h3>Filament</h3>
@@ -720,8 +740,8 @@ function detectFact(d, b) {
     if (d.message) bits.push(d.message);
     return bits.join(" · ");
   }
-  bits.push(d.quality != null ? `${d.quality}/10 ${qualityWord(d.quality)}` : "no result yet");
-  if (d.layerNum != null) bits.push(`layer ${d.layerNum} at inspection`);
+  // Quality, layer, and check age already show on the vitals line above;
+  // this fact adds only the flags and reasons behind them.
   if (detectPausePending(d)) bits.push("pause pending · printer not yet paused");
   if (detectPauseUnconfirmed(d)) bits.push("pause unconfirmed");
   if (detectPauseConfirmed(d)) bits.push("pause confirmed by printer");
@@ -729,8 +749,6 @@ function detectFact(d, b) {
   if (d.cameraLost) bits.push("camera view lost");
   if (d.faster) bits.push("closer monitoring requested");
   if (d.fallback) bits.push("fallback URL in use");
-  if (d.age != null) bits.push(`checked ${fmtAgo(Math.round(d.age))}${detectOld(d) ? " · old" : ""}`);
-  if (d.suspended) bits.push("suspended · account error");
   if (reasonWords(d)) bits.push(reasonWords(d));
   if (d.message) bits.push(d.message);
   return bits.join(" · ");
@@ -796,13 +814,14 @@ function createTile(p) {
       details: q(".details"), grip: q(".grip"), model: q(".model"), serial: q(".serial"),
       kpiMain: q(".kpi-main"), kpiSub: q(".kpi-sub"), level: q(".level"),
       alertRow: q(".alert-row"), alertText: q(".alert-text"),
-      l2: q(".l2"), l3: q(".l3"), progressRow: q(".progress-row"), meter: q(".meter"),
-      layers: q(".layers span"), eta: q(".eta span"), temps: q(".temps"),
+      alertFull: q(".alert-full"), alertList: q(".alert-full .alert-list"),
+      l2: q(".l2"), l3: q(".l3"), progressRow: q(".progress-row"),
+      layers: q(".layers b"), eta: q(".eta b"), temps: q(".temps"),
       detect: q(".pill.detect"), detectLabel: q(".pill.detect .label"),
       detectQ: q(".pill.detect .q"), d2: q(".detect-l2"), d2q: q(".detect-l2 .d-q"),
       d2text: q(".detect-l2 .d-text"), fDetectDt: q(".dt-detect"), fDetect: q(".f-detect"),
-      fFile: q(".f-file"), fRemain: q(".f-remain"), fCamera: q(".f-camera"), fAlerts: q(".f-alerts"),
-      fReport: q(".f-report"), fSerial: q(".f-serial"), open: q(".open"),
+      dtFile: q(".dt-file"), fFile: q(".f-file"), dtCamera: q(".dt-camera"), fCamera: q(".f-camera"),
+      dtReport: q(".dt-report"), fReport: q(".f-report"), dtSerial: q(".dt-serial"), fSerial: q(".f-serial"), open: q(".open"),
       stage: q(".stage"), amsSec: q(".ams"), amsRows: q(".ams-rows"), amsNote: q(".ams-note"),
       actList: q(".act-list"), actEmpty: q(".act-empty"),
     },
@@ -828,7 +847,7 @@ function createTile(p) {
   details.addEventListener("click", e => {
     // The activity and filament sections stay readable, so clicks there
     // must not cycle the detail level.
-    if (e.target.closest("a, .grip, .activity, .ams") || getSelection()?.toString()) return;
+    if (e.target.closest("a, .grip, .activity, .ams, .alert-full") || getSelection()?.toString()) return;
     t.level = t.level % 3 + 1;
     prefs.levels[t.serial] = t.level;
     savePrefs();
@@ -972,6 +991,7 @@ function applyLevel(t) {
   t.r.l3.inert = t.level < 3;
   t.r.level.setAttribute("aria-label",
     `Detail level: ${names[t.level - 1]}. Switch to ${names[t.level % 3]}.`);
+  t.r.level.title = t.level === 3 ? "Show less" : "Show more";
 }
 
 function camView(t) {
@@ -1035,14 +1055,18 @@ function renderTile(t) {
     `${alerts.length ? `, ${alerts.length} alert${alerts.length > 1 ? "s" : ""}` : ""}`);
   r.stateUse.setAttribute("href", `#${s.icon}`);
   r.stateLabel.textContent = s.label;
+  t.el.dataset.camera = p.camera_supported ? "yes" : "none";
+  // A named printer's subtitle is its model; the serial moves to full
+  // detail. Unnamed printers already use the model as their title.
   r.model.textContent = p.name || p.model || "Printer";
-  r.serial.textContent = p.name ? `${p.model ? `${p.model} · ` : ""}${p.serial}` : p.serial;
+  r.serial.textContent = p.name ? p.model || "" : p.serial;
+  r.dtSerial.hidden = r.fSerial.hidden = !p.name;
   // Stage is secondary: it never replaces the state pill, and it hides
   // where it could be outdated — offline or stale printers may have
   // stopped mid-action, and finished or idle printers have ended the print
-  // the stage described.
+  // the stage described. A stage that only repeats the state is dropped.
   const stage = stageWords(p.stage);
-  r.stage.hidden = !stage || b === "offline" || b === "stale" ||
+  r.stage.hidden = !stage || stage.toLowerCase() === s.label.toLowerCase() || b === "offline" || b === "stale" ||
     b === "finished" || b === "idle";
   r.stage.textContent = stage;
   r.grip.setAttribute("aria-label", `Reorder ${nameOf(t)}. Drag, or use arrow keys.`);
@@ -1050,19 +1074,26 @@ function renderTile(t) {
   r.hit.setAttribute("aria-pressed", String(t.serial === spotlight));
   r.hit.hidden = !p.camera_supported;
 
-  // Headline metric: progress and time left for jobs, otherwise the state.
+  // Headline metric: progress and time left for jobs. The state pill already
+  // names the state, so the headline never repeats it; offline and stale
+  // printers show how old their data is instead.
   const remain = fmtDuration(p.remain_min);
   const reportAge = p.report_age_seconds != null ? Math.round(p.report_age_seconds) : null;
-  r.kpiMain.textContent = progress ? `${pct}%` : "";
-  r.kpiSub.textContent = isActive(b) ? (remain ? `${remain} left` : s.label)
-    : b === "finished" ? "Complete" : b === "failed" ? "Stopped"
-    : b === "stale" ? `No data for ${fmtAgo(reportAge).replace(" ago", "")}` : s.label;
+  r.kpiMain.textContent = progress && b !== "finished" ? `${pct}%` : "";
+  r.kpiSub.textContent = isActive(b) ? (remain ? `${remain} left` : "")
+    : b === "failed" && progress ? "when stopped"
+    : b === "stale" ? `No data for ${fmtAgo(reportAge).replace(" ago", "")}`
+    : b === "offline" && reportAge != null ? `Seen ${fmtAgo(reportAge)}` : "";
 
   // Alerts stay visible at every detail level: they are why someone looks.
+  // Compact and vitals show the top alert on one line; full detail replaces
+  // it with every alert and its fix.
   r.alertRow.hidden = alerts.length === 0;
+  r.alertFull.hidden = alerts.length === 0;
   if (alerts.length) {
     const top = alerts[0];
     r.alertRow.dataset.sev = top.severity;
+    r.alertFull.dataset.sev = top.severity;
     // Human description first, then the raw code linked to Printara3D's
     // lookup; codes without a dataset entry still carry the link.
     r.alertText.replaceChildren();
@@ -1115,22 +1146,27 @@ function renderTile(t) {
       r.d2text.textContent = bits.join(" · ");
     }
   }
-  r.fDetectDt.hidden = r.fDetect.hidden = !d || d.state === "idle";
-  if (d && d.state !== "idle") r.fDetect.textContent = detectFact(d, b);
+  const fact = d && d.state !== "idle" ? detectFact(d, b) : "";
+  r.fDetectDt.hidden = r.fDetect.hidden = !fact;
+  r.fDetect.textContent = fact;
   const sig = detSig(d, b);
   if (t.detSig === undefined) t.detSig = sig;
   else if (sig !== t.detSig) { announceDetect(t, t.detSig, sig); t.detSig = sig; }
 
   t.el.style.setProperty("--pct", `${pct}%`);
   r.camBar.hidden = !progress;
-  r.progressRow.hidden = !progress;
-  r.meter.setAttribute("aria-valuenow", String(pct));
-  r.meter.setAttribute("aria-label", `Print progress ${pct}%`);
-  r.layers.textContent = p.layer_num != null && p.total_layers ? `${p.layer_num}/${p.total_layers}` : "–";
-  r.layers.parentElement.title = "Layer";
+  r.camBar.setAttribute("aria-valuenow", String(pct));
+  r.camBar.setAttribute("aria-label", `Print progress ${pct}%`);
+  // Progress itself lives on the camera bar and the headline; vitals add
+  // the layer count and the clock time the print should end.
+  const layers = progress && p.layer_num != null && p.total_layers ? `${p.layer_num} of ${p.total_layers}` : "";
   const finish = isActive(b) ? fmtFinish(p.remain_min) : "";
-  r.eta.textContent = finish || "–";
-  r.eta.parentElement.title = finish ? "Estimated finish" : "";
+  r.layers.textContent = layers;
+  r.layers.parentElement.hidden = !layers;
+  r.eta.textContent = finish;
+  r.eta.parentElement.hidden = !finish;
+  r.eta.parentElement.title = finish ? "Estimated finish time" : "";
+  r.progressRow.hidden = !layers && !finish;
 
   const chips = [
     tempChip("i-nozzle", "Nozzle", p.nozzle_temp, p.nozzle_target),
@@ -1145,56 +1181,47 @@ function renderTile(t) {
     r.temps.replaceChildren(none);
   }
 
-  r.fFile.textContent = p.filename || "–";
-  r.fRemain.textContent = isActive(b) && remain ? `${remain} (finish ${finish})` : "–";
-  if (alerts.length) {
-    const list = document.createElement("ul");
-    list.className = "alert-list";
-    for (const a of alerts) {
-      const li = document.createElement("li");
-      li.dataset.sev = a.severity;
-      const code = document.createElement("code");
-      code.textContent = a.text ?? a.code;
-      const note = document.createElement("small");
-      if (a.text) {
-        if (a.code) note.textContent = a.code;
-      } else {
-        note.textContent = a.severity === "error" ? a.label.toLowerCase() : a.severity;
-      }
-      if (a.url) {
-        const ref = document.createElement("a");
-        ref.href = a.url;
-        ref.target = "_blank";
-        ref.rel = "noopener";
-        ref.append(code);
-        li.append(ref);
-      } else {
-        li.append(code);
-      }
-      if (a.fix) {
-        const fix = document.createElement("div");
-        fix.className = "alert-fix";
-        fix.textContent = a.fix;
-        li.append(fix);
-      }
-      li.append(note);
-      list.append(li);
+  r.fFile.textContent = p.filename || "";
+  r.dtFile.hidden = r.fFile.hidden = !p.filename;
+  r.alertList.replaceChildren(...alerts.map(a => {
+    const li = document.createElement("li");
+    li.dataset.sev = a.severity;
+    const text = document.createElement("span");
+    text.textContent = a.text || `${a.label}${a.severity === "error" ? "" : ` · ${a.severity}`}`;
+    li.append(icon(SEVERITY_RANK[a.severity] >= 3 ? "i-alert" : "i-bell"), text);
+    if (a.fix) {
+      const fix = document.createElement("span");
+      fix.className = "alert-fix";
+      fix.textContent = a.fix;
+      li.append(fix);
     }
-    r.fAlerts.replaceChildren(list);
-  } else {
-    r.fAlerts.textContent = "None";
-  }
+    if (a.code) {
+      const code = document.createElement(a.url ? "a" : "span");
+      code.className = "alert-code";
+      code.textContent = a.code;
+      if (a.url) {
+        code.href = a.url;
+        code.target = "_blank";
+        code.rel = "noopener";
+        code.title = "Look up this code";
+      }
+      li.append(code);
+    }
+    return li;
+  }));
   renderActivity(t);
   renderAMS(t);
   r.fReport.textContent = reportAge == null ? "No report yet" : reportAge < 2 ? "Just now" : fmtAgo(reportAge);
+  // Offline and stale headlines already carry the report age.
+  r.dtReport.hidden = r.fReport.hidden = b === "offline" || b === "stale";
   r.fSerial.textContent = p.serial;
   const frameAge = Math.round(Number(p.frame_age_seconds || 0));
   const frameNote = p.frame_seq ? ` · frame captured ${frameAge ? fmtAgo(frameAge) : "just now"}` : "";
-  r.fCamera.textContent = !p.camera_supported ? "Not supported on this model"
-    : t.feed === "live" ? `Live stream${frameNote}`
-    : t.feed === "snap" ? `Snapshot every ${prefs.snapSec}s${frameNote}`
-    : !p.connected ? "Printer offline" : "Paused while off-screen";
-  r.open.hidden = !p.camera_supported;
+  // The camera stage already says when there is no camera or no printer.
+  r.dtCamera.hidden = r.fCamera.hidden = !p.camera_supported || !p.connected;
+  r.fCamera.textContent = t.feed === "live" ? `Live stream${frameNote}`
+    : t.feed === "snap" ? `Snapshot every ${prefs.snapSec}s${frameNote}` : "Paused while off-screen";
+  r.open.hidden = !p.camera_supported || !p.connected;
 
   const view = camView(t);
   r.cam.classList.toggle("blocked", !!view?.[2]);
@@ -1411,8 +1438,7 @@ function chip(iconId, accent) {
 function buildFleet() {
   for (const key of FILTER_KEYS) {
     const def = key === "attention" ? ATTENTION : STATES[key];
-    // Offline counts read as errors; the other chips keep their state color.
-    const c = chip(def.icon, key === "offline" ? "var(--failed)" : `var(--${key})`);
+    const c = chip(def.icon, `var(--${key})`);
     c.label.textContent = def.label.toLowerCase();
     c.el.addEventListener("click", () => toggleFilter(key));
     fleetChips.set(key, c);
@@ -1463,7 +1489,7 @@ function renderHealth() {
   el.dataset.health = failing ? "down" : !lastOk ? "wait" : quiet ? "stale" : "ok";
   const base = failing
     ? (lastOk ? `Reconnecting · updated ${fmtAgo(age)}` : "Proxy unreachable")
-    : !lastOk ? "Connecting…" : quiet ? `Updated ${fmtAgo(age)}` : "Live";
+    : !lastOk ? "Connecting…" : quiet ? `Updated ${fmtAgo(age)}` : "Connected";
   document.getElementById("health-text").textContent = detSuspended ? `${base} · AI off` : base;
   el.title = (lastOk ? `Last status update ${new Date(lastOk).toLocaleTimeString()}` : "") +
     (detSuspended && detMessage ? ` · AI: ${detMessage}` : "");
