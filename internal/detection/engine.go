@@ -240,6 +240,12 @@ type Engine struct {
 // New builds the engine; Start spawns the workers.
 func New(printers []config.Printer, client gadgetClient, frames FrameSource,
 	sessions sessionSource, control PrinterControl, gens GenerationSource, log *slog.Logger) *Engine {
+	if log != nil {
+		log = log.With("origin", "detection")
+	}
+	if logger, ok := client.(interface{ setLogger(*slog.Logger) }); ok && log != nil {
+		logger.setLogger(log.With("component", "gadget_client"))
+	}
 	specs := make(map[string]config.Printer, len(printers))
 	workers := make(map[string]*worker, len(printers))
 	e := &Engine{
@@ -442,6 +448,34 @@ func newWorker(e *Engine, serial string) *worker {
 		controlWake: make(chan struct{}, 1),
 		pauseState:  PauseNone,
 	}
+}
+
+// diagnosticAttrs returns concise engine state for info and warning events.
+func (w *worker) diagnosticAttrs() []any {
+	now := w.e.now()
+	attrs := []any{"connection_generation", w.e.gens.Generation(w.serial)}
+	if w.e.sessions != nil {
+		if snap, ok := w.e.sessions.Session(w.serial); ok {
+			attrs = append(attrs,
+				"print_state", snap.State,
+				"session_generation", snap.SessionGen,
+				"session_epoch", snap.Epoch,
+				"telemetry_generation", snap.ObsGen,
+				"telemetry_age_ms", now.Sub(snap.ObsAt).Milliseconds())
+			if snap.LayerNum != nil {
+				attrs = append(attrs, "layer", *snap.LayerNum)
+			}
+		}
+	}
+	w.mu.Lock()
+	attrs = append(attrs,
+		"using_fallback", w.useFallback,
+		"pause_state", w.pauseState,
+		"retry_attempt", w.tempAttempts,
+		"intensive_inspection", w.intensiveLocked(now),
+		"degraded_reason", w.degraded)
+	w.mu.Unlock()
+	return attrs
 }
 
 // clearOverrideForSession drops the per-print override only when fresh
@@ -824,7 +858,7 @@ func (w *worker) onPauseHold(snap telemetry.SessionView) time.Duration {
 			s.Reason, s.Message = "", ""
 			s.State = StatePaused
 		})
-		w.log.Info("pause confirmed by printer report")
+		w.log.Info("pause confirmed by printer report", w.diagnosticAttrs()...)
 		w.e.activity.Record(w.serial, "ai_pause_confirmed", activity.Warning, "Printer confirmed AI pause")
 		return w.e.kIdlePoll
 	case w.pauseState == PausePending && w.e.now().After(w.pauseDeadline):
@@ -922,6 +956,11 @@ func (w *worker) onRunning(ctx context.Context, snap telemetry.SessionView) time
 	w.mu.Unlock()
 	if !held {
 		if !w.e.frames.Acquire(w.serial) {
+			if w.log.Enabled(context.Background(), slog.LevelDebug) {
+				w.log.Debug("detection inspection deferred", append(w.diagnosticAttrs(),
+					"operation", "process", "reason", "camera_acquire_failed",
+					"retry_seconds", w.e.kCameraRetry.Seconds())...)
+			}
 			return w.degrade(ReasonCameraLost, "camera frames are unavailable; waiting before retry", w.e.kCameraRetry, true)
 		}
 		w.mu.Lock()
@@ -929,6 +968,49 @@ func (w *worker) onRunning(ctx context.Context, snap telemetry.SessionView) time
 		w.mu.Unlock()
 	}
 	return w.inspect(ctx, snap)
+}
+
+// gadgetRequestContext attaches correlation and inspection details to one API request.
+func (w *worker) gadgetRequestContext(ctx context.Context, action string, snap telemetry.SessionView,
+	gen uint64, frame *Frame, layer *int) (context.Context, requestLogContext) {
+	now := w.e.now()
+	detail := requestLogContext{
+		requestID:            fmt.Sprintf("detect-%s-%s-%d-%d-%d-%d", w.serial, action, snap.SessionGen, snap.Epoch, gen, w.lastSeq),
+		action:               action,
+		serial:               w.serial,
+		inspectionReason:     "scheduled_inspection",
+		printState:           snap.State,
+		sessionGeneration:    snap.SessionGen,
+		sessionEpoch:         snap.Epoch,
+		connectionGeneration: gen,
+		telemetryAgeMS:       now.Sub(snap.ObsAt).Milliseconds(),
+		layer:                copyLayer(layer),
+	}
+	w.mu.Lock()
+	if !w.haveSession {
+		detail.inspectionReason = "first_inspection_for_print"
+	} else if w.tempAttempts > 0 {
+		detail.inspectionReason = "retry_after_failure"
+	} else if w.riskActive {
+		detail.inspectionReason = "risk_triggered_intensive_inspection"
+	} else if w.lastLayer != nil && *w.lastLayer > 0 && *w.lastLayer <= 3 {
+		detail.inspectionReason = "early_layer_intensive_inspection"
+	} else if now.Before(w.intensiveUntil) {
+		detail.inspectionReason = "startup_or_recovery_intensive_inspection"
+	} else {
+		detail.inspectionReason = "routine_provider_interval"
+	}
+	detail.frameSequence = w.lastSeq
+	detail.retryAttempt = w.tempAttempts
+	detail.intensive = w.intensiveLocked(now)
+	detail.usingFallback = w.useFallback
+	w.mu.Unlock()
+	if frame != nil {
+		detail.frameSequence = frame.Seq
+		detail.frameBytes = len(frame.JPEG)
+		detail.frameAgeMS = now.Sub(frame.Captured).Milliseconds()
+	}
+	return withRequestLogContext(ctx, detail), detail
 }
 
 // noteRunningTransition starts a two-minute intensive period after a
@@ -989,7 +1071,7 @@ func (w *worker) resetForNewSession(sessionGen uint64) {
 	w.mu.Unlock()
 	w.controlMu.Unlock()
 	w.publish(func(s *Status) { *s = Status{State: StateMonitoring} })
-	w.log.Info("new print session detected; gadget context reset")
+	w.log.Info("new print session detected; gadget context reset", w.diagnosticAttrs()...)
 }
 
 // guardPauseOnRunning applies the confirm-window rules to a RUNNING report:
@@ -1022,7 +1104,7 @@ func (w *worker) guardPauseOnRunning() {
 		w.mu.Unlock()
 		w.publish(func(s *Status) { s.Reason, s.Message = "", "" })
 		w.recomputeState()
-		w.log.Info("print resumed after confirmed pause")
+		w.log.Info("print resumed after confirmed pause", w.diagnosticAttrs()...)
 	}
 }
 
@@ -1036,6 +1118,17 @@ func (w *worker) inspect(ctx context.Context, snap telemetry.SessionView) time.D
 		// Stale or older-generation telemetry: a reconnect's cached RUNNING
 		// report must never authorize an action before a fresh observation
 		// arrives on the current connection.
+		if w.log.Enabled(context.Background(), slog.LevelDebug) {
+			w.log.Debug("detection inspection deferred", append(w.diagnosticAttrs(),
+				"operation", "process", "reason", "telemetry_not_authorized",
+				"inspection_session_generation", snap.SessionGen,
+				"inspection_session_epoch", snap.Epoch,
+				"inspection_connection_generation", gen,
+				"inspection_telemetry_generation", snap.ObsGen,
+				"inspection_state_generation", snap.StateGen,
+				"inspection_state", snap.State,
+				"inspection_telemetry_age_ms", w.e.now().Sub(snap.ObsAt).Milliseconds())...)
+		}
 		return w.degrade(ReasonAwaitingTelemetry, "waiting for fresh printer telemetry", w.e.kStalePoll, false)
 	}
 	// Snapshot this attempt's work scope: startGen is the marker onResult
@@ -1054,14 +1147,31 @@ func (w *worker) inspect(ctx context.Context, snap telemetry.SessionView) time.D
 	if overridden {
 		return w.e.kIdlePoll
 	}
+	frameWaitStarted := time.Now()
 	frame, ok := w.e.frames.WaitFrame(w.serial, wctx, w.lastSeq, w.e.kFrameWait)
+	frameWaitDuration := time.Since(frameWaitStarted)
 	if wctx.Err() != nil {
 		// Superseded by a control change: re-evaluate instead of recording
 		// a camera failure.
 		return w.e.kStalePoll
 	}
 	if !ok || w.e.now().Sub(frame.Captured) > w.e.kFrameFreshMax {
+		if w.log.Enabled(context.Background(), slog.LevelDebug) {
+			w.log.Debug("detection inspection deferred", append(w.diagnosticAttrs(),
+				"operation", "process", "reason", "no_fresh_camera_frame",
+				"last_frame_sequence", w.lastSeq,
+				"frame_wait_duration_ms", frameWaitDuration.Milliseconds(),
+				"frame_wait_limit_ms", w.e.kFrameWait.Milliseconds())...)
+		}
 		return w.degrade(ReasonCameraLost, "no fresh camera frame for inspection", w.e.kCameraRetry, true)
+	}
+	if w.log.Enabled(context.Background(), slog.LevelDebug) {
+		w.log.Debug("fresh camera frame acquired for inspection", append(w.diagnosticAttrs(),
+			"operation", "process", "frame_sequence", frame.Seq,
+			"frame_bytes", len(frame.JPEG),
+			"frame_age_ms", w.e.now().Sub(frame.Captured).Milliseconds(),
+			"frame_wait_duration_ms", frameWaitDuration.Milliseconds(),
+			"frame_wait_limit_ms", w.e.kFrameWait.Milliseconds())...)
 	}
 	w.lastSeq = frame.Seq
 	// Layer alignment: the layer the frame actually captured is read from a
@@ -1079,9 +1189,16 @@ func (w *worker) inspect(ctx context.Context, snap telemetry.SessionView) time.D
 
 	if !w.hasSession() {
 		rctx, cancel := context.WithTimeout(wctx, requestTimeout)
+		rctx, detail := w.gadgetRequestContext(rctx, "create_context", snap, gen, &frame, layer)
+		started := time.Now()
 		session, err := w.e.client.CreateContext(rctx)
 		cancel()
 		if err != nil {
+			if w.log.Enabled(context.Background(), slog.LevelDebug) {
+				completion := append(detail.logAttrs(), "operation", "create",
+					"duration_ms", time.Since(started).Milliseconds(), "error", err.Error())
+				w.log.Debug("gadget operation completed", completion...)
+			}
 			if ctx.Err() != nil {
 				return -1
 			}
@@ -1095,19 +1212,43 @@ func (w *worker) inspect(ctx context.Context, snap telemetry.SessionView) time.D
 		w.haveSession = true
 		w.useFallback = false
 		w.mu.Unlock()
-		w.log.Info("gadget operation completed", "operation", "create", "using_fallback", false)
+		w.log.Info("gadget context created", "operation", "create",
+			"session_generation", snap.SessionGen,
+			"connection_generation", gen,
+			"frame_sequence", frame.Seq,
+			"inspection_reason", detail.inspectionReason,
+			"duration_ms", time.Since(started).Milliseconds())
 		w.e.activity.Record(w.serial, "ai_monitoring", activity.Info, "AI inspection started")
 	}
 
 	url := w.sessionURL()
 	rctx, cancel := context.WithTimeout(wctx, requestTimeout)
+	rctx, detail := w.gadgetRequestContext(rctx, "process", snap, gen, &frame, layer)
 	w.publish(func(s *Status) { s.Processing = true })
+	started := time.Now()
 	res, err := w.e.client.Process(rctx, url, frame.JPEG)
 	if validIntervals(res.Intervals) {
 		w.rememberIntervals(res.Intervals)
 	}
 	cancel()
 	w.publish(func(s *Status) { s.Processing = false })
+	if w.log.Enabled(context.Background(), slog.LevelDebug) {
+		completion := append(detail.logAttrs(),
+			"operation", "process",
+			"duration_ms", time.Since(started).Milliseconds(),
+			"using_fallback", w.usingFallback(),
+			"response_minimum_interval_seconds", res.Intervals.Minimum,
+			"response_recommended_interval_seconds", res.Intervals.Recommended,
+			"print_quality", res.PrintQuality,
+			"warning_suggested", res.WarningSuggested,
+			"pause_suggested", res.PauseSuggested,
+			"faster_inspection_suggested", res.FasterInspectionSuggested,
+			"score", res.Score)
+		if err != nil {
+			completion = append(completion, "error", err.Error())
+		}
+		w.log.Debug("gadget operation completed", completion...)
+	}
 	if err != nil {
 		if ctx.Err() != nil {
 			return -1
@@ -1118,12 +1259,41 @@ func (w *worker) inspect(ctx context.Context, snap telemetry.SessionView) time.D
 		}
 		return w.handleFailure(err, true)
 	}
-	w.log.Debug("gadget operation completed", "operation", "process", "using_fallback", w.usingFallback())
 	// The session ended or changed while the request was in flight: onResult
 	// discards the stale result, but valid response timing still paces this
 	// same print context.
-	w.onResult(snap, gen, frame, res, layer, startGen)
-	return w.scheduleResponse(res.Intervals)
+	accepted := w.onResult(snap, gen, frame, res, layer, startGen)
+	delay := w.scheduleResponse(res.Intervals)
+	if w.log.Enabled(context.Background(), slog.LevelDebug) {
+		w.log.Debug("gadget response cadence scheduled", append(w.responseCadenceAttrs(delay),
+			"result_accepted", accepted)...)
+	}
+	return delay
+}
+
+// responseCadenceAttrs explains the policy inputs that selected the next check.
+func (w *worker) responseCadenceAttrs(delay time.Duration) []any {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	intensive := w.intensiveLocked(w.e.now())
+	source := "provider_recommended_interval"
+	if intensive {
+		source = "provider_minimum_interval_intensive"
+	} else if !w.haveIntervals {
+		source = "default_retry_floor"
+	}
+	return []any{
+		"session_generation", w.sessionGen,
+		"connection_generation", w.e.gens.Generation(w.serial),
+		"using_fallback", w.useFallback,
+		"cadence_source", source,
+		"provider_minimum_interval_seconds", w.latestIntervals.Minimum,
+		"provider_recommended_interval_seconds", w.latestIntervals.Recommended,
+		"required_retry_floor_seconds", w.requiredFloorLocked().Seconds(),
+		"intensive_inspection", intensive,
+		"next_check_seconds", delay.Seconds(),
+		"retry_attempt", w.tempAttempts,
+	}
 }
 
 // copyLayer snapshots a telemetry layer pointer for status and cadence.
@@ -1462,7 +1632,10 @@ func (w *worker) sessionURL() string {
 // discarded.
 func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, res Result, layer *int, workGen uint64) bool {
 	if current, ok := w.e.sessions.Session(w.serial); !ok || !current.Active || current.Epoch != snap.Epoch {
-		w.log.Info("inspection result discarded; print session changed during upload")
+		w.log.Info("inspection result discarded; print session changed during upload",
+			"operation", "process", "session_generation", snap.SessionGen,
+			"session_epoch", snap.Epoch, "connection_generation", gen,
+			"frame_sequence", frame.Seq, "reason", "print_session_changed")
 		return false
 	}
 	// The supersede check and the final pause dispatch share controlMu, so
@@ -1475,14 +1648,20 @@ func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, r
 	w.mu.Unlock()
 	if superseded {
 		w.controlMu.Unlock()
-		w.log.Info("inspection result discarded; detection availability changed during upload")
+		w.log.Info("inspection result discarded; detection availability changed during upload",
+			"operation", "process", "session_generation", snap.SessionGen,
+			"session_epoch", snap.Epoch, "connection_generation", gen,
+			"frame_sequence", frame.Seq, "reason", "detection_availability_changed")
 		return false
 	}
 	// Recheck continuity after acquiring the control lock. A result that became
 	// stale while waiting for the lock must not alter policy or pause state.
 	if current, ok := w.e.sessions.Session(w.serial); !ok || !current.Active || current.Epoch != snap.Epoch {
 		w.controlMu.Unlock()
-		w.log.Info("inspection result discarded; print session changed during upload")
+		w.log.Info("inspection result discarded; print session changed during upload",
+			"operation", "process", "session_generation", snap.SessionGen,
+			"session_epoch", snap.Epoch, "connection_generation", gen,
+			"frame_sequence", frame.Seq, "reason", "print_session_changed")
 		return false
 	}
 	w.mu.Lock()
@@ -1522,8 +1701,14 @@ func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, r
 	reason := ""
 	pauseAuthorized := false
 	attempted := false
+	authorizationReason := "pause_not_suggested"
 	if pauseWanted {
-		pauseAuthorized = w.pauseAuthorized(snap, gen, frame)
+		authorizationReason = w.pauseAuthorizationReason(snap, gen, frame)
+		pauseAuthorized = authorizationReason == ""
+	} else if res.PauseSuggested {
+		authorizationReason = "pause_latched_until_clear"
+	}
+	if pauseWanted {
 		if pauseAuthorized {
 			err := w.e.control.PausePrint(w.serial, gen)
 			attempted = true
@@ -1532,16 +1717,52 @@ func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, r
 				pauseState = PauseUnconfirmed
 				reason = ReasonPauseFailed
 				message = "pause command failed: " + err.Error()
-				w.log.Warn("pause command rejected", "error", err.Error())
+				w.log.Warn("pause command rejected", "operation", "pause",
+					"session_generation", snap.SessionGen, "session_epoch", snap.Epoch,
+					"connection_generation", gen, "frame_sequence", frame.Seq,
+					"quality", res.PrintQuality, "error", err.Error())
 			} else {
 				pauseState = PausePending
 				message = "pause sent; waiting for printer confirmation"
-				w.log.Warn("pause command published", "quality", res.PrintQuality)
+				w.log.Warn("pause command published", "operation", "pause",
+					"session_generation", snap.SessionGen, "session_epoch", snap.Epoch,
+					"connection_generation", gen, "frame_sequence", frame.Seq,
+					"quality", res.PrintQuality)
 			}
 		} else {
 			// The print changed while the request was in flight (PAUSE to
 			// RUNNING, a reconnect, or stale telemetry): discard the result.
-			w.log.Info("pause suggestion discarded; print state changed during inspection")
+			w.log.Info("pause suggestion discarded; print state changed during inspection",
+				"operation", "pause", "session_generation", snap.SessionGen,
+				"session_epoch", snap.Epoch, "connection_generation", gen,
+				"frame_sequence", frame.Seq, "reason", authorizationReason)
+		}
+	}
+	decision := "pause_not_suggested"
+	switch {
+	case pauseWanted && !pauseAuthorized:
+		decision = "pause_rejected"
+	case attempted && pauseState == PausePending:
+		decision = "pause_sent"
+	case attempted:
+		decision = "pause_command_failed"
+	case res.PauseSuggested:
+		decision = "pause_suppressed_until_clear"
+	}
+	if w.log.Enabled(context.Background(), slog.LevelDebug) {
+		w.log.Debug("gadget action evaluated", "operation", "process",
+			"decision", decision, "session_generation", snap.SessionGen,
+			"session_epoch", snap.Epoch, "connection_generation", gen,
+			"frame_sequence", frame.Seq,
+			"frame_age_ms", w.e.now().Sub(frame.Captured).Milliseconds(),
+			"print_quality", res.PrintQuality,
+			"warning_suggested", res.WarningSuggested,
+			"pause_suggested", res.PauseSuggested,
+			"pause_latch_awaiting_clear", !pauseWanted && res.PauseSuggested,
+			"pause_authorized", pauseAuthorized,
+			"pause_authorization_reason", authorizationReason)
+		if layer != nil {
+			w.log.Debug("gadget action evaluated", "layer", *layer)
 		}
 	}
 	// The pause outcome moves into loop state while controlMu is still
@@ -1605,21 +1826,42 @@ func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, r
 // in-flight request cancels the pause), still running, telemetry fresh on
 // the same connection generation with RUNNING explicitly restated on it,
 // and a still-recent frame.
-func (w *worker) pauseAuthorized(snap telemetry.SessionView, gen uint64, frame Frame) bool {
+func layerValue(layer *int) int {
+	if layer == nil {
+		return 0
+	}
+	return *layer
+}
+
+func (w *worker) pauseAuthorizationReason(snap telemetry.SessionView, gen uint64, frame Frame) string {
 	if w.e.now().Sub(frame.Captured) > w.e.kResultValidity {
-		return false
+		return "inspection_frame_expired"
 	}
 	current, ok := w.e.sessions.Session(w.serial)
 	if !ok || !current.Active {
-		return false
+		return "no_active_print_session"
 	}
 	nowGen := w.e.gens.Generation(w.serial)
-	return current.Epoch == snap.Epoch &&
-		isRunning(current.State) &&
-		nowGen == gen && gen != 0 &&
-		current.ObsGen == nowGen &&
-		current.StateGen == nowGen &&
-		w.e.now().Sub(current.ObsAt) <= w.e.kReportFreshMax
+	switch {
+	case current.Epoch != snap.Epoch:
+		return "print_session_changed"
+	case !isRunning(current.State):
+		return "printer_not_running"
+	case nowGen != gen || gen == 0:
+		return "connection_generation_changed"
+	case current.ObsGen != nowGen:
+		return "telemetry_not_observed_on_current_connection"
+	case current.StateGen != nowGen:
+		return "running_state_not_observed_on_current_connection"
+	case w.e.now().Sub(current.ObsAt) > w.e.kReportFreshMax:
+		return "printer_telemetry_stale"
+	default:
+		return ""
+	}
+}
+
+func (w *worker) pauseAuthorized(snap telemetry.SessionView, gen uint64, frame Frame) bool {
+	return w.pauseAuthorizationReason(snap, gen, frame) == ""
 }
 
 // handleFailure classifies an API or transport failure: terminal account
@@ -1642,6 +1884,15 @@ func (w *worker) handleFailure(err error, processCall bool) time.Duration {
 		typeName = safeAPIErrorType(apiErr)
 	}
 	reason := failureReason(err)
+	if w.log.Enabled(context.Background(), slog.LevelDebug) {
+		w.log.Debug("Gadget failure detail",
+			"operation", operation,
+			"http_status", httpStatus,
+			"failure_class", class,
+			"error_type", typeName,
+			"error_detail", err.Error(),
+			"frame_bytes", errorsFrameSize(err))
+	}
 	level := slog.LevelWarn
 	delay := time.Duration(0)
 	switch {
@@ -1685,19 +1936,19 @@ func (w *worker) handleFailure(err error, processCall bool) time.Duration {
 		return w.logTemporaryFailure(operation, httpStatus, typeName, class, reason, delay)
 	}
 	fallback := w.usingFallback()
-	w.log.Log(context.Background(), level, "Gadget inspection failed",
+	w.log.Log(context.Background(), level, "Gadget inspection failed", append(w.diagnosticAttrs(),
 		"operation", operation, "status", httpStatus, "type", typeName,
-		"class", class, "retry_seconds", 0, "fallback", fallback, "reason", reason)
+		"class", class, "retry_seconds", 0, "fallback", fallback, "reason", reason)...)
 	return delay
 }
 
 // logTemporaryFailure records a retryable failure and publishes its safe
 // diagnostic reason to status and activity.
 func (w *worker) logTemporaryFailure(operation string, httpStatus int, typeName, class, reason string, delay time.Duration) time.Duration {
-	w.log.Warn("Gadget inspection failed",
+	w.log.Warn("Gadget inspection failed", append(w.diagnosticAttrs(),
 		"operation", operation, "status", httpStatus, "type", typeName,
 		"class", class, "retry_seconds", delay.Seconds(),
-		"fallback", w.usingFallback(), "reason", reason)
+		"fallback", w.usingFallback(), "reason", reason)...)
 	return w.degrade(ReasonAPIRetrying, reason, delay, false)
 }
 

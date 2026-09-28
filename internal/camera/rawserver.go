@@ -19,6 +19,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"bambu-mqtt-proxy/internal/tlsutil"
@@ -62,6 +63,8 @@ type RawServer struct {
 	sockets  map[net.Conn]struct{}
 	wg       sync.WaitGroup
 	closed   bool
+	// connectionID uniquely identifies accepted raw-camera sessions in logs.
+	connectionID atomic.Uint64
 }
 
 // NewRawServer builds the raw camera server for one manager's captures.
@@ -121,7 +124,8 @@ func (s *RawServer) acceptLoop(ln net.Listener) {
 			closed := s.closed
 			s.mu.Unlock()
 			if !closed {
-				s.log.Info("camera raw listener stopped", "error", err)
+				s.log.Error("camera raw listener stopped",
+					"address", ln.Addr().String(), "error", err)
 			}
 			return
 		}
@@ -173,47 +177,53 @@ func (s *RawServer) handle(raw net.Conn) {
 	defer s.wg.Done()
 	defer s.forget(raw)
 	defer raw.Close()
+	log := s.log.With("connection_id", s.connectionID.Add(1), "remote", raw.RemoteAddr().String())
 
 	// The handshake and the authentication read share one absolute
 	// deadline. A client that is not fully authenticated within it closes
 	// with no reply and no capture acquisition.
 	if err := raw.SetDeadline(time.Now().Add(rawAuthBudget)); err != nil {
+		log.Debug("camera raw authentication deadline failed", "error", err)
 		return
 	}
 	conn := tls.Server(raw, s.tlsConfig)
 	if err := conn.Handshake(); err != nil {
-		s.log.Debug("camera raw TLS handshake failed", "remote", raw.RemoteAddr(), "error", err)
+		log.Debug("camera raw TLS handshake failed", "error", err)
 		return
 	}
 	var payload [authPayloadLen]byte
 	if _, err := io.ReadFull(conn, payload[:]); err != nil {
-		s.log.Debug("camera raw authentication read failed", "remote", raw.RemoteAddr(), "error", err)
+		log.Debug("camera raw authentication read failed", "error", err)
 		return
 	}
 	if !validAuthHeader(payload[:]) {
 		// Wrong magic or command: close silently, like the printer does,
 		// and never touch a capture.
-		s.log.Info("camera raw authentication refused", "remote", raw.RemoteAddr())
+		log.Info("camera raw authentication refused", "reason", "invalid header")
 		return
 	}
 	printer, ok := s.manager.matchCameraCredentials(payload[16:48], payload[48:80])
 	if !ok {
 		// Unknown credentials or an ineligible printer: close silently,
 		// like the printer does, and never touch a capture.
-		s.log.Info("camera raw authentication refused", "remote", raw.RemoteAddr())
+		log.Info("camera raw authentication refused", "reason", "unknown credentials or ineligible printer")
 		return
 	}
 	// Authenticated: clear the shared deadline. From here the session lives
 	// until client EOF, a protocol error, or a frame budget.
 	if err := conn.SetDeadline(time.Time{}); err != nil {
+		log.Debug("camera raw session deadline could not be cleared", "serial", printer.Serial, "error", err)
 		return
 	}
 	if _, st := s.manager.Acquire(printer.Serial); st != StatusOK {
+		log.Info("camera raw session unavailable", "serial", printer.Serial, "status", st)
 		return
 	}
+	log.Info("camera raw client connected", "serial", printer.Serial)
 	// One persistent reference per raw session, released when it ends.
 	// Manager.Wait balances its own temporary references internally.
 	defer s.manager.Release(printer.Serial)
+	defer log.Info("camera raw client disconnected", "serial", printer.Serial)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -228,8 +238,7 @@ func (s *RawServer) handle(raw net.Conn) {
 		defer cancel()
 		var probe [1]byte
 		if n, _ := conn.Read(probe[:]); n > 0 {
-			s.log.Info("camera raw client sent unexpected data; ending session",
-				"remote", raw.RemoteAddr())
+			log.Info("camera raw client sent unexpected data; ending session")
 		}
 		_ = raw.Close()
 	}()
@@ -244,7 +253,7 @@ func (s *RawServer) handle(raw net.Conn) {
 	if cached := s.manager.Latest(printer.Serial); cached != nil {
 		lastSeq = cached.Seq
 		if time.Since(cached.Captured) <= rawCacheMaxAge {
-			if !s.sendFrame(conn, cached) {
+			if !s.sendFrameWithLogger(conn, cached, log) {
 				return
 			}
 			budgetStart = time.Now()
@@ -268,7 +277,7 @@ func (s *RawServer) handle(raw net.Conn) {
 			// window and keep waiting for a fresh one.
 			continue
 		}
-		if !s.sendFrame(conn, frame) {
+		if !s.sendFrameWithLogger(conn, frame, log) {
 			return
 		}
 		budgetStart = time.Now()
@@ -280,11 +289,17 @@ func (s *RawServer) handle(raw net.Conn) {
 // deadline. A frame without its raw header is a bug: it is never
 // synthesized, and the session ends instead.
 func (s *RawServer) sendFrame(conn net.Conn, f *Frame) bool {
+	return s.sendFrameWithLogger(conn, f, s.log)
+}
+
+// sendFrameWithLogger writes a frame and logs failures with the session context.
+func (s *RawServer) sendFrameWithLogger(conn net.Conn, f *Frame, log *slog.Logger) bool {
 	if len(f.Header) != frameHeaderLen {
-		s.log.Error("camera raw frame lost its raw header; ending session", "seq", f.Seq)
+		log.Error("camera raw frame lost its raw header; ending session", "seq", f.Seq)
 		return false
 	}
 	if err := conn.SetWriteDeadline(time.Now().Add(rawWriteBudget)); err != nil {
+		log.Debug("camera raw client write deadline failed", "seq", f.Seq, "error", err)
 		return false
 	}
 	var err error
@@ -292,7 +307,7 @@ func (s *RawServer) sendFrame(conn net.Conn, f *Frame) bool {
 		_, err = conn.Write(f.JPEG)
 	}
 	if err != nil {
-		s.log.Info("camera raw client write failed; ending session", "error", err)
+		log.Info("camera raw client write failed; ending session", "seq", f.Seq, "error", err)
 		return false
 	}
 	return true

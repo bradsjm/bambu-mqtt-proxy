@@ -198,8 +198,15 @@ func (b *Bridge) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, 
 	if len(serials) == 0 {
 		return pk, packets.CodeSuccessIgnore
 	}
-	b.log.Debug("request forwarded", "client", cl.ID, "serial", serials[0], "bytes", len(pk.Payload))
-	b.pool.Publish(serials[0], pk.TopicName, pk.Payload, pk.FixedHeader.Qos)
+	b.pool.PublishWithContext(serials[0], pk.TopicName, pk.Payload, pk.FixedHeader.Qos, upstream.PublishContext{
+		Origin:       "client",
+		Action:       "request",
+		ClientID:     cl.ID,
+		SourcePacket: true,
+		SourceQoS:    pk.FixedHeader.Qos,
+		SourceDup:    pk.FixedHeader.Dup,
+		SourceRetain: pk.FixedHeader.Retain,
+	})
 	return pk, packets.CodeSuccessIgnore
 }
 

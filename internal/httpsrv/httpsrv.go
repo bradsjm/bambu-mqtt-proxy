@@ -45,7 +45,7 @@ func (s *Server) Start() error {
 	}
 	go func() {
 		if err := s.srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-			s.log.Error("http server", "error", err)
+			s.log.Error("http server stopped unexpectedly", "address", ln.Addr().String(), "error", err)
 		}
 	}()
 	return nil

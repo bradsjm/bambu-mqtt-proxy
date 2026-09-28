@@ -201,7 +201,8 @@ func (s *sampler) enqueue(serial string) {
 	select {
 	case s.notfCh <- serial:
 	default:
-		s.srv.log.Debug("resource notification queue full; hint dropped", "serial", serial)
+		s.srv.log.Debug("resource notification queue full; hint dropped",
+			"serial", serial, "uri", stateURI(serial), "queue_capacity", cap(s.notfCh))
 	}
 }
 

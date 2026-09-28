@@ -5,25 +5,29 @@
 //
 // Security posture: the API key travels only in the X-API-Key header; every
 // request URL is validated to HTTPS on the vendor domain; redirects are
-// never followed; and every error rendered here is sanitized — no raw URLs,
-// no provider ErrorDetails, and no response body fragments — so context ids
-// or provider-side text can never reach logs or public status payloads.
+// never followed; and errors rendered in status remain sanitized. Debug
+// logs include complete bounded response bodies for diagnosis.
 package detection
 
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
 
 // Gadget API endpoints and hard limits. These are vendor guarantees and
@@ -77,9 +81,8 @@ type Result struct {
 
 // APIError is the common Gadget error body returned on non-2XX responses.
 // It intentionally carries only the status code and the classified error
-// type token: the provider's ErrorDetails text is never parsed or stored,
-// because it may contain provider-side context that must not surface in
-// logs or status payloads.
+// type token: provider details are not parsed or stored in errors. The
+// bounded raw response body is available in debug logs, not public errors.
 type APIError struct {
 	Type   string
 	Status int
@@ -199,9 +202,119 @@ func IsFrameTooLarge(err error) bool {
 // Client calls the Gadget API with the account key. It is safe for
 // concurrent use; the detection engine serializes calls per printer anyway.
 type Client struct {
-	apiKey    string
-	createURL string
-	http      *http.Client
+	apiKey     string
+	createURL  string
+	http       *http.Client
+	log        *slog.Logger
+	logMu      sync.RWMutex
+	requestSeq atomic.Uint64
+}
+
+// requestLogContextKey identifies Gadget request diagnostics in a context.
+type requestLogContextKey struct{}
+
+// requestLogContext ties one Gadget HTTP request to the printer state and
+// camera frame that caused it. It contains no image bytes or credentials.
+type requestLogContext struct {
+	requestID            string
+	action               string
+	serial               string
+	inspectionReason     string
+	printState           string
+	sessionGeneration    uint64
+	sessionEpoch         uint64
+	connectionGeneration uint64
+	frameSequence        uint64
+	frameBytes           int
+	layer                *int
+	telemetryAgeMS       int64
+	frameAgeMS           int64
+	retryAttempt         int
+	intensive            bool
+	usingFallback        bool
+}
+
+// withRequestLogContext attaches diagnostic metadata to one Gadget request.
+func withRequestLogContext(ctx context.Context, detail requestLogContext) context.Context {
+	return context.WithValue(ctx, requestLogContextKey{}, detail)
+}
+
+// setLogger attaches the engine logger before its workers start.
+func (c *Client) setLogger(log *slog.Logger) {
+	c.logMu.Lock()
+	c.log = log
+	c.logMu.Unlock()
+}
+
+// logger returns the logger attached by the detection engine.
+func (c *Client) logger() *slog.Logger {
+	c.logMu.RLock()
+	defer c.logMu.RUnlock()
+	return c.log
+}
+
+// requestLogAttrs returns non-secret metadata for one HTTP request.
+func (c *Client) requestLogAttrs(req *http.Request) []any {
+	detail, _ := req.Context().Value(requestLogContextKey{}).(requestLogContext)
+	action := detail.action
+	if action == "" {
+		action = "request"
+	}
+	attrs := []any{"action", action, "method", req.Method,
+		"request_host", req.URL.Hostname(), "request_content_type", req.Header.Get("Content-Type"),
+		"request_bytes", req.ContentLength}
+	attrs = append(attrs, "request_url", req.URL.String())
+	return append(attrs, detail.logAttrs()...)
+}
+
+// logAttrs returns correlation and inspection metadata without context tokens.
+func (d requestLogContext) logAttrs() []any {
+	attrs := []any{
+		"request_id", d.requestID,
+		"printer", d.serial,
+		"inspection_reason", d.inspectionReason,
+		"print_state", d.printState,
+		"session_generation", d.sessionGeneration,
+		"session_epoch", d.sessionEpoch,
+		"connection_generation", d.connectionGeneration,
+		"frame_sequence", d.frameSequence,
+		"frame_bytes", d.frameBytes,
+		"telemetry_age_ms", d.telemetryAgeMS,
+		"frame_age_ms", d.frameAgeMS,
+		"retry_attempt", d.retryAttempt,
+		"intensive_inspection", d.intensive,
+		"using_fallback", d.usingFallback,
+	}
+	if d.layer != nil {
+		attrs = append(attrs, "layer", *d.layer)
+	}
+	return attrs
+}
+
+// debugResponse logs the complete bounded response bytes only when debug is enabled.
+func debugResponse(logger *slog.Logger, ctx context.Context, attrs []any, resp *http.Response,
+	body []byte, duration time.Duration, readErr error) {
+	if logger == nil || !logger.Enabled(ctx, slog.LevelDebug) {
+		return
+	}
+	truncated := len(body) > maxResponseBytes ||
+		resp.ContentLength >= 0 && int64(len(body)) < resp.ContentLength || readErr != nil
+	attrs = append(attrs,
+		"http_status", resp.StatusCode,
+		"http_status_line", resp.Status,
+		"response_content_type", resp.Header.Get("Content-Type"),
+		"response_content_length", resp.ContentLength,
+		"duration_ms", duration.Milliseconds(),
+		"response_body_bytes", len(body),
+		"response_body_truncated", truncated,
+		"response_body", string(body))
+	if !utf8.Valid(body) {
+		attrs = append(attrs, "response_body_base64", base64.StdEncoding.EncodeToString(body))
+	}
+	if readErr != nil {
+		attrs = append(attrs, "read_error", readErr.Error())
+	}
+	logger.Debug("Gadget HTTP response received", attrs...)
 }
 
 // NewGadgetClient builds the client. The key only ever travels in the
@@ -420,12 +533,28 @@ func (c *Client) Process(ctx context.Context, url string, jpeg []byte) (Result, 
 
 // do sends one authenticated request and returns the bounded response body.
 // Non-2XX responses become *APIError; redirects are never followed.
-// Transport failures become sanitized generic class errors: neither the
-// request URL and host nor the underlying cause text is ever rendered,
-// because both may embed context or arbitrary provider-side strings.
+// The returned transport and validation errors stay sanitized. Debug logs
+// retain the underlying transport details and complete bounded response.
 func (c *Client) do(req *http.Request) ([]byte, error) {
+	detail, _ := req.Context().Value(requestLogContextKey{}).(requestLogContext)
+	if detail.requestID == "" {
+		detail.requestID = fmt.Sprintf("gadget-%d", c.requestSeq.Add(1))
+		req = req.WithContext(withRequestLogContext(req.Context(), detail))
+	}
+	logger := c.logger()
+	debug := logger != nil && logger.Enabled(req.Context(), slog.LevelDebug)
+	var attrs []any
+	if debug {
+		attrs = c.requestLogAttrs(req)
+		logger.Debug("Gadget HTTP request attempted", attrs...)
+	}
+	started := time.Now()
 	resp, err := c.http.Do(req)
 	if err != nil {
+		if debug {
+			logger.Debug("Gadget HTTP request failed", append(attrs,
+				"duration_ms", time.Since(started).Milliseconds(), "transport_error", err.Error())...)
+		}
 		switch {
 		case errors.Is(err, context.Canceled):
 			return nil, &TransportError{message: "gadget request canceled"}
@@ -434,11 +563,20 @@ func (c *Client) do(req *http.Request) ([]byte, error) {
 		}
 		return nil, &TransportError{message: "gadget request failed"}
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			if debug {
+				logger.Debug("Gadget HTTP response close failed", append(attrs,
+					"http_status", resp.StatusCode, "close_error", closeErr.Error())...)
+			}
+		}
+	}()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
+		debugResponse(logger, req.Context(), attrs, resp, body, time.Since(started), err)
 		return nil, &TransportError{message: "gadget response read failed"}
 	}
+	debugResponse(logger, req.Context(), attrs, resp, body, time.Since(started), nil)
 	if len(body) > maxResponseBytes {
 		return nil, &responseValidationError{message: "gadget response exceeds the supported size limit"}
 	}
