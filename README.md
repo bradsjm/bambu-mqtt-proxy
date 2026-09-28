@@ -36,7 +36,7 @@ topic path.
 | **Printer connection limits stop mattering** | Any number of clients share one merged subscription per printer. |
 | **One endpoint for the whole fleet** | MQTT topics route by serial (`device/{serial}/report`, `device/{serial}/request`); only raw camera connections route by access code instead. |
 | **Printer outages ride out** | Capped exponential backoff with jitter, automatic reconnect and resubscribe, and a `pushall` warmup. Late joiners get full state (P1 printers otherwise send deltas only). |
-| **Cameras, two ways** | A live multi-printer dashboard wall and a printer-compatible raw passthrough on port 6000. |
+| **Cameras, two ways** | A live multi-printer dashboard wall — P1/A1 cameras natively, X1/P2S/H2-series cameras through bundled FFmpeg — and a printer-compatible raw passthrough on port 6000. |
 | **Optional AI failure detection** | With an OctoEverywhere Gadget key, snapshots from active prints are analyzed and the proxy pauses likely failures. No key, no uploads, no automatic pauses. |
 | **Read-only MCP endpoint** | `/mcp` exposes printer state and camera snapshots to AI agents; it has no control methods. |
 | **Supervision-friendly** | `/livez`, `/readyz`, and `/status` for Docker/Kubernetes probes. |
@@ -181,8 +181,8 @@ disabled.
 | `/livez`, `/readyz` | `200 ok` once serving (printer state deliberately excluded — clients stay connected while printers recover) |
 | `/status` | JSON: `{"status":"ok","upstreams":{"<serial>":true\|false}}`, plus a `detection` map per printer when the Gadget key is set |
 | `/activity`, `/activity/{serial}` | Recent per-printer events (in memory; cleared when the proxy restarts) |
-| `/camera/{serial}/snapshot` | Single JPEG frame |
-| `/camera/{serial}/stream` | Live multipart MJPEG stream |
+| `/camera/{serial}/snapshot` | Single JPEG frame (P1/A1 native; X1/P2S/H2-series converted server-side with FFmpeg) |
+| `/camera/{serial}/stream` | Live multipart MJPEG stream (same model support as the snapshot) |
 | `/camera/status` | Display state for every printer (no credentials) |
 | `/camera/events` | The same display state as server-sent events: on connect, on change, and at least every 10 s |
 | `/camwall` | Multi-printer camera wall dashboard |
@@ -231,20 +231,37 @@ Open `http://<host>:8080/camwall`.
   by design: anyone who can reach the HTTP port can view cameras and
   telemetry. The state endpoints never include credentials.
 
-Camera capture works on the models that use Bambu's chamber image protocol;
-support is auto-detected from the serial prefix, so no per-printer
-configuration is required:
+Camera capture is automatic for configured printers: the model is detected
+from the serial prefix, so no per-printer configuration is required. Two
+transports exist:
 
-| Model | Serial prefix |
-|---|---|
-| P1P | `01P` |
-| P1S | `01S` |
-| A1 MINI | `030` |
-| A1 | `039` |
+| Model | Serial prefix | Web transport |
+|---|---|---|
+| P1P | `01P` | Native chamber JPEG protocol |
+| P1S | `01S` | Native chamber JPEG protocol |
+| A1 MINI | `030` | Native chamber JPEG protocol |
+| A1 | `039` | Native chamber JPEG protocol |
+| X1 | `00W` | RTSPS, converted server-side with FFmpeg |
+| X1C | `00M` | RTSPS, converted server-side with FFmpeg |
+| X1E | `03W` | RTSPS, converted server-side with FFmpeg |
+| P2S | `22E` | RTSPS, converted server-side with FFmpeg |
+| H2S | `093` | RTSPS, converted server-side with FFmpeg |
+| H2D | `094` | RTSPS, converted server-side with FFmpeg |
+
+For RTSPS models the proxy pulls `rtsps://<printer>:322/streaming/live/1`
+with the printer's `bblp` access code and converts the video to JPEG frames
+for the wall at a fixed low rate. H2-series firmware may need
+**Settings → LAN Mode Liveview** enabled on the printer for port 322 to
+answer. The Docker images bundle FFmpeg, so no extra setup is needed there;
+a native install needs `ffmpeg` on `PATH`. Without it, RTSPS models show
+"camera unavailable: FFmpeg is not installed" on the wall, one warning is
+logged at startup, and P1/A1 cameras keep working — install FFmpeg and
+restart the proxy to enable them.
 
 An explicit `model` field overrides the inference. Ineligible serials
-(X1-class RTSP cameras, unknown prefixes) answer `404` (unknown serial) or
-`422` (unsupported model) without ever opening a camera socket. Chamber
+(unsupported models, unknown prefixes) answer `404` (unknown serial) or
+`422` (unsupported model) without ever opening a camera socket. The Gadget AI
+detection feature covers only the P1/A1 chamber-protocol models. Chamber
 temperature is shown only for models with a physical chamber sensor (the
 X1/X2/P2/H2 classes); P1 and A1 models omit the reading even if their report
 contains `chamber_temper`.
@@ -254,6 +271,8 @@ contains `chamber_temper`.
 - TLS listener speaking the printer's own camera protocol: the client sends
   the printer's 80-byte `bblp` + access-code authentication and receives the
   printer's native JPEG frame flow unchanged.
+- Serves the chamber-protocol models (P1/A1) only; X1/P2S/H2-series cameras
+  are not proxied on this port.
 - Starts with the camera feature — even with `http.port: 0` — and a port or
   certificate failure fails startup with a wrapped error.
 - The access code is the routing key, so printers need unique access codes for

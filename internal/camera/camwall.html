@@ -1029,6 +1029,7 @@ function applyLevel(t) {
 function camView(t) {
   const p = t.data;
   if (!p.camera_supported) return ["i-camera-off", `No chamber camera on ${p.model || "this model"}`, true];
+  if (p.camera_reason) return ["i-camera-off", p.camera_reason, true];
   if (!p.connected) return ["i-offline", "Printer offline", true];
   if (t.feed === "live" && t.liveError) return ["i-camera-off", "Camera unavailable · retrying", true];
   if (t.feed === "snap" && t.snap.error && !t.hasFrame) return ["i-camera-off", "Camera unavailable · retrying", true];
@@ -1285,10 +1286,10 @@ function renderTile(t) {
   const frameAge = Math.round(Number(p.frame_age_seconds || 0));
   const frameNote = p.frame_seq ? ` · frame captured ${frameAge ? fmtAgo(frameAge) : "just now"}` : "";
   // The camera stage already says when there is no camera or no printer.
-  r.dtCamera.hidden = r.fCamera.hidden = !p.camera_supported || !p.connected;
-  r.fCamera.textContent = t.feed === "live" ? `Live stream${frameNote}`
-    : t.feed === "snap" ? `Snapshot every ${prefs.snapSec}s${frameNote}` : "Paused while off-screen";
-  r.open.hidden = !p.camera_supported || !p.connected;
+  r.dtCamera.hidden = r.fCamera.hidden = !p.camera_supported || (!p.connected && !p.camera_reason);
+  r.fCamera.textContent = p.camera_reason || (t.feed === "live" ? `Live stream${frameNote}`
+    : t.feed === "snap" ? `Snapshot every ${prefs.snapSec}s${frameNote}` : "Paused while off-screen");
+  r.open.hidden = !p.camera_supported || !p.connected || !!p.camera_reason;
 
   const view = camView(t);
   r.cam.classList.toggle("blocked", !!view?.[2]);
@@ -1305,7 +1306,8 @@ function renderTile(t) {
 
 // Camera feeds: bounded live MJPEG slots, snapshot polling for the rest.
 function eligible(t) {
-  return !document.hidden && !t.el.hidden && visible.has(t.serial) && t.data.connected && t.data.camera_supported;
+  return !document.hidden && !t.el.hidden && visible.has(t.serial) && t.data.connected &&
+    t.data.camera_supported && !t.data.camera_reason;
 }
 function allocate() {
   const order = [...grid.children].map(el => tiles.get(el.dataset.serial));

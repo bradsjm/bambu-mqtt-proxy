@@ -8,9 +8,16 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/rand/v2"
+	"mime/multipart"
+	"net"
+	"net/url"
+	"os/exec"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"bambu-mqtt-proxy/internal/config"
@@ -24,6 +31,7 @@ const (
 	backoffMax       = 5 * time.Second
 	snapshotMaxAge   = 5 * time.Second  // accept a shared frame younger than this
 	initialFrameWait = 15 * time.Second // bound a snapshot's wait for the first frame
+	rtspsReadTimeout = 15 * time.Second // kill FFmpeg if a frame stalls
 )
 
 // Frame is an immutable captured JPEG. Buffers are never reused, so a frame
@@ -41,6 +49,8 @@ type Frame struct {
 type capture struct {
 	spec config.Printer
 	log  *slog.Logger
+	// ffmpegPath selects the RTSPS process backend when non-empty.
+	ffmpegPath string
 	// endpoint resolves the printer's camera address. Production code uses
 	// cameraAddress; tests point captures at loopback fakes without
 	// changing printer configuration.
@@ -58,6 +68,16 @@ type capture struct {
 	cancel    context.CancelFunc
 	done      chan struct{} // closed when the capture loop exits
 	backoffN  int
+}
+
+func newRTSPCapture(spec config.Printer, log *slog.Logger, ffmpegPath string) *capture {
+	return &capture{
+		spec:       spec,
+		log:        log,
+		ffmpegPath: ffmpegPath,
+		notify:     make(chan struct{}),
+		done:       make(chan struct{}),
+	}
 }
 
 // newCapture builds the idle capture for one printer serial. The endpoint
@@ -258,10 +278,14 @@ func (c *capture) close() {
 func (c *capture) run(ctx context.Context, cancel context.CancelFunc, done chan struct{}) {
 	defer cancel()
 	defer close(done)
-	address, err := c.endpoint(c.spec)
-	if err != nil {
-		c.log.Error("camera capture cannot start", "serial", c.spec.Serial, "error", err)
-		return
+	address := ""
+	if c.ffmpegPath == "" {
+		var err error
+		address, err = c.endpoint(c.spec)
+		if err != nil {
+			c.log.Error("camera capture cannot start", "serial", c.spec.Serial, "error", err)
+			return
+		}
 	}
 	for {
 		if ctx.Err() != nil {
@@ -273,8 +297,13 @@ func (c *capture) run(ctx context.Context, cancel context.CancelFunc, done chan 
 		// Lost connection: backoff before reconnecting. The wait re-reads
 		// consumer state under the lock so shutdown races resolve safely.
 		d := c.backoffDuration()
-		c.log.Info("camera reconnect scheduled",
-			"serial", c.spec.Serial, "address", address, "retry_in", d.String())
+		if c.ffmpegPath == "" {
+			c.log.Info("camera reconnect scheduled",
+				"serial", c.spec.Serial, "address", address, "retry_in", d.String())
+		} else {
+			c.log.Info("RTSPS capture reconnect scheduled",
+				"serial", c.spec.Serial, "retry_in", d.String())
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -286,6 +315,9 @@ func (c *capture) run(ctx context.Context, cancel context.CancelFunc, done chan 
 // streamOnce runs one connected session. It reports whether the loop is
 // finished (context cancelled); connection loss returns false.
 func (c *capture) streamOnce(ctx context.Context, address string) bool {
+	if c.ffmpegPath != "" {
+		return c.streamRTSPSOnce(ctx)
+	}
 	conn, err := dialTLS(ctx, address)
 	if err != nil {
 		c.log.Info("camera connect failed",
@@ -328,6 +360,99 @@ func (c *capture) streamOnce(ctx context.Context, address string) bool {
 		}
 		c.publish(frame)
 	}
+}
+
+// streamRTSPSOnce runs one FFmpeg RTSPS session and publishes bounded JPEG
+// parts. A true result means the capture context ended; every other exit is
+// retried by run after its shared backoff.
+func (c *capture) streamRTSPSOnce(ctx context.Context) bool {
+	streamURL, err := rtspsURL(c.spec)
+	if err != nil {
+		c.log.Warn("RTSPS camera address is invalid", "serial", c.spec.Serial)
+		return false
+	}
+	cmd := exec.CommandContext(ctx, c.ffmpegPath,
+		"-hide_banner", "-loglevel", "error", "-nostdin",
+		"-rtsp_transport", "tcp", "-i", streamURL,
+		"-an", "-sn", "-dn", "-vf", "fps=2", "-c:v", "mjpeg", "-q:v", "5",
+		"-f", "mpjpeg", "-boundary_tag", "ffmpeg", "pipe:1",
+	)
+	cmd.Stderr = io.Discard
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		c.log.Warn("cannot create RTSPS camera output pipe", "serial", c.spec.Serial)
+		return false
+	}
+	if err := cmd.Start(); err != nil {
+		c.log.Info("FFmpeg RTSPS camera process could not start", "serial", c.spec.Serial)
+		return false
+	}
+	// Every started process is killed and waited on this path, including
+	// parser errors and normal EOF. stderr is discarded, so FFmpeg cannot
+	// disclose the URL or access code in logs.
+	defer func() {
+		_ = cmd.Process.Kill()
+		_ = stdout.Close()
+		_ = cmd.Wait()
+	}()
+
+	reader := multipart.NewReader(stdout, "ffmpeg")
+	for {
+		stalled := make(chan struct{}, 1)
+		readDone := new(atomic.Bool)
+		timer := time.AfterFunc(rtspsReadTimeout, func() {
+			if !readDone.CompareAndSwap(false, true) {
+				return
+			}
+			select {
+			case stalled <- struct{}{}:
+			default:
+			}
+			_ = cmd.Process.Kill()
+		})
+		part, readErr := reader.NextPart()
+		var jpeg []byte
+		if readErr == nil {
+			jpeg, readErr = io.ReadAll(io.LimitReader(part, maxPayloadLen+1))
+		}
+		timedOut := !readDone.CompareAndSwap(false, true)
+		timer.Stop()
+		if timedOut {
+			<-stalled
+			c.log.Warn("RTSPS camera frame read stalled", "serial", c.spec.Serial)
+			return false
+		}
+		if readErr != nil {
+			if ctx.Err() == nil {
+				c.log.Info("RTSPS camera stream ended", "serial", c.spec.Serial)
+			}
+			return ctx.Err() != nil
+		}
+		if len(jpeg) == 0 || len(jpeg) > maxPayloadLen || !isJPEG(jpeg) {
+			c.log.Warn("RTSPS camera returned an invalid JPEG frame", "serial", c.spec.Serial)
+			return false
+		}
+		_ = part.Close()
+		c.resetBackoff()
+		c.publish(&Frame{JPEG: jpeg})
+	}
+}
+
+// rtspsURL builds the printer RTSPS endpoint from its configured host and
+// credentials. Structured URL construction escapes credentials and
+// net.JoinHostPort preserves IPv6 host syntax.
+func rtspsURL(printer config.Printer) (string, error) {
+	host, _, err := net.SplitHostPort(printer.Address)
+	if err != nil || strings.TrimSpace(host) == "" {
+		return "", fmt.Errorf("invalid printer address")
+	}
+	u := url.URL{
+		Scheme: "rtsps",
+		Host:   net.JoinHostPort(host, "322"),
+		Path:   "/streaming/live/1",
+		User:   url.UserPassword(printer.Username, printer.Password),
+	}
+	return u.String(), nil
 }
 
 // publish stamps the frame with its sequence and capture time, stores it as

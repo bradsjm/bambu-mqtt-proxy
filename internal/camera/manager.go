@@ -5,6 +5,8 @@ package camera
 import (
 	"context"
 	"log/slog"
+	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,6 +29,10 @@ type Manager struct {
 	mu       sync.Mutex
 	captures map[string]*capture
 	bySerial map[string]config.Printer
+	// ffmpegPath is the resolved executable for RTSPS web captures.
+	ffmpegPath string
+	// webEnabled allows RTSPS models only for managers serving web routes.
+	webEnabled bool
 	// cameraEndpoint resolves a printer's camera address. Production code
 	// uses cameraAddress; tests inject loopback fakes so they never fight
 	// over the fixed camera port.
@@ -34,19 +40,71 @@ type Manager struct {
 	log            *slog.Logger
 }
 
-// NewManager indexes the configured printers. Only P1 and A1 series models
-// ever get a capture; other serials are permanently unsupported.
+// NewManager indexes configured printers without enabling RTSPS web capture.
+// The legacy camera protocol remains limited to P1 and A1 models.
 func NewManager(printers []config.Printer, log *slog.Logger) *Manager {
+	return newManager(printers, log, false)
+}
+
+// NewWebManager indexes configured printers and resolves FFmpeg once when
+// the web camera routes are enabled.
+func NewWebManager(printers []config.Printer, log *slog.Logger) *Manager {
+	return newManager(printers, log, true)
+}
+
+// newManager indexes printers and optionally resolves the RTSPS capture tool.
+func newManager(printers []config.Printer, log *slog.Logger, webEnabled bool) *Manager {
 	bySerial := make(map[string]config.Printer, len(printers))
+	needsFFmpeg := false
 	for _, p := range printers {
 		bySerial[p.Serial] = p
+		if requiresFFmpeg(p.Model, p.Serial) {
+			needsFFmpeg = true
+		}
 	}
-	return &Manager{
+	m := &Manager{
 		captures:       make(map[string]*capture),
 		bySerial:       bySerial,
 		cameraEndpoint: cameraAddress,
 		log:            log,
+		webEnabled:     webEnabled,
 	}
+	if webEnabled && needsFFmpeg {
+		if path, err := exec.LookPath("ffmpeg"); err == nil {
+			m.ffmpegPath = path
+		} else {
+			log.Warn("RTSPS web cameras unavailable: FFmpeg executable was not found; install FFmpeg (the Docker image includes it) and restart",
+				"executable", "ffmpeg")
+		}
+	}
+	return m
+}
+
+// webSupported reports whether the configured model can provide a web camera
+// image. It is deliberately separate from CameraEligible, which gates raw,
+// Gadget, and MCP camera behavior.
+func (m *Manager) webSupported(serial string) (config.Printer, bool) {
+	if !m.webEnabled {
+		return m.supported(serial)
+	}
+	p, ok := m.bySerial[serial]
+	return p, ok && webCameraSupported(p.Model, p.Serial)
+}
+
+// WebSupported reports web-camera capability without starting a capture.
+func (m *Manager) WebSupported(serial string) bool {
+	_, ok := m.webSupported(serial)
+	return ok
+}
+
+// WebUnavailableReason returns the stable display reason for a web camera
+// that is model-capable but cannot run because FFmpeg is unavailable.
+func (m *Manager) WebUnavailableReason(serial string) string {
+	p, ok := m.webSupported(serial)
+	if m.webEnabled && ok && requiresFFmpeg(p.Model, p.Serial) && m.ffmpegPath == "" {
+		return "RTSPS camera unavailable: FFmpeg is not installed"
+	}
+	return ""
 }
 
 // supported reports whether the serial names a configured camera-capable
@@ -69,7 +127,13 @@ func (m *Manager) get(serial string) *capture {
 	if c, ok := m.captures[serial]; ok {
 		return c
 	}
-	c := newCapture(m.bySerial[serial], m.log, m.cameraEndpoint)
+	p := m.bySerial[serial]
+	var c *capture
+	if m.webEnabled && requiresFFmpeg(p.Model, p.Serial) {
+		c = newRTSPCapture(p, m.log, m.ffmpegPath)
+	} else {
+		c = newCapture(p, m.log, m.cameraEndpoint)
+	}
 	m.captures[serial] = c
 	return c
 }
@@ -132,6 +196,24 @@ func (m *Manager) Snapshot(serial string, wait func(*capture) (*Frame, bool)) (*
 	return frame, StatusOK
 }
 
+// WebSnapshot returns a camera frame for a model supported by the web wall.
+func (m *Manager) WebSnapshot(serial string, wait func(*capture) (*Frame, bool)) (*Frame, Status) {
+	if _, ok := m.webSupported(serial); !ok {
+		if _, known := m.bySerial[serial]; known {
+			return nil, StatusUnsupportedModel
+		}
+		return nil, StatusUnknownSerial
+	}
+	if m.WebUnavailableReason(serial) != "" {
+		return nil, StatusUnavailable
+	}
+	frame, ok := wait(m.get(serial))
+	if !ok || frame == nil {
+		return nil, StatusUnavailable
+	}
+	return frame, StatusOK
+}
+
 // Acquire starts (or joins) the shared capture for serial and returns the
 // frame notification channel. It reports StatusOK only for eligible serials;
 // callers own the matching Release.
@@ -146,6 +228,21 @@ func (m *Manager) Acquire(serial string) (chan struct{}, Status) {
 	return c.acquire(), StatusOK
 }
 
+// AcquireWeb starts or joins a web camera capture. RTSPS captures are
+// unavailable without FFmpeg and are never started by raw/Gadget/MCP callers.
+func (m *Manager) AcquireWeb(serial string) (chan struct{}, Status) {
+	if _, ok := m.webSupported(serial); !ok {
+		if _, known := m.bySerial[serial]; known {
+			return nil, StatusUnsupportedModel
+		}
+		return nil, StatusUnknownSerial
+	}
+	if m.WebUnavailableReason(serial) != "" {
+		return nil, StatusUnavailable
+	}
+	return m.get(serial).acquire(), StatusOK
+}
+
 // Release drops one consumer interest previously taken with Acquire.
 func (m *Manager) Release(serial string) {
 	m.mu.Lock()
@@ -153,6 +250,57 @@ func (m *Manager) Release(serial string) {
 	m.mu.Unlock()
 	if ok {
 		c.release()
+	}
+}
+
+// webCameraModel uses explicit model configuration first, then known legacy
+// P1/A1 inference and verified RTSPS serial prefixes.
+func webCameraModel(model, serial string) string {
+	if strings.TrimSpace(model) != "" {
+		return config.NormalizeModel(model)
+	}
+	if inferred := config.ModelFromSerial(serial); inferred != "" {
+		return inferred
+	}
+	s := strings.ToUpper(strings.TrimSpace(serial))
+	for _, mapping := range rtspSerialPrefixes {
+		if strings.HasPrefix(s, mapping.prefix) {
+			return mapping.model
+		}
+	}
+	return ""
+}
+
+// rtspSerialPrefixes maps verified RTSPS printer serial prefixes to models.
+var rtspSerialPrefixes = []struct {
+	prefix string
+	model  string
+}{
+	{"00M", "X1C"},
+	{"00W", "X1"},
+	{"03W", "X1E"},
+	{"22E", "P2S"},
+	{"093", "H2S"},
+	{"094", "H2D"},
+}
+
+// webCameraSupported reports image-capture support for web camera routes.
+func webCameraSupported(model, serial string) bool {
+	switch webCameraModel(model, serial) {
+	case "P1P", "P1S", "A1", "A1MINI", "X1", "X1C", "X1E", "P2S", "H2S", "H2D":
+		return true
+	default:
+		return false
+	}
+}
+
+// requiresFFmpeg reports whether web capture needs the external FFmpeg tool.
+func requiresFFmpeg(model, serial string) bool {
+	switch webCameraModel(model, serial) {
+	case "X1", "X1C", "X1E", "P2S", "H2S", "H2D":
+		return true
+	default:
+		return false
 	}
 }
 

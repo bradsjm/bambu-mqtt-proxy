@@ -124,7 +124,11 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	var cameras *camera.Manager
 	var renderer *camera.StatusRenderer
 	if cfg.CameraEnabled() {
-		cameras = camera.NewManager(cfg.Printers, logger)
+		if cfg.HTTP.Port > 0 {
+			cameras = camera.NewWebManager(cfg.Printers, logger)
+		} else {
+			cameras = camera.NewManager(cfg.Printers, logger)
+		}
 		renderer = camera.NewStatusRenderer(cameras, state, pool)
 		renderer.SetActivity(activities)
 	}

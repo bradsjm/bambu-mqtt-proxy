@@ -1,5 +1,5 @@
-// Package camera implements the Bambu chamber image camera protocol for the
-// P1 and A1 series and serves the captured JPEG frames over HTTP.
+// Package camera implements Bambu chamber image and RTSPS camera capture,
+// then serves the captured JPEG frames over HTTP.
 //
 // The protocol is a TLS session on printer port 6000: the client sends an
 // 80-byte authentication payload (username bblp plus the LAN access code)

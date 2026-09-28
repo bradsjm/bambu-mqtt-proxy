@@ -34,7 +34,8 @@ func (m *Manager) Status(serial string) any {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	state := map[string]any{"supported": true, "connected": c.cancel != nil}
+	supported := m.WebSupported(serial)
+	state := map[string]any{"supported": supported, "connected": c.cancel != nil}
 	if c.frame != nil {
 		state["frame_age_seconds"] = time.Since(c.frame.Captured).Seconds()
 		state["frame_seq"] = c.frame.Seq
@@ -51,14 +52,14 @@ func noStore(w http.ResponseWriter) {
 func (m *Manager) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 	serial := r.PathValue("serial")
 	noStore(w)
-	frame, st := m.Snapshot(serial, func(c *capture) (*Frame, bool) {
+	frame, st := m.WebSnapshot(serial, func(c *capture) (*Frame, bool) {
 		return c.snapshot(r.Context())
 	})
 	switch st {
 	case StatusUnknownSerial:
 		http.Error(w, "unknown printer serial", http.StatusNotFound)
 	case StatusUnsupportedModel:
-		http.Error(w, "printer model does not support the camera protocol", http.StatusUnprocessableEntity)
+		http.Error(w, "printer model does not support a web camera", http.StatusUnprocessableEntity)
 	case StatusUnavailable:
 		http.Error(w, "camera unavailable", http.StatusServiceUnavailable)
 	default:
@@ -74,12 +75,12 @@ func (m *Manager) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 func (m *Manager) handleStream(w http.ResponseWriter, r *http.Request) {
 	serial := r.PathValue("serial")
 	noStore(w)
-	if _, st := m.Acquire(serial); st != StatusOK {
+	if _, st := m.AcquireWeb(serial); st != StatusOK {
 		switch st {
 		case StatusUnknownSerial:
 			http.Error(w, "unknown printer serial", http.StatusNotFound)
 		case StatusUnsupportedModel:
-			http.Error(w, "printer model does not support the camera protocol", http.StatusUnprocessableEntity)
+			http.Error(w, "printer model does not support a web camera", http.StatusUnprocessableEntity)
 		default:
 			http.Error(w, "camera unavailable", http.StatusServiceUnavailable)
 		}

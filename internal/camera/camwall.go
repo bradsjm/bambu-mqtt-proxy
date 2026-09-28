@@ -54,6 +54,7 @@ type Tile struct {
 	Name         string   `json:"name,omitempty"`
 	Model        string   `json:"model"`
 	CameraOK     bool     `json:"camera_supported"`
+	CameraReason string   `json:"camera_reason,omitempty"`
 	Connected    bool     `json:"connected"`
 	State        string   `json:"state,omitempty"`
 	Filename     string   `json:"filename,omitempty"`
@@ -178,7 +179,7 @@ func (r *StatusRenderer) Tiles() []Tile {
 		// from configs without model fields still show a useful label.
 		model := st.Model
 		if strings.TrimSpace(model) == "" {
-			model = config.ModelFromSerial(st.Serial)
+			model = webCameraModel(st.Model, st.Serial)
 		}
 		chamberTemp := st.ChamberTemp
 		if !config.ChamberTemperatureSupported(st.Model, st.Serial) {
@@ -188,7 +189,8 @@ func (r *StatusRenderer) Tiles() []Tile {
 			Serial:       st.Serial,
 			Name:         st.Name,
 			Model:        model,
-			CameraOK:     config.CameraEligible(st.Model, st.Serial),
+			CameraOK:     r.cameras.WebSupported(st.Serial),
+			CameraReason: r.cameras.WebUnavailableReason(st.Serial),
 			Connected:    st.Connected,
 			State:        st.PrintingState,
 			Filename:     st.Filename,

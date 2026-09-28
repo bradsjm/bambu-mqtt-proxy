@@ -14,7 +14,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 
 FROM alpine:3.22
 RUN addgroup -S proxy && adduser -S -G proxy proxy \
-    && apk add --no-cache ca-certificates \
+    && apk add --no-cache ca-certificates ffmpeg \
     && mkdir /config && chown proxy:proxy /config
 COPY --from=build --chown=proxy:proxy /out/bambu-mqtt-proxy /bambu-mqtt-proxy
 USER proxy

@@ -14,7 +14,8 @@ services:
       # One entry per printer, separated by ';'. Replace the placeholders.
       # name= sets an optional friendly camera wall label; MQTT routing always uses
       # the serial (the raw camera endpoint on 6000 routes by access code instead).
-      # Camera support is auto-detected from the serial prefix (01P/01S/030/039).
+      # Camera support is auto-detected from the serial prefix (01P/01S/030/039 native;
+      # 00W/00M/03W/22E/093/094 via FFmpeg, which this image bundles).
       BMBPX_PRINTERS: >-
         serial=01P00A123456789,address=192.168.1.42:8883,tls=true,insecure_skip_verify=true,password=12345678,name=Garage P1S;
         serial=01S00C351100139,address=192.168.1.43:8883,tls=true,insecure_skip_verify=true,password=87654321
