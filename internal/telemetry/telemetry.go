@@ -24,8 +24,7 @@ type State struct {
 	Serial        string
 	Name          string
 	Model         string
-	Connected     bool // last known MQTT upstream connectivity
-	LastReport    time.Time
+	Connected     bool    // last known MQTT upstream connectivity
 	PrintingState string  // gcode_state, e.g. RUNNING / IDLE / FINISH
 	Filename      string  // subtask_name
 	Progress      float64 // mc_percent
@@ -60,6 +59,21 @@ type State struct {
 	AMS      []AMSUnit
 	ExtSpool *AMSSlot
 
+	// Display-only extras merged before the real-print gate (see
+	// mergeExtras). None of them refresh detection freshness.
+	ChamberLight         string    // on|off|flashing; empty = never reported
+	StartedAt            time.Time // gcode_start_time; zero = unknown
+	SpeedPercent         *int      // spd_mag
+	Fans                 Fans
+	NozzleDiameter       *float64
+	NozzleType           string
+	WifiDBm              *int
+	SDCard               *bool
+	ExtSpoolSensor       *bool // hw_switch_state: filament present at the external spool sensor
+	Timelapse            *bool
+	FirstLayerInspection *bool
+	SpaghettiDetection   *bool
+
 	// Detection session bookkeeping. Not display state: these fields track
 	// the current print session for the optional OctoEverywhere detection
 	// worker. Guarded by the Cache mutex like every other field.
@@ -81,6 +95,11 @@ type State struct {
 	obsGen           uint64    // upstream connection generation of the last report
 	obsAt            time.Time // time of the last real report
 	lastSeq          uint64    // paho delivery order token of the last merge
+}
+
+// Fans holds fan speeds in percent; nil means never reported.
+type Fans struct {
+	Part, Aux, Chamber, Heatbreak *int
 }
 
 // HMSAlert is one Bambu Health Management System entry from a report's
@@ -174,16 +193,17 @@ func (c *Cache) ObserveReport(serial string, seq, gen uint64, payload []byte) {
 			return
 		}
 		st.lastSeq = seq
-		before := activitySnapshot{state: st.PrintingState, sessionGen: st.sessionGen, printError: st.PrintError, hms: append([]HMSAlert(nil), st.HMS...)}
+		before := activitySnapshot{state: st.PrintingState, sessionGen: st.sessionGen, printError: st.PrintError, hms: append([]HMSAlert(nil), st.HMS...), chamberLight: st.ChamberLight}
 		real = mergeReport(st, gen, payload)
-		st.LastReport = time.Now()
 		if real {
 			events = collectActivityEvents(before, st)
-			if len(events) > 0 {
-				// Reserve event-recording order while report merges are still
-				// serialized. Record after releasing c.mu to avoid nested locks.
-				c.activityMu.Lock()
-			}
+		} else {
+			events = lightEvents(before, st)
+		}
+		if len(events) > 0 {
+			// Reserve event-recording order while report merges are still
+			// serialized. Record after releasing c.mu to avoid nested locks.
+			c.activityMu.Lock()
 		}
 	}
 	c.mu.Unlock()
@@ -200,16 +220,32 @@ func (c *Cache) ObserveReport(serial string, seq, gen uint64, payload []byte) {
 
 // activitySnapshot is the state needed to identify notable report changes.
 type activitySnapshot struct {
-	state      string
-	sessionGen uint64
-	printError int
-	hms        []HMSAlert
+	state        string
+	sessionGen   uint64
+	printError   int
+	hms          []HMSAlert
+	chamberLight string
 }
 
 // activityRecord is an event collected while Cache.mu is held and recorded
 // after it is released.
 type activityRecord struct {
 	kind, severity, message string
+}
+
+// lightEvents reports a chamber light change. The first observation records
+// nothing: it is not a change the user made.
+func lightEvents(before activitySnapshot, st *State) []activityRecord {
+	if before.chamberLight == "" || st.ChamberLight == before.chamberLight {
+		return nil
+	}
+	switch st.ChamberLight {
+	case "on":
+		return []activityRecord{{kind: "chamber_light_on", severity: activity.Info, message: "Chamber light on"}}
+	case "off":
+		return []activityRecord{{kind: "chamber_light_off", severity: activity.Info, message: "Chamber light off"}}
+	}
+	return nil
 }
 
 // collectActivityEvents derives user-facing events from one merged report.
@@ -283,6 +319,7 @@ func collectActivityEvents(before activitySnapshot, st *State) []activityRecord 
 			add("print_error", activity.Error, "Printer error "+code)
 		}
 	}
+	events = append(events, lightEvents(before, st)...)
 	return events
 }
 
@@ -346,6 +383,8 @@ type SessionView struct {
 	Progress     *float64
 	RemainingMin *float64
 	LayerNum     *int
+	ChamberLight string
+	StartedAt    time.Time
 }
 
 // Session returns the detection view for one serial.
@@ -386,6 +425,8 @@ func (c *Cache) Session(serial string) (SessionView, bool) {
 		view.RemainingMin = &v
 	}
 	view.LayerNum = st.LayerNum
+	view.ChamberLight = st.ChamberLight
+	view.StartedAt = st.StartedAt
 	return view, true
 }
 

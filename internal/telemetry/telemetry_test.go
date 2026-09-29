@@ -48,8 +48,8 @@ func TestMergeErrorsAndHMS(t *testing.T) {
 	c := NewCache([]config.Printer{{Serial: "S1", Name: "Garage"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	c.Observe("S1", []byte(`{"print":{"print_error":50348044,"hms":[{"attr":50331904,"code":131079},{"attr":"not-a-number","code":1}]}}`))
 	st := c.Snapshot()[0]
-	if st.Name != "Garage" || st.LastReport.IsZero() {
-		t.Fatalf("name/last report = %q/%v", st.Name, st.LastReport)
+	if st.Name != "Garage" || st.obsAt.IsZero() {
+		t.Fatalf("name/last report = %q/%v", st.Name, st.obsAt)
 	}
 	if st.PrintError != 50348044 {
 		t.Fatalf("print_error = %d", st.PrintError)
@@ -496,5 +496,82 @@ func TestSnapshotImmutableAcrossMerges(t *testing.T) {
 	}
 	if fresh[0].ExtSpool == nil || !fresh[0].ExtSpool.Active {
 		t.Fatalf("fresh selection missing: %+v", fresh[0].ExtSpool)
+	}
+}
+
+func TestChamberLightIsDisplayOnlyAndRecordsChanges(t *testing.T) {
+	printers := []config.Printer{{Serial: "S1", Name: "Shop"}}
+	c := NewCache(printers, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	log := activity.New(printers)
+	c.SetActivity(log)
+	light := func(mode string) {
+		c.Observe("S1", []byte(`{"print":{"lights_report":[{"node":"work_light","mode":"flashing"},{"node":"chamber_light","mode":"`+mode+`"}]}}`))
+	}
+	light("on")
+	st, _ := c.State("S1")
+	if st.ChamberLight != "on" {
+		t.Fatalf("ChamberLight = %q, want on", st.ChamberLight)
+	}
+	if sv, _ := c.Session("S1"); sv.Obs != 0 || sv.ChamberLight != "on" {
+		t.Fatalf("session = %+v, want Obs 0 and light on", sv)
+	}
+	if n := len(log.Recent("S1")); n != 0 {
+		t.Fatalf("first observation recorded %d events", n)
+	}
+	light("off")
+	light("bogus")
+	light("on")
+	entries := log.Recent("S1")
+	if len(entries) != 2 || entries[0].Kind != "chamber_light_on" || entries[1].Kind != "chamber_light_off" {
+		t.Fatalf("entries = %+v, want off then on", entries)
+	}
+	if st, _ := c.State("S1"); st.ChamberLight != "on" {
+		t.Fatalf("ChamberLight = %q", st.ChamberLight)
+	}
+}
+
+func TestExtrasParse(t *testing.T) {
+	c := NewCache([]config.Printer{{Serial: "S1", Name: "Shop"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	c.Observe("S1", []byte(`{"print":{"cooling_fan_speed":"15","big_fan1_speed":"0","big_fan2_speed":"8","wifi_signal":"-61dBm","gcode_start_time":"1700000000","spd_mag":124,"nozzle_diameter":"0.4","nozzle_type":"hardened_steel","sdcard":true,"hw_switch_state":1,"ipcam":{"timelapse":"enable"},"xcam":{"first_layer_inspector":true,"spaghetti_detector":false}}}`))
+	st, _ := c.State("S1")
+	if st.Fans.Part == nil || *st.Fans.Part != 100 || st.Fans.Aux == nil || *st.Fans.Aux != 0 || *st.Fans.Chamber != 53 || st.Fans.Heatbreak != nil {
+		t.Fatalf("fans = %+v", st.Fans)
+	}
+	if st.WifiDBm == nil || *st.WifiDBm != -61 {
+		t.Fatalf("wifi = %v", st.WifiDBm)
+	}
+	if st.StartedAt.Unix() != 1700000000 {
+		t.Fatalf("StartedAt = %v", st.StartedAt)
+	}
+	if *st.SpeedPercent != 124 || *st.NozzleDiameter != 0.4 || st.NozzleType != "hardened_steel" || !*st.SDCard || !*st.ExtSpoolSensor || !*st.Timelapse || !*st.FirstLayerInspection || *st.SpaghettiDetection {
+		t.Fatalf("extras = %+v", st)
+	}
+	// Malformed values keep the previous value; zero start clears.
+	c.Observe("S1", []byte(`{"print":{"wifi_signal":"weak","cooling_fan_speed":"x","sdcard":"yes","gcode_start_time":"0"}}`))
+	st, _ = c.State("S1")
+	if *st.WifiDBm != -61 || *st.Fans.Part != 100 || !*st.SDCard || !st.StartedAt.IsZero() {
+		t.Fatalf("after malformed delta: %+v", st)
+	}
+	if sv, _ := c.Session("S1"); sv.Obs != 0 {
+		t.Fatalf("extras refreshed detection freshness: Obs %d", sv.Obs)
+	}
+}
+
+func TestAMSSubBrandPersistsAcrossMetadataOnlyDelta(t *testing.T) {
+	c := NewCache([]config.Printer{{Serial: "S1", Name: "Shop"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	c.Observe("S1", []byte(`{"print":{"ams":{"ams":[{"id":"0","temp":"24.5","tray":[{"id":"0","state":3,"tray_type":"PLA","tray_sub_brands":"PLA Basic","nozzle_temp_min":"190","nozzle_temp_max":"230"}]}]}}}`))
+	c.Observe("S1", []byte(`{"print":{"ams":{"ams":[{"id":"0","tray":[{"id":"0","state":3}]}]}}}`))
+	st, _ := c.State("S1")
+	slot := st.AMS[0].Slots[0]
+	if slot.SubBrand != "PLA Basic" || slot.NozzleTempMin == nil || *slot.NozzleTempMin != 190 || *slot.NozzleTempMax != 230 {
+		t.Fatalf("slot = %+v", slot)
+	}
+	if st.AMS[0].Temp == nil || *st.AMS[0].Temp != 24.5 {
+		t.Fatalf("unit temp = %v", st.AMS[0].Temp)
+	}
+	c.Observe("S1", []byte(`{"print":{"ams":{"ams":[{"id":"0","tray":[{"id":"0","state":0}]}]}}}`))
+	st, _ = c.State("S1")
+	if slot := st.AMS[0].Slots[0]; slot.SubBrand != "" || slot.NozzleTempMin != nil {
+		t.Fatalf("empty slot kept metadata: %+v", slot)
 	}
 }

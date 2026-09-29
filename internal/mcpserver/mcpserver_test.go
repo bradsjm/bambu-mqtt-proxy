@@ -21,6 +21,7 @@ import (
 
 	"bambu-mqtt-proxy/internal/camera"
 	"bambu-mqtt-proxy/internal/config"
+	"bambu-mqtt-proxy/internal/control"
 	"bambu-mqtt-proxy/internal/detection"
 	"bambu-mqtt-proxy/internal/telemetry"
 )
@@ -74,6 +75,12 @@ func (f *fakeState) Snapshot() []telemetry.State {
 		out = append(out, st)
 	}
 	return out
+}
+
+func (f *fakeState) setState(st telemetry.State) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.states[st.Serial] = st
 }
 
 func (f *fakeState) setSession(serial string, sv telemetry.SessionView) {
@@ -208,9 +215,40 @@ func (f *fakeDet) AccountSuspended() (bool, string) {
 	return f.susp, f.why
 }
 
+// fakeCommander records control commands over the fixture's connectivity
+// and generation fakes.
+type fakeCommander struct {
+	*fakeConn
+	*fakeGens
+	mu   sync.Mutex
+	sent []string
+}
+
+func (f *fakeCommander) record(name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sent = append(f.sent, name)
+	return nil
+}
+
+func (f *fakeCommander) sentList() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.sent...)
+}
+
+func (f *fakeCommander) PausePrint(string, uint64) error           { return f.record("pause") }
+func (f *fakeCommander) ResumePrint(string, uint64) error          { return f.record("resume") }
+func (f *fakeCommander) StopPrint(string, uint64) error            { return f.record("stop") }
+func (f *fakeCommander) SetSpeedProfile(string, uint64, int) error { return f.record("speed") }
+func (f *fakeCommander) SetChamberLight(string, uint64, bool) error {
+	return f.record("light")
+}
+
 // fixture bundles one server with mutable fakes and a fixed clock.
 type fixture struct {
 	srv   *Server
+	cmd   *fakeCommander
 	state *fakeState
 	conn  *fakeConn
 	gens  *fakeGens
@@ -236,6 +274,7 @@ func newFixture(t *testing.T) *fixture {
 		det:   &fakeDet{},
 		now:   now,
 	}
+	f.cmd = &fakeCommander{fakeConn: f.conn, fakeGens: f.gens}
 	f.srv = New(Deps{
 		Printers: []config.Printer{
 			{Serial: "P001", Name: "Alpha", Model: "P1S", Address: "secret-a", Password: "pw-a"},
@@ -247,6 +286,7 @@ func newFixture(t *testing.T) *fixture {
 		Generations:  f.gens,
 		Cameras:      cams,
 		Detector:     f.det,
+		Control:      control.New(f.cmd, st, nil),
 	})
 	f.srv.now = func() time.Time { return now }
 	return f
@@ -366,6 +406,12 @@ func TestAttentionEventTransitions(t *testing.T) {
 			set(func(c *sample) { c.fresh = true }), []string{kindReportsFresh}, false},
 		{"detection health", nil, set(func(c *sample) { c.detKey = "changed" }), []string{kindDetectionChange}, false},
 		{"state churn without a notable state", nil, set(func(c *sample) { c.state = "SLICING" }), nil, true},
+		{"stopped", nil, set(func(c *sample) { c.state = "IDLE" }), []string{kindPrintStopped}, false},
+		{"idle from finish", func(p *sample) { p.state = "FINISH" }, set(func(c *sample) { c.state = "IDLE" }), nil, true},
+		{"hms gained", func(p *sample) { p.hmsKey = "HMS_A" }, set(func(c *sample) { c.hmsKey = "HMS_A,HMS_B" }), []string{kindHMSAlert}, false},
+		{"hms cleared", func(p *sample) { p.hmsKey = "HMS_A" }, base, nil, true},
+		{"print error", nil, set(func(c *sample) { c.printError = 0x0300400C }), []string{kindPrintError}, false},
+		{"print error cleared", func(p *sample) { p.printError = 1 }, base, nil, true},
 	}
 	for _, tc := range cases {
 		prev := base
@@ -388,6 +434,24 @@ func TestAttentionEventTransitions(t *testing.T) {
 				t.Errorf("%s: event %d = %q, want %q", tc.name, i, events[i].Kind, want)
 			}
 		}
+	}
+}
+
+func TestSamplerHMSAndStopEvents(t *testing.T) {
+	f := newFixture(t)
+	f.state.setSession("P001", printingSession("P001", f.now, 7, 42))
+	f.step()
+	f.state.setState(telemetry.State{Serial: "P001", HMS: []telemetry.HMSAlert{{Attr: 0x03000100, Code: 0x00010007}}})
+	f.step()
+	if ev := f.srv.sampler.lastEvents("P001"); len(ev) != 1 || ev[0].Kind != kindHMSAlert || !strings.Contains(ev[0].Detail, "HMS_0300_0100_0001_0007") {
+		t.Fatalf("events = %+v, want one hms_alert", ev)
+	}
+	sv := printingSession("P001", f.now, 7, 42)
+	sv.State, sv.Active = "IDLE", false
+	f.state.setSession("P001", sv)
+	f.step()
+	if ev := f.srv.sampler.lastEvents("P001"); len(ev) != 1 || ev[0].Kind != kindPrintStopped {
+		t.Fatalf("events = %+v, want print_stopped", ev)
 	}
 }
 

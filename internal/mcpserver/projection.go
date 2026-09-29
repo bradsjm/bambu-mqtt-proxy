@@ -7,7 +7,9 @@ import (
 	"strings"
 	"time"
 
+	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/detection"
+	"bambu-mqtt-proxy/internal/printerview"
 )
 
 // Printer projection. These types double as the tools' typed output schema:
@@ -36,21 +38,6 @@ const (
 	errSubscriptionsLimit = "subscriptions_limit"
 )
 
-// Freshness describes real-report evidence for one printer. A report only
-// counts when it carried print state; command ACKs never refresh it.
-type Freshness struct {
-	// Fresh is true when a real report arrived within the freshness window
-	// on the upstream connection that is still current.
-	Fresh bool `json:"fresh"`
-	// LastReportAgeSeconds is the age of the last real report; null when no
-	// real report was ever observed.
-	LastReportAgeSeconds *float64 `json:"last_report_age_seconds"`
-	// UpstreamGeneration identifies the connection the last real report
-	// arrived on; null when none was ever observed. It changes on every
-	// reconnect, so a pre-reconnect observation never looks current.
-	UpstreamGeneration *uint64 `json:"upstream_generation"`
-}
-
 // DetectionView is the projection of the optional OctoEverywhere detection
 // worker. The disabled state is explicit, never omitted, and the per-print
 // user override surfaces as its own permission state.
@@ -70,9 +57,8 @@ type DetectionView struct {
 	// DisabledUntil explains the override's lifetime and is set only while
 	// Enabled is false because of a user override.
 	DisabledUntil string `json:"disabled_until,omitempty"`
-	// SessionID is the opaque token of the active print session. It is
-	// informational here: the MCP endpoint itself stays read-only, and
-	// disabling goes through the proxy's HTTP endpoint.
+	// SessionID is the opaque token of the active print session;
+	// set_ai_monitoring uses it to scope the override to this print.
 	SessionID string `json:"session_id,omitempty"`
 	// PauseState mirrors the pause lifecycle: none, pending, confirmed, or
 	// unconfirmed. It is preserved while a user override is active.
@@ -83,44 +69,18 @@ type DetectionView struct {
 	SuspendedReason string `json:"suspended_reason,omitempty"`
 }
 
-// PrinterState is the typed projection of one printer.
+// PrinterState is the typed projection of one printer: the shared printer
+// view (the same fields /camera/status serves) plus MCP feature states.
 type PrinterState struct {
-	Serial    string `json:"serial"`
-	Name      string `json:"name"`
-	Model     string `json:"model"`
-	Connected bool   `json:"connected"`
-	// PrintState is the merged gcode_state; null when never reported.
-	PrintState *string `json:"print_state"`
-	Printing   bool    `json:"printing"`
-	// JobName is the printer's subtask name; null when never reported.
-	JobName *string `json:"job_name"`
-	// Progress is mc_percent with source presence: null means never
-	// reported, even though the merged scalar would read 0.
-	Progress *float64 `json:"progress"`
-	// RemainingMinutes is mc_remaining_time under the same presence rule.
-	RemainingMinutes *float64 `json:"remaining_minutes"`
-	LayerNum         *int     `json:"layer_num"`
-	TotalLayers      *int     `json:"total_layers"`
-	NozzleTemp       *float64 `json:"nozzle_temp"`
-	NozzleTarget     *float64 `json:"nozzle_target"`
-	BedTemp          *float64 `json:"bed_temp"`
-	BedTarget        *float64 `json:"bed_target"`
-	ChamberTemp      *float64 `json:"chamber_temp"`
-	// PrintError is the raw print_error code; 0 means the printer reported
-	// no error, null means no real report was ever observed.
-	PrintError *int           `json:"print_error"`
-	HMS        []HMSAlertView `json:"hms"`
+	printerview.View
 	// Camera and Detection are explicit feature states; they never disappear
 	// when a feature is switched off.
 	Camera    string        `json:"camera"`
 	Detection DetectionView `json:"detection"`
-	Freshness Freshness     `json:"freshness"`
-}
-
-// HMSAlertView is one Bambu HMS alert in published ID form.
-type HMSAlertView struct {
-	ID       string `json:"id"`
-	Severity string `json:"severity"`
+	// Activity lists recent printer events, newest first.
+	Activity []activity.Entry `json:"activity"`
+	// Controls lists the control actions currently available.
+	Controls []string `json:"controls"`
 }
 
 // Camera states reported in PrinterState.Camera.
@@ -155,12 +115,10 @@ const (
 	kindReportsFresh    = "reports_fresh"
 	kindDetectionChange = "detection_health_changed"
 	kindProgressStep    = "progress_milestone"
+	kindHMSAlert        = "hms_alert"
+	kindPrintError      = "print_error"
+	kindPrintStopped    = "print_stopped"
 )
-
-// freshnessWindow bounds how long since the last real report a printer is
-// still called fresh. It matches the detection engine's reportFreshMax so
-// every consumer shares one staleness semantic.
-const freshnessWindow = 15 * time.Second
 
 // revision is the opaque wake counter pair behind watch_printer and every
 // returned revision token. Clients treat the token as opaque. The epoch is
@@ -247,52 +205,23 @@ func (s *Server) buildPrinterState(serial string, now time.Time) (PrinterState, 
 	if !known {
 		return PrinterState{}, false
 	}
+	st, _ := s.state.State(serial)
+	st.Serial, st.Name, st.Model = info.serial, info.name, info.model
+	sv, _ := s.state.Session(serial)
 	out := PrinterState{
-		Serial:    info.serial,
-		Name:      info.name,
-		Model:     info.model,
-		Connected: s.connStatus(serial),
+		View:      printerview.Build(st, sv, s.connStatus(serial), s.generation(serial), now),
 		Camera:    s.cameraState(serial),
 		Detection: s.detectionView(serial),
+		Activity:  []activity.Entry{},
+		Controls:  []string{},
 	}
-	st, haveState := s.state.State(serial)
-	if haveState {
-		out.PrintState = nullableString(st.PrintingState)
-		out.JobName = nullableString(st.Filename)
-		out.TotalLayers = st.TotalLayers
-		out.NozzleTemp = st.NozzleTemp
-		out.NozzleTarget = st.NozzleTarget
-		out.BedTemp = st.BedTemp
-		out.BedTarget = st.BedTarget
-		out.ChamberTemp = st.ChamberTemp
-		for _, a := range st.HMS {
-			out.HMS = append(out.HMS, HMSAlertView{ID: a.ID(), Severity: a.Severity()})
+	if s.control != nil {
+		out.Controls = s.control.Available(serial)
+	}
+	if s.activity != nil {
+		if recent := s.activity.Recent(serial); recent != nil {
+			out.Activity = recent
 		}
-	}
-	sv, haveSession := s.state.Session(serial)
-	if haveSession {
-		out.Printing = sv.Active
-		out.Progress = sv.Progress
-		out.RemainingMinutes = sv.RemainingMin
-		out.LayerNum = sv.LayerNum
-		if sv.Obs > 0 {
-			out.PrintError = &st.PrintError
-		}
-	}
-	if !sv.ObsAt.IsZero() {
-		age := now.Sub(sv.ObsAt).Seconds()
-		out.Freshness.LastReportAgeSeconds = &age
-		gen := sv.ObsGen
-		out.Freshness.UpstreamGeneration = &gen
-		out.Freshness.Fresh = age <= freshnessWindow.Seconds() &&
-			s.generation(serial) == sv.ObsGen
 	}
 	return out, true
-}
-
-func nullableString(s string) *string {
-	if s == "" {
-		return nil
-	}
-	return &s
 }

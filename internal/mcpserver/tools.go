@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -22,15 +23,19 @@ type ListPrintersIn struct {
 
 // PrinterSummary is one row of list_printers.
 type PrinterSummary struct {
-	Serial     string        `json:"serial"`
-	Name       string        `json:"name"`
-	Model      string        `json:"model"`
-	Connected  bool          `json:"connected"`
-	PrintState *string       `json:"print_state"`
-	Printing   bool          `json:"printing"`
-	Fresh      bool          `json:"fresh"`
-	Detection  DetectionView `json:"detection"`
-	Revision   string        `json:"revision"`
+	Serial           string        `json:"serial"`
+	Name             string        `json:"name"`
+	Model            string        `json:"model"`
+	Connected        bool          `json:"connected"`
+	PrintState       *string       `json:"print_state"`
+	Printing         bool          `json:"printing"`
+	Progress         *float64      `json:"progress"`
+	RemainingMinutes *float64      `json:"remaining_minutes"`
+	AlertCount       int           `json:"alert_count"`
+	ChamberLight     *string       `json:"chamber_light"`
+	Fresh            bool          `json:"fresh"`
+	Detection        DetectionView `json:"detection"`
+	Revision         string        `json:"revision"`
 }
 
 // ListPrintersOut is one page; NextCursor is empty after the last page.
@@ -148,23 +153,21 @@ func (s *Server) summarize(serial string, now time.Time) PrinterSummary {
 	// the change. Captured first, the token can only be stale, and staleness
 	// forces a resync.
 	rev := s.sampler.revision(serial)
-	summary := PrinterSummary{Serial: serial}
-	if info, ok := s.printers[serial]; ok {
-		summary.Name = info.name
-		summary.Model = info.model
+	st, _ := s.buildPrinterState(serial, now)
+	summary := PrinterSummary{
+		Serial:           serial,
+		Name:             st.Name,
+		Model:            st.Model,
+		Connected:        st.Connected,
+		PrintState:       st.PrintState,
+		Printing:         st.Printing,
+		Progress:         st.Progress,
+		RemainingMinutes: st.RemainingMinutes,
+		AlertCount:       st.ActiveAlerts(),
+		ChamberLight:     st.ChamberLight,
+		Fresh:            st.Freshness.Fresh,
+		Detection:        st.Detection,
 	}
-	summary.Connected = s.connStatus(serial)
-	if st, ok := s.state.State(serial); ok {
-		summary.PrintState = nullableString(st.PrintingState)
-	}
-	if sv, ok := s.state.Session(serial); ok {
-		summary.Printing = sv.Active
-		if !sv.ObsAt.IsZero() {
-			summary.Fresh = now.Sub(sv.ObsAt) <= freshnessWindow &&
-				s.generation(serial) == sv.ObsGen
-		}
-	}
-	summary.Detection = s.detectionView(serial)
 	summary.Revision = s.token(rev)
 	return summary
 }
@@ -188,17 +191,36 @@ func (s *Server) toolGetPrinterState(_ context.Context, _ *mcp.CallToolRequest, 
 	return shortText(nil, fmt.Sprintf("%s: %s", in.Serial, stateLine(state))), out, nil
 }
 
-// stateLine renders the one-line text summary.
+// stateLine renders the one-line text summary. Parts whose value is null
+// are omitted.
 func stateLine(st PrinterState) string {
 	state := "unknown"
 	if st.PrintState != nil {
 		state = *st.PrintState
 	}
+	if st.Progress != nil {
+		state += fmt.Sprintf(" %.0f%%", *st.Progress)
+		if st.RemainingMinutes != nil {
+			state += fmt.Sprintf(" (%.0f min left)", *st.RemainingMinutes)
+		}
+	}
+	parts := []string{state}
+	if st.JobName != nil {
+		parts = append(parts, *st.JobName)
+	}
+	parts = append(parts, fmt.Sprintf("%d alerts", st.ActiveAlerts()))
+	if st.ChamberLight != nil {
+		parts = append(parts, "light "+*st.ChamberLight)
+	}
 	conn := "disconnected"
 	if st.Connected {
 		conn = "connected"
 	}
-	return fmt.Sprintf("%s, upstream %s, camera %s, fresh %v", state, conn, st.Camera, st.Freshness.Fresh)
+	parts = append(parts, "upstream "+conn, "camera "+st.Camera, fmt.Sprintf("fresh %v", st.Freshness.Fresh))
+	if len(st.Controls) > 0 {
+		parts = append(parts, "controls "+strings.Join(st.Controls, ","))
+	}
+	return strings.Join(parts, " · ")
 }
 
 // toolGetCameraSnapshot captures one bounded, fresh-enough chamber image.

@@ -2,10 +2,15 @@ package mcpserver
 
 import (
 	"context"
+	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"bambu-mqtt-proxy/internal/printerview"
 )
 
 // resourceNotifyTimeout bounds one ResourceUpdated fan-out. The SDK applies
@@ -62,6 +67,10 @@ type sample struct {
 	connected  bool
 	fresh      bool
 	detKey     string
+	// hmsKey is the sorted active HMS alert IDs joined by ","; printError
+	// is the raw print_error code.
+	hmsKey     string
+	printError int
 	// milestone is the current 5-percentage-point bucket while printing,
 	// or -1 when not printing or progress is unknown.
 	milestone int
@@ -255,12 +264,21 @@ func (s *Server) sampleNow(serial string, now time.Time) sample {
 		sm.sessionGen = sv.SessionGen
 		sm.active = sv.Active
 		if !sv.ObsAt.IsZero() {
-			sm.fresh = now.Sub(sv.ObsAt) <= freshnessWindow &&
+			sm.fresh = now.Sub(sv.ObsAt) <= printerview.FreshnessWindow &&
 				s.generation(serial) == sv.ObsGen
 		}
 		if sv.Active && sv.Progress != nil {
 			sm.milestone = int(*sv.Progress / 5)
 		}
+	}
+	if st, ok := s.state.State(serial); ok {
+		ids := make([]string, 0, len(st.HMS))
+		for _, a := range st.HMS {
+			ids = append(ids, a.ID())
+		}
+		sort.Strings(ids)
+		sm.hmsKey = strings.Join(ids, ",")
+		sm.printError = st.PrintError
 	}
 	sm.connected = s.connStatus(serial)
 	if s.det != nil {
@@ -271,8 +289,9 @@ func (s *Server) sampleNow(serial string, now time.Time) sample {
 
 // attentionEvents diffs two samples into the stable attention event list.
 // The transitions follow the printed contract: pause, fail, finish, job
-// changes, connectivity, freshness, and detection health. Ordinary resume
-// and pure value churn stay silent.
+// changes, stops, new HMS alerts and printer errors, connectivity,
+// freshness, and detection health. Ordinary resume and pure value churn
+// stay silent.
 func attentionEvents(prev, cur sample) []WatchEvent {
 	var events []WatchEvent
 	add := func(kind, detail string) {
@@ -288,7 +307,30 @@ func attentionEvents(prev, cur sample) []WatchEvent {
 			add(kindPrintFailed, "print state FAILED")
 		case "FINISH":
 			add(kindPrintFinished, "print state FINISH")
+		case "IDLE":
+			if prev.state == "RUNNING" || prev.state == "PAUSE" || prev.state == "PAUSED" {
+				add(kindPrintStopped, "print stopped before finishing")
+			}
 		}
+	}
+	if cur.hmsKey != prev.hmsKey && cur.hmsKey != "" {
+		old := map[string]bool{}
+		for _, id := range strings.Split(prev.hmsKey, ",") {
+			old[id] = true
+		}
+		var added []string
+		for _, id := range strings.Split(cur.hmsKey, ",") {
+			if !old[id] {
+				added = append(added, id)
+			}
+		}
+		if len(added) > 0 {
+			add(kindHMSAlert, "new HMS alerts "+strings.Join(added, ","))
+		}
+	}
+	if cur.printError != prev.printError && cur.printError != 0 {
+		v := uint32(cur.printError)
+		add(kindPrintError, fmt.Sprintf("printer error %04X_%04X", v>>16, v&0xFFFF))
 	}
 	if cur.sessionGen > prev.sessionGen {
 		if prev.active {

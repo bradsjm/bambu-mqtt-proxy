@@ -284,14 +284,6 @@ func (s *RawServer) handle(raw net.Conn) {
 	}
 }
 
-// sendFrame writes one frame byte-for-byte — the raw 16-byte header captured
-// from the printer, then its JPEG payload — under one absolute write
-// deadline. A frame without its raw header is a bug: it is never
-// synthesized, and the session ends instead.
-func (s *RawServer) sendFrame(conn net.Conn, f *Frame) bool {
-	return s.sendFrameWithLogger(conn, f, s.log)
-}
-
 // sendFrameWithLogger writes a frame and logs failures with the session context.
 func (s *RawServer) sendFrameWithLogger(conn net.Conn, f *Frame, log *slog.Logger) bool {
 	if len(f.Header) != frameHeaderLen {

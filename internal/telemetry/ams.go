@@ -1,8 +1,11 @@
 package telemetry
 
 import (
+	"math"
 	"sort"
 	"strconv"
+	"strings"
+	"time"
 )
 
 // This file holds the display-only projection of the Bambu AMS report
@@ -17,6 +20,7 @@ type AMSUnit struct {
 	// placeholder values keep the field omitted instead of showing a
 	// meaningless 0.
 	Humidity *int      `json:"humidity,omitempty"`
+	Temp     *float64  `json:"temp,omitempty"`
 	Slots    []AMSSlot `json:"slots"`
 }
 
@@ -34,6 +38,11 @@ type AMSSlot struct {
 	// printer reported none or only the all-zero placeholder.
 	Color  string `json:"color,omitempty"`
 	Remain *int   `json:"remain,omitempty"`
+	// SubBrand, NozzleTempMin and NozzleTempMax follow Material's
+	// persistence rules.
+	SubBrand      string `json:"sub_brand,omitempty"`
+	NozzleTempMin *int   `json:"nozzle_temp_min,omitempty"`
+	NozzleTempMax *int   `json:"nozzle_temp_max,omitempty"`
 	// stateReported records that this slot's firmware reports the state
 	// bitfield, so occupancy resolves from that bitfield instead of the
 	// metadata fallback; state is the last reported bitfield value.
@@ -65,6 +74,7 @@ func mergeDisplay(st *State, printObj map[string]any) {
 	if v, ok := intField(printObj, "stg_cur"); ok {
 		st.Stage = &v
 	}
+	mergeExtras(st, printObj)
 	if raw, ok := lookup(printObj, "ams"); ok {
 		if amsObj, ok := raw.(map[string]any); ok {
 			if v, ok := intField(amsObj, "tray_now"); ok {
@@ -79,6 +89,107 @@ func mergeDisplay(st *State, printObj map[string]any) {
 		}
 	}
 	resolveSelection(st)
+}
+
+// mergeExtras applies the remaining display-only report fields. Each field
+// updates only when present and well-formed; anything else keeps the
+// previous value. None of these keys are print-state markers.
+func mergeExtras(st *State, printObj map[string]any) {
+	if raw, ok := lookup(printObj, "lights_report"); ok {
+		if list, ok := raw.([]any); ok {
+			for _, item := range list {
+				obj, ok := item.(map[string]any)
+				if !ok {
+					continue
+				}
+				if node, _ := stringField(obj, "node"); node != "chamber_light" {
+					continue
+				}
+				if mode, ok := stringField(obj, "mode"); ok && (mode == "on" || mode == "off" || mode == "flashing") {
+					st.ChamberLight = mode
+				}
+			}
+		}
+	}
+	if raw, ok := lookup(printObj, "gcode_start_time"); ok {
+		if s, isStr := raw.(string); isStr && strings.TrimSpace(s) == "" {
+			st.StartedAt = time.Time{}
+		} else if v, ok := numberField(printObj, "gcode_start_time"); ok {
+			if v <= 0 {
+				st.StartedAt = time.Time{}
+			} else {
+				st.StartedAt = time.Unix(int64(v), 0).UTC()
+			}
+		}
+	}
+	if v, ok := intField(printObj, "spd_mag"); ok {
+		st.SpeedPercent = &v
+	}
+	fan := func(key string, dst **int) {
+		v, ok := numberField(printObj, key)
+		if !ok || v < 0 {
+			return
+		}
+		// Bambu reports fan speed on a 0..15 scale; larger values are
+		// already percents.
+		pct := int(math.Round(v * 100 / 15))
+		if v > 15 {
+			pct = min(int(math.Round(v)), 100)
+		}
+		*dst = &pct
+	}
+	fans := st.Fans
+	fan("cooling_fan_speed", &fans.Part)
+	fan("big_fan1_speed", &fans.Aux)
+	fan("big_fan2_speed", &fans.Chamber)
+	fan("heatbreak_fan_speed", &fans.Heatbreak)
+	st.Fans = fans
+	if v, ok := numberField(printObj, "nozzle_diameter"); ok && v > 0 {
+		st.NozzleDiameter = &v
+	}
+	if v, ok := stringField(printObj, "nozzle_type"); ok && v != "" {
+		st.NozzleType = v
+	}
+	if s, ok := stringField(printObj, "wifi_signal"); ok {
+		if v, err := strconv.Atoi(strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(s), "dBm"))); err == nil {
+			st.WifiDBm = &v
+		}
+	}
+	if v, ok := boolField(printObj, "sdcard"); ok {
+		st.SDCard = &v
+	}
+	if v, ok := intField(printObj, "hw_switch_state"); ok && (v == 0 || v == 1) {
+		present := v == 1
+		st.ExtSpoolSensor = &present
+	}
+	if raw, ok := lookup(printObj, "ipcam"); ok {
+		if obj, ok := raw.(map[string]any); ok {
+			if s, ok := stringField(obj, "timelapse"); ok && (s == "enable" || s == "disable") {
+				on := s == "enable"
+				st.Timelapse = &on
+			}
+		}
+	}
+	if raw, ok := lookup(printObj, "xcam"); ok {
+		if obj, ok := raw.(map[string]any); ok {
+			if v, ok := boolField(obj, "first_layer_inspector"); ok {
+				st.FirstLayerInspection = &v
+			}
+			if v, ok := boolField(obj, "spaghetti_detector"); ok {
+				st.SpaghettiDetection = &v
+			}
+		}
+	}
+}
+
+// boolField extracts a JSON boolean.
+func boolField(obj map[string]any, key string) (bool, bool) {
+	v, ok := lookup(obj, key)
+	if !ok {
+		return false, false
+	}
+	b, ok := v.(bool)
+	return b, ok
 }
 
 // mergeAMS merges one report's AMS unit deltas into st by unit and slot id.
@@ -119,6 +230,9 @@ func mergeAMS(st *State, amsObj map[string]any) {
 		unit.Slots = append([]AMSSlot(nil), unit.Slots...)
 		if h, ok := intField(obj, "humidity_raw"); ok && h >= 1 && h <= 100 {
 			unit.Humidity = &h
+		}
+		if t, ok := numberField(obj, "temp"); ok {
+			unit.Temp = &t
 		}
 		if trays, ok := lookup(obj, "tray"); ok {
 			if list, ok := trays.([]any); ok {
@@ -166,6 +280,15 @@ func mergeSlot(slot AMSSlot, tray map[string]any) AMSSlot {
 		if v, ok := stringField(tray, "tray_color"); ok {
 			slot.Color = trayColor(v)
 		}
+		if v, ok := stringField(tray, "tray_sub_brands"); ok {
+			slot.SubBrand = v
+		}
+		if v, ok := intField(tray, "nozzle_temp_min"); ok {
+			slot.NozzleTempMin = &v
+		}
+		if v, ok := intField(tray, "nozzle_temp_max"); ok {
+			slot.NozzleTempMax = &v
+		}
 		if v, ok := intField(tray, "remain"); ok {
 			slot.Remain = nil
 			if v >= 0 {
@@ -181,6 +304,7 @@ func mergeSlot(slot AMSSlot, tray map[string]any) AMSSlot {
 	slot.Loaded = &loaded
 	if !loaded {
 		slot.idx, slot.Material, slot.Color, slot.Remain = "", "", "", nil
+		slot.SubBrand, slot.NozzleTempMin, slot.NozzleTempMax = "", nil, nil
 	}
 	return slot
 }

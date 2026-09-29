@@ -540,8 +540,8 @@ func TestRawServerSendFrameWriteDeadline(t *testing.T) {
 	}
 
 	start := time.Now()
-	if ok := srv.sendFrame(server, frame); ok {
-		t.Fatal("sendFrame must fail when the peer never reads")
+	if ok := srv.sendFrameWithLogger(server, frame, srv.log); ok {
+		t.Fatal("sendFrameWithLogger must fail when the peer never reads")
 	}
 	if elapsed := time.Since(start); elapsed < 250*time.Millisecond {
 		t.Fatalf("write failed after %s; the write deadline did not fire", elapsed)

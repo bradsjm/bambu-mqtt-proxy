@@ -38,7 +38,7 @@ topic path.
 | **Printer outages ride out** | Capped exponential backoff with jitter, automatic reconnect and resubscribe, and a `pushall` warmup. Late joiners get full state (P1 printers otherwise send deltas only). |
 | **Cameras, two ways** | A live multi-printer dashboard wall — P1/A1 cameras natively, X1/P2S/H2-series cameras through bundled FFmpeg — and a printer-compatible raw passthrough on port 6000. |
 | **Optional AI failure detection** | With an OctoEverywhere Gadget key, snapshots from active prints are analyzed and the proxy pauses likely failures. No key, no uploads, no automatic pauses. |
-| **Read-only MCP endpoint** | `/mcp` exposes printer state and camera snapshots to AI agents; it has no control methods. |
+| **MCP endpoint** | `/mcp` exposes printer state, camera snapshots, and printer controls (pause, resume, emergency stop, chamber light, speed profile, AI monitoring toggle) to AI agents. |
 | **Supervision-friendly** | `/livez`, `/readyz`, and `/status` for Docker/Kubernetes probes. |
 | **Stateless and multi-arch** | No database, no volumes required; `linux/amd64` and `linux/arm64` images. |
 
@@ -148,7 +148,7 @@ http:
 camera:
   enabled: true                      # false removes camera routes, the camera wall, and the raw camera listener on port 6000
 mcp:
-  enabled: true                      # default; set false to remove the read-only MCP endpoint at /mcp
+  enabled: true                      # default; set false to remove the MCP endpoint at /mcp
 log:
   level: info
 ```
@@ -163,7 +163,7 @@ log:
 | `BMBPX_LOG_LEVEL` | `info` | `info` logs client and upstream state, subscriptions, retries, and backoff delays; `debug` adds per-packet request routing |
 | `BMBPX_HTTP_PORT` | `8080` | Shared health, camera, and MCP HTTP port; `0` disables HTTP (the raw camera listener on 6000 keeps serving while cameras are enabled) |
 | `BMBPX_CAMERA_ENABLED` | `true` | `false` removes the camera routes, the camera wall, their MQTT report subscriptions, and the raw camera listener on port 6000 |
-| `BMBPX_MCP_ENABLED` | `true` | `false` removes the read-only MCP endpoint at `/mcp`; the endpoint is also off when `http.port` is `0` |
+| `BMBPX_MCP_ENABLED` | `true` | `false` removes the MCP endpoint at `/mcp`; the endpoint is also off when `http.port` is `0` |
 | `BMBPX_OCTOEVERYWHERE_API_KEY` | *(empty)* | OctoEverywhere Gadget API key; empty = detection off. Setting it consents to external snapshot uploads and automatic pauses — see [Gadget AI print-failure detection](#gadget-ai-print-failure-detection-optional) |
 
 ## HTTP endpoints
@@ -188,11 +188,28 @@ disabled.
 | `/camwall` | Multi-printer camera wall dashboard |
 | `/config`, `/config/api` | Browser configuration page and its JSON API (`GET` never returns access codes; `PUT` saves and applies) |
 | `/favicon.ico`, `/apple-touch-icon.png` | Browser-tab, bookmark, and home-screen icons |
-| `/mcp` | Read-only Model Context Protocol endpoint (off with `BMBPX_MCP_ENABLED=false` or `http.port: 0`) |
+| `/mcp` | Model Context Protocol endpoint (off with `BMBPX_MCP_ENABLED=false` or `http.port: 0`) |
+| `/control/{serial}` | Printer control from the camera wall: `POST` `{"action":"light\|pause\|resume\|speed\|stop"}` (see below) |
 
 ### Camera wall
 
 Open `http://<host>:8080/camwall`.
+
+- **Controls** — each tile carries buttons for chamber light, pause/resume,
+  and emergency stop, plus a speed-profile selector. They `POST` to
+  `/control/{serial}` with a JSON body:
+
+  ```json
+  {"action": "light|pause|resume|speed|stop", "on": true, "profile": "silent|standard|sport|ludicrous"}
+  ```
+
+  `on` is required for `light`; `profile` is required for `speed`. Responses:
+  `200` `{"serial":"...","action":"...","sent":true}`; `400` invalid body,
+  unknown action, missing `on`, or bad profile; `404` unknown printer;
+  `409` the action is not available in the printer's current state; `502`
+  the command could not be sent; `503` the printer is not connected. Errors
+  return `{"error":"..."}`. There is no authentication and no confirmation;
+  stop is the emergency stop and sends immediately.
 
 - **Tiles** pair each camera with color-coded print state, a progress edge,
   and a headline progress/time-left figure. Print errors and HMS alerts appear
@@ -281,14 +298,17 @@ contains `chamber_temper`.
 ### MCP endpoint (`/mcp`)
 
 On by default; disable with `BMBPX_MCP_ENABLED=false`. MCP protocol
-2026-07-28 over Streamable HTTP, read-only:
+2026-07-28 over Streamable HTTP:
 
-- **Tools** — `list_printers`, `get_printer_state`, `get_camera_snapshot`,
-  and `watch_printer`.
+- **Read-only tools** — `list_printers`, `get_printer_state`,
+  `get_camera_snapshot`, and `watch_printer`.
+- **Control tools** — `pause_print`, `resume_print`, `stop_print` (a
+  destructive emergency stop with no confirmation), `set_chamber_light`,
+  `set_speed_profile`, and `set_ai_monitoring`.
 - **Resource** — `bambu://printers/{serial}/state`, a typed live state
   projection that clients can subscribe to.
-- **No control** — the endpoint exposes no printer control methods and never
-  learns printer credentials.
+- The endpoint never learns printer credentials; control commands go through
+  the same allow-listed command service as the camera wall.
 
 ### Configuration page (`/config`)
 
@@ -378,9 +398,13 @@ Full policy, retry, and state-machine detail lives in
 - The camera endpoints, `/mcp`, and the `/config` page are unauthenticated:
   anyone who can reach the HTTP port can view cameras and printer state,
   fetch snapshots, and change settings (though never read access codes, or
-  send a stored code to a new address). Browser requests from other sites are
-  rejected. Set `BMBPX_MCP_ENABLED=false`, mount the config file read-only, or
-  set `http.port: 0` to narrow the surface.
+  send a stored code to a new address). The camera wall's
+  `POST /control/{serial}` and the MCP control tools can also pause, resume,
+  change speed, toggle the chamber light, and **emergency-stop** prints
+  without login; heater and temperature commands are never exposed. Browser
+  requests from other sites are rejected. Set `BMBPX_MCP_ENABLED=false`,
+  mount the config file read-only, or set `http.port: 0` to narrow the
+  surface.
 - The raw camera endpoint on port 6000 authenticates with `bblp` plus a
   configured printer access code; the code selects the printer.
 - The OctoEverywhere key is a secret: keep it in your environment (`.env` is

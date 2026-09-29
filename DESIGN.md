@@ -14,9 +14,10 @@ Many Bambu integrations (Bambu Studio, Home Assistant, xtouch, OctoPrint plugins
 2. Pose as a printer: MQTT behavior, authentication, and TLS match the printer's embedded broker, so existing apps (Bambu Studio, Home Assistant, xtouch, OctoPrint plugins) work without changes.
 3. Hold exactly one upstream MQTT connection per configured printer endpoint.
 4. Route publishes and subscriptions bidirectionally by serial number.
-5. Stay transparent: forward payloads byte-for-byte. No JSON parsing.
+5. Stay transparent for clients: forward client payloads byte-for-byte. The proxy parses printer reports only to display them and publishes only its own allow-listed commands.
 6. Ship as one small static Go binary with a YAML config file.
 7. Serve live camera snapshots, MJPEG streams, and a browser camera wall over one shared HTTP port for P1/A1-series printers (native chamber protocol) and X1/P2S/H2-series printers (RTSPS converted server-side with FFmpeg), and expose the P1/A1 camera also through a printer-compatible raw TLS endpoint on camera port 6000.
+8. Make every view scannable at a glance: spend visual space on the most useful information for that view first, and represent state with icons, color, and visual elements (progress bars, gauges, swatches, badges) instead of long text wherever they carry the same meaning. Text is for detail the visuals cannot convey.
 
 ### Non-goals
 
@@ -173,13 +174,13 @@ HTTP surface (all on the shared `http.port` listener, unauthenticated by design)
 |---|---|
 | `GET /camera/{serial}/snapshot` | Freshest frame younger than 5 s from the shared buffer; otherwise waits up to 15 s for a new frame; 503 if none arrives |
 | `GET /camera/{serial}/stream` | Multipart MJPEG; complete parts flushed per frame; survives printer outages while the client stays connected |
-| `GET /camera/status` | Display state for every printer (name, state, stage, filename, progress, layers, temperatures, print error, HMS alerts, AMS filament slots with the external spool, report and frame age). No credentials, no addresses |
+| `GET /camera/status` | Display state for every printer (name, print state, stage, job name, progress, remaining minutes, layers, temperatures, fans, print error, HMS alerts, AMS filament slots with the external spool, available controls, freshness, frame age). No credentials, no addresses |
 | `GET /camera/events` | Server-sent events carrying the `/camera/status` payload: on connect, when display state changes (checked every 1 s), and at least every 10 s |
 | `GET /activity` | Recent events for every configured printer, newest first |
 | `GET /activity/{serial}` | Recent events for one configured printer; 404 for an unknown serial |
 | `GET /camwall` | Multi-printer camera wall dashboard; composes camera images with telemetry in the browser |
 | `GET /favicon.ico`, `GET /apple-touch-icon.png` | Embedded raster icons for the wall (browser probes, bookmarks, iOS home screen); the page itself inlines an SVG favicon |
-| `POST /mcp` | Read-only Model Context Protocol endpoint (on by default; `BMBPX_MCP_ENABLED=false` removes it): the `list_printers`, `get_printer_state`, `get_camera_snapshot`, and `watch_printer` tools plus the subscribable `bambu://printers/{serial}/state` resource, over MCP 2026-07-28 Streamable HTTP |
+| `POST /mcp` | Model Context Protocol endpoint (on by default; `BMBPX_MCP_ENABLED=false` removes it): the read-only `list_printers`, `get_printer_state`, `get_camera_snapshot`, and `watch_printer` tools, the `pause_print`, `resume_print`, `stop_print`, `set_chamber_light`, `set_speed_profile`, and `set_ai_monitoring` control tools, plus the subscribable `bambu://printers/{serial}/state` resource, over MCP 2026-07-28 Streamable HTTP |
 
 The camera wall is one self-contained embedded HTML page (inline CSS, JS, and
 SVG icons, including an inline SVG favicon; no external assets beyond the
@@ -203,7 +204,7 @@ these camera routes are intentionally open on the configured HTTP interface.
 
 Eligibility is checked before any camera socket is opened, with no operator configuration required: the model is inferred from the serial prefix (01P→P1P, 01S→P1S, 030→A1 MINI, 039→A1, 00W→X1, 00M→X1C, 03W→X1E, 22E→P2S, 093→H2S, 094→H2D; 01P/01S verified against live printers, the RTSPS prefixes against community serial tables), and an explicit `model` field overrides the inference when present. Unknown serial → 404; models outside both transports → 422. Camera capture never affects MQTT proxying. A disabled camera feature (`BMBPX_CAMERA_ENABLED=false`) removes the routes, stops capture workers, and skips the camera wall's per-printer report subscriptions, which are otherwise held asynchronously so HTTP starts without waiting for printers.
 
-The MCP endpoint (`internal/mcpserver`, official `github.com/modelcontextprotocol/go-sdk`, protocol 2026-07-28, stateless Streamable HTTP) serves exactly four read-only tools and one resource; there are no control methods, no sampling, no MCP Tasks, and no path from a tool call to an MQTT publish or a Gadget upload. `watch_printer` long-parks up to 30 s on a single shared one-second sampler that diffs a notification-relevant fingerprint per printer (state transitions, job changes, connectivity, real-report freshness, detection health; progress mode adds 5-point milestones) — it never consumes the detection engine's `WatchDetection` channel. Revision tokens are epoch-stamped counters captured before state reads, so a change landing mid-read leaves the token stale and forces `resync_required` instead of being silently consumed. Resource subscriptions ride `subscriptions/listen`; legacy-protocol subscribe requests are refused before touching the bounded 32-slot ceiling. Waits (32), subscriptions (32), bodies (64 KiB), and per-printer snapshot slots are capped; camera Acquire/Release balance on every path; the endpoint never outputs credentials, addresses, or raw MQTT payloads. `http.port: 0` keeps the endpoint off without failing validation.
+The MCP endpoint (`internal/mcpserver`, official `github.com/modelcontextprotocol/go-sdk`, protocol 2026-07-28, stateless Streamable HTTP) serves ten tools and one resource: the read-only `list_printers`, `get_printer_state`, `get_camera_snapshot`, and `watch_printer`, plus control tools `pause_print`, `resume_print`, `stop_print` (destructive emergency stop with no confirmation), `set_chamber_light`, `set_speed_profile`, and `set_ai_monitoring`. Control calls go through one allow-listed command service; there is no sampling, no MCP Tasks, and no path from a tool call to a Gadget upload. `watch_printer` long-parks up to 30 s on a single shared one-second sampler that diffs a notification-relevant fingerprint per printer (state transitions, job changes, connectivity, real-report freshness, detection health; progress mode adds 5-point milestones) — it never consumes the detection engine's `WatchDetection` channel. Revision tokens are epoch-stamped counters captured before state reads, so a change landing mid-read leaves the token stale and forces `resync_required` instead of being silently consumed. Resource subscriptions ride `subscriptions/listen`; legacy-protocol subscribe requests are refused before touching the bounded 32-slot ceiling. Waits (32), subscriptions (32), bodies (64 KiB), and per-printer snapshot slots are capped; camera Acquire/Release balance on every path; the endpoint never outputs credentials, addresses, or raw MQTT payloads. `http.port: 0` keeps the endpoint off without failing validation.
 
 Telemetry for `/camera/status` comes from a delta-merging cache that observes upstream reports through the pool observer hook. Merges apply only fields present in each report; P1 `pushall` warmup supplies the initial full state. The display-only AMS, external-spool, and stage fields merge before the real-print report gate and never touch detection freshness. The cache never feeds back into MQTT forwarding.
 
@@ -528,7 +529,7 @@ http:
 camera:
   enabled: true             # false removes camera routes and the camera wall
 mcp:
-  enabled: true             # default; false removes the read-only MCP endpoint at /mcp
+  enabled: true             # default; false removes the MCP endpoint at /mcp
 ```
 
 Validation at startup: unique serials, resolvable addresses, TLS flag consistency, HTTP port range. Startup fails fast on invalid config.
@@ -547,7 +548,7 @@ internal/upstream/conn.go      paho client wrapper (connect, publish, merged sub
 internal/routing/topic.go      serial extraction, wildcard expansion, filter↔serial sets
 internal/telemetry/            delta-merging display-state cache fed by upstream reports
 internal/camera/               P1/A1 chamber-image capture, X1/P2S/H2-series RTSPS capture via FFmpeg, raw TLS camera endpoint, snapshot/stream/camera wall handlers
-internal/mcpserver/            read-only MCP endpoint (tools, state resource, subscriptions, shared sampler)
+internal/mcpserver/            MCP endpoint (tools, state resource, subscriptions, shared sampler)
 internal/httpsrv/              shared health + camera HTTP listener
 internal/tlsutil/              self-signed certificate generation and persistence
 ```
@@ -573,7 +574,7 @@ Dependencies: `github.com/mochi-mqtt/server/v2`, `github.com/eclipse/paho.mqtt.g
 | FFmpeg missing for an RTSPS model | RTSPS capture stays disabled; snapshot/stream answer 503 and the tile shows the reason; one startup warning explains the dependency | P1/A1 capture and every other service are unaffected; install FFmpeg (bundled in the Docker image) and restart |
 | Camera connection drops mid-stream | Capture reconnects with 0.5–5 s backoff while consumers remain; streams resume | Brief frame gap; slow clients skip frames instead of stalling capture |
 | Raw camera port 6000 busy at startup (second proxy instance, another service) or its certificate cannot be created | Startup fails fast with a wrapped `raw camera endpoint` error after the deferred teardown stops every already-started service | Operator frees the port or sets `camera.enabled: false`; no half-started services remain |
-| Unauthenticated HTTP exposure | Camera, camera wall, status endpoints, and the `/mcp` endpoint (default on) have no login | Anyone who can reach `http.port` sees cameras, telemetry, and MCP camera snapshots/state; bind accordingly (state responses carry no credentials); set `BMBPX_MCP_ENABLED=false` to remove the MCP surface |
+| Unauthenticated HTTP exposure | Camera, camera wall, status endpoints, the camera wall `POST /control/{serial}` endpoint, and the `/mcp` endpoint (default on) have no login | Anyone who can reach `http.port` sees cameras and telemetry, and can pause, resume, change speed, toggle the chamber light, and **emergency-stop** prints through the camera wall control endpoint or the MCP control tools, without login. Heater and temperature commands are never exposed. Bind accordingly (state responses carry no credentials); set `BMBPX_MCP_ENABLED=false` or `BMBPX_CAMERA_ENABLED=false` to remove part of the surface |
 | Bambu Studio "add printer by IP" | Studio probes camera/FTP ports in addition to MQTT; probe failure can block discovery | MQTT control and status work; camera/FTP passthrough is future work |
 | Tools that pin the printer TLS certificate | The self-signed proxy cert fails pinning | Load a custom cert/key via config, or disable pinning (clients must already skip verify against the real printer) |
 | Downstream QoS 1 command while printer offline | PUBACK was already issued; command does not reach the printer | App-level retry, identical to a direct-connection drop |
@@ -627,7 +628,7 @@ Configuration comes from a YAML file, environment variables, or both; environmen
 | `BMBPX_LOG_LEVEL` | `info` | `debug` logs routing decisions |
 | `BMBPX_HTTP_PORT` | `8080` | Shared health + camera HTTP port (0 off) |
 | `BMBPX_CAMERA_ENABLED` | `true` | Camera endpoints, camera wall, and the raw camera listener on port 6000 |
-| `BMBPX_MCP_ENABLED` | `true` | Read-only MCP endpoint at `/mcp` (off when `http.port` is 0) |
+| `BMBPX_MCP_ENABLED` | `true` | MCP endpoint at `/mcp` (off when `http.port` is 0) |
 | `BMBPX_OCTOEVERYWHERE_API_KEY` | empty | Empty = off; set to an OctoEverywhere Gadget API key to enable AI failure detection (consents to external snapshot upload and automatic pause; see §6.1) |
 
 Behavior tuning (`behavior:` in YAML) has no environment surface — its defaults match the design.

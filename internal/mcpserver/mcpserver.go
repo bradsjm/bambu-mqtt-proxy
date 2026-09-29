@@ -1,8 +1,9 @@
-// Package mcpserver exposes a small read-only Model Context Protocol (MCP)
-// endpoint on the shared HTTP listener. It serves four observation tools, a
-// per-printer state resource with subscriptions, and nothing else: there are
-// no write or control methods, no arbitrary URLs, and no credential or raw
-// payload output. The endpoint speaks protocol 2026-07-28 (SEP-2575) over
+// Package mcpserver exposes a small Model Context Protocol (MCP) endpoint on
+// the shared HTTP listener. It serves four read-only observation tools, a
+// per-printer state resource with subscriptions, and the allow-listed
+// printer control tools (pause, resume, stop, chamber light, speed profile,
+// AI monitoring). There are no gcode, heater, or temperature commands, no
+// arbitrary URLs, and no credential or raw payload output. The endpoint speaks protocol 2026-07-28 (SEP-2575) over
 // Streamable HTTP in stateless mode, which is the only mode the official Go
 // SDK supports for that protocol.
 package mcpserver
@@ -23,6 +24,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/camera"
 	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/detection"
@@ -101,6 +103,12 @@ type DetectionSource interface {
 	AccountSuspended() (bool, string)
 }
 
+// ActivitySource is the recent printer event log. It is satisfied by
+// *activity.Log.
+type ActivitySource interface {
+	Recent(serial string) []activity.Entry
+}
+
 // printerInfo is the narrow inventory record the endpoint is allowed to
 // know: identity and display fields only. New copies these out of the
 // configured printers, so credentials, addresses, and TLS settings from
@@ -123,7 +131,12 @@ type Deps struct {
 	Generations  GenerationSource
 	Cameras      SnapshotSource // nil when the camera feature is disabled
 	Detector     DetectionSource
-	Log          *slog.Logger
+	Activity     ActivitySource // nil yields empty activity lists
+	// Control enables the printer control tools; nil registers none.
+	Control ControlService
+	// DetectorControl backs set_ai_monitoring; nil when detection is off.
+	DetectorControl DetectorControl
+	Log             *slog.Logger
 }
 
 // Server owns the MCP endpoint. Construct with New, register the handler on
@@ -136,6 +149,9 @@ type Server struct {
 	gens     GenerationSource
 	cams     SnapshotSource
 	det      DetectionSource
+	activity ActivitySource
+	control  ControlService
+	detCtl   DetectorControl
 	log      *slog.Logger
 	now      func() time.Time
 
@@ -185,6 +201,9 @@ func New(deps Deps) *Server {
 		gens:        deps.Generations,
 		cams:        deps.Cameras,
 		det:         deps.Detector,
+		activity:    deps.Activity,
+		control:     deps.Control,
+		detCtl:      deps.DetectorControl,
 		log:         log,
 		epoch:       newEpoch(),
 		rootCtx:     ctx,
@@ -216,6 +235,9 @@ func New(deps Deps) *Server {
 			SupportedProtocolVersions: []string{protocolVersionCurrent},
 		})
 	s.registerTools()
+	if s.control != nil {
+		s.registerControlTools()
+	}
 	s.registerResource()
 	s.sampler = newSampler(s)
 	s.handler = mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s.srv },
@@ -298,14 +320,7 @@ func (s *Server) Close() {
 	}
 }
 
-// closed reports whether Close ran. Guarded by closeMu.
-func (s *Server) isClosed() bool {
-	s.closeMu.Lock()
-	defer s.closeMu.Unlock()
-	return s.closed
-}
-
-// registerTools adds the four read-only tools. Each carries read-only,
+// registerTools adds the four observation tools. Each carries read-only,
 // non-destructive, idempotent annotations and a hand-written input schema so
 // enums, ranges, and defaults are exact on the wire.
 func (s *Server) registerTools() {
@@ -353,7 +368,7 @@ func (s *Server) registerTools() {
 
 	mcp.AddTool(s.srv, &mcp.Tool{
 		Name:        "watch_printer",
-		Description: "Long-poll one printer for state changes. mode=attention fires on pause/fail/finish/job/connectivity/freshness/detection-health changes; mode=progress additionally fires every 5 percentage points of print progress. Age and countdown churn is suppressed. Read-only.",
+		Description: "Long-poll one printer for state changes. mode=attention fires on pause/fail/finish/stop/job changes, new HMS alerts, printer errors, and connectivity/freshness/detection-health changes; mode=progress additionally fires every 5 percentage points of print progress. Age and countdown churn is suppressed. Read-only.",
 		Annotations: readOnly("Watch printer"),
 		InputSchema: objSchema(map[string]*jsonschema.Schema{
 			"serial": strRequiredProp("Printer serial number."),

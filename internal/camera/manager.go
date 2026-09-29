@@ -6,7 +6,6 @@ import (
 	"context"
 	"log/slog"
 	"os/exec"
-	"strings"
 	"sync"
 	"time"
 
@@ -253,40 +252,9 @@ func (m *Manager) Release(serial string) {
 	}
 }
 
-// webCameraModel uses explicit model configuration first, then known legacy
-// P1/A1 inference and verified RTSPS serial prefixes.
-func webCameraModel(model, serial string) string {
-	if strings.TrimSpace(model) != "" {
-		return config.NormalizeModel(model)
-	}
-	if inferred := config.ModelFromSerial(serial); inferred != "" {
-		return inferred
-	}
-	s := strings.ToUpper(strings.TrimSpace(serial))
-	for _, mapping := range rtspSerialPrefixes {
-		if strings.HasPrefix(s, mapping.prefix) {
-			return mapping.model
-		}
-	}
-	return ""
-}
-
-// rtspSerialPrefixes maps verified RTSPS printer serial prefixes to models.
-var rtspSerialPrefixes = []struct {
-	prefix string
-	model  string
-}{
-	{"00M", "X1C"},
-	{"00W", "X1"},
-	{"03W", "X1E"},
-	{"22E", "P2S"},
-	{"093", "H2S"},
-	{"094", "H2D"},
-}
-
 // webCameraSupported reports image-capture support for web camera routes.
 func webCameraSupported(model, serial string) bool {
-	switch webCameraModel(model, serial) {
+	switch config.DisplayModel(model, serial) {
 	case "P1P", "P1S", "A1", "A1MINI", "X1", "X1C", "X1E", "P2S", "H2S", "H2D":
 		return true
 	default:
@@ -296,7 +264,7 @@ func webCameraSupported(model, serial string) bool {
 
 // requiresFFmpeg reports whether web capture needs the external FFmpeg tool.
 func requiresFFmpeg(model, serial string) bool {
-	switch webCameraModel(model, serial) {
+	switch config.DisplayModel(model, serial) {
 	case "X1", "X1C", "X1E", "P2S", "H2S", "H2D":
 		return true
 	default:

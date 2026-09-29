@@ -12,13 +12,12 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
-	"strings"
 	"time"
 
 	"bambu-mqtt-proxy/internal/activity"
-	"bambu-mqtt-proxy/internal/config"
+	"bambu-mqtt-proxy/internal/control"
 	"bambu-mqtt-proxy/internal/detection"
-	"bambu-mqtt-proxy/internal/hmscodes"
+	"bambu-mqtt-proxy/internal/printerview"
 	"bambu-mqtt-proxy/internal/telemetry"
 )
 
@@ -44,67 +43,25 @@ const (
 	eventsKeepalive = 10 * time.Second
 )
 
-// detectionPutMaxBody bounds the toggle request body: two small fields.
+// detectionPutMaxBody bounds the toggle and control request bodies: a few
+// small fields.
 const detectionPutMaxBody = 4 << 10
 
-// Tile is one printer's entry in /camera/status. It carries only display
-// state: never serial-derived credentials or raw configuration.
+// Tile is one printer's entry in /camera/status: the shared printer view
+// plus camera-wall-only state. It carries only display state: never
+// serial-derived credentials or raw configuration.
 type Tile struct {
-	Serial       string   `json:"serial"`
-	Name         string   `json:"name,omitempty"`
-	Model        string   `json:"model"`
-	CameraOK     bool     `json:"camera_supported"`
-	CameraReason string   `json:"camera_reason,omitempty"`
-	Connected    bool     `json:"connected"`
-	State        string   `json:"state,omitempty"`
-	Filename     string   `json:"filename,omitempty"`
-	Progress     float64  `json:"progress,omitempty"`
-	RemainMin    float64  `json:"remain_min,omitempty"`
-	LayerNum     *int     `json:"layer_num,omitempty"`
-	TotalLayers  *int     `json:"total_layers,omitempty"`
-	NozzleTemp   *float64 `json:"nozzle_temp,omitempty"`
-	NozzleTarget *float64 `json:"nozzle_target,omitempty"`
-	BedTemp      *float64 `json:"bed_temp,omitempty"`
-	BedTarget    *float64 `json:"bed_target,omitempty"`
-	ChamberTemp  *float64 `json:"chamber_temp,omitempty"`
-	PrintError   string   `json:"print_error,omitempty"`
-	// Stage is the printer's current action mapped from stg_cur, e.g.
-	// "changing_filament". It stays empty for the idle sentinels and for
-	// unknown stage ids, so consumers keep state as the headline.
-	Stage string `json:"stage,omitempty"`
-	// AMS lists the printer's conventional four-slot AMS units sorted by
-	// unit id with slots 0-3, and ExtSpool the single external spool. Both
-	// stay omitted until the printer reports them; the values alias the
-	// telemetry cache's copy-on-write projection, which merges never
-	// mutate in place.
-	AMS      []telemetry.AMSUnit `json:"ams,omitempty"`
-	ExtSpool *telemetry.AMSSlot  `json:"ext_spool,omitempty"`
-	// PrintErrorText, PrintErrorSeverity, and PrintErrorFix carry the
-	// error-code dataset's description of PrintError and stay empty for
-	// codes it does not cover. PrintErrorURL always links to Printara3D.
-	PrintErrorText     string `json:"print_error_text,omitempty"`
-	PrintErrorSeverity string `json:"print_error_severity,omitempty"`
-	PrintErrorFix      string `json:"print_error_fix,omitempty"`
-	PrintErrorURL      string `json:"print_error_url,omitempty"`
-	HMS                []HMS  `json:"hms,omitempty"`
+	printerview.View
+	CameraOK     bool   `json:"camera_supported"`
+	CameraReason string `json:"camera_reason,omitempty"`
 	// Detection is the optional OctoEverywhere detection status object,
 	// omitted when the feature is not configured.
 	Detection any              `json:"detection,omitempty"`
 	Activity  []activity.Entry `json:"activity,omitempty"` // recent events, newest first
-	ReportAge *float64         `json:"report_age_seconds,omitempty"`
-	FrameAge  float64          `json:"frame_age_seconds,omitempty"`
-	FrameSeq  uint64           `json:"frame_seq,omitempty"`
-}
-
-// HMS is one Health Management System alert in display form. Text and Fix
-// come from the error-code dataset and stay empty for codes it does not
-// cover; URL always links the code to Printara3D.
-type HMS struct {
-	Code     string `json:"code"`
-	Severity string `json:"severity"`
-	Text     string `json:"text,omitempty"`
-	Fix      string `json:"fix,omitempty"`
-	URL      string `json:"url,omitempty"`
+	// Controls lists the printer controls currently available.
+	Controls []string `json:"controls"`
+	FrameAge float64  `json:"frame_age_seconds,omitempty"`
+	FrameSeq uint64   `json:"frame_seq,omitempty"`
 }
 
 // statusPayload is the shared /camera/status and /camera/events body.
@@ -123,7 +80,8 @@ type StatusRenderer struct {
 	status    connectivitySource
 	detection detectionSource
 	control   detectionControl
-	activity  *activity.Log // optional recent-event source
+	printer   controlService // optional printer controls
+	activity  *activity.Log  // optional recent-event source
 }
 
 // NewStatusRenderer builds the /camera/status payload renderer.
@@ -146,6 +104,18 @@ type detectionControl interface {
 	SetDetectionEnabled(serial string, enabled bool, sessionID string) (any, error)
 }
 
+// controlService is the allow-listed printer control backend behind POST
+// /control/{serial}. It is satisfied by *control.Service.
+type controlService interface {
+	Do(serial, origin string, req control.Request) (control.Result, error)
+	Available(serial string) []string
+}
+
+// SetControl attaches the printer control service.
+func (r *StatusRenderer) SetControl(c controlService) {
+	r.printer = c
+}
+
 // SetDetection attaches the optional detection engine after construction.
 func (r *StatusRenderer) SetDetection(d detectionSource) {
 	r.detection = d
@@ -165,6 +135,7 @@ func (r *StatusRenderer) SetActivity(log *activity.Log) {
 // camera wall can distinguish an idle printer from a disconnected one.
 type connectivitySource interface {
 	Status() map[string]bool
+	Generation(serial string) uint64
 }
 
 // Tiles merges telemetry and camera state for every configured printer,
@@ -175,61 +146,15 @@ func (r *StatusRenderer) Tiles() []Tile {
 	states := r.state.Snapshot()
 	tiles := make([]Tile, 0, len(states))
 	for _, st := range states {
-		// Display model falls back to the serial-prefix inference so tiles
-		// from configs without model fields still show a useful label.
-		model := st.Model
-		if strings.TrimSpace(model) == "" {
-			model = webCameraModel(st.Model, st.Serial)
-		}
-		chamberTemp := st.ChamberTemp
-		if !config.ChamberTemperatureSupported(st.Model, st.Serial) {
-			chamberTemp = nil
-		}
+		sv, _ := r.state.Session(st.Serial)
 		t := Tile{
-			Serial:       st.Serial,
-			Name:         st.Name,
-			Model:        model,
+			View:         printerview.Build(st, sv, st.Connected, r.status.Generation(st.Serial), time.Now()),
 			CameraOK:     r.cameras.WebSupported(st.Serial),
 			CameraReason: r.cameras.WebUnavailableReason(st.Serial),
-			Connected:    st.Connected,
-			State:        st.PrintingState,
-			Filename:     st.Filename,
-			Progress:     st.Progress,
-			RemainMin:    st.RemainMin,
-			LayerNum:     st.LayerNum,
-			TotalLayers:  st.TotalLayers,
-			NozzleTemp:   st.NozzleTemp,
-			NozzleTarget: st.NozzleTarget,
-			BedTemp:      st.BedTemp,
-			BedTarget:    st.BedTarget,
-			ChamberTemp:  chamberTemp,
-			Stage:        stageLabel(st.Stage),
-			AMS:          st.AMS,
-			ExtSpool:     st.ExtSpool,
+			Controls:     []string{},
 		}
-		if st.PrintError != 0 {
-			v := uint32(st.PrintError)
-			t.PrintError = fmt.Sprintf("%04X_%04X", v>>16, v&0xFFFF)
-			// The link is set even when the dataset does not describe
-			// the code, so every alert can reach the lookup tool.
-			info := hmscodes.PrintError(v)
-			t.PrintErrorURL = info.URL
-			if info.Title != "" {
-				t.PrintErrorText, t.PrintErrorSeverity, t.PrintErrorFix = info.Title, info.Severity, info.Fix
-			}
-		}
-		for _, a := range st.HMS {
-			h := HMS{Code: a.ID(), Severity: a.Severity()}
-			info := hmscodes.HMS(a.Attr)
-			h.URL = info.URL
-			if info.Title != "" {
-				h.Text, h.Fix = info.Title, info.Fix
-			}
-			t.HMS = append(t.HMS, h)
-		}
-		if !st.LastReport.IsZero() {
-			age := time.Since(st.LastReport).Seconds()
-			t.ReportAge = &age
+		if r.printer != nil {
+			t.Controls = r.printer.Available(st.Serial)
 		}
 		if f := r.cameras.Latest(st.Serial); f != nil {
 			t.FrameAge = time.Since(f.Captured).Seconds()
@@ -260,7 +185,7 @@ func (r *StatusRenderer) payload(tiles []Tile) statusPayload {
 func changeKey(tiles []Tile) ([]byte, error) {
 	stable := make([]Tile, len(tiles))
 	for i, t := range tiles {
-		t.ReportAge, t.FrameAge, t.FrameSeq = nil, 0, 0
+		t.Freshness.LastReportAgeSeconds, t.FrameAge, t.FrameSeq = nil, 0, 0
 		t.Activity = append([]activity.Entry(nil), t.Activity...)
 		for j := range t.Activity {
 			t.Activity[j].AgeSeconds = 0
@@ -330,10 +255,12 @@ func (r *StatusRenderer) RegisterStatus(mux *http.ServeMux) {
 		_ = json.NewEncoder(w).Encode(r.payload(r.Tiles()))
 	})
 	mux.HandleFunc("GET /camera/events", r.handleEvents)
-	// The per-print AI toggle is the wall's only write endpoint; it is
-	// protected against cross-origin browser writes like /config/api.
+	// The per-print AI toggle and the printer controls are the wall's write
+	// endpoints; they are protected against cross-origin browser writes like
+	// /config/api.
 	protection := http.NewCrossOriginProtection()
 	mux.Handle("PUT /detection/{serial}", protection.Handler(http.HandlerFunc(r.handleDetectionPut)))
+	mux.Handle("POST /control/{serial}", protection.Handler(http.HandlerFunc(r.handleControl)))
 	mux.HandleFunc("GET /camwall", func(w http.ResponseWriter, _ *http.Request) {
 		noStore(w)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -390,6 +317,47 @@ func (r *StatusRenderer) handleDetectionPut(w http.ResponseWriter, req *http.Req
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(st)
+}
+
+// handleControl sends one allow-listed printer control: POST JSON
+// {"action":"light|pause|resume|speed|stop","on":bool,"profile":string}.
+// There is no confirmation step; the result reports that the command was
+// sent, and the printer's next report confirms the effect.
+func (r *StatusRenderer) handleControl(w http.ResponseWriter, req *http.Request) {
+	noStore(w)
+	if r.printer == nil {
+		writeJSONError(w, http.StatusNotFound, "printer controls are not configured")
+		return
+	}
+	var in control.Request
+	dec := json.NewDecoder(http.MaxBytesReader(w, req.Body, detectionPutMaxBody))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&in); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "body must be a JSON object with an action")
+		return
+	}
+	res, err := r.printer.Do(req.PathValue("serial"), "camera wall", in)
+	if err != nil {
+		var code int
+		switch {
+		case errors.Is(err, control.ErrUnknownPrinter):
+			code = http.StatusNotFound
+		case errors.Is(err, control.ErrInvalidRequest):
+			code = http.StatusBadRequest
+		case errors.Is(err, control.ErrNotAvailable):
+			code = http.StatusConflict
+		case errors.Is(err, control.ErrNotConnected):
+			code = http.StatusServiceUnavailable
+		case errors.Is(err, control.ErrSendFailed):
+			code = http.StatusBadGateway
+		default:
+			code = http.StatusInternalServerError
+		}
+		writeJSONError(w, code, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(res)
 }
 
 // writeJSONError renders one operational error as a JSON object.

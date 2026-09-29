@@ -415,14 +415,17 @@ func TestMCPDiscovery(t *testing.T) {
 				} `json:"properties"`
 			} `json:"inputSchema"`
 			Annotations *struct {
-				ReadOnlyHint bool `json:"readOnlyHint"`
+				ReadOnlyHint    bool  `json:"readOnlyHint"`
+				DestructiveHint *bool `json:"destructiveHint"`
 			} `json:"annotations"`
 		} `json:"tools"`
 	}
 	if err := json.Unmarshal(tl.Result, &tools); err != nil {
 		t.Fatalf("bad tools/list result: %v", err)
 	}
-	want := []string{"list_printers", "get_printer_state", "get_camera_snapshot", "watch_printer"}
+	readOnly := []string{"list_printers", "get_printer_state", "get_camera_snapshot", "watch_printer"}
+	want := append(slices.Clone(readOnly), "pause_print", "resume_print", "stop_print",
+		"set_chamber_light", "set_speed_profile", "set_ai_monitoring")
 	if len(tools.Tools) != len(want) {
 		t.Fatalf("tools/list returned %d tools, want exactly %d", len(tools.Tools), len(want))
 	}
@@ -432,8 +435,12 @@ func TestMCPDiscovery(t *testing.T) {
 			t.Fatalf("duplicate tool %q", tool.Name)
 		}
 		seen[tool.Name] = true
-		if tool.Annotations == nil || !tool.Annotations.ReadOnlyHint {
-			t.Fatalf("tool %q lacks readOnlyHint", tool.Name)
+		if tool.Annotations == nil || tool.Annotations.ReadOnlyHint != slices.Contains(readOnly, tool.Name) {
+			t.Fatalf("tool %q readOnlyHint wrong: %+v", tool.Name, tool.Annotations)
+		}
+		destructive := tool.Annotations.DestructiveHint != nil && *tool.Annotations.DestructiveHint
+		if destructive != (tool.Name == "stop_print") {
+			t.Fatalf("tool %q destructiveHint = %v", tool.Name, destructive)
 		}
 		if tool.InputSchema.Type != "object" {
 			t.Fatalf("tool %q schema type %q", tool.Name, tool.InputSchema.Type)
@@ -1134,5 +1141,84 @@ func TestMCPSubscribeLegacyProtocolRefused(t *testing.T) {
 			t.Fatalf("subscription leaked: %d", w.activeSubs())
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestMCPStateSchemaFlattensView pins the embedded printer view: the shared
+// fields must appear at the top level of state in the output schema.
+func TestMCPStateSchemaFlattensView(t *testing.T) {
+	w := newWireFixture(t)
+	tl := w.post(t, 1, "tools/list", map[string]any{})
+	var tools struct {
+		Tools []struct {
+			Name         string `json:"name"`
+			OutputSchema struct {
+				Properties map[string]struct {
+					Properties map[string]json.RawMessage `json:"properties"`
+				} `json:"properties"`
+			} `json:"outputSchema"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(tl.Result, &tools); err != nil {
+		t.Fatalf("bad tools/list result: %v", err)
+	}
+	for _, tool := range tools.Tools {
+		if tool.Name != "get_printer_state" {
+			continue
+		}
+		props := tool.OutputSchema.Properties["state"].Properties
+		for _, key := range []string{"print_state", "chamber_light", "freshness", "controls", "activity", "camera"} {
+			if _, ok := props[key]; !ok {
+				t.Fatalf("state schema lacks %q: %v", key, props)
+			}
+		}
+		return
+	}
+	t.Fatal("get_printer_state missing")
+}
+
+func TestMCPControlTools(t *testing.T) {
+	w := newWireFixture(t)
+	w.conn.set("P001", true)
+	call := func(id int, name string, args map[string]any) sseMessage {
+		t.Helper()
+		return w.post(t, id, "tools/call", map[string]any{"name": name, "arguments": args})
+	}
+	res := call(1, "stop_print", map[string]any{"serial": "P001"})
+	var out struct {
+		IsError           bool `json:"isError"`
+		StructuredContent struct {
+			Serial string `json:"serial"`
+			Action string `json:"action"`
+			Sent   bool   `json:"sent"`
+			State  *struct {
+				Controls []string `json:"controls"`
+			} `json:"state"`
+		} `json:"structuredContent"`
+	}
+	if err := json.Unmarshal(res.Result, &out); err != nil {
+		t.Fatalf("bad stop result: %v", err)
+	}
+	sc := out.StructuredContent
+	if out.IsError || !sc.Sent || sc.Action != "stop" || sc.State == nil || !slices.Contains(sc.State.Controls, "stop") {
+		t.Fatalf("stop_print = %s", res.Result)
+	}
+	if got := w.cmd.sentList(); !slices.Equal(got, []string{"stop"}) {
+		t.Fatalf("sent = %v", got)
+	}
+	assertToolError(t, call(2, "set_chamber_light", map[string]any{"serial": "P002", "on": true}), errUpstreamUnavailable)
+	assertToolError(t, call(3, "pause_print", map[string]any{"serial": "P001"}), errInvalidState)
+	assertToolError(t, call(4, "stop_print", map[string]any{"serial": "NOPE"}), errUnknownSerial)
+	assertToolError(t, call(5, "set_ai_monitoring", map[string]any{"serial": "P001", "enabled": false}), errDetectionDisabled)
+	if bad := call(6, "set_speed_profile", map[string]any{"serial": "P001", "profile": "turbo"}); bad.Error == nil {
+		var r struct {
+			IsError bool `json:"isError"`
+		}
+		if json.Unmarshal(bad.Result, &r); !r.IsError {
+			t.Fatalf("invalid profile accepted: %s", bad.Result)
+		}
+	}
+	if got := w.cmd.sentList(); len(got) != 1 {
+		t.Fatalf("sent = %v, want only the stop", got)
 	}
 }

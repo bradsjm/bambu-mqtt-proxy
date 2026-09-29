@@ -496,3 +496,34 @@ func (c *Config) Validate() error {
 	}
 	return nil
 }
+
+// DisplayModel names a printer model: explicit model configuration first,
+// then known legacy P1/A1 inference and verified RTSPS serial prefixes.
+func DisplayModel(model, serial string) string {
+	if strings.TrimSpace(model) != "" {
+		return NormalizeModel(model)
+	}
+	if inferred := ModelFromSerial(serial); inferred != "" {
+		return inferred
+	}
+	s := strings.ToUpper(strings.TrimSpace(serial))
+	for _, mapping := range rtspSerialPrefixes {
+		if strings.HasPrefix(s, mapping.prefix) {
+			return mapping.model
+		}
+	}
+	return ""
+}
+
+// rtspSerialPrefixes maps verified RTSPS printer serial prefixes to models.
+var rtspSerialPrefixes = []struct {
+	prefix string
+	model  string
+}{
+	{"00M", "X1C"},
+	{"00W", "X1"},
+	{"03W", "X1E"},
+	{"22E", "P2S"},
+	{"093", "H2S"},
+	{"094", "H2D"},
+}

@@ -175,9 +175,11 @@ func (c *etClient) counts() (creates, processes int) {
 }
 
 type etPauser struct {
-	mu   sync.Mutex
-	gens []uint64
-	err  error
+	mu       sync.Mutex
+	gens     []uint64
+	err      error
+	lights   []bool
+	lightErr error
 }
 
 func (p *etPauser) PausePrint(_ string, gen uint64) error {
@@ -188,6 +190,19 @@ func (p *etPauser) PausePrint(_ string, gen uint64) error {
 }
 
 func (p *etPauser) SetSpeedProfile(string, uint64, int) error { return p.err }
+
+func (p *etPauser) SetChamberLight(_ string, _ uint64, on bool) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.lights = append(p.lights, on)
+	return p.lightErr
+}
+
+func (p *etPauser) lightCalls() []bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]bool(nil), p.lights...)
+}
 
 func (p *etPauser) calls() int {
 	p.mu.Lock()
@@ -1083,5 +1098,90 @@ func TestEngineTelemetryReconnectDuringUploadDoesNotPause(t *testing.T) {
 	w.worker.step(context.Background())
 	if calls := w.pauser.calls(); calls != 0 {
 		t.Fatalf("pause calls = %d, want no command on a newer connection", calls)
+	}
+}
+
+// lightSession starts an AI-monitored print whose report carries the given
+// chamber light mode.
+func (w *etWorld) lightSession(sessionGen uint64, light string) {
+	w.sessions.running(w.clock, sessionGen, sessionGen, "RUNNING")
+	v, _ := w.sessions.Session("S1")
+	v.ChamberLight = light
+	w.sessions.set(v, true)
+}
+
+func TestChamberLightAutoOnOncePerSession(t *testing.T) {
+	w := newEtWorld(t)
+	printers := []config.Printer{{Serial: "S1", Name: "Shop", Model: "P1S"}}
+	activities := activity.New(printers)
+	w.engine.SetActivity(activities)
+	w.lightSession(1, "off")
+	for i := 0; i < 3; i++ {
+		w.client.queue(etClearResult())
+		w.worker.step(context.Background())
+		w.clock.Advance(30 * time.Second)
+	}
+	if got := w.pauser.lightCalls(); len(got) != 1 || !got[0] {
+		t.Fatalf("light calls = %v, want exactly one on", got)
+	}
+	if !hasActivityKind(activities.Recent("S1"), "ai_light_on") {
+		t.Fatalf("activity missing ai_light_on: %+v", activities.Recent("S1"))
+	}
+}
+
+func TestChamberLightReenableAllowsOneNewAttempt(t *testing.T) {
+	w := newEtWorld(t)
+	w.lightSession(1, "off")
+	w.client.queue(etClearResult())
+	w.worker.step(context.Background())
+	if got := w.pauser.lightCalls(); len(got) != 1 || !got[0] {
+		t.Fatalf("initial light calls = %v, want one on", got)
+	}
+	if _, err := w.engine.SetDetectionEnabled("S1", false, w.engine.sessionToken(1)); err != nil {
+		t.Fatal(err)
+	}
+	w.worker.step(context.Background())
+	if _, err := w.engine.SetDetectionEnabled("S1", true, ""); err != nil {
+		t.Fatal(err)
+	}
+	w.client.queue(etClearResult())
+	w.worker.step(context.Background())
+	if got := w.pauser.lightCalls(); len(got) != 2 || !got[0] || !got[1] {
+		t.Fatalf("light calls after re-enable = %v, want two one-shot attempts", got)
+	}
+}
+
+func TestChamberLightSkippedWhenOverriddenOrAlreadyOn(t *testing.T) {
+	w := newEtWorld(t)
+	w.lightSession(1, "off")
+	if _, err := w.engine.SetDetectionEnabled("S1", false, w.engine.sessionToken(1)); err != nil {
+		t.Fatal(err)
+	}
+	w.worker.step(context.Background())
+	w.worker.step(context.Background())
+	if got := w.pauser.lightCalls(); len(got) != 0 {
+		t.Fatalf("light calls under override = %v", got)
+	}
+
+	w2 := newEtWorld(t)
+	w2.lightSession(1, "on")
+	w2.client.queue(etClearResult())
+	w2.worker.step(context.Background())
+	if got := w2.pauser.lightCalls(); len(got) != 0 {
+		t.Fatalf("light calls with light already on = %v", got)
+	}
+}
+
+func TestChamberLightFailureIsNotRetried(t *testing.T) {
+	w := newEtWorld(t)
+	w.pauser.lightErr = errors.New("offline")
+	w.lightSession(1, "off")
+	for i := 0; i < 3; i++ {
+		w.client.queue(etClearResult())
+		w.worker.step(context.Background())
+		w.clock.Advance(31 * time.Second)
+	}
+	if got := w.pauser.lightCalls(); len(got) != 1 {
+		t.Fatalf("light attempts = %d, want 1", len(got))
 	}
 }

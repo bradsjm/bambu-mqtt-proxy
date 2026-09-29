@@ -224,3 +224,42 @@ func (m fakeMessage) Topic() string     { return "device/S1/report" }
 func (m fakeMessage) MessageID() uint16 { return 0 }
 func (m fakeMessage) Payload() []byte   { return m.payload }
 func (m fakeMessage) Ack()              {}
+
+func TestControlCommandsPublishExactGuardedPayloads(t *testing.T) {
+	cases := []struct {
+		name string
+		send func(p *Pool, gen uint64) error
+		want string
+	}{
+		{"resume", func(p *Pool, gen uint64) error { return p.ResumePrint("S1", gen) },
+			`{"print":{"sequence_id":"0","command":"resume"}}`},
+		{"stop", func(p *Pool, gen uint64) error { return p.StopPrint("S1", gen) },
+			`{"print":{"sequence_id":"0","command":"stop"}}`},
+		{"light on", func(p *Pool, gen uint64) error { return p.SetChamberLight("S1", gen, true) },
+			`{"system":{"sequence_id":"0","command":"ledctrl","led_node":"chamber_light","led_mode":"on","led_on_time":500,"led_off_time":500,"loop_times":0,"interval_time":0}}`},
+		{"light off", func(p *Pool, gen uint64) error { return p.SetChamberLight("S1", gen, false) },
+			`{"system":{"sequence_id":"0","command":"ledctrl","led_node":"chamber_light","led_mode":"off","led_on_time":500,"led_off_time":500,"loop_times":0,"interval_time":0}}`},
+	}
+	for _, tc := range cases {
+		fake := newFakePaho(true)
+		p := NewPool([]config.Printer{{Serial: "S1", Name: "Shop"}}, nil, config.Behavior{},
+			slog.New(slog.NewTextHandler(io.Discard, nil)))
+		p.conns["S1"] = newTestConn(fake, 7)
+		if err := tc.send(p, 6); err == nil {
+			t.Fatalf("%s: stale generation accepted", tc.name)
+		}
+		if len(fake.publishes) != 0 {
+			t.Fatalf("%s: published on a generation mismatch", tc.name)
+		}
+		if err := tc.send(p, 7); err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if len(fake.publishes) != 1 {
+			t.Fatalf("%s: publishes = %d, want 1", tc.name, len(fake.publishes))
+		}
+		pub := fake.publishes[0]
+		if pub.topic != "device/S1/request" || pub.qos != 0 || pub.retained || string(pub.payload) != tc.want {
+			t.Fatalf("%s: publish = %+v %s", tc.name, pub, pub.payload)
+		}
+	}
+}

@@ -1,7 +1,7 @@
-package camera
+package printerview
 
 // This file projects the report's stg_cur stage id to display-name form
-// for /camera/status.
+// for the shared printer view.
 
 // printerStageNames maps stg_cur stage ids to the names the established
 // Bambu report format uses. The idle sentinels (-1 and 255) are absent on
@@ -88,10 +88,10 @@ var printerStageNames = map[int]string{
 	77: "preparing_ams",
 }
 
-// stageLabel maps a merged stage id to its display name. Empty means the
+// StageName maps a merged stage id to its display name. Empty means the
 // stage was never reported, is an idle sentinel, or is unknown; the tile
 // then shows only the printer state.
-func stageLabel(stage *int) string {
+func StageName(stage *int) string {
 	if stage == nil {
 		return ""
 	}

@@ -21,6 +21,7 @@ import (
 	"bambu-mqtt-proxy/internal/camera"
 	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/configui"
+	"bambu-mqtt-proxy/internal/control"
 	"bambu-mqtt-proxy/internal/detection"
 	"bambu-mqtt-proxy/internal/health"
 	"bambu-mqtt-proxy/internal/httpsrv"
@@ -117,6 +118,9 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	// detection can never treat a pre-reconnect observation as current.
 	state := telemetry.NewCache(cfg.Printers, logger)
 	state.SetActivity(activities)
+	// Printer controls: the only allow-listed path from the camera wall and
+	// MCP to printer commands. No heater or temperature command exists.
+	controls := control.New(pool, state, activities)
 	pool.SetObserver(func(serial string, seq, gen uint64, payload []byte) {
 		state.ObserveReport(serial, seq, gen, payload)
 	})
@@ -131,6 +135,7 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		}
 		renderer = camera.NewStatusRenderer(cameras, state, pool)
 		renderer.SetActivity(activities)
+		renderer.SetControl(controls)
 	}
 	// Optional OctoEverywhere Gadget detection. The key is env-only; with a
 	// key but the camera feature disabled the engine stays visible in the
@@ -155,10 +160,10 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		renderer.SetDetection(detector)
 		renderer.SetDetectionControl(detector)
 	}
-	// Read-only MCP endpoint on the shared HTTP listener, on by default and
-	// disabled with mcp.enabled: false / BMBPX_MCP_ENABLED=false. Its
-	// sampler reads cached state for every configured printer, and it never
-	// writes to or controls a printer. Disabled features must leave the
+	// MCP endpoint on the shared HTTP listener, on by default and disabled
+	// with mcp.enabled: false / BMBPX_MCP_ENABLED=false. Its sampler reads
+	// cached state for every configured printer; printer commands go only
+	// through the allow-listed control service. Disabled features must leave the
 	// Deps interface fields truly nil: a typed nil would pass the nil check
 	// and panic on first use.
 	var mcpsrv *mcpserver.Server
@@ -168,6 +173,8 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 			State:        state,
 			Connectivity: pool,
 			Generations:  pool,
+			Activity:     activities,
+			Control:      controls,
 			Log:          logger,
 		}
 		if cameras != nil {
@@ -175,6 +182,7 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		}
 		if detector != nil {
 			deps.Detector = detector
+			deps.DetectorControl = detector
 		}
 		mcpsrv = mcpserver.New(deps)
 	}

@@ -183,6 +183,7 @@ type sessionSource interface {
 type PrinterControl interface {
 	PausePrint(serial string, generation uint64) error
 	SetSpeedProfile(serial string, generation uint64, profile int) error
+	SetChamberLight(serial string, generation uint64, on bool) error
 }
 
 // GenerationSource reports the printer's current upstream connection
@@ -401,6 +402,10 @@ type worker struct {
 	workGen     uint64 // bumped on every override change
 	workCtx     context.Context
 	workCancel  context.CancelFunc
+	// lightGen is the session generation whose chamber light auto-on was
+	// attempted or found unnecessary because the light was already on.
+	// Guarded by mu.
+	lightGen uint64
 
 	// Loop state, owned by the worker goroutine only.
 	lastSeq       uint64
@@ -538,8 +543,8 @@ func (e *Engine) sessionToken(gen uint64) string {
 // session generation, invalidates in-flight inspection work, cancels its
 // camera wait and API calls, and drops the detection camera hold. The
 // supersede and pause-dispatch serialization lives in onResult under the
-// same controlMu. Re-enabling only clears the override; the loop then
-// resumes with normal eligibility.
+// same controlMu. Re-enabling clears the override and permits one new
+// chamber-light attempt for the active session.
 func (w *worker) setEnabled(enabled bool, sessionID string) (any, error) {
 	if enabled {
 		w.controlMu.Lock()
@@ -548,6 +553,8 @@ func (w *worker) setEnabled(enabled bool, sessionID string) (any, error) {
 		w.overrideGen = 0
 		if had {
 			w.workGen++
+			// Re-enabled AI can make one new light-on attempt.
+			w.lightGen = 0
 		}
 		w.mu.Unlock()
 		w.controlMu.Unlock()
@@ -779,11 +786,41 @@ func (w *worker) step(ctx context.Context) time.Duration {
 			// camera or API activity until it ends or a new print starts.
 			return w.onDisabled(snap)
 		}
+		w.ensureLight(snap)
 		if !isRunning(snap.State) {
 			return w.onPauseHold(snap)
 		}
 		return w.onRunning(ctx, snap)
 	}
+}
+
+// ensureLight tries once per AI-monitored print session to turn the
+// chamber light on, so inspections see the print. A failed attempt is not
+// retried; the user can switch the light on.
+func (w *worker) ensureLight(snap telemetry.SessionView) {
+	w.mu.Lock()
+	if snap.SessionGen == 0 || w.lightGen == snap.SessionGen {
+		w.mu.Unlock()
+		return
+	}
+	if snap.ChamberLight == "on" {
+		w.lightGen = snap.SessionGen
+		w.mu.Unlock()
+		return
+	}
+	w.mu.Unlock()
+	gen := w.e.gens.Generation(w.serial)
+	if gen != snap.ObsGen {
+		return
+	}
+	w.mu.Lock()
+	w.lightGen = snap.SessionGen
+	w.mu.Unlock()
+	if err := w.e.control.SetChamberLight(w.serial, gen, true); err != nil {
+		w.log.Warn("chamber light command failed", append(w.diagnosticAttrs(), "error", err)...)
+		return
+	}
+	w.e.activity.Record(w.serial, "ai_light_on", activity.Info, "Chamber light turned on for AI inspection")
 }
 
 // overrideActive reports whether the user's disable override is in force

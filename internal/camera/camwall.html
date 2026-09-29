@@ -170,6 +170,21 @@ body.kiosk .bar { display: none; }
 .cam-progress > div { height: 100%; width: var(--pct, 0%); background: var(--accent);
                       box-shadow: 0 0 10px var(--accent); transition: width .8s var(--ease); }
 .cam-progress[hidden] { display: none; }
+/* Printer controls sit on the camera stage at every detail level, above the
+   focus button and the progress bar. */
+.ctl-bar { position: absolute; z-index: 5; right: .55rem; bottom: .6rem; display: flex; gap: .35rem; }
+.ctl-bar:not(:has(.ctl:not([hidden]))) { display: none; }
+.ctl-bar .ctl { display: grid; place-items: center; width: 32px; height: 32px; padding: 0; border-radius: 50%;
+                border: 1px solid color-mix(in srgb, var(--text) 18%, transparent); cursor: pointer; font-size: 1rem;
+                color: var(--text); background: color-mix(in srgb, var(--panel) 78%, transparent);
+                -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); }
+.ctl-bar .ctl:hover { background: var(--panel-2); }
+.ctl-bar .ctl:focus-visible { outline-offset: 1px; }
+.ctl-bar .ctl.stop { background: var(--failed); border-color: var(--failed); color: #fff; }
+.ctl-bar .ctl.stop:hover { background: color-mix(in srgb, var(--failed) 80%, #000); }
+.ctl-bar .ctl.light[aria-pressed="true"] { color: var(--paused);
+  box-shadow: 0 0 12px -2px color-mix(in srgb, var(--paused) 70%, transparent); }
+.ctl[aria-busy="true"] { opacity: .55; cursor: progress; }
 
 .details { padding: .6rem .7rem .7rem; cursor: pointer; }
 .head { display: flex; align-items: center; gap: .5rem; min-height: 2.5rem; }
@@ -241,7 +256,8 @@ body.kiosk .bar { display: none; }
                 border: 1px solid var(--line); background: var(--sw, transparent); }
 .slot b { font-weight: 650; }
 .slot .mat { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.slot .left { color: var(--faint); }
+.slot .remain-bar { flex-basis: 100%; height: 3px; border-radius: 2px; background: var(--line); overflow: hidden; }
+.slot .remain-bar > i { display: block; height: 100%; width: var(--pct, 0%); background: var(--dim); }
 .slot .on-text { flex-basis: 100%; font-size: .68rem; font-weight: 650; color: var(--printing); }
 .ams-note { margin: .35rem 0 0; color: var(--faint); font-size: .74rem; }
 /* Detail disclosure: the chevron points down while more detail remains and
@@ -258,8 +274,8 @@ body.kiosk .bar { display: none; }
 .more > div { min-height: 0; overflow: hidden; }
 .tile[data-level="2"] .l2, .tile[data-level="3"] .l2, .tile[data-level="3"] .l3 { grid-template-rows: 1fr; opacity: 1; }
 .pad { padding-top: .6rem; display: grid; gap: .55rem; }
-.progress-row { display: flex; align-items: center; gap: 1rem; font-size: .8rem; color: var(--dim);
-                font-variant-numeric: tabular-nums; }
+.progress-row { display: flex; flex-wrap: wrap; align-items: center; gap: .35rem 1rem; font-size: .8rem;
+                color: var(--dim); font-variant-numeric: tabular-nums; }
 .stat b { color: var(--text); font-weight: 600; }
 .detect-l2 { --tone: var(--dim); display: flex; align-items: center; gap: .45rem; font-size: .8rem;
              color: var(--dim); font-variant-numeric: tabular-nums; }
@@ -268,6 +284,21 @@ body.kiosk .bar { display: none; }
 .detect-l2[data-tone="info"], .detect-l2[data-tone="warn"] { --tone: var(--paused); }
 .detect-l2[data-tone="error"] { --tone: var(--failed); }
 .stat { display: inline-flex; align-items: center; gap: .3rem; white-space: nowrap; }
+.speed-wrap { --sp: var(--dim); margin-left: auto; }
+.speed-wrap .ic { color: var(--sp); }
+.speed-wrap[data-profile="silent"] { --sp: var(--preparing); }
+.speed-wrap[data-profile="sport"] { --sp: var(--paused); }
+.speed-wrap[data-profile="ludicrous"] { --sp: var(--failed); }
+select.speed { min-height: 1.9rem; padding: 0 .35rem; border-radius: 6px; border: 1px solid var(--line);
+               background: var(--panel-2); color: var(--sp); font: inherit; font-weight: 600; cursor: pointer; }
+.temp.fan { --t: var(--preparing); }
+.f-wifi[data-bars="3"] { color: var(--printing); }
+.f-wifi[data-bars="2"] { color: var(--paused); }
+.f-wifi[data-bars="1"] { color: var(--failed); }
+.checks { display: flex; flex-wrap: wrap; gap: .3rem; }
+.check-badge { display: inline-flex; align-items: center; gap: .25rem; padding: .05rem .45rem; border-radius: 999px;
+               font-size: .74rem; border: 1px solid var(--line); color: var(--dim); }
+.check-badge[data-on="true"] { color: var(--printing); border-color: color-mix(in srgb, var(--printing) 40%, transparent); }
 .temps { display: grid; grid-template-columns: repeat(auto-fit, minmax(6.5rem, 1fr)); gap: .4rem; }
 .temp { --t: var(--faint); position: relative; display: flex; align-items: center; gap: .4rem; overflow: hidden;
         padding: .35rem .5rem; border-radius: 8px; background: var(--panel-2); font-size: .8rem;
@@ -372,6 +403,12 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
   <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
   <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
   <symbol id="i-bell" viewBox="0 0 24 24"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10.3 21a1.94 1.94 0 0 0 3.4 0"/></symbol>
+  <symbol id="i-light" viewBox="0 0 24 24"><path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-3.5 10.9c.6.5 1 1.2 1 2.1h5c0-.9.4-1.6 1-2.1A6 6 0 0 0 12 3z"/></symbol>
+  <symbol id="i-light-off" viewBox="0 0 24 24"><path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-3.5 10.9c.6.5 1 1.2 1 2.1h5c0-.9.4-1.6 1-2.1A6 6 0 0 0 12 3z"/><path d="m3 3 18 18"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24"><path d="M8.2 3h7.6L21 8.2v7.6L15.8 21H8.2L3 15.8V8.2z"/><rect x="9" y="9" width="6" height="6" rx="1" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-speed" viewBox="0 0 24 24"><path d="M4 16a8 8 0 1 1 16 0M12 16l4-5"/></symbol>
+  <symbol id="i-fan" viewBox="0 0 24 24"><circle cx="12" cy="12" r="2"/><path d="M12 10c0-4 1-7 4-7 2 0 2 3-2 7M14 12c4 0 7 1 7 4 0 2-3 2-7-2M12 14c0 4-1 7-4 7-2 0-2-3 2-7M10 12c-4 0-7-1-7-4 0-2 3-2 7 2"/></symbol>
+  <symbol id="i-wifi" viewBox="0 0 24 24"><path d="M2 8.8a15 15 0 0 1 20 0M5 12.9a10 10 0 0 1 14 0M8.5 16.4a5 5 0 0 1 7 0M12 20h.01"/></symbol>
   <symbol id="i-clock-alert" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-9-9M12 7v5l3 2M19 3v4M19 10.5v.01"/></symbol>
 </svg>
 
@@ -434,6 +471,11 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
       <span class="pill state"><svg class="ic" aria-hidden="true"><use/></svg><span class="label"></span></span>
       <span class="pill feed" hidden><span class="dot" aria-hidden="true"></span><svg class="ic" aria-hidden="true"><use href="#i-camera"/></svg><span class="feed-label"></span></span>
       <button class="pill detect" type="button" hidden><svg class="ic" aria-hidden="true"><use href="#i-ai"/></svg><span class="label"></span><span class="q"></span></button>
+      <div class="ctl-bar">
+        <button class="ctl light" type="button" hidden><svg class="ic" aria-hidden="true"><use href="#i-light"/></svg></button>
+        <button class="ctl pause" type="button" hidden><svg class="ic" aria-hidden="true"><use href="#i-pause"/></svg></button>
+        <button class="ctl stop" type="button" hidden><svg class="ic" aria-hidden="true"><use href="#i-stop"/></svg></button>
+      </div>
       <div class="cam-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" hidden><div></div></div>
     </div>
     <div class="details">
@@ -447,8 +489,13 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
       <div class="alert-full" hidden><ul class="alert-list" aria-label="Alerts"></ul></div>
       <div class="more l2"><div><div class="pad">
         <div class="progress-row">
-          <span class="stat layers"><svg class="ic" aria-hidden="true"><use href="#i-layers"/></svg>Layer <b></b></span>
-          <span class="stat eta"><svg class="ic" aria-hidden="true"><use href="#i-flag"/></svg>Done at <b></b></span>
+          <span class="stat layers"><svg class="ic" aria-hidden="true"><use href="#i-layers"/></svg><b></b></span>
+          <span class="stat eta"><svg class="ic" aria-hidden="true"><use href="#i-flag"/></svg><b></b></span>
+          <span class="stat elapsed"><svg class="ic" aria-hidden="true"><use href="#i-clock"/></svg><b></b></span>
+          <label class="stat speed-wrap" hidden><svg class="ic" aria-hidden="true"><use href="#i-speed"/></svg><select class="ctl speed">
+            <option value="silent">Silent</option><option value="standard">Standard</option>
+            <option value="sport">Sport</option><option value="ludicrous">Ludicrous</option>
+          </select></label>
         </div>
         <div class="detect-l2" hidden><svg class="ic" aria-hidden="true"><use href="#i-ai"/></svg><b class="d-q"></b><span class="d-text"></span></div>
         <div class="temps"></div>
@@ -458,6 +505,9 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
           <dt class="dt-file"><svg class="ic" aria-hidden="true"><use href="#i-file"/></svg>File</dt><dd class="f-file"></dd>
           <dt class="dt-camera"><svg class="ic" aria-hidden="true"><use href="#i-camera"/></svg>Camera</dt><dd class="f-camera"></dd>
           <dt class="dt-detect" hidden><svg class="ic" aria-hidden="true"><use href="#i-ai"/></svg>Inspection</dt><dd class="f-detect" hidden></dd>
+          <dt class="dt-nozzle" hidden><svg class="ic" aria-hidden="true"><use href="#i-nozzle"/></svg>Nozzle</dt><dd class="f-nozzle" hidden></dd>
+          <dt class="dt-wifi" hidden><svg class="ic" aria-hidden="true"><use href="#i-wifi"/></svg>Wi-Fi</dt><dd class="f-wifi" hidden></dd>
+          <dt class="dt-checks" hidden><svg class="ic" aria-hidden="true"><use href="#i-check"/></svg>Checks</dt><dd class="f-checks checks" hidden></dd>
           <dt class="dt-report"><svg class="ic" aria-hidden="true"><use href="#i-clock-alert"/></svg>Last report</dt><dd class="f-report"></dd>
           <dt class="dt-serial"><svg class="ic" aria-hidden="true"><use href="#i-tag"/></svg>Serial</dt><dd class="f-serial"></dd>
         </dl>
@@ -562,11 +612,12 @@ function bucket(p) {
   const base = {
     RUNNING: "printing", PAUSE: "paused", PREPARE: "preparing", SLICING: "preparing",
     FINISH: "finished", FAILED: "failed", "": "waiting",
-  }[(p.state || "").toUpperCase()] ?? "idle";
+  }[(p.print_state || "").toUpperCase()] ?? "idle";
   // Busy printers report constantly; silence while connected means stale data.
   const busy = base === "printing" || base === "paused" || base === "preparing";
-  return busy && p.report_age_seconds > STALE_REPORT_SEC ? "stale" : base;
+  return busy && reportAgeOf(p) > STALE_REPORT_SEC ? "stale" : base;
 }
+const reportAgeOf = p => p.freshness?.last_report_age_seconds ?? null;
 const isActive = b => b === "printing" || b === "paused";
 const showsProgress = (b, p) => isActive(b) || b === "finished" || b === "failed" || (b === "stale" && p.progress > 0);
 const nameOf = t => t.data.name || `${t.data.model || "Printer"} ${t.serial}`;
@@ -705,8 +756,9 @@ function detectAlerts(d, b) {
 // Print errors and HMS alerts, most severe first, with detection findings in
 // the same row without masking severe HMS.
 function alertsOf(p) {
-  const list = (p.hms || []).map(h => ({ code: h.code, severity: h.severity, prio: 0, label: "HMS alert", text: h.text, fix: h.fix, url: h.url }));
-  if (p.print_error) list.push({ code: p.print_error, severity: p.print_error_severity || "error", prio: 0, label: "Print error", text: p.print_error_text, fix: p.print_error_fix, url: p.print_error_url });
+  const list = (p.hms || []).map(h => ({ code: h.id, severity: h.severity, prio: 0, label: "HMS alert", text: h.text, fix: h.fix, url: h.url }));
+  const pe = p.print_error;
+  if (pe) list.push({ code: pe.id, severity: pe.severity && pe.severity !== "unknown" ? pe.severity : "error", prio: 0, label: "Print error", text: pe.text, fix: pe.fix, url: pe.url });
   const d = detectOf(p);
   if (d) list.push(...detectAlerts(d, bucket(p)));
   return list.sort((a, b) => (SEVERITY_RANK[b.severity] || 0) - (SEVERITY_RANK[a.severity] || 0) ||
@@ -834,7 +886,7 @@ function createTile(p) {
   const t = {
     serial: p.serial, el, data: p, feed: "none", hasFrame: false, liveError: false, blobURL: "",
     snap: { ctrl: null, pending: false, requested: 0, at: 0, error: false },
-    detPending: false, detError: "",
+    detPending: false, detError: "", ctlPending: false, ctlError: "",
     level: [1, 2, 3].includes(prefs.levels[p.serial]) ? prefs.levels[p.serial] : 1,
     r: {
       cam: q(".cam"), img: q("img"), phUse: q(".ph-icon use"), phText: q(".ph-text"), hit: q(".cam-hit"),
@@ -853,6 +905,10 @@ function createTile(p) {
       dtReport: q(".dt-report"), fReport: q(".f-report"), dtSerial: q(".dt-serial"), fSerial: q(".f-serial"), open: q(".open"),
       stage: q(".stage"), amsSec: q(".ams"), amsRows: q(".ams-rows"), amsNote: q(".ams-note"),
       actList: q(".act-list"), actEmpty: q(".act-empty"),
+      ctlLight: q(".ctl.light"), ctlLightUse: q(".ctl.light use"), ctlPause: q(".ctl.pause"),
+      ctlPauseUse: q(".ctl.pause use"), ctlStop: q(".ctl.stop"), speedWrap: q(".speed-wrap"), speed: q("select.speed"),
+      elapsed: q(".elapsed b"), dtNozzle: q(".dt-nozzle"), fNozzle: q(".f-nozzle"),
+      dtWifi: q(".dt-wifi"), fWifi: q(".f-wifi"), dtChecks: q(".dt-checks"), fChecks: q(".f-checks"),
     },
   };
   const { img, details, grip, hit, open } = t.r;
@@ -876,10 +932,17 @@ function createTile(p) {
   // The AI control never focuses the camera or cycles detail levels; it
   // only toggles per-print AI monitoring through the proxy API.
   t.r.detect.addEventListener("click", () => toggleDetection(t));
+  // Printer controls act immediately: no confirmation, by design.
+  t.r.ctlLight.addEventListener("click", () =>
+    sendControl(t, { action: "light", on: !(t.data.chamber_light === "on") }));
+  t.r.ctlPause.addEventListener("click", () => sendControl(t, { action: t.r.ctlPause.dataset.action }));
+  t.r.ctlStop.addEventListener("click", () => sendControl(t, { action: "stop" }));
+  t.r.speed.addEventListener("change", () => sendControl(t, { action: "speed", profile: t.r.speed.value }));
   details.addEventListener("click", e => {
     // The activity and filament sections stay readable, so clicks there
     // must not cycle the detail level.
-    if (e.target.closest("a, .grip, .activity, .ams, .alert-full") || getSelection()?.toString()) return;
+    if (e.target.closest("a, .grip, .activity, .ams, .alert-full, .ctl-bar, .speed-wrap, .speed") ||
+        getSelection()?.toString()) return;
     t.level = t.level % 3 + 1;
     prefs.levels[t.serial] = t.level;
     savePrefs();
@@ -948,9 +1011,9 @@ function renderAMS(t) {
   const rows = [];
   for (const u of units) {
     const cells = (Array.isArray(u.slots) ? u.slots : []).map(s => slotCell(s, (s?.id ?? 0) + 1));
-    rows.push(amsRow(`AMS ${typeof u.id === "number" ? u.id + 1 : ""}`, u.humidity ?? null, cells));
+    rows.push(amsRow(`AMS ${typeof u.id === "number" ? u.id + 1 : ""}`, u.humidity ?? null, u.temp ?? null, cells));
   }
-  if (ext) rows.push(amsRow("External spool", null, [slotCell(ext, null)]));
+  if (ext) rows.push(amsRow("External spool", null, null, [slotCell(ext, null)]));
   t.r.amsSec.hidden = !rows.length;
   t.r.amsRows.replaceChildren(...rows);
   t.r.amsNote.hidden = !note;
@@ -980,11 +1043,14 @@ function slotCell(s, num) {
   mat.textContent = s.loaded === false ? "Empty" : s.material || "Unknown";
   cell.append(mat);
   if (Number.isFinite(s.remain)) {
-    const left = document.createElement("span");
-    left.className = "left";
-    left.textContent = `~${s.remain}% left`;
-    left.title = `Estimated ${s.remain}% remaining`;
-    cell.append(left);
+    const bar = document.createElement("span");
+    bar.className = "remain-bar";
+    bar.style.setProperty("--pct", `${Math.max(0, Math.min(100, s.remain))}%`);
+    bar.title = `Estimated ${s.remain}% remaining`;
+    bar.setAttribute("role", "img");
+    bar.setAttribute("aria-label", bar.title);
+    bar.append(document.createElement("i"));
+    cell.append(bar);
   }
   if (s.active === true) {
     cell.classList.add("on");
@@ -996,7 +1062,7 @@ function slotCell(s, num) {
   return cell;
 }
 // One AMS overview row: the heading line and the slot cells under it.
-function amsRow(name, humidity, cells) {
+function amsRow(name, humidity, temp, cells) {
   const row = document.createElement("div");
   row.className = "ams-unit";
   const head = document.createElement("div");
@@ -1009,6 +1075,12 @@ function amsRow(name, humidity, cells) {
     const h = document.createElement("span");
     h.textContent = `Humidity ${humidity}%`;
     head.append(h);
+  }
+  if (temp != null) {
+    const tc = document.createElement("span");
+    tc.textContent = `${Math.round(temp)}°`;
+    tc.title = `AMS temperature ${Math.round(temp)}°C`;
+    head.append(tc);
   }
   const slots = document.createElement("div");
   slots.className = "ams-slots";
@@ -1075,6 +1147,29 @@ function tempChip(iconId, name, cur, target) {
   return el;
 }
 
+// A vitals stat shows its value next to an icon; the title and label carry
+// the words.
+function setStat(el, value, words) {
+  el.textContent = value;
+  el.parentElement.hidden = !value;
+  el.parentElement.title = words;
+  if (words) el.parentElement.setAttribute("aria-label", words);
+  else el.parentElement.removeAttribute("aria-label");
+}
+function fanChip(name, pct) {
+  if (pct == null || !(pct > 0)) return null;
+  const el = document.createElement("span");
+  el.className = "temp fan";
+  el.setAttribute("role", "img");
+  el.style.setProperty("--fill", `${Math.min(100, pct)}%`);
+  el.title = `${name} fan ${pct}%`;
+  el.setAttribute("aria-label", el.title);
+  const value = document.createElement("b");
+  value.textContent = `${pct}%`;
+  el.append(icon("i-fan"), value);
+  return el;
+}
+
 function renderTile(t) {
   const p = t.data, r = t.r, b = bucket(p), s = STATES[b];
   const pct = Math.max(0, Math.min(100, Math.round(p.progress || 0)));
@@ -1084,8 +1179,10 @@ function renderTile(t) {
   // joins the always-visible alert row at every detail level (with a
   // spoken announcement when it happens) without changing the tile's
   // alert state.
-  const shown = t.detError ? [{ severity: "common", prio: -1, sevHidden: true,
-    text: `AI toggle failed · ${t.detError}` }, ...alerts] : alerts;
+  const shown = [
+    ...(t.ctlError ? [{ severity: "common", prio: -1, sevHidden: true, text: `Control failed · ${t.ctlError}` }] : []),
+    ...(t.detError ? [{ severity: "common", prio: -1, sevHidden: true, text: `AI toggle failed · ${t.detError}` }] : []),
+    ...alerts];
   const d = detectOf(p), bd = detectBadge(d, b);
   t.el.dataset.state = b;
   t.el.dataset.alert = highAlert(p) ? "high" : shown.length ? "low" : "none";
@@ -1116,8 +1213,8 @@ function renderTile(t) {
   // Headline metric: progress and time left for jobs. The state pill already
   // names the state, so the headline never repeats it; offline and stale
   // printers show how old their data is instead.
-  const remain = fmtDuration(p.remain_min);
-  const reportAge = p.report_age_seconds != null ? Math.round(p.report_age_seconds) : null;
+  const remain = fmtDuration(p.remaining_minutes);
+  const reportAge = reportAgeOf(p) != null ? Math.round(reportAgeOf(p)) : null;
   r.kpiMain.textContent = progress && b !== "finished" ? `${pct}%` : "";
   r.kpiSub.textContent = isActive(b) ? (remain ? `${remain} left` : "")
     : b === "failed" && progress ? "when stopped"
@@ -1226,20 +1323,53 @@ function renderTile(t) {
   r.camBar.setAttribute("aria-valuenow", String(pct));
   r.camBar.setAttribute("aria-label", `Print progress ${pct}%`);
   // Progress itself lives on the camera bar and the headline; vitals add
-  // the layer count and the clock time the print should end.
+  // the layer count, the clock time the print should end, the elapsed time,
+  // and the speed profile. Icons carry the meaning; titles carry the words.
   const layers = progress && p.layer_num != null && p.total_layers ? `${p.layer_num} of ${p.total_layers}` : "";
-  const finish = isActive(b) ? fmtFinish(p.remain_min) : "";
-  r.layers.textContent = layers;
-  r.layers.parentElement.hidden = !layers;
-  r.eta.textContent = finish;
-  r.eta.parentElement.hidden = !finish;
-  r.eta.parentElement.title = finish ? "Estimated finish time" : "";
-  r.progressRow.hidden = !layers && !finish;
+  const finish = isActive(b) ? fmtFinish(p.remaining_minutes) : "";
+  const started = isActive(b) && p.started_at ? new Date(p.started_at) : null;
+  const elapsed = started && !isNaN(started) ? fmtDuration((Date.now() - started.getTime()) / 60000) : "";
+  setStat(r.layers, layers, layers ? `Layer ${layers}` : "");
+  setStat(r.eta, finish, finish ? `Done at ${finish}` : "");
+  setStat(r.elapsed, elapsed, elapsed
+    ? `Elapsed ${elapsed} · Started ${started.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "");
+  const controls = Array.isArray(p.controls) ? p.controls : [];
+  const speedOn = controls.includes("speed");
+  r.speedWrap.hidden = !speedOn;
+  r.speedWrap.dataset.profile = p.speed_profile || "";
+  if (speedOn && document.activeElement !== r.speed) r.speed.value = p.speed_profile || "";
+  r.speed.disabled = t.ctlPending;
+  r.speed.setAttribute("aria-label", `Speed profile for ${nameOf(t)}`);
+  r.speedWrap.title = `Speed ${p.speed_profile || "unknown"}${p.speed_percent != null ? ` · ${p.speed_percent}%` : ""}`;
+  r.progressRow.hidden = !layers && !finish && !elapsed && !speedOn;
+
+  // Printer controls: the server lists what the printer allows right now.
+  const busy = String(t.ctlPending === true);
+  const lightOn = p.chamber_light === "on";
+  r.ctlLight.hidden = !controls.includes("light");
+  r.ctlLight.setAttribute("aria-pressed", String(lightOn));
+  r.ctlLight.setAttribute("aria-label", `Chamber light for ${nameOf(t)}`);
+  r.ctlLight.title = lightOn ? "Turn chamber light off" : "Turn chamber light on";
+  r.ctlLightUse.setAttribute("href", lightOn ? "#i-light" : "#i-light-off");
+  const pauseAction = controls.includes("pause") ? "pause" : controls.includes("resume") ? "resume" : "";
+  r.ctlPause.hidden = !pauseAction;
+  r.ctlPause.dataset.action = pauseAction;
+  r.ctlPauseUse.setAttribute("href", pauseAction === "resume" ? "#i-play" : "#i-pause");
+  r.ctlPause.setAttribute("aria-label", `${pauseAction === "resume" ? "Resume" : "Pause"} print on ${nameOf(t)}`);
+  r.ctlPause.title = pauseAction === "resume" ? "Resume print" : "Pause print";
+  const stoppable = ["RUNNING", "PAUSE", "PAUSED", "PREPARE", "SLICING"].includes((p.print_state || "").toUpperCase());
+  r.ctlStop.hidden = !controls.includes("stop") || !(isActive(b) || stoppable);
+  r.ctlStop.setAttribute("aria-label", `Emergency stop ${nameOf(t)}`);
+  r.ctlStop.title = "Emergency stop · cancels the print immediately";
+  for (const btn of [r.ctlLight, r.ctlPause, r.ctlStop]) btn.setAttribute("aria-busy", busy);
 
   const chips = [
     tempChip("i-nozzle", "Nozzle", p.nozzle_temp, p.nozzle_target),
     tempChip("i-bed", "Bed", p.bed_temp, p.bed_target),
     tempChip("i-thermo", "Chamber", p.chamber_temp, null),
+    fanChip("Part cooling", p.fans?.part),
+    fanChip("Aux", p.fans?.aux),
+    fanChip("Chamber", p.fans?.chamber),
   ].filter(Boolean);
   if (chips.length) r.temps.replaceChildren(...chips);
   else {
@@ -1249,8 +1379,30 @@ function renderTile(t) {
     r.temps.replaceChildren(none);
   }
 
-  r.fFile.textContent = p.filename || "";
-  r.dtFile.hidden = r.fFile.hidden = !p.filename;
+  r.fFile.textContent = p.job_name || "";
+  r.dtFile.hidden = r.fFile.hidden = !p.job_name;
+  const nozzle = [p.nozzle_diameter != null ? `${p.nozzle_diameter} mm` : "",
+    p.nozzle_type ? p.nozzle_type.replaceAll("_", " ") : ""].filter(Boolean).join(" · ");
+  r.fNozzle.textContent = nozzle;
+  r.dtNozzle.hidden = r.fNozzle.hidden = !nozzle;
+  const wifi = p.wifi_signal_dbm;
+  const bars = wifi == null ? 0 : wifi >= -55 ? 3 : wifi >= -70 ? 2 : 1;
+  r.dtWifi.hidden = r.fWifi.hidden = !bars;
+  r.fWifi.textContent = bars ? `${wifi} dBm` : "";
+  r.fWifi.dataset.bars = bars ? String(bars) : "";
+  r.fWifi.title = bars ? `Wi-Fi signal ${["", "weak", "fair", "strong"][bars]}` : "";
+  const checks = [["first_layer_inspection", "First layer"], ["spaghetti_detection", "Spaghetti"], ["timelapse", "Timelapse"]]
+    .filter(([key]) => typeof p[key] === "boolean")
+    .map(([key, label]) => {
+      const badge = document.createElement("span");
+      badge.className = "check-badge";
+      badge.dataset.on = String(p[key]);
+      badge.title = `${key === "timelapse" ? "Timelapse" : `${label} inspection`} ${p[key] ? "on" : "off"}`;
+      badge.append(icon(p[key] ? "i-check" : "i-close"), label);
+      return badge;
+    });
+  r.fChecks.replaceChildren(...checks);
+  r.dtChecks.hidden = r.fChecks.hidden = !checks.length;
   r.alertList.replaceChildren(...shown.map(a => {
     const li = document.createElement("li");
     li.dataset.sev = a.severity;
@@ -1429,6 +1581,37 @@ async function toggleDetection(t) {
   }
   if (t.detError) announce(`${nameOf(t)}: AI toggle failed · ${t.detError}`);
   t.detPending = false;
+  renderTile(t);
+}
+
+// Printer controls: POST one allow-listed command. One request per tile at a
+// time; the printer's next report, mirrored by SSE, shows the effect.
+async function sendControl(t, body) {
+  if (t.ctlPending || !body.action) return;
+  t.ctlPending = true;
+  t.ctlError = "";
+  renderTile(t);
+  try {
+    const res = await fetch("/control/" + encodeURIComponent(t.serial), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      let message = `HTTP ${res.status}`;
+      try {
+        const err = await res.json();
+        if (err && typeof err.error === "string") message = err.error;
+      } catch {}
+      t.ctlError = message;
+    }
+  } catch {
+    t.ctlError = "network error";
+  }
+  const what = body.action === "light" ? `chamber light ${body.on ? "on" : "off"}`
+    : body.action === "speed" ? `speed ${body.profile}` : body.action;
+  announce(t.ctlError ? `${nameOf(t)}: control failed · ${t.ctlError}` : `${nameOf(t)}: ${what} sent`);
+  t.ctlPending = false;
   renderTile(t);
 }
 

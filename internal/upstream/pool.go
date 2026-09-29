@@ -15,7 +15,6 @@ import (
 	"unicode/utf8"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
-	"github.com/eclipse/paho.mqtt.golang/packets"
 
 	"bambu-mqtt-proxy/internal/config"
 )
@@ -58,151 +57,6 @@ type PublishContext struct {
 	SourceDup bool
 	// SourceRetain is the RETAIN flag of the incoming source packet.
 	SourceRetain bool
-}
-
-// replayPublish carries source metadata for one publish while Paho stores it.
-type replayPublish struct {
-	// context describes the publish source and action.
-	context PublishContext
-	// attemptID identifies this publish attempt.
-	attemptID uint64
-	// generation is the connection generation used for this attempt.
-	generation uint64
-}
-
-// replayStore observes stored outbound publishes when Paho reads them for
-// reconnect recovery. Other operations delegate to the embedded Store, backed
-// by a MemoryStore.
-type replayStore struct {
-	// Store is the underlying Paho packet store.
-	mqtt.Store
-	// log receives replay-selection records.
-	log *slog.Logger
-	// serial identifies the printer that owns this store.
-	serial string
-	// generation returns the current upstream connection generation.
-	generation func() uint64
-
-	// mu protects pending and metadata.
-	mu sync.Mutex
-	// pending is metadata for a publish not yet written by Paho.
-	pending *replayPublish
-	// metadata maps stored outbound packets to their publish metadata.
-	metadata map[string]replayPublish
-}
-
-// newReplayStore wraps a memory store to observe outbound publish replay.
-func newReplayStore(serial string, log *slog.Logger, generation func() uint64) *replayStore {
-	return &replayStore{
-		Store:      mqtt.NewMemoryStore(),
-		log:        log,
-		serial:     serial,
-		generation: generation,
-		metadata:   make(map[string]replayPublish),
-	}
-}
-
-// beginPublish associates metadata with the next outbound publish packet.
-func (s *replayStore) beginPublish(publish replayPublish) {
-	s.mu.Lock()
-	s.pending = &publish
-	s.mu.Unlock()
-}
-
-// endPublish clears metadata not consumed by a store write.
-func (s *replayStore) endPublish() {
-	s.mu.Lock()
-	s.pending = nil
-	s.mu.Unlock()
-}
-
-// Put stores a packet and records metadata for an outbound publish.
-func (s *replayStore) Put(key string, packet packets.ControlPacket) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if strings.HasPrefix(key, "o.") {
-		if _, isPublish := packet.(*packets.PublishPacket); isPublish {
-			if s.pending != nil {
-				s.metadata[key] = *s.pending
-				s.pending = nil
-			}
-		}
-	}
-	s.Store.Put(key, packet)
-}
-
-// Get returns a stored packet and logs outbound packets selected for replay.
-func (s *replayStore) Get(key string) packets.ControlPacket {
-	s.mu.Lock()
-	packet := s.Store.Get(key)
-	if !strings.HasPrefix(key, "o.") {
-		s.mu.Unlock()
-		return packet
-	}
-	publish, ok := packet.(*packets.PublishPacket)
-	if !ok {
-		s.mu.Unlock()
-		return packet
-	}
-	metadata, haveMetadata := s.metadata[key]
-	s.mu.Unlock()
-	selectedGeneration := s.generation()
-	attrs := []any{
-		"serial", s.serial,
-		"topic", publish.TopicName,
-		"qos", publish.Qos,
-		"retain", publish.Retain,
-		"message_id", publish.MessageID,
-		"connection_generation", selectedGeneration,
-		"replay_generation", selectedGeneration,
-		"selection", "paho_store_get",
-		"replay_wire_send_observed", false,
-	}
-	if haveMetadata {
-		attrs = append(attrs,
-			"origin", metadata.context.Origin,
-			"action", metadata.context.Action,
-			"publish_attempt", metadata.attemptID,
-			"publish_generation", metadata.generation,
-		)
-		if metadata.context.ClientID != "" {
-			attrs = append(attrs, "origin_id", metadata.context.ClientID, "client", metadata.context.ClientID)
-		}
-		if metadata.context.Reason != "" {
-			attrs = append(attrs, "reason", metadata.context.Reason)
-		}
-		if metadata.context.SourcePacket {
-			attrs = append(attrs,
-				"source_qos", metadata.context.SourceQoS,
-				"source_dup", metadata.context.SourceDup,
-				"source_retain", metadata.context.SourceRetain,
-			)
-		}
-	}
-	s.log.Info("upstream outbound publish selected for replay", attrs...)
-	debugAttrs := append(append([]any(nil), attrs...), "payload", string(publish.Payload))
-	if !utf8.Valid(publish.Payload) {
-		debugAttrs = append(debugAttrs, "payload_base64", base64.StdEncoding.EncodeToString(publish.Payload))
-	}
-	s.log.Debug("upstream outbound publish replay payload", debugAttrs...)
-	return packet
-}
-
-// Del removes a packet and its associated publish metadata.
-func (s *replayStore) Del(key string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.metadata, key)
-	s.Store.Del(key)
-}
-
-// Reset clears the packet store and all associated publish metadata.
-func (s *replayStore) Reset() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.pending = nil
-	s.metadata = make(map[string]replayPublish)
-	s.Store.Reset()
 }
 
 // Pool owns one Conn per configured printer and merges downstream
@@ -395,9 +249,56 @@ func (p *Pool) SetSpeedProfile(serial string, generation uint64, profile int) er
 	return c.command(generation, "speed profile", speedProfilePayload(profile))
 }
 
+// ResumePrint sends a guarded resume command.
+func (p *Pool) ResumePrint(serial string, generation uint64) error {
+	c, ok := p.existing(serial)
+	if !ok {
+		return fmt.Errorf("resume %s: no upstream connection", serial)
+	}
+	return c.command(generation, "resume", resumePayload())
+}
+
+// StopPrint sends a guarded stop command, cancelling the current print.
+func (p *Pool) StopPrint(serial string, generation uint64) error {
+	c, ok := p.existing(serial)
+	if !ok {
+		return fmt.Errorf("stop %s: no upstream connection", serial)
+	}
+	return c.command(generation, "stop", stopPayload())
+}
+
+// SetChamberLight sends a guarded chamber light on/off command.
+func (p *Pool) SetChamberLight(serial string, generation uint64, on bool) error {
+	c, ok := p.existing(serial)
+	if !ok {
+		return fmt.Errorf("chamber light %s: no upstream connection", serial)
+	}
+	return c.command(generation, "chamber light", chamberLightPayload(on))
+}
+
 // pausePayload is the Bambu pause command published to the request topic.
 func pausePayload() string {
 	return `{"print":{"sequence_id":"0","command":"pause"}}`
+}
+
+// resumePayload is the Bambu resume command.
+func resumePayload() string {
+	return `{"print":{"sequence_id":"0","command":"resume"}}`
+}
+
+// stopPayload is the Bambu stop command.
+func stopPayload() string {
+	return `{"print":{"sequence_id":"0","command":"stop"}}`
+}
+
+// chamberLightPayload returns Bambu's ledctrl command for the chamber light.
+func chamberLightPayload(on bool) string {
+	mode := "off"
+	if on {
+		mode = "on"
+	}
+	return `{"system":{"sequence_id":"0","command":"ledctrl","led_node":"chamber_light","led_mode":"` + mode +
+		`","led_on_time":500,"led_off_time":500,"loop_times":0,"interval_time":0}}`
 }
 
 // speedProfilePayload returns Bambu's print_speed command. The parameter is
@@ -572,11 +473,6 @@ type Conn struct {
 	reportSeq atomic.Uint64
 	// publishSeq identifies publish attempts within this printer connection.
 	publishSeq atomic.Uint64
-	// publishMu keeps each publish's origin metadata paired with Paho's
-	// synchronous Store.Put call for its outbound packet.
-	publishMu sync.Mutex
-	// store wraps Paho's packet store to observe outbound publish replay.
-	store *replayStore
 }
 
 // bumpGeneration advances the connection generation under the lock. Every
@@ -998,20 +894,11 @@ func (c *Conn) publish(topic string, payload []byte, qos byte, publishContext Pu
 func (c *Conn) publishUpstream(client mqtt.Client, generation uint64, publishContext PublishContext, topic string, payload []byte, qos byte, retain bool) (uint64, mqtt.Token, bool) {
 	attemptID := c.publishSeq.Add(1)
 	c.log.Debug("upstream publish attempt", publishDebugLogAttrs(publishContext, c.spec.Serial, topic, payload, qos, retain, generation, attemptID, "attempted", "not_yet_observed", "")...)
-	c.publishMu.Lock()
-	if c.store != nil {
-		c.store.beginPublish(replayPublish{context: publishContext, attemptID: attemptID, generation: generation})
-	}
 	tok := client.Publish(topic, qos, retain, payload)
-	if c.store != nil {
-		c.store.endPublish()
-	}
-	c.publishMu.Unlock()
 	completed := tok.WaitTimeout(c.connectTO)
 	if !completed {
 		c.log.Warn("upstream publish completion wait timed out", publishLogAttrs(publishContext, c.spec.Serial, topic, qos, retain, generation, attemptID, "pending", "pending", "completion wait timed out")...)
 		c.log.Debug("upstream publish timeout payload details", publishDebugLogAttrs(publishContext, c.spec.Serial, topic, payload, qos, retain, generation, attemptID, "pending", "pending", "completion wait timed out")...)
-		go c.observeLatePublishCompletion(tok, publishContext, topic, payload, qos, retain, generation, attemptID)
 		return attemptID, tok, false
 	}
 	if err := tok.Error(); err != nil {
@@ -1027,35 +914,6 @@ func (c *Conn) publishUpstream(client mqtt.Client, generation uint64, publishCon
 	}
 	c.log.Debug("upstream publish complete", publishDebugLogAttrs(publishContext, c.spec.Serial, topic, payload, qos, retain, generation, attemptID, completion, delivery, "")...)
 	return attemptID, tok, completed
-}
-
-// publishLateCompletionObserveTimeout bounds observation after the initial wait expires.
-const publishLateCompletionObserveTimeout = 30 * time.Second
-
-// observeLatePublishCompletion records a publish token that completes after its initial wait.
-func (c *Conn) observeLatePublishCompletion(tok mqtt.Token, publishContext PublishContext, topic string, payload []byte, qos byte, retain bool, generation, attemptID uint64) {
-	timer := time.NewTimer(publishLateCompletionObserveTimeout)
-	defer timer.Stop()
-	select {
-	case <-tok.Done():
-		err := tok.Error()
-		if err != nil {
-			c.log.Warn("upstream publish failed after completion timeout", publishLogAttrs(publishContext, c.spec.Serial, topic, qos, retain, generation, attemptID, "error", "unknown", errString(err))...)
-			c.log.Debug("upstream publish late completion payload details", publishDebugLogAttrs(publishContext, c.spec.Serial, topic, payload, qos, retain, generation, attemptID, "error", "unknown", errString(err))...)
-			return
-		}
-		completion := "local_qos0_complete"
-		delivery := "local_only_no_broker_ack"
-		if qos > 0 {
-			completion = "broker_acknowledged"
-			delivery = "mqtt_puback_received"
-		}
-		c.log.Info("upstream publish late completion observed", publishLogAttrs(publishContext, c.spec.Serial, topic, qos, retain, generation, attemptID, completion, delivery, "")...)
-		c.log.Debug("upstream publish late completion payload details", publishDebugLogAttrs(publishContext, c.spec.Serial, topic, payload, qos, retain, generation, attemptID, completion, delivery, "")...)
-	case <-timer.C:
-		c.log.Debug("upstream publish late completion observation expired", publishLogAttrs(publishContext, c.spec.Serial, topic, qos, retain, generation, attemptID, "unknown", "unobserved", "late completion observation expired")...)
-	case <-c.stopCh:
-	}
 }
 
 // publishLogAttrs builds structured attributes for an upstream publish log.
@@ -1163,11 +1021,6 @@ func (c *Conn) newClientLocked() mqtt.Client {
 	if c.spec.TLS {
 		scheme = "ssl"
 	}
-	c.store = newReplayStore(c.spec.Serial, c.log, func() uint64 {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		return c.generation
-	})
 	opts := mqtt.NewClientOptions().
 		AddBroker(scheme + "://" + c.spec.Address).
 		SetClientID("bmbpx-" + c.spec.Serial).
@@ -1177,7 +1030,7 @@ func (c *Conn) newClientLocked() mqtt.Client {
 		SetAutoReconnect(true).
 		SetMaxReconnectInterval(c.backoffMax).
 		SetConnectTimeout(c.connectTO).
-		SetStore(c.store).
+		SetStore(mqtt.NewMemoryStore()).
 		SetKeepAlive(c.keepalive).
 		SetPingTimeout(10 * time.Second).
 		SetOrderMatters(false).

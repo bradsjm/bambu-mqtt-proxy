@@ -19,6 +19,8 @@ import (
 
 	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/config"
+	"bambu-mqtt-proxy/internal/control"
+	"bambu-mqtt-proxy/internal/printerview"
 	"bambu-mqtt-proxy/internal/telemetry"
 )
 
@@ -26,7 +28,8 @@ import (
 type testConnectivity struct{}
 
 // Status returns no connected printers for route tests.
-func (testConnectivity) Status() map[string]bool { return map[string]bool{} }
+func (testConnectivity) Status() map[string]bool  { return map[string]bool{} }
+func (testConnectivity) Generation(string) uint64 { return 0 }
 
 // discardLogger keeps test output quiet.
 func discardLogger() *slog.Logger {
@@ -353,21 +356,21 @@ func TestCamWallRoutesServeEmbeddedWall(t *testing.T) {
 	if !ok || !p1s.CameraOK || p1s.ChamberTemp != nil {
 		t.Fatalf("P1S tile must be camera-supported and omit chamber temp: %+v", p1s)
 	}
-	if p1s.Name != "Garage" || p1s.PrintError != "0300_400C" || p1s.ReportAge == nil || len(p1s.HMS) != 2 {
+	if p1s.Name != "Garage" || p1s.PrintError == nil || p1s.PrintError.ID != "0300_400C" || p1s.Freshness.LastReportAgeSeconds == nil || len(p1s.HMS) != 2 {
 		t.Fatalf("P1S tile name/errors/report age wrong: %+v", p1s)
 	}
-	if p1s.PrintErrorText != "Print Cancelled" || p1s.PrintErrorSeverity != "info" || p1s.PrintErrorFix == "" ||
-		p1s.PrintErrorURL != "https://printara3d.com/tools/bambu-error-codes/hms-0300-400c/" {
+	if pe := p1s.PrintError; pe.Text != "Print Cancelled" || pe.Severity != "info" || pe.Fix == "" ||
+		pe.URL != "https://printara3d.com/tools/bambu-error-codes/hms-0300-400c/" {
 		t.Fatalf("P1S print error description wrong: %+v", p1s)
 	}
 	// The unknown print-module alert keeps its code and gains only the
 	// reference link; the AMS alert carries the dataset description.
-	if p1s.HMS[0] != (HMS{Code: "HMS_0300_0100_0001_0007", Severity: "fatal",
+	if p1s.HMS[0] != (printerview.Alert{ID: "HMS_0300_0100_0001_0007", Severity: "fatal",
 		URL: "https://printara3d.com/tools/bambu-error-codes/?code=0300-0100"}) {
 		t.Fatalf("unknown HMS alert must keep code and reference link: %+v", p1s.HMS[0])
 	}
 	hms := p1s.HMS[1]
-	if hms.Code != "HMS_0700_8010_0001_0007" || hms.Severity != "fatal" || hms.Text != "AMS Motor Overload" ||
+	if hms.ID != "HMS_0700_8010_0001_0007" || hms.Severity != "fatal" || hms.Text != "AMS Motor Overload" ||
 		hms.Fix == "" || hms.URL != "https://printara3d.com/tools/bambu-error-codes/hms-0700-8010/" {
 		t.Fatalf("known HMS alert must carry description: %+v", p1s.HMS[1])
 	}
@@ -384,8 +387,8 @@ func TestCamWallRoutesServeEmbeddedWall(t *testing.T) {
 }
 
 func TestChangeKeyIgnoresActivityAge(t *testing.T) {
-	first := []Tile{{Serial: "S1", Activity: []activity.Entry{{ID: 1, AgeSeconds: 2}}}}
-	second := []Tile{{Serial: "S1", Activity: []activity.Entry{{ID: 1, AgeSeconds: 8}}}}
+	first := []Tile{{View: printerview.View{Serial: "S1"}, Activity: []activity.Entry{{ID: 1, AgeSeconds: 2}}}}
+	second := []Tile{{View: printerview.View{Serial: "S1"}, Activity: []activity.Entry{{ID: 1, AgeSeconds: 8}}}}
 	a, err := changeKey(first)
 	if err != nil {
 		t.Fatal(err)
@@ -444,11 +447,11 @@ func TestCameraEventsStreamsChanges(t *testing.T) {
 	}
 
 	first := nextEvent()
-	if len(first.Printers) != 1 || first.Printers[0].State != "" {
+	if len(first.Printers) != 1 || first.Printers[0].PrintState != nil {
 		t.Fatalf("initial event = %+v", first)
 	}
 	state.Observe("01S00C351100139", []byte(`{"print":{"gcode_state":"RUNNING"}}`))
-	if second := nextEvent(); second.Printers[0].State != "RUNNING" {
+	if second := nextEvent(); second.Printers[0].PrintState == nil || *second.Printers[0].PrintState != "RUNNING" {
 		t.Fatalf("change event = %+v", second)
 	}
 }
@@ -489,8 +492,8 @@ func TestCameraStatusProjectsFilamentAndStage(t *testing.T) {
 	}
 
 	tile := getTile()
-	if tile.Stage != "changing_filament" {
-		t.Fatalf("stage = %q, want the mapped stg_cur 4", tile.Stage)
+	if tile.Stage == nil || *tile.Stage != "changing_filament" {
+		t.Fatalf("stage = %v, want the mapped stg_cur 4", tile.Stage)
 	}
 	if len(tile.AMS) != 2 || tile.AMS[0].ID != 0 || tile.AMS[1].ID != 1 {
 		t.Fatalf("ams units = %+v, want ids 0 then 1", tile.AMS)
@@ -547,15 +550,15 @@ func TestCameraStatusProjectsFilamentAndStage(t *testing.T) {
 		t.Fatalf("ext_spool = %v, want the loaded spool object", wire["ext_spool"])
 	}
 
-	// The idle sentinel and unknown stage ids leave stage out, so
+	// The idle sentinel and unknown stage ids leave stage null, so
 	// consumers keep the printer state.
 	state.Observe("01S00C351100139", []byte(`{"print":{"stg_cur":255}}`))
-	if tile = getTile(); tile.Stage != "" {
-		t.Fatalf("idle sentinel stage = %q, want empty", tile.Stage)
+	if tile = getTile(); tile.Stage != nil {
+		t.Fatalf("idle sentinel stage = %q, want null", *tile.Stage)
 	}
 	state.Observe("01S00C351100139", []byte(`{"print":{"stg_cur":99}}`))
-	if tile = getTile(); tile.Stage != "" {
-		t.Fatalf("unknown stage = %q, want empty", tile.Stage)
+	if tile = getTile(); tile.Stage != nil {
+		t.Fatalf("unknown stage = %q, want null", *tile.Stage)
 	}
 }
 
@@ -614,5 +617,69 @@ func TestFrameValidation(t *testing.T) {
 	}
 	if len(f.Header) != frameHeaderLen || string(f.Header) != string(header[:]) {
 		t.Fatal("readFrame must preserve the printer's raw header bytes")
+	}
+}
+
+// fakeCommander accepts every command for a connected S1.
+type fakeCommander struct{ sent []string }
+
+func (f *fakeCommander) Status() map[string]bool  { return map[string]bool{"S1": true} }
+func (f *fakeCommander) Generation(string) uint64 { return 1 }
+func (f *fakeCommander) PausePrint(string, uint64) error {
+	f.sent = append(f.sent, "pause")
+	return nil
+}
+func (f *fakeCommander) ResumePrint(string, uint64) error {
+	f.sent = append(f.sent, "resume")
+	return nil
+}
+func (f *fakeCommander) StopPrint(string, uint64) error {
+	f.sent = append(f.sent, "stop")
+	return nil
+}
+func (f *fakeCommander) SetSpeedProfile(string, uint64, int) error {
+	f.sent = append(f.sent, "speed")
+	return nil
+}
+func (f *fakeCommander) SetChamberLight(string, uint64, bool) error {
+	f.sent = append(f.sent, "light")
+	return nil
+}
+
+func TestControlEndpoint(t *testing.T) {
+	printers := []config.Printer{{Serial: "S1", Name: "Shop"}}
+	state := telemetry.NewCache(printers, discardLogger())
+	cmd := &fakeCommander{}
+	renderer := NewStatusRenderer(NewManager(printers, discardLogger()), state, testConnectivity{})
+	renderer.SetControl(control.New(cmd, state, nil))
+	mux := http.NewServeMux()
+	renderer.RegisterStatus(mux)
+	post := func(body string, header map[string]string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/control/S1", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		for k, v := range header {
+			req.Header.Set(k, v)
+		}
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		return w
+	}
+	if w := post(`{"action":"stop"}`, nil); w.Code != 200 || strings.TrimSpace(w.Body.String()) != `{"serial":"S1","action":"stop","sent":true}` {
+		t.Fatalf("stop = %d %s", w.Code, w.Body)
+	}
+	if w := post(`{"action":"heat"}`, nil); w.Code != 400 {
+		t.Fatalf("heat = %d", w.Code)
+	}
+	if w := post(`{"action":"stop","temp":200}`, nil); w.Code != 400 {
+		t.Fatalf("unknown field = %d", w.Code)
+	}
+	if w := post(`{"action":"pause"}`, nil); w.Code != 409 {
+		t.Fatalf("pause on idle = %d", w.Code)
+	}
+	if w := post(`{"action":"stop"}`, map[string]string{"Sec-Fetch-Site": "cross-site", "Origin": "https://evil.example"}); w.Code != 403 {
+		t.Fatalf("cross-site = %d", w.Code)
+	}
+	if len(cmd.sent) != 1 {
+		t.Fatalf("sent = %v, want only the first stop", cmd.sent)
 	}
 }
