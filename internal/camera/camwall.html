@@ -143,6 +143,12 @@ body.kiosk .bar { display: none; }
 .pill[hidden] { display: none; }
 .pill.state { left: .55rem; color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent); }
 .pill.state .label { color: var(--text); }
+/* The printer's current action rides in the state pill as a dim suffix; the
+   pill truncates the action, never the state, before reaching the feed pill. */
+.pill.state { max-width: calc(100% - 5.5rem); white-space: nowrap; }
+.pill.state .label { flex: none; }
+.pill.state .stage { min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--dim); font-weight: 600; }
+.pill.state .stage::before { content: "·"; margin-right: .35rem; }
 .pill.feed { right: .55rem; color: var(--dim); font-variant-numeric: tabular-nums; }
 .pill.feed[data-mode="live"] { color: #fff; background: color-mix(in srgb, var(--live) 85%, transparent); }
 .pill.feed .dot, .pill.feed[data-mode="live"] .ic { display: none; }
@@ -197,16 +203,24 @@ body.kiosk .bar { display: none; }
   .grip { opacity: 0; transition: opacity .2s; }
   .tile:hover .grip, .grip:focus-visible, .tile.dragging .grip { opacity: 1; }
 }
-.ident { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
-.model { font-weight: 650; font-size: 1rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.serial { font: .72rem/1.2 var(--mono); color: var(--dim); letter-spacing: .04em;
+/* Head: name with its model tag on line one, the job on line two; the KPI
+   column mirrors it with progress over layer and time left. */
+.ident { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: .1rem; }
+.id-line { display: flex; align-items: baseline; gap: .45rem; min-width: 0; }
+.model { flex: 0 1 auto; min-width: 0; font-weight: 650; font-size: 1rem;
+         white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.serial { flex: 0 1 auto; min-width: 0; font: .72rem/1.2 var(--mono); color: var(--dim); letter-spacing: .04em;
           white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .serial:empty { display: none; }
-.stage { font-size: .74rem; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.job-line { display: flex; align-items: center; gap: .3rem; min-width: 0; font-size: .78rem; color: var(--text); }
+.job-line .ic { flex: none; color: var(--dim); font-size: .85rem; }
+.job-line .job { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.job-line.past { color: var(--dim); }
 .kpi { display: flex; flex-direction: column; align-items: flex-end; text-align: right; white-space: nowrap; }
 .kpi-main { font-size: 1.3rem; font-size: clamp(1.1rem, .75rem + 3.2cqi, 1.75rem); font-weight: 700;
             line-height: 1.1; font-variant-numeric: tabular-nums; color: var(--accent); }
-.kpi-sub { font-size: .76rem; color: var(--dim); }
+.kpi-sub { font-size: .76rem; color: var(--dim); font-variant-numeric: tabular-nums; }
+.kpi-sub > span + span::before { content: " · "; }
 .alert-row { --sev: var(--dim); display: flex; align-items: center; gap: .45rem; margin-top: .45rem;
              padding: .4rem .55rem; border-radius: 8px; font-size: .8rem;
              background: color-mix(in srgb, var(--sev) 15%, transparent);
@@ -231,8 +245,10 @@ body.kiosk .bar { display: none; }
 .alert-list .alert-fix { grid-column: 2; color: var(--dim); }
 .alert-list .alert-code { grid-column: 2; justify-self: start; color: var(--dim); font: .72rem var(--mono); text-decoration: none; }
 /* Section and fact labels borrow the rating-plate lettering of /config. */
-.activity h3, .ams h3 { margin: 0 0 .35rem; color: var(--dim); font: 600 .66rem/1.4 var(--mono);
-                        letter-spacing: .12em; text-transform: uppercase; }
+.sec h3 { margin: 0 0 .35rem; color: var(--dim); font: 600 .66rem/1.4 var(--mono);
+          letter-spacing: .12em; text-transform: uppercase; }
+.job-full { margin: 0; font-size: .8rem; overflow-wrap: anywhere; }
+.job-meta { margin: .15rem 0 0; }
 .act-list { max-height: 14rem; overflow-y: auto; display: grid; gap: .25rem; margin: 0; padding: 0; list-style: none; }
 .act-list li { display: flex; align-items: baseline; gap: .4rem; font-size: .76rem; }
 .act-list li::before { content: ""; width: .45rem; height: .45rem; margin-top: .2rem; border-radius: 50%;
@@ -242,12 +258,17 @@ body.kiosk .bar { display: none; }
 .act-ago { flex: none; margin-left: auto; color: var(--faint); font-size: .7rem; }
 .act-empty { margin: 0; color: var(--dim); font-size: .78rem; }
 /* Filament overview (full detail only): one row per AMS unit with its four
-   slot cells, plus the external spool row. The active slot is marked with
-   an outline and visible text, never color alone. */
-.ams-rows { display: grid; gap: .5rem; }
+   slot cells; the external spool is a fifth column beside the first unit.
+   The active slot is marked with an outline and visible text, never color
+   alone. */
+.ams-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)) minmax(0, 1fr); gap: .25rem .3rem; }
+.ams-grid.solo { grid-template-columns: minmax(0, 10rem); }
 .ams-unit-head { display: flex; align-items: baseline; gap: .5rem; font-size: .74rem; color: var(--dim); }
+.ams-grid > .ams-unit-head:not(:first-child) { margin-top: .3rem; }
+.ams-grid:not(.solo) .ext-col { position: relative; margin-left: .35rem; }
+.ams-grid:not(.solo) .ext-col::before { content: ""; position: absolute; left: -.35rem; top: 0; bottom: 0;
+                                         border-left: 1px solid var(--line); }
 .ams-unit-name { font-weight: 650; color: var(--text); }
-.ams-slots { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .3rem; margin-top: .25rem; }
 .slot { display: flex; flex-wrap: wrap; align-items: center; gap: .2rem .3rem; min-width: 0;
         padding: .3rem .4rem; border-radius: 8px; background: var(--panel-2); border: 1px solid var(--line);
         font-size: .74rem; font-variant-numeric: tabular-nums; }
@@ -259,7 +280,21 @@ body.kiosk .bar { display: none; }
 .slot .remain-bar { flex-basis: 100%; height: 3px; border-radius: 2px; background: var(--line); overflow: hidden; }
 .slot .remain-bar > i { display: block; height: 100%; width: var(--pct, 0%); background: var(--dim); }
 .slot .on-text { flex-basis: 100%; font-size: .68rem; font-weight: 650; color: var(--printing); }
+.slot .sensor { flex-basis: 100%; font-size: .68rem; color: var(--dim); }
 .ams-note { margin: .35rem 0 0; color: var(--faint); font-size: .74rem; }
+/* The filament feeding the print, on one line at vitals level. Full detail
+   marks it in the filament grid instead. */
+.active-fil { display: flex; align-items: center; gap: .45rem; min-width: 0; font-size: .8rem;
+              font-variant-numeric: tabular-nums; }
+.active-fil .swatch { flex: none; width: .9rem; height: .9rem; border-radius: 4px;
+                      border: 1px solid var(--line); background: var(--sw, transparent); }
+.active-fil b { flex: none; font-weight: 650; }
+.active-fil .af-mat { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dim); }
+.active-fil .remain-bar { flex: 0 0 3rem; height: 4px; margin-left: auto; border-radius: 2px;
+                          background: var(--line); overflow: hidden; }
+.active-fil .remain-bar > i { display: block; height: 100%; width: var(--pct, 0%); background: var(--dim); }
+.active-fil .af-pct { flex: none; color: var(--dim); }
+.tile[data-level="3"] .active-fil { display: none; }
 /* Detail disclosure: the chevron points down while more detail remains and
    flips up at full detail, where the next press collapses the tile. */
 .level { display: inline-grid; place-items: center; width: 2.25rem; height: 2.5rem; margin-right: -.35rem;
@@ -291,17 +326,16 @@ body.kiosk .bar { display: none; }
 .speed-wrap[data-profile="ludicrous"] { --sp: var(--failed); }
 select.speed { min-height: 1.9rem; padding: 0 .35rem; border-radius: 6px; border: 1px solid var(--line);
                background: var(--panel-2); color: var(--sp); font: inherit; font-weight: 600; cursor: pointer; }
+.speed-pct { color: var(--dim); }
 .temp.fan { --t: var(--preparing); }
+.temp.fan small { color: var(--dim); }
 .f-wifi[data-bars="3"] { color: var(--printing); }
 .f-wifi[data-bars="2"] { color: var(--paused); }
 .f-wifi[data-bars="1"] { color: var(--failed); }
-.checks { display: flex; flex-wrap: wrap; gap: .3rem; }
-.check-badge { display: inline-flex; align-items: center; gap: .25rem; padding: .05rem .45rem; border-radius: 999px;
-               font-size: .74rem; border: 1px solid var(--line); color: var(--dim); }
-.check-badge[data-on="true"] { color: var(--printing); border-color: color-mix(in srgb, var(--printing) 40%, transparent); }
-.temps { display: grid; grid-template-columns: repeat(auto-fit, minmax(6.5rem, 1fr)); gap: .4rem; }
-.temp { --t: var(--faint); position: relative; display: flex; align-items: center; gap: .4rem; overflow: hidden;
-        padding: .35rem .5rem; border-radius: 8px; background: var(--panel-2); font-size: .8rem;
+/* Thermal row: content-sized chips on one wrapping line. */
+.temps { display: flex; flex-wrap: wrap; gap: .35rem; }
+.temp { --t: var(--faint); position: relative; display: inline-flex; align-items: center; gap: .35rem; overflow: hidden;
+        padding: .25rem .5rem; border-radius: 8px; background: var(--panel-2); font-size: .8rem; white-space: nowrap;
         font-variant-numeric: tabular-nums; }
 .temp::before { content: ""; position: absolute; inset: 0; width: var(--fill, 0%);
                 background: color-mix(in srgb, var(--t) 18%, transparent); transition: width .8s var(--ease); }
@@ -317,6 +351,11 @@ select.speed { min-height: 1.9rem; padding: 0 .35rem; border-radius: 6px; border
             font: 600 .66rem/1.9 var(--mono); letter-spacing: .12em; text-transform: uppercase; }
 .facts dt .ic { font-size: .9rem; }
 .facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+/* Diagnostics close full detail: smaller, dimmer, set apart by a rule. */
+.diag { padding-top: .55rem; border-top: 1px solid var(--line); display: grid; gap: .45rem; }
+.diag .facts { font-size: .74rem; color: var(--dim); gap: .15rem .9rem; }
+.diag .facts dt { font-size: .62rem; line-height: 1.8; color: var(--faint); }
+.diag .facts dd:is(.f-serial, .f-wifi) { font-family: var(--mono); }
 .open { display: inline-flex; align-items: center; gap: .4rem; justify-self: start; padding: .35rem .7rem;
         border-radius: 8px; border: 1px solid var(--line); color: var(--text); text-decoration: none; font-size: .8rem; }
 .open:hover { background: var(--panel-2); }
@@ -326,11 +365,20 @@ select.speed { min-height: 1.9rem; padding: 0 .35rem; border-radius: 6px; border
 .no-match .btn { flex: none; }
 
 @container tile (width < 300px) {
-  .pill .label, .serial { display: none; }
+  .pill .label, .pill.state .stage, .serial { display: none; }
   /* The detection badge is the only place this state lives, so its label survives narrow tiles. */
   .pill.detect .label { display: initial; }
-  .temps { grid-template-columns: 1fr; }
-  .ams-slots { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  /* Two slot columns; the external spool flows after the first unit. */
+  .ams-grid:not(.solo) { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ams-grid > * { grid-column: auto !important; grid-row: auto !important; }
+  .ams-grid > .ams-unit-head { grid-column: 1 / -1 !important; }
+  .ams-grid:not(.solo) .ext-col { margin-left: 0; }
+  .ams-grid:not(.solo) .ext-col::before { display: none; }
+}
+/* Narrow tiles stack layer over time left so the name and job keep width. */
+@container tile (width < 380px) {
+  .kpi-sub { display: flex; flex-direction: column; align-items: flex-end; line-height: 1.25; }
+  .kpi-sub > span + span::before { content: none; }
 }
 @container tile (width > 560px) {
   .pill { font-size: .8rem; }
@@ -468,7 +516,7 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
       <div class="placeholder"><svg class="ic ph-icon" aria-hidden="true"><use/></svg><span class="ph-text"></span></div>
       <img alt="" decoding="async" hidden>
       <button class="cam-hit" type="button" aria-pressed="false"></button>
-      <span class="pill state"><svg class="ic" aria-hidden="true"><use/></svg><span class="label"></span></span>
+      <span class="pill state"><svg class="ic" aria-hidden="true"><use/></svg><span class="label"></span><span class="stage" hidden></span></span>
       <span class="pill feed" hidden><span class="dot" aria-hidden="true"></span><svg class="ic" aria-hidden="true"><use href="#i-camera"/></svg><span class="feed-label"></span></span>
       <button class="pill detect" type="button" hidden><svg class="ic" aria-hidden="true"><use href="#i-ai"/></svg><span class="label"></span><span class="q"></span></button>
       <div class="ctl-bar">
@@ -481,7 +529,10 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
     <div class="details">
       <div class="head">
         <button class="grip" type="button"><svg class="ic" aria-hidden="true"><use href="#i-grip"/></svg></button>
-        <div class="ident"><span class="model"></span><span class="serial"></span><span class="stage" hidden></span></div>
+        <div class="ident">
+          <div class="id-line"><span class="model"></span><span class="serial"></span></div>
+          <div class="job-line" hidden><svg class="ic" aria-hidden="true"><use href="#i-file"/></svg><span class="job"></span></div>
+        </div>
         <div class="kpi"><span class="kpi-main"></span><span class="kpi-sub"></span></div>
         <button class="level" type="button"><svg class="ic" aria-hidden="true"><use href="#i-chevron"/></svg></button>
       </div>
@@ -489,39 +540,54 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
       <div class="alert-full" hidden><ul class="alert-list" aria-label="Alerts"></ul></div>
       <div class="more l2"><div><div class="pad">
         <div class="progress-row">
-          <span class="stat layers"><svg class="ic" aria-hidden="true"><use href="#i-layers"/></svg><b></b></span>
           <span class="stat eta"><svg class="ic" aria-hidden="true"><use href="#i-flag"/></svg><b></b></span>
           <span class="stat elapsed"><svg class="ic" aria-hidden="true"><use href="#i-clock"/></svg><b></b></span>
           <label class="stat speed-wrap" hidden><svg class="ic" aria-hidden="true"><use href="#i-speed"/></svg><select class="ctl speed">
             <option value="silent">Silent</option><option value="standard">Standard</option>
             <option value="sport">Sport</option><option value="ludicrous">Ludicrous</option>
-          </select></label>
+          </select><span class="speed-pct"></span></label>
         </div>
         <div class="detect-l2" hidden><svg class="ic" aria-hidden="true"><use href="#i-ai"/></svg><b class="d-q"></b><span class="d-text"></span></div>
         <div class="temps"></div>
+        <div class="active-fil" hidden><i class="swatch"></i><b class="af-slot"></b><span class="af-mat"></span>
+          <span class="remain-bar" role="img"><i></i></span><span class="af-pct"></span></div>
       </div></div></div>
       <div class="more l3"><div><div class="pad">
-        <dl class="facts">
-          <dt class="dt-file"><svg class="ic" aria-hidden="true"><use href="#i-file"/></svg>File</dt><dd class="f-file"></dd>
-          <dt class="dt-camera"><svg class="ic" aria-hidden="true"><use href="#i-camera"/></svg>Camera</dt><dd class="f-camera"></dd>
-          <dt class="dt-detect" hidden><svg class="ic" aria-hidden="true"><use href="#i-ai"/></svg>Inspection</dt><dd class="f-detect" hidden></dd>
-          <dt class="dt-nozzle" hidden><svg class="ic" aria-hidden="true"><use href="#i-nozzle"/></svg>Nozzle</dt><dd class="f-nozzle" hidden></dd>
-          <dt class="dt-wifi" hidden><svg class="ic" aria-hidden="true"><use href="#i-wifi"/></svg>Wi-Fi</dt><dd class="f-wifi" hidden></dd>
-          <dt class="dt-checks" hidden><svg class="ic" aria-hidden="true"><use href="#i-check"/></svg>Checks</dt><dd class="f-checks checks" hidden></dd>
-          <dt class="dt-report"><svg class="ic" aria-hidden="true"><use href="#i-clock-alert"/></svg>Last report</dt><dd class="f-report"></dd>
-          <dt class="dt-serial"><svg class="ic" aria-hidden="true"><use href="#i-tag"/></svg>Serial</dt><dd class="f-serial"></dd>
-        </dl>
-        <section class="ams" aria-label="Filament" hidden>
+        <section class="sec job-sec" aria-label="Job" hidden>
+          <h3>Job</h3>
+          <p class="job-full"></p>
+          <p class="job-meta muted" hidden></p>
+          <dl class="facts job-facts">
+            <dt class="dt-detect" hidden><svg class="ic" aria-hidden="true"><use href="#i-ai"/></svg>AI</dt><dd class="f-detect" hidden></dd>
+          </dl>
+        </section>
+        <section class="sec ams" aria-label="Filament" hidden>
           <h3>Filament</h3>
-          <div class="ams-rows"></div>
+          <div class="ams-grid"></div>
           <p class="ams-note" hidden></p>
         </section>
-        <section class="activity" aria-label="Recent activity">
+        <section class="sec printer-sec" aria-label="Printer" hidden>
+          <h3>Printer</h3>
+          <dl class="facts">
+            <dt class="dt-nozzle" hidden><svg class="ic" aria-hidden="true"><use href="#i-nozzle"/></svg>Nozzle</dt><dd class="f-nozzle" hidden></dd>
+          </dl>
+        </section>
+        <section class="sec activity" aria-label="Recent activity">
           <h3>Recent activity</h3>
           <ol class="act-list"></ol>
           <p class="act-empty">No activity since the proxy started.</p>
         </section>
-        <a class="open" target="_blank" rel="noopener"><svg class="ic" aria-hidden="true"><use href="#i-external"/></svg>Open live stream</a>
+        <section class="sec diag" aria-label="Diagnostics">
+          <h3>Diagnostics</h3>
+          <dl class="facts">
+            <dt class="dt-camera"><svg class="ic" aria-hidden="true"><use href="#i-camera"/></svg>Camera</dt><dd class="f-camera"></dd>
+            <dt class="dt-report"><svg class="ic" aria-hidden="true"><use href="#i-clock-alert"/></svg>Report</dt><dd class="f-report"></dd>
+            <dt class="dt-wifi" hidden><svg class="ic" aria-hidden="true"><use href="#i-wifi"/></svg>Wi-Fi</dt><dd class="f-wifi" hidden></dd>
+            <dt class="dt-sd" hidden><svg class="ic" aria-hidden="true"><use href="#i-file"/></svg>SD card</dt><dd class="f-sd" hidden></dd>
+            <dt class="dt-serial"><svg class="ic" aria-hidden="true"><use href="#i-tag"/></svg>Serial</dt><dd class="f-serial"></dd>
+          </dl>
+          <a class="open" target="_blank" rel="noopener"><svg class="ic" aria-hidden="true"><use href="#i-external"/></svg>Open live stream</a>
+        </section>
       </div></div></div>
     </div>
   </article>
@@ -897,18 +963,24 @@ function createTile(p) {
       alertRow: q(".alert-row"), alertText: q(".alert-text"),
       alertFull: q(".alert-full"), alertList: q(".alert-full .alert-list"),
       l2: q(".l2"), l3: q(".l3"), progressRow: q(".progress-row"),
-      layers: q(".layers b"), eta: q(".eta b"), temps: q(".temps"),
+      eta: q(".eta b"), temps: q(".temps"),
+      jobLine: q(".job-line"), job: q(".job-line .job"),
+      jobSec: q(".job-sec"), jobFull: q(".job-full"), jobMeta: q(".job-meta"), jobFacts: q(".job-facts"),
+      printerSec: q(".printer-sec"), speedPct: q(".speed-pct"),
+      af: q(".active-fil"), afSwatch: q(".active-fil .swatch"), afSlot: q(".af-slot"), afMat: q(".af-mat"),
+      afBar: q(".active-fil .remain-bar"), afPct: q(".af-pct"),
+      dtSd: q(".dt-sd"), fSd: q(".f-sd"),
       detect: q(".pill.detect"), detectUse: q(".pill.detect use"), detectLabel: q(".pill.detect .label"),
       detectQ: q(".pill.detect .q"), d2: q(".detect-l2"), d2q: q(".detect-l2 .d-q"),
       d2text: q(".detect-l2 .d-text"), fDetectDt: q(".dt-detect"), fDetect: q(".f-detect"),
-      dtFile: q(".dt-file"), fFile: q(".f-file"), dtCamera: q(".dt-camera"), fCamera: q(".f-camera"),
+      dtCamera: q(".dt-camera"), fCamera: q(".f-camera"),
       dtReport: q(".dt-report"), fReport: q(".f-report"), dtSerial: q(".dt-serial"), fSerial: q(".f-serial"), open: q(".open"),
-      stage: q(".stage"), amsSec: q(".ams"), amsRows: q(".ams-rows"), amsNote: q(".ams-note"),
+      stage: q(".pill.state .stage"), amsSec: q(".ams"), amsGrid: q(".ams-grid"), amsNote: q(".ams-note"),
       actList: q(".act-list"), actEmpty: q(".act-empty"),
       ctlLight: q(".ctl.light"), ctlLightUse: q(".ctl.light use"), ctlPause: q(".ctl.pause"),
       ctlPauseUse: q(".ctl.pause use"), ctlStop: q(".ctl.stop"), speedWrap: q(".speed-wrap"), speed: q("select.speed"),
       elapsed: q(".elapsed b"), dtNozzle: q(".dt-nozzle"), fNozzle: q(".f-nozzle"),
-      dtWifi: q(".dt-wifi"), fWifi: q(".f-wifi"), dtChecks: q(".dt-checks"), fChecks: q(".f-checks"),
+      dtWifi: q(".dt-wifi"), fWifi: q(".f-wifi"),
     },
   };
   const { img, details, grip, hit, open } = t.r;
@@ -991,33 +1063,87 @@ const stageWords = s => {
   return words.charAt(0).toUpperCase() + words.slice(1);
 };
 // Filament overview (full detail): one row per conventional AMS unit with
-// its four slot cells, then the external spool row. Occupancy labels stay
-// honest: "Empty" only for a resolved-empty slot, "Unknown" for a slot the
-// printer never reported or loaded without reported material. Offline and
-// stale printers keep showing their last known spools, so the section
-// notes that. Pure rendering: no interaction, no animation.
+// its four slot cells, and the external spool as a fifth column beside the
+// first unit (DOM order puts it right after that unit, so narrow tiles flow
+// it there). Occupancy labels stay honest: "Empty" only for a resolved-empty
+// slot, "Unknown" for a slot the printer never reported or loaded without
+// reported material. Offline and stale printers keep showing their last
+// known spools, so the section notes that. Pure rendering: no interaction.
 function renderAMS(t) {
   const p = t.data;
   const units = Array.isArray(p.ams) ? p.ams : [];
   const ext = p.ext_spool && typeof p.ext_spool === "object" ? p.ext_spool : null;
+  const sensor = typeof p.ext_spool_filament_detected === "boolean" ? p.ext_spool_filament_detected : null;
   const b = bucket(p);
   const note = units.length || ext
     ? b === "offline" ? "Last known · printer offline"
       : b === "stale" ? "Last known · no recent data" : ""
     : "";
-  const key = JSON.stringify([units, ext, note]);
+  renderActiveFilament(t, units, ext, b);
+  const key = JSON.stringify([units, ext, sensor, note]);
   if (key === t.amsKey) return;
   t.amsKey = key;
-  const rows = [];
-  for (const u of units) {
-    const cells = (Array.isArray(u.slots) ? u.slots : []).map(s => slotCell(s, (s?.id ?? 0) + 1));
-    rows.push(amsRow(`AMS ${typeof u.id === "number" ? u.id + 1 : ""}`, u.humidity ?? null, u.temp ?? null, cells));
-  }
-  if (ext) rows.push(amsRow("External spool", null, null, [slotCell(ext, null)]));
-  t.r.amsSec.hidden = !rows.length;
-  t.r.amsRows.replaceChildren(...rows);
+  const place = (el, col, row) => { el.style.gridColumn = col; el.style.gridRow = String(row); return el; };
+  const extCells = () => {
+    const cell = slotCell(ext, null);
+    if (sensor != null) {
+      const s = document.createElement("span");
+      s.className = "sensor";
+      s.textContent = sensor ? "Sensor: filament" : "Sensor: empty";
+      s.title = `External spool sensor ${sensor ? "detects filament" : "detects no filament"}`;
+      cell.append(s);
+    }
+    cell.classList.add("ext-col");
+    const head = amsHead("Ext", null, null);
+    head.classList.add("ext-col");
+    head.title = "External spool";
+    return [head, cell];
+  };
+  const kids = [];
+  units.forEach((u, i) => {
+    kids.push(place(amsHead(`AMS ${typeof u.id === "number" ? u.id + 1 : ""}`, u.humidity ?? null, u.temp ?? null),
+      "1 / 5", i * 2 + 1));
+    (Array.isArray(u.slots) ? u.slots : []).forEach((s, j) =>
+      kids.push(place(slotCell(s, (s?.id ?? j) + 1), String(j + 1), i * 2 + 2)));
+    if (i === 0 && ext) {
+      const [head, cell] = extCells();
+      kids.push(place(head, "5", 1), place(cell, "5", 2));
+    }
+  });
+  if (!units.length && ext) kids.push(...extCells());
+  t.r.amsGrid.classList.toggle("solo", !units.length);
+  t.r.amsSec.hidden = !kids.length;
+  t.r.amsGrid.replaceChildren(...kids);
   t.r.amsNote.hidden = !note;
   t.r.amsNote.textContent = note;
+}
+// Vitals level: the one slot feeding the print, when the printer reports an
+// active selection and is connected.
+function renderActiveFilament(t, units, ext, b) {
+  let hit = null;
+  for (const u of units) {
+    for (const s of Array.isArray(u.slots) ? u.slots : []) {
+      if (s?.active === true) hit = { s, label: `${units.length > 1 && typeof u.id === "number" ? `AMS ${u.id + 1} · ` : ""}Slot ${(s.id ?? 0) + 1}` };
+    }
+  }
+  if (!hit && ext?.active === true) hit = { s: ext, label: "Ext" };
+  const r = t.r;
+  r.af.hidden = !hit || b === "offline";
+  if (r.af.hidden) return;
+  const s = hit.s;
+  const color = typeof s.color === "string" && /^[0-9a-fA-F]{8}$/.test(s.color) ? `#${s.color}` : "";
+  r.afSwatch.style.setProperty("--sw", color || "transparent");
+  r.afSlot.textContent = hit.label;
+  r.afMat.textContent = [s.material, s.sub_brand && s.sub_brand !== s.material ? s.sub_brand : ""]
+    .filter(Boolean).join(" · ") || "Unknown";
+  const remain = Number.isFinite(s.remain) ? Math.max(0, Math.min(100, s.remain)) : null;
+  r.afBar.hidden = r.afPct.hidden = remain == null;
+  if (remain != null) {
+    r.afBar.style.setProperty("--pct", `${remain}%`);
+    r.afBar.setAttribute("aria-label", `Estimated ${remain}% remaining`);
+    r.afPct.textContent = `${remain}%`;
+  }
+  r.af.title = `Active filament · ${hit.label}`;
 }
 // One filament slot cell: the color swatch, the slot number outside the
 // swatch, the material, a labelled remaining estimate, and the active
@@ -1061,10 +1187,8 @@ function slotCell(s, num) {
   }
   return cell;
 }
-// One AMS overview row: the heading line and the slot cells under it.
-function amsRow(name, humidity, temp, cells) {
-  const row = document.createElement("div");
-  row.className = "ams-unit";
+// One AMS heading: unit name, humidity, and temperature.
+function amsHead(name, humidity, temp) {
   const head = document.createElement("div");
   head.className = "ams-unit-head";
   const label = document.createElement("span");
@@ -1073,7 +1197,8 @@ function amsRow(name, humidity, temp, cells) {
   head.append(label);
   if (humidity != null) {
     const h = document.createElement("span");
-    h.textContent = `Humidity ${humidity}%`;
+    h.textContent = `${humidity}% RH`;
+    h.title = `AMS humidity ${humidity}%`;
     head.append(h);
   }
   if (temp != null) {
@@ -1082,11 +1207,7 @@ function amsRow(name, humidity, temp, cells) {
     tc.title = `AMS temperature ${Math.round(temp)}°C`;
     head.append(tc);
   }
-  const slots = document.createElement("div");
-  slots.className = "ams-slots";
-  slots.append(...cells);
-  row.append(head, slots);
-  return row;
+  return head;
 }
 function applyLevel(t) {
   const names = ["compact", "vitals", "full details"];
@@ -1156,17 +1277,40 @@ function setStat(el, value, words) {
   if (words) el.parentElement.setAttribute("aria-label", words);
   else el.parentElement.removeAttribute("aria-label");
 }
-function fanChip(name, pct) {
-  if (pct == null || !(pct > 0)) return null;
+// All fans in one chip: part · aux · chamber percentages, names in the
+// title. Hidden while every fan is off; the fill follows the fastest fan.
+function fanChip(fans) {
+  const list = [["Part cooling", fans?.part], ["Aux", fans?.aux], ["Chamber", fans?.chamber]]
+    .filter(([, v]) => v != null);
+  const max = Math.max(0, ...list.map(([, v]) => v));
+  if (!(max > 0)) return null;
   const el = document.createElement("span");
   el.className = "temp fan";
   el.setAttribute("role", "img");
-  el.style.setProperty("--fill", `${Math.min(100, pct)}%`);
-  el.title = `${name} fan ${pct}%`;
+  el.style.setProperty("--fill", `${Math.min(100, max)}%`);
+  el.title = `Fans · ${list.map(([n, v]) => `${n} ${v}%`).join(", ")}`;
   el.setAttribute("aria-label", el.title);
   const value = document.createElement("b");
-  value.textContent = `${pct}%`;
-  el.append(icon("i-fan"), value);
+  value.textContent = list.map(([, v]) => v).join(" · ");
+  const unit = document.createElement("small");
+  unit.textContent = "%";
+  el.append(icon("i-fan"), value, unit);
+  return el;
+}
+// Cold heaters with no target: one chip with the warmest reading.
+function offChip(p) {
+  const readings = [["Nozzle", p.nozzle_temp], ["Bed", p.bed_temp], ["Chamber", p.chamber_temp]]
+    .filter(([, v]) => v != null);
+  const el = document.createElement("span");
+  el.className = "temp cold";
+  el.setAttribute("role", "img");
+  el.title = `Heaters off · ${readings.map(([n, v]) => `${n} ${Math.round(v)}°C`).join(", ")}`;
+  el.setAttribute("aria-label", el.title);
+  const label = document.createElement("span");
+  label.textContent = "Heaters off";
+  const value = document.createElement("b");
+  value.textContent = `${Math.round(Math.max(...readings.map(([, v]) => v)))}°`;
+  el.append(icon("i-thermo"), label, value);
   return el;
 }
 
@@ -1192,34 +1336,48 @@ function renderTile(t) {
   r.stateUse.setAttribute("href", `#${s.icon}`);
   r.stateLabel.textContent = s.label;
   t.el.dataset.camera = p.camera_supported ? "yes" : "none";
-  // A named printer's subtitle is its model; the serial moves to full
-  // detail. Unnamed printers already use the model as their title.
+  // Line one: the name with the model as a dim tag. Unnamed printers use
+  // the model as their title, so the tag carries the serial instead.
   r.model.textContent = p.name || p.model || "Printer";
   r.serial.textContent = p.name ? p.model || "" : p.serial;
-  r.dtSerial.hidden = r.fSerial.hidden = !p.name;
-  // Stage is secondary: it never replaces the state pill, and it hides
-  // where it could be outdated — offline or stale printers may have
-  // stopped mid-action, and finished or idle printers have ended the print
-  // the stage described. A stage that only repeats the state is dropped.
+  // Stage rides in the state pill as a suffix. It hides where it could be
+  // outdated — offline or stale printers may have stopped mid-action, and
+  // finished or idle printers have ended the print the stage described. A
+  // stage that only repeats the state is dropped.
   const stage = stageWords(p.stage);
   r.stage.hidden = !stage || stage.toLowerCase() === s.label.toLowerCase() || b === "offline" || b === "stale" ||
     b === "finished" || b === "idle";
   r.stage.textContent = stage;
+  // Line two: the job. It stays through finished, failed, and idle until
+  // the next print replaces it, dimmed once the print is no longer running.
+  const job = p.job_name || "";
+  const jobLive = isActive(b) || b === "preparing" || b === "stale";
+  r.jobLine.hidden = !job;
+  r.jobLine.classList.toggle("past", !jobLive);
+  r.job.textContent = job;
+  r.jobLine.title = job ? `${jobLive ? "Printing" : "Last job"}: ${job}` : "";
   r.grip.setAttribute("aria-label", `Reorder ${nameOf(t)}. Drag, or use arrow keys.`);
   r.hit.setAttribute("aria-label", `${t.serial === spotlight ? "Exit focus view for" : "Focus camera of"} ${nameOf(t)}`);
   r.hit.setAttribute("aria-pressed", String(t.serial === spotlight));
   r.hit.hidden = !p.camera_supported;
 
-  // Headline metric: progress and time left for jobs. The state pill already
-  // names the state, so the headline never repeats it; offline and stale
-  // printers show how old their data is instead.
+  // Headline metric: progress over layer and time left for jobs. The state
+  // pill already names the state, so the headline never repeats it; offline
+  // and stale printers show how old their data is instead.
   const remain = fmtDuration(p.remaining_minutes);
   const reportAge = reportAgeOf(p) != null ? Math.round(reportAgeOf(p)) : null;
+  const layer = progress && p.layer_num != null && p.total_layers ? `L ${p.layer_num}/${p.total_layers}` : "";
   r.kpiMain.textContent = progress && b !== "finished" ? `${pct}%` : "";
-  r.kpiSub.textContent = isActive(b) ? (remain ? `${remain} left` : "")
-    : b === "failed" && progress ? "when stopped"
-    : b === "stale" ? `No data for ${fmtAgo(reportAge).replace(" ago", "")}`
-    : b === "offline" && reportAge != null ? `Seen ${fmtAgo(reportAge)}` : "";
+  const parts = isActive(b) ? [layer, remain ? `${remain} left` : ""]
+    : b === "failed" && progress ? [layer, "when stopped"]
+    : b === "stale" ? [`No data for ${fmtAgo(reportAge).replace(" ago", "")}`]
+    : b === "offline" && reportAge != null ? [`Seen ${fmtAgo(reportAge)}`] : [];
+  r.kpiSub.replaceChildren(...parts.filter(Boolean).map(text => {
+    const span = document.createElement("span");
+    span.textContent = text;
+    return span;
+  }));
+  r.kpiSub.title = layer ? `Layer ${p.layer_num} of ${p.total_layers}` : "";
 
   // Alerts stay visible at every detail level: they are why someone looks.
   // Compact and vitals show the top alert on one line; full detail replaces
@@ -1314,6 +1472,8 @@ function renderTile(t) {
   const fact = d && d.state !== "idle" ? detectFact(d, b) : "";
   r.fDetectDt.hidden = r.fDetect.hidden = !fact;
   r.fDetect.textContent = fact;
+  r.jobFacts.hidden = !fact;
+  r.jobSec.hidden = !job && !fact;
   const sig = detSig(d, b);
   if (t.detSig === undefined) t.detSig = sig;
   else if (sig !== t.detSig) { announceDetect(t, t.detSig, sig); t.detSig = sig; }
@@ -1322,14 +1482,12 @@ function renderTile(t) {
   r.camBar.hidden = !progress;
   r.camBar.setAttribute("aria-valuenow", String(pct));
   r.camBar.setAttribute("aria-label", `Print progress ${pct}%`);
-  // Progress itself lives on the camera bar and the headline; vitals add
-  // the layer count, the clock time the print should end, the elapsed time,
-  // and the speed profile. Icons carry the meaning; titles carry the words.
-  const layers = progress && p.layer_num != null && p.total_layers ? `${p.layer_num} of ${p.total_layers}` : "";
+  // Progress and layer live on the camera bar and the headline; vitals add
+  // the clock time the print should end, the elapsed time, and the speed
+  // profile. Icons carry the meaning; titles carry the words.
   const finish = isActive(b) ? fmtFinish(p.remaining_minutes) : "";
   const started = isActive(b) && p.started_at ? new Date(p.started_at) : null;
   const elapsed = started && !isNaN(started) ? fmtDuration((Date.now() - started.getTime()) / 60000) : "";
-  setStat(r.layers, layers, layers ? `Layer ${layers}` : "");
   setStat(r.eta, finish, finish ? `Done at ${finish}` : "");
   setStat(r.elapsed, elapsed, elapsed
     ? `Elapsed ${elapsed} · Started ${started.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "");
@@ -1340,8 +1498,9 @@ function renderTile(t) {
   if (speedOn && document.activeElement !== r.speed) r.speed.value = p.speed_profile || "";
   r.speed.disabled = t.ctlPending;
   r.speed.setAttribute("aria-label", `Speed profile for ${nameOf(t)}`);
+  r.speedPct.textContent = p.speed_percent != null ? `${p.speed_percent}%` : "";
   r.speedWrap.title = `Speed ${p.speed_profile || "unknown"}${p.speed_percent != null ? ` · ${p.speed_percent}%` : ""}`;
-  r.progressRow.hidden = !layers && !finish && !elapsed && !speedOn;
+  r.progressRow.hidden = !finish && !elapsed && !speedOn;
 
   // Printer controls: the server lists what the printer allows right now.
   const busy = String(t.ctlPending === true);
@@ -1363,14 +1522,17 @@ function renderTile(t) {
   r.ctlStop.title = "Emergency stop · cancels the print immediately";
   for (const btn of [r.ctlLight, r.ctlPause, r.ctlStop]) btn.setAttribute("aria-busy", busy);
 
-  const chips = [
+  // Thermal row: content-sized chips on one line. Cold heaters with no
+  // target collapse into a single "Heaters off" chip carrying the highest
+  // reading, so an idle printer spends one chip, not three.
+  const heatersOff = [p.nozzle_target, p.bed_target].every(v => !(v > 0)) &&
+    [p.nozzle_temp, p.bed_temp].some(v => v != null) &&
+    [p.nozzle_temp, p.bed_temp, p.chamber_temp].every(v => v == null || v <= 45);
+  const chips = (heatersOff ? [offChip(p)] : [
     tempChip("i-nozzle", "Nozzle", p.nozzle_temp, p.nozzle_target),
     tempChip("i-bed", "Bed", p.bed_temp, p.bed_target),
     tempChip("i-thermo", "Chamber", p.chamber_temp, null),
-    fanChip("Part cooling", p.fans?.part),
-    fanChip("Aux", p.fans?.aux),
-    fanChip("Chamber", p.fans?.chamber),
-  ].filter(Boolean);
+  ]).concat(fanChip(p.fans)).filter(Boolean);
   if (chips.length) r.temps.replaceChildren(...chips);
   else {
     const none = document.createElement("span");
@@ -1379,30 +1541,32 @@ function renderTile(t) {
     r.temps.replaceChildren(none);
   }
 
-  r.fFile.textContent = p.job_name || "";
-  r.dtFile.hidden = r.fFile.hidden = !p.job_name;
+  // Full detail, print first: the job, then filament, printer, activity,
+  // and diagnostics last.
+  r.jobFull.textContent = job;
+  const startedAll = p.started_at ? new Date(p.started_at) : null;
+  const meta = [
+    startedAll && !isNaN(startedAll) && (jobLive || b === "failed")
+      ? `Started ${startedAll.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "",
+    p.layer_num != null && p.total_layers && (jobLive || b === "failed") ? `layer ${p.layer_num} of ${p.total_layers}` : "",
+    !jobLive ? "last job" : "",
+  ].filter(Boolean).join(" · ");
+  r.jobMeta.textContent = meta;
+  r.jobMeta.hidden = !meta;
   const nozzle = [p.nozzle_diameter != null ? `${p.nozzle_diameter} mm` : "",
     p.nozzle_type ? p.nozzle_type.replaceAll("_", " ") : ""].filter(Boolean).join(" · ");
   r.fNozzle.textContent = nozzle;
   r.dtNozzle.hidden = r.fNozzle.hidden = !nozzle;
+  r.printerSec.hidden = !nozzle;
   const wifi = p.wifi_signal_dbm;
   const bars = wifi == null ? 0 : wifi >= -55 ? 3 : wifi >= -70 ? 2 : 1;
   r.dtWifi.hidden = r.fWifi.hidden = !bars;
   r.fWifi.textContent = bars ? `${wifi} dBm` : "";
   r.fWifi.dataset.bars = bars ? String(bars) : "";
   r.fWifi.title = bars ? `Wi-Fi signal ${["", "weak", "fair", "strong"][bars]}` : "";
-  const checks = [["first_layer_inspection", "First layer"], ["spaghetti_detection", "Spaghetti"], ["timelapse", "Timelapse"]]
-    .filter(([key]) => typeof p[key] === "boolean")
-    .map(([key, label]) => {
-      const badge = document.createElement("span");
-      badge.className = "check-badge";
-      badge.dataset.on = String(p[key]);
-      badge.title = `${key === "timelapse" ? "Timelapse" : `${label} inspection`} ${p[key] ? "on" : "off"}`;
-      badge.append(icon(p[key] ? "i-check" : "i-close"), label);
-      return badge;
-    });
-  r.fChecks.replaceChildren(...checks);
-  r.dtChecks.hidden = r.fChecks.hidden = !checks.length;
+  const sd = typeof p.sd_card === "boolean" ? p.sd_card : null;
+  r.dtSd.hidden = r.fSd.hidden = sd == null;
+  r.fSd.textContent = sd == null ? "" : sd ? "Present" : "Not inserted";
   r.alertList.replaceChildren(...shown.map(a => {
     const li = document.createElement("li");
     li.dataset.sev = a.severity;
@@ -1432,8 +1596,6 @@ function renderTile(t) {
   renderActivity(t);
   renderAMS(t);
   r.fReport.textContent = reportAge == null ? "No report yet" : reportAge < 2 ? "Just now" : fmtAgo(reportAge);
-  // Offline and stale headlines already carry the report age.
-  r.dtReport.hidden = r.fReport.hidden = b === "offline" || b === "stale";
   r.fSerial.textContent = p.serial;
   const frameAge = Math.round(Number(p.frame_age_seconds || 0));
   const frameNote = p.frame_seq ? ` · frame captured ${frameAge ? fmtAgo(frameAge) : "just now"}` : "";
