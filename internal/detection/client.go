@@ -6,13 +6,13 @@
 // Security posture: the API key travels only in the X-API-Key header; every
 // request URL is validated to HTTPS on the vendor domain; redirects are
 // never followed; and errors rendered in status remain sanitized. Debug
-// logs include complete bounded response bodies for diagnosis.
+// logs carry sanitized metadata and fixed error classifications only: no
+// URLs, no response bodies, and no provider-controlled text.
 package detection
 
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,7 +27,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode/utf8"
 )
 
 // Gadget API endpoints and hard limits. These are vendor guarantees and
@@ -81,8 +80,7 @@ type Result struct {
 
 // APIError is the common Gadget error body returned on non-2XX responses.
 // It intentionally carries only the status code and the classified error
-// type token: provider details are not parsed or stored in errors. The
-// bounded raw response body is available in debug logs, not public errors.
+// type token: provider details are not parsed, stored in errors, or logged.
 type APIError struct {
 	Type   string
 	Status int
@@ -253,7 +251,8 @@ func (c *Client) logger() *slog.Logger {
 	return c.log
 }
 
-// requestLogAttrs returns non-secret metadata for one HTTP request.
+// requestLogAttrs returns non-secret metadata for one HTTP request. It
+// never includes the URL: its path embeds the context id.
 func (c *Client) requestLogAttrs(req *http.Request) []any {
 	detail, _ := req.Context().Value(requestLogContextKey{}).(requestLogContext)
 	action := detail.action
@@ -263,7 +262,6 @@ func (c *Client) requestLogAttrs(req *http.Request) []any {
 	attrs := []any{"action", action, "method", req.Method,
 		"request_host", req.URL.Hostname(), "request_content_type", req.Header.Get("Content-Type"),
 		"request_bytes", req.ContentLength}
-	attrs = append(attrs, "request_url", req.URL.String())
 	return append(attrs, detail.logAttrs()...)
 }
 
@@ -291,7 +289,9 @@ func (d requestLogContext) logAttrs() []any {
 	return attrs
 }
 
-// debugResponse logs the complete bounded response bytes only when debug is enabled.
+// debugResponse logs sanitized response metadata only when debug is
+// enabled: numeric status, duration, sizes, and truncation state. It never
+// logs the body, provider-controlled header text, or raw error strings.
 func debugResponse(logger *slog.Logger, ctx context.Context, attrs []any, resp *http.Response,
 	body []byte, duration time.Duration, readErr error) {
 	if logger == nil || !logger.Enabled(ctx, slog.LevelDebug) {
@@ -301,20 +301,43 @@ func debugResponse(logger *slog.Logger, ctx context.Context, attrs []any, resp *
 		resp.ContentLength >= 0 && int64(len(body)) < resp.ContentLength || readErr != nil
 	attrs = append(attrs,
 		"http_status", resp.StatusCode,
-		"http_status_line", resp.Status,
-		"response_content_type", resp.Header.Get("Content-Type"),
 		"response_content_length", resp.ContentLength,
 		"duration_ms", duration.Milliseconds(),
 		"response_body_bytes", len(body),
-		"response_body_truncated", truncated,
-		"response_body", string(body))
-	if !utf8.Valid(body) {
-		attrs = append(attrs, "response_body_base64", base64.StdEncoding.EncodeToString(body))
-	}
+		"response_body_truncated", truncated)
 	if readErr != nil {
-		attrs = append(attrs, "read_error", readErr.Error())
+		attrs = append(attrs, "read_error_class", classifyTransport(readErr, true))
 	}
 	logger.Debug("Gadget HTTP response received", attrs...)
+}
+
+// Fixed sanitized transport classifications shared by TransportError values
+// and debug logs. They never include URLs, provider text, or underlying
+// error strings.
+const (
+	transportCanceled    = "gadget request canceled"
+	transportTimedOut    = "gadget request timed out"
+	transportFailed      = "gadget request failed"
+	transportReadFailed  = "gadget response read failed"
+	transportCloseFailed = "gadget response close failed"
+)
+
+// classifyTransport maps a transport failure to the fixed sanitized text a
+// TransportError carries, so debug logs reuse the same classification
+// instead of the underlying error string. readFailure selects the
+// response-body class when the error is neither a cancellation nor a
+// timeout.
+func classifyTransport(err error, readFailure bool) string {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return transportCanceled
+	case errors.Is(err, context.DeadlineExceeded):
+		return transportTimedOut
+	case readFailure:
+		return transportReadFailed
+	default:
+		return transportFailed
+	}
 }
 
 // NewGadgetClient builds the client. The key only ever travels in the
@@ -381,10 +404,16 @@ func decodeJSON(kind string, body []byte, v any) error {
 	return nil
 }
 
-// decodeField parses one known response field without including provider data.
+// decodeField parses one known response field without including provider
+// data. A JSON null is treated as absent: required fields are then rejected
+// by their presence checks with the same safe errors, and optional fields
+// keep their missing-value defaults.
 func decodeField[T any](fields map[string]json.RawMessage, name string) (*T, error) {
 	raw, ok := fields[name]
 	if !ok {
+		return nil, nil
+	}
+	if string(bytes.TrimSpace(raw)) == "null" {
 		return nil, nil
 	}
 	var value T
@@ -534,7 +563,8 @@ func (c *Client) Process(ctx context.Context, url string, jpeg []byte) (Result, 
 // do sends one authenticated request and returns the bounded response body.
 // Non-2XX responses become *APIError; redirects are never followed.
 // The returned transport and validation errors stay sanitized. Debug logs
-// retain the underlying transport details and complete bounded response.
+// carry only fixed classifications and numeric metadata: never the URL,
+// the body, or provider-controlled text.
 func (c *Client) do(req *http.Request) ([]byte, error) {
 	detail, _ := req.Context().Value(requestLogContextKey{}).(requestLogContext)
 	if detail.requestID == "" {
@@ -551,23 +581,18 @@ func (c *Client) do(req *http.Request) ([]byte, error) {
 	started := time.Now()
 	resp, err := c.http.Do(req)
 	if err != nil {
+		class := classifyTransport(err, false)
 		if debug {
 			logger.Debug("Gadget HTTP request failed", append(attrs,
-				"duration_ms", time.Since(started).Milliseconds(), "transport_error", err.Error())...)
+				"duration_ms", time.Since(started).Milliseconds(), "transport_class", class)...)
 		}
-		switch {
-		case errors.Is(err, context.Canceled):
-			return nil, &TransportError{message: "gadget request canceled"}
-		case errors.Is(err, context.DeadlineExceeded):
-			return nil, &TransportError{message: "gadget request timed out"}
-		}
-		return nil, &TransportError{message: "gadget request failed"}
+		return nil, &TransportError{message: class}
 	}
 	defer func() {
 		if closeErr := resp.Body.Close(); closeErr != nil {
 			if debug {
 				logger.Debug("Gadget HTTP response close failed", append(attrs,
-					"http_status", resp.StatusCode, "close_error", closeErr.Error())...)
+					"http_status", resp.StatusCode, "close_error_class", transportCloseFailed)...)
 			}
 		}
 	}()

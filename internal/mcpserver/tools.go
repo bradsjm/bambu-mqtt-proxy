@@ -423,7 +423,10 @@ func (s *Server) toolWatchPrinter(ctx context.Context, _ *mcp.CallToolRequest, i
 		// lossless history is claimed; the client resyncs from a snapshot.
 		return answer(false, true)
 	}
-	expired := (mode == "attention" && after.attention != cur.attention) ||
+	// An attention change expires the token in both modes, because
+	// progress mode is a superset of attention. Progress mode additionally
+	// expires on progress-only movement, which attention mode ignores.
+	expired := after.attention != cur.attention ||
 		(mode == "progress" && after.progress != cur.progress)
 	if expired {
 		return answer(false, true)

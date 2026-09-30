@@ -45,8 +45,9 @@ type sampler struct {
 // entry holds the wake state for one serial. The wake channels are closed
 // (never sent on) when their counter bumps, releasing every parked watcher
 // of that mode at once; a fresh channel replaces each for the next park.
-// Attention and progress wake separately, so a progress-only bump does not
-// wake attention-mode watchers.
+// A progress-only bump does not wake attention-mode watchers, while any
+// attention change also closes wakeProg: progress mode is a superset of
+// attention.
 type entry struct {
 	rev      revision
 	wakeAtt  chan struct{}
@@ -159,7 +160,11 @@ func (s *sampler) step() {
 // observe compares one serial's fresh sample against its stored sample and
 // bumps the wake counters on any notification-relevant change. An attention
 // change bumps the attention counter and wakes attention watchers; a
-// progress bucket bump does the same for progress watchers.
+// progress bucket bump increments only the progress counter. Progress mode
+// is a superset of attention, so either change wakes progress watchers,
+// exactly once per tick. A silent transition still refreshes the stored
+// sample so the next diff starts from the present, but it moves no counter
+// and wakes nobody.
 func (s *sampler) observe(serial string, now time.Time) {
 	cur := s.srv.sampleNow(serial, now)
 	s.mu.Lock()
@@ -182,6 +187,10 @@ func (s *sampler) observe(serial string, now time.Time) {
 		milestone = &pct
 	}
 	if !attChanged && milestone == nil {
+		// Silent transition: refresh the baseline so the next diff
+		// compares against the present sample, not one from before the
+		// silent resume or clear.
+		e.sampled = cur
 		s.mu.Unlock()
 		return
 	}
@@ -192,9 +201,14 @@ func (s *sampler) observe(serial string, now time.Time) {
 	}
 	if milestone != nil {
 		e.rev.progress++
+		events = append(events, WatchEvent{Kind: kindProgressStep, Percent: milestone})
+	}
+	if attChanged || milestone != nil {
+		// One close per tick releases progress watchers for either
+		// change; the attention branch above must not close wakeProg a
+		// second time.
 		close(e.wakeProg)
 		e.wakeProg = make(chan struct{})
-		events = append(events, WatchEvent{Kind: kindProgressStep, Percent: milestone})
 	}
 	e.sampled = cur
 	e.events = events
@@ -216,10 +230,12 @@ func (s *sampler) enqueue(serial string) {
 }
 
 // watch returns the serial's current revision plus the wake channel for the
-// mode to select on. The pair is consistent: any bump of that mode after
-// this call closes exactly the returned channel. Entries live for the
-// process lifetime, so no teardown bookkeeping is needed when the watcher
-// leaves. A nil channel (unknown serial) blocks a select forever; the tool
+// mode to select on. The pair is consistent: any change relevant to that
+// mode after this call closes exactly the returned channel. For progress
+// mode that is any attention change or progress milestone; for attention
+// mode it is attention changes only. Entries live for the process
+// lifetime, so no teardown bookkeeping is needed when the watcher leaves.
+// A nil channel (unknown serial) blocks a select forever; the tool
 // handlers validate the serial before parking.
 func (s *sampler) watch(serial, mode string) (revision, <-chan struct{}) {
 	s.mu.Lock()

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -258,4 +259,171 @@ func freePort(t *testing.T) int {
 	}
 	defer ln.Close()
 	return ln.Addr().(*net.TCPAddr).Port
+}
+
+// getConfigAPI fetches /config/api and returns its decoded payload.
+func getConfigAPI(t *testing.T, url string) map[string]any {
+	t.Helper()
+	doc, ok := tryGetConfigAPI(url)
+	if !ok {
+		t.Fatal("GET /config/api failed")
+	}
+	return doc
+}
+
+// tryGetConfigAPI fetches /config/api, reporting failure instead of dying so
+// waitFor can poll through the restart window when the endpoint is down.
+func tryGetConfigAPI(url string) (map[string]any, bool) {
+	resp, err := http.Get(url + "/config/api")
+	if err != nil {
+		return nil, false
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, false
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, false
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return nil, false
+	}
+	return doc, true
+}
+
+// TestConfigApplyStartupFailureRestoresPreviousConfig saves a config whose
+// MQTT listener port is already held, then requires run() to keep the
+// previous file bytes, report the apply failure on the page, and resume
+// serving from the restored configuration.
+func TestConfigApplyStartupFailureRestoresPreviousConfig(t *testing.T) {
+	httpPort := freePort(t)
+	listenPort := freePort(t)
+	victimPort := freePort(t)
+	// Held for the whole test: the saved config must fail to bind it.
+	victim, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", victimPort))
+	if err != nil {
+		t.Fatalf("hold victim port: %v", err)
+	}
+	defer victim.Close()
+
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "bambu-mqtt-proxy.yaml")
+	original := fmt.Sprintf(`printers:
+  - serial: "01P00A123456789"
+    address: "127.0.0.1:1"
+    tls: true
+    insecure_skip_verify: true
+    password: "orig-code"
+listen:
+  - port: %d
+    tls: false
+auth:
+  mode: printer
+http:
+  port: %d
+camera:
+  enabled: false
+log:
+  level: error
+`, listenPort, httpPort)
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("test binary: %v", err)
+	}
+	cmd := exec.Command(exe, "-config", configPath)
+	cmd.Env = append(bmbpxFreeEnv(), childEnv+"=1")
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start child: %v", err)
+	}
+	stopped := false
+	t.Cleanup(func() {
+		if !stopped {
+			_ = cmd.Process.Signal(syscall.SIGTERM)
+			_ = cmd.Wait()
+		}
+	})
+
+	url := "http://127.0.0.1:" + strconv.Itoa(httpPort)
+	waitFor(t, 10*time.Second, func() bool { return probeOK(url + "/livez") })
+
+	// Save the same printers but move the listener onto the held port. The
+	// blank access code plus previous_serial reuses the stored code.
+	doc := getConfigAPI(t, url)
+	view, ok := doc["config"].(map[string]any)
+	if !ok {
+		t.Fatalf("config payload shape: %v", doc)
+	}
+	printers, ok := view["printers"].([]any)
+	if !ok || len(printers) == 0 {
+		t.Fatalf("printers payload shape: %v", view)
+	}
+	printer := printers[0].(map[string]any)
+	printer["previous_serial"] = printer["serial"]
+	printer["access_code"] = ""
+	listen, ok := view["listen"].([]any)
+	if !ok || len(listen) == 0 {
+		t.Fatalf("listen payload shape: %v", view)
+	}
+	listen[0].(map[string]any)["port"] = float64(victimPort)
+	body, err := json.Marshal(view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPut, url+"/config/api", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("PUT /config/api: %v", err)
+	}
+	resBody, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("PUT /config/api = %d: %s", res.StatusCode, resBody)
+	}
+
+	// The restart fails, the page reports it, and service resumes from the
+	// restored file with a fresh generation.
+	waitFor(t, 15*time.Second, func() bool {
+		doc, ok := tryGetConfigAPI(url)
+		if !ok {
+			return false
+		}
+		meta, _ := doc["meta"].(map[string]any)
+		errMsg, _ := meta["apply_error"].(string)
+		return errMsg != ""
+	})
+	waitFor(t, 10*time.Second, func() bool { return probeOK(url + "/livez") })
+	var meta map[string]any
+	waitFor(t, 10*time.Second, func() bool {
+		doc, ok := tryGetConfigAPI(url)
+		if !ok {
+			return false
+		}
+		meta, _ = doc["meta"].(map[string]any)
+		gen, _ := meta["generation"].(float64)
+		return gen >= 2
+	})
+	if meta == nil {
+		t.Fatal("resumed service never recorded a new apply generation")
+	}
+	restored, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(restored) != original {
+		t.Fatalf("config file was not restored byte-for-byte:\n%s", restored)
+	}
+
+	terminate(t, cmd, &out, &stopped)
 }

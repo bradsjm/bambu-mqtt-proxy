@@ -42,11 +42,18 @@ const (
 // and the proxy's upstream subscription lifecycle.
 type recorder struct {
 	mochi.HookBase
-	mu       sync.Mutex
-	seen     map[string]recItem
-	subs     map[string]int
-	unsubs   map[string]int
-	onWarmup func() // optional full-state response to a warmup pushall
+	mu        sync.Mutex
+	seen      map[string]recItem
+	subs      map[string]int
+	unsubs    map[string]int
+	subEvents []subEvent
+	onWarmup  func() // optional full-state response to a warmup pushall
+}
+
+// subEvent records one upstream SUBSCRIBE with its requested QoS.
+type subEvent struct {
+	filter string
+	qos    byte
 }
 
 // recItem is one recorded request payload.
@@ -89,6 +96,7 @@ func (r *recorder) OnSubscribed(_ *mochi.Client, pk packets.Packet, _ []byte) {
 	defer r.mu.Unlock()
 	for _, f := range pk.Filters {
 		r.subs[f.Filter]++
+		r.subEvents = append(r.subEvents, subEvent{filter: f.Filter, qos: f.Qos})
 	}
 }
 
@@ -127,6 +135,19 @@ func (r *recorder) unsubCount(filter string) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.unsubs[filter]
+}
+
+// lastSubQos reports the QoS of the most recent upstream subscribe for
+// filter; ok is false when the proxy never subscribed it.
+func (r *recorder) lastSubQos(filter string) (byte, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i := len(r.subEvents) - 1; i >= 0; i-- {
+		if r.subEvents[i].filter == filter {
+			return r.subEvents[i].qos, true
+		}
+	}
+	return 0, false
 }
 
 // setWarmupResponder installs the callback fired for every warmup pushall.
@@ -489,6 +510,121 @@ func TestRepeatedSubscribeDoesNotLeakRefcount(t *testing.T) {
 	}
 
 	// Disconnect releases the interest: the proxy unsubscribes upstream.
+	c.cl.Disconnect(100)
+	waitFor(t, 5*time.Second, func() bool {
+		return p1.rec.unsubCount(filter) == 1
+	})
+}
+
+// TestPublishOnlyReachesPrinterOnceWithNoReportInterest pins the publish-only
+// path: with no downstream report interest the first request engages the
+// supervisor, reaches the printer exactly once, and no upstream subscription
+// is ever created.
+func TestPublishOnlyReachesPrinterOnceWithNoReportInterest(t *testing.T) {
+	p1 := newFakePrinter(t, freePort(t))
+	p := startProxy(t, []config.Printer{printerSpec(p1.port, serial1)})
+	c := connect(t, p, "c1", "bblp", accessCode, true)
+
+	payload := `{"print":{"sequence_id":"1","command":"pause"}}`
+	c.publish(t, requestTopic(serial1), payload, 1, false)
+	waitFor(t, 5*time.Second, func() bool {
+		return p1.rec.count(requestTopic(serial1), payload) == 1
+	})
+	time.Sleep(300 * time.Millisecond) // no duplicate delivery window
+	if got := p1.rec.count(requestTopic(serial1), payload); got != 1 {
+		t.Fatalf("printer received %d copies of the publish-only request, want exactly 1", got)
+	}
+	if got := p1.rec.subCount(reportTopic(serial1)); got != 0 {
+		t.Fatalf("upstream report subscriptions with no report interest = %d, want 0", got)
+	}
+}
+
+// TestOfflineRequestNotReplayed pins the drop-don't-queue contract: a request
+// published while the printer is unreachable is dropped and never reaches the
+// printer, not at the first connection and not after an outage recovery.
+func TestOfflineRequestNotReplayed(t *testing.T) {
+	port := freePort(t) // nothing listens yet: the printer is offline
+	p := startProxy(t, []config.Printer{printerSpec(port, serial1)})
+	c := connect(t, p, "c1", "bblp", accessCode, true)
+
+	offline := `{"print":{"sequence_id":"2","command":"resume"}}`
+	c.publish(t, requestTopic(serial1), offline, 1, false)
+
+	p1 := newFakePrinter(t, port)
+	online := `{"print":{"sequence_id":"3","command":"resume"}}`
+	c.publish(t, requestTopic(serial1), online, 1, false)
+	waitFor(t, 10*time.Second, func() bool {
+		return p1.rec.count(requestTopic(serial1), online) == 1
+	})
+	time.Sleep(300 * time.Millisecond) // replay window after the connection is live
+	if got := p1.rec.count(requestTopic(serial1), offline); got != 0 {
+		t.Fatalf("offline request was replayed %d times after the first connect, want 0", got)
+	}
+
+	// The same contract across an outage: a request published while the
+	// printer is down is dropped, and recovery does not replay it.
+	p1.stop()
+	offline2 := `{"print":{"sequence_id":"4","command":"resume"}}`
+	c.publish(t, requestTopic(serial1), offline2, 1, false)
+	p2 := newFakePrinter(t, port)
+	online2 := `{"print":{"sequence_id":"5","command":"resume"}}`
+	c.publish(t, requestTopic(serial1), online2, 1, false)
+	waitFor(t, 15*time.Second, func() bool {
+		return p2.rec.count(requestTopic(serial1), online2) == 1
+	})
+	time.Sleep(300 * time.Millisecond)
+	if got := p2.rec.count(requestTopic(serial1), offline2); got != 0 {
+		t.Fatalf("outage request was replayed %d times after recovery, want 0", got)
+	}
+}
+
+// TestSubscribeUpgradeQoS0ToQoS1 pins the upgrade contract: the first QoS 0
+// report interest emits one upstream SUBSCRIBE, the same client re-subscribing
+// at QoS 1 emits exactly one upgrade SUBSCRIBE without another reference or
+// warmup, reports still flow, and the single reference unsubscribes once.
+func TestSubscribeUpgradeQoS0ToQoS1(t *testing.T) {
+	p1 := newFakePrinter(t, freePort(t))
+	p := startProxy(t, []config.Printer{printerSpec(p1.port, serial1)})
+	c := connect(t, p, "c1", "bblp", accessCode, true)
+	filter := reportTopic(serial1)
+
+	if got := c.subscribe(t, filter, 0); got != 0 {
+		t.Fatalf("granted qos %#x, want 0", got)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		qos, ok := p1.rec.lastSubQos(filter)
+		return p1.rec.subCount(filter) == 1 && ok && qos == 0
+	})
+	// Let the connect-time restore warmup burst settle (the restore pass and
+	// the first interest can both warm idempotently), then take the baseline.
+	waitFor(t, 5*time.Second, func() bool {
+		return p1.rec.count(requestTopic(serial1), warmupPayload()) >= 1
+	})
+	time.Sleep(300 * time.Millisecond)
+	baselineWarmups := p1.rec.count(requestTopic(serial1), warmupPayload())
+
+	// The same client raises its own interest to QoS 1: one upgrade
+	// SUBSCRIBE, no new reference, no warmup.
+	if got := c.subscribe(t, filter, 1); got != 1 {
+		t.Fatalf("granted qos %#x, want 1", got)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		qos, ok := p1.rec.lastSubQos(filter)
+		return p1.rec.subCount(filter) == 2 && ok && qos == 1
+	})
+	time.Sleep(300 * time.Millisecond) // duplicate-subscribe window
+	if got := p1.rec.subCount(filter); got != 2 {
+		t.Fatalf("upstream subscribes settled at %d, want 2 (initial plus upgrade)", got)
+	}
+	if got := p1.rec.count(requestTopic(serial1), warmupPayload()); got != baselineWarmups {
+		t.Fatalf("upgrade changed warmups to %d, baseline %d", got, baselineWarmups)
+	}
+
+	p1.publish(t, filter, "after-upgrade")
+	waitFor(t, 5*time.Second, func() bool {
+		return c.box.has(filter, "after-upgrade")
+	})
+
 	c.cl.Disconnect(100)
 	waitFor(t, 5*time.Second, func() bool {
 		return p1.rec.unsubCount(filter) == 1

@@ -1665,8 +1665,12 @@ func (w *worker) sessionURL() string {
 // since ended or changed is discarded entirely, so it can never publish
 // stale layers or rearm the pause latch for the next print, and a result
 // whose work scope was invalidated by an override change is discarded even
-// across a disable/re-enable pair. It returns false when the result was
-// discarded.
+// across a disable/re-enable pair. It then gates every result — clear,
+// warning, and pause alike — on the same evidence-freshness rules the
+// pause dispatch uses, so a stale analysis can never move risk counters,
+// the latch, speed ownership, or the published analysis. A discarded
+// response still counts as transport success, so the temporary-failure
+// counter resets. It returns false when the result was discarded.
 func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, res Result, layer *int, workGen uint64) bool {
 	if current, ok := w.e.sessions.Session(w.serial); !ok || !current.Active || current.Epoch != snap.Epoch {
 		w.log.Info("inspection result discarded; print session changed during upload",
@@ -1699,6 +1703,22 @@ func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, r
 			"operation", "process", "session_generation", snap.SessionGen,
 			"session_epoch", snap.Epoch, "connection_generation", gen,
 			"frame_sequence", frame.Seq, "reason", "print_session_changed")
+		return false
+	}
+	// The same freshness and continuity rules that authorize a pause also
+	// authorize accepting any analysis. Evidence rejected here must leave
+	// risk counters, clear counters, the degraded condition, resultAt, the
+	// pause latch, and speed ownership untouched; only the transport
+	// success resets tempAttempts.
+	if reason := w.pauseAuthorizationReason(snap, gen, frame); reason != "" {
+		w.mu.Lock()
+		w.tempAttempts = 0
+		w.mu.Unlock()
+		w.controlMu.Unlock()
+		w.log.Info("inspection result discarded; evidence rejected",
+			"operation", "process", "session_generation", snap.SessionGen,
+			"session_epoch", snap.Epoch, "connection_generation", gen,
+			"frame_sequence", frame.Seq, "reason", reason)
 		return false
 	}
 	w.mu.Lock()

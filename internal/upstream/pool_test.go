@@ -2,28 +2,58 @@ package upstream
 
 import (
 	"errors"
-	"io"
-	"log/slog"
 	"testing"
 	"time"
+
+	mqtt "github.com/eclipse/paho.mqtt.golang"
 
 	"bambu-mqtt-proxy/internal/config"
 )
 
 func TestConnectivityObserverReceivesConnectionLoss(t *testing.T) {
-	var gotSerial string
-	var gotConnected bool
-	var gotErr error
-	p := NewPool([]config.Printer{{Serial: "S1"}}, nil, config.Behavior{},
-		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	var (
+		gotSerial    string
+		gotConnected bool
+		gotErr       error
+		hit          = make(chan struct{}, 2)
+	)
+	p := NewPool([]config.Printer{{Serial: "S1"}}, nopInject{}, config.Behavior{
+		UpstreamConnectTimeoutSeconds: 1,
+		UpstreamBackoffInitialSeconds: 1,
+		UpstreamBackoffMaxSeconds:     1,
+	}, discardLogger())
 	p.SetConnectivityObserver(func(serial string, connected bool, err error) {
 		gotSerial, gotConnected, gotErr = serial, connected, err
+		hit <- struct{}{}
 	})
 	c := p.conn("S1")
+	fake := newFakePaho(true)
+	var t1 *transport
+	c.newClient = func(tr *transport) mqtt.Client {
+		t1 = tr
+		return fake
+	}
+	c.subscribeAsync("device/S1/report", 1)
+	waitChannel(t, 2*time.Second, hit)
+	if t1 == nil || t1.generation == 0 {
+		t.Fatalf("transport installed = %v with generation %d, want an installed generation", t1 != nil, t1.generation)
+	}
 	wantErr := errors.New("lost")
-	c.onLost(nil, wantErr)
+	t1.signalLoss(wantErr)
+	waitChannel(t, 2*time.Second, hit)
 	if gotSerial != "S1" || gotConnected || !errors.Is(gotErr, wantErr) {
 		t.Fatalf("observer got %q/%v/%v, want S1/false/lost", gotSerial, gotConnected, gotErr)
+	}
+	c.stop()
+}
+
+// waitChannel waits for one receive on ch.
+func waitChannel(t *testing.T, timeout time.Duration, ch <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(timeout):
+		t.Fatalf("channel not signaled within %s", timeout)
 	}
 }
 

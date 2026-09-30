@@ -106,11 +106,10 @@ func (m *Manager) handleStream(w http.ResponseWriter, r *http.Request) {
 		frame := m.Wait(serial, r.Context(), lastSeq, streamHeartbeat)
 		if frame == nil {
 			// No new frame within the heartbeat: retry while the client
-			// stays connected so a printer outage self-heals.
-			select {
-			case <-r.Context().Done():
+			// stays connected so a printer outage self-heals. A closed
+			// manager or a canceled request ends the stream instead.
+			if m.isClosed() || r.Context().Err() != nil {
 				return
-			default:
 			}
 			continue
 		}

@@ -34,6 +34,12 @@ const (
 	rtspsReadTimeout = 15 * time.Second // kill FFmpeg if a frame stalls
 )
 
+// frameReadTimeout bounds each complete native frame read (header and
+// payload): a stalled camera ends the session, and the capture loop
+// reconnects after its backoff. A variable so focused tests can shorten
+// the wait without touching the production budget.
+var frameReadTimeout = 15 * time.Second
+
 // Frame is an immutable captured JPEG. Buffers are never reused, so a frame
 // handed to an HTTP handler stays valid while the capture loop moves on.
 // Header holds the exact 16 raw header bytes the printer sent; the raw
@@ -184,6 +190,9 @@ func (c *capture) stopIdle(gen uint64) {
 func (c *capture) latest() *Frame {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		return nil
+	}
 	return c.frame
 }
 
@@ -197,6 +206,10 @@ func (c *capture) snapshot(ctx context.Context) (*Frame, bool) {
 	notify := c.acquire()
 	defer c.release()
 	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil, false
+	}
 	notify = c.notify
 	f := c.frame
 	c.mu.Unlock()
@@ -210,12 +223,19 @@ func (c *capture) snapshot(ctx context.Context) (*Frame, bool) {
 		case <-ctx.Done():
 			return nil, false
 		case <-timer.C:
-			if f := c.latest(); f != nil && time.Since(f.Captured) <= snapshotMaxAge {
+			c.mu.Lock()
+			closed, f := c.closed, c.frame
+			c.mu.Unlock()
+			if !closed && f != nil && time.Since(f.Captured) <= snapshotMaxAge {
 				return f, true
 			}
 			return nil, false
 		case <-notify:
 			c.mu.Lock()
+			if c.closed {
+				c.mu.Unlock()
+				return nil, false
+			}
 			f := c.frame
 			notify = c.notify
 			c.mu.Unlock()
@@ -235,6 +255,12 @@ func (c *capture) wait(ctx context.Context, after uint64, timeout time.Duration)
 	defer timer.Stop()
 	for {
 		c.mu.Lock()
+		if c.closed {
+			// close woke this wait through the notify channel; return
+			// immediately instead of serving a stale frame or spinning.
+			c.mu.Unlock()
+			return nil
+		}
 		f := c.frame
 		ch := c.notify
 		c.mu.Unlock()
@@ -251,8 +277,10 @@ func (c *capture) wait(ctx context.Context, after uint64, timeout time.Duration)
 	}
 }
 
-// close shuts the capture down permanently. It cancels any pending idle
-// stop and waits for a running or retiring loop to exit.
+// close shuts the capture down permanently. It wakes every waiter by
+// closing the notification channel once, cancels any pending idle stop,
+// then cancels the capture loop and waits for a running or retiring loop
+// to exit.
 func (c *capture) close() {
 	c.mu.Lock()
 	if c.closed {
@@ -264,6 +292,9 @@ func (c *capture) close() {
 		c.idle.Stop()
 		c.idle = nil
 	}
+	// Wake every waiter before the transport goes away. publish discards
+	// post-close frames, so this channel stays closed forever after.
+	close(c.notify)
 	cancel, done, stopping := c.cancel, c.done, c.stopping
 	c.cancel = nil
 	c.mu.Unlock()
@@ -340,22 +371,30 @@ func (c *capture) streamOnce(ctx context.Context, address string, connectionID u
 
 	readCtx, stopRead := context.WithCancel(ctx)
 	defer stopRead()
+	// Cancellation closes the connection instead of writing deadlines: a
+	// pending read always unblocks, and a concurrent per-frame deadline
+	// reset cannot defeat it.
 	go func() {
 		<-readCtx.Done()
-		_ = conn.SetDeadline(time.Unix(1, 0)) // unblock the pending read
+		_ = conn.Close()
 	}()
-	_ = conn.SetDeadline(time.Time{})
 
 	for {
 		if readCtx.Err() != nil {
 			return true
 		}
+		// One bounded budget per complete frame read: a stalled header or
+		// payload ends this session, and run reconnects after its backoff.
+		_ = conn.SetReadDeadline(time.Now().Add(frameReadTimeout))
 		frame, err := readFrame(reader)
 		if err != nil {
+			if readCtx.Err() != nil {
+				return true
+			}
 			c.mu.Lock()
 			stopped := c.cancel == nil
 			c.mu.Unlock()
-			if stopped || readCtx.Err() != nil {
+			if stopped {
 				return true
 			}
 			log.Info("camera stream ended", "error", err)
@@ -381,8 +420,10 @@ func (c *capture) streamRTSPSOnce(ctx context.Context, connectionID uint64) bool
 		"-an", "-sn", "-dn", "-vf", "fps=2", "-c:v", "mjpeg", "-q:v", "5",
 		"-f", "mpjpeg", "-boundary_tag", "ffmpeg", "pipe:1",
 	)
-	var stderr boundedLogBuffer
-	cmd.Stderr = &stderr
+	// FFmpeg diagnostics are discarded: FFmpeg reflects the stream URL,
+	// and the URL carries the printer's access code. The structured logs
+	// below describe every failure this path reports.
+	cmd.Stderr = io.Discard
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		log.Warn("cannot create RTSPS camera output pipe", "error", err)
@@ -431,69 +472,24 @@ func (c *capture) streamRTSPSOnce(ctx context.Context, connectionID uint64) bool
 			<-stalled
 			stop()
 			log.Warn("RTSPS camera frame read stalled", "error", "frame read timeout")
-			log.Debug("FFmpeg RTSPS diagnostics", "ffmpeg_stderr_unredacted", stderr.String())
 			return false
 		}
 		if readErr != nil {
 			if ctx.Err() == nil {
 				stop()
 				log.Info("RTSPS camera stream ended", "error", readErr)
-				log.Debug("FFmpeg RTSPS diagnostics", "ffmpeg_stderr_unredacted", stderr.String())
 			}
 			return ctx.Err() != nil
 		}
 		if len(jpeg) == 0 || len(jpeg) > maxPayloadLen || !isJPEG(jpeg) {
 			stop()
 			log.Warn("RTSPS camera returned an invalid JPEG frame", "bytes", len(jpeg))
-			log.Debug("FFmpeg RTSPS diagnostics", "ffmpeg_stderr_unredacted", stderr.String())
 			return false
 		}
 		_ = part.Close()
 		c.resetBackoff()
 		c.publish(&Frame{JPEG: jpeg})
 	}
-}
-
-// maxCameraDiagnosticBytes bounds the FFmpeg stderr text retained for debug logs.
-const maxCameraDiagnosticBytes = 4096
-
-// boundedLogBuffer retains only the end of FFmpeg's stderr diagnostics.
-// Error bursts therefore cannot grow memory without bound.
-type boundedLogBuffer struct {
-	mu        sync.Mutex
-	data      []byte
-	truncated bool
-}
-
-// Write retains at most the newest maxCameraDiagnosticBytes bytes.
-func (b *boundedLogBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	n := len(p)
-	if n >= maxCameraDiagnosticBytes {
-		if n > maxCameraDiagnosticBytes || len(b.data) > 0 {
-			b.truncated = true
-		}
-		b.data = append(b.data[:0], p[n-maxCameraDiagnosticBytes:]...)
-		return n, nil
-	}
-	if excess := len(b.data) + n - maxCameraDiagnosticBytes; excess > 0 {
-		b.truncated = true
-		copy(b.data, b.data[excess:])
-		b.data = b.data[:len(b.data)-excess]
-	}
-	b.data = append(b.data, p...)
-	return n, nil
-}
-
-// String returns the retained suffix and marks it when earlier bytes were discarded.
-func (b *boundedLogBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.truncated {
-		return "[truncated; last 4096 bytes follow] " + string(b.data)
-	}
-	return string(b.data)
 }
 
 // rtspsURL builds the printer RTSPS endpoint from its configured host and
@@ -526,6 +522,12 @@ func rtspsAddress(printer config.Printer) (string, error) {
 // per frame keeps handler-held bytes valid without copies.
 func (c *capture) publish(f *Frame) {
 	c.mu.Lock()
+	if c.closed {
+		// Replacing the closed notification channel would strand future
+		// waiters on an open channel; discard post-close frames instead.
+		c.mu.Unlock()
+		return
+	}
 	seq := uint64(0)
 	if c.frame != nil {
 		seq = c.frame.Seq

@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -715,15 +716,7 @@ func TestMCPWatchToolWire(t *testing.T) {
 			wireHeaders("tools/call", watchParams))
 		resCh <- posted{msgs: msgs, err: err}
 	}()
-	parked := false
-	for i := 0; i < 2000 && !parked; i++ {
-		if len(w.srv.waits) == 1 {
-			parked = true
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
-	if !parked {
+	if !waitWatchParked() {
 		t.Fatal("freshness-loss watch never parked")
 	}
 	w.gens.set("P001", 2)
@@ -837,6 +830,106 @@ func TestMCPWatchChangedFlowWire(t *testing.T) {
 		}
 	}
 	t.Fatal("changed flow never observed over the wire")
+}
+
+func TestMCPWatchProgressSupersetWire(t *testing.T) {
+	w := newWireFixture(t)
+	w.conn.set("P001", true)
+	w.state.setSession("P001", printingSession("P001", w.now, 7, 10))
+	w.step()
+
+	watch := func(id int, args map[string]any) map[string]any {
+		t.Helper()
+		res := w.post(t, id, "tools/call", map[string]any{
+			"name": "watch_printer", "arguments": args,
+		})
+		if res.Error != nil {
+			t.Fatalf("watch error: %+v", res.Error)
+		}
+		var out struct {
+			StructuredContent map[string]any `json:"structuredContent"`
+		}
+		if err := json.Unmarshal(res.Result, &out); err != nil {
+			t.Fatalf("bad watch result: %v", err)
+		}
+		return out.StructuredContent
+	}
+	flag := func(sc map[string]any, key string) bool {
+		b, _ := sc[key].(bool)
+		return b
+	}
+
+	// Initial progress-mode call yields the replayable token.
+	first := watch(40, map[string]any{"serial": "P001", "mode": "progress"})
+	if flag(first, "changed") || flag(first, "resync_required") {
+		t.Fatalf("initial progress watch = %+v", first)
+	}
+	token, _ := first["revision"].(string)
+	if token == "" {
+		t.Fatal("initial progress watch without revision")
+	}
+
+	// A parked progress watch must wake on an attention change: progress
+	// mode is a superset of attention on the wire, not mode-exclusive.
+	type posted struct {
+		msgs []sseMessage
+		err  error
+	}
+	params := map[string]any{
+		"name": "watch_printer",
+		"arguments": map[string]any{
+			"serial": "P001", "after_revision": token,
+			"timeout_seconds": 3, "mode": "progress",
+		},
+	}
+	resCh := make(chan posted, 1)
+	go func() {
+		msgs, err := w.postRaw(t, rpcRequest(41, "tools/call", params),
+			wireHeaders("tools/call", params))
+		resCh <- posted{msgs: msgs, err: err}
+	}()
+	if !waitWatchParked() {
+		t.Fatal("progress watch never parked")
+	}
+	w.conn.set("P001", false)
+	w.step()
+	var res posted
+	select {
+	case res = <-resCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("progress watch did not return")
+	}
+	if res.err != nil {
+		t.Fatalf("progress watch POST: %v", res.err)
+	}
+	var msg sseMessage
+	for _, m := range res.msgs {
+		if m.ID != nil && string(m.ID) == "41" {
+			msg = m
+		}
+	}
+	if msg.Result == nil {
+		t.Fatalf("no progress watch response: %+v", res.msgs)
+	}
+	var out struct {
+		StructuredContent map[string]any `json:"structuredContent"`
+	}
+	if err := json.Unmarshal(msg.Result, &out); err != nil {
+		t.Fatalf("bad progress watch result: %v", err)
+	}
+	if !flag(out.StructuredContent, "changed") {
+		t.Fatalf("attention change did not wake progress watch: %+v", out.StructuredContent)
+	}
+	events, _ := out.StructuredContent["events"].([]any)
+	found := false
+	for _, e := range events {
+		if m, ok := e.(map[string]any); ok && m["kind"] == kindConnectLost {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("connectivity event missing: %+v", events)
+	}
 }
 
 func TestMCPSubscriptionLifecycle(t *testing.T) {
@@ -1221,4 +1314,23 @@ func TestMCPControlTools(t *testing.T) {
 	if got := w.cmd.sentList(); len(got) != 1 {
 		t.Fatalf("sent = %v, want only the stop", got)
 	}
+}
+
+// waitWatchParked reports whether a watch_printer handler became blocked in
+// its park select within two seconds. Parking happens only after the handler
+// captured its revision and wake channel, so a change applied afterwards is
+// guaranteed to wake it; the admission-slot count is taken earlier and is
+// not that barrier.
+func waitWatchParked() bool {
+	buf := make([]byte, 1<<20)
+	for i := 0; i < 2000; i++ {
+		n := runtime.Stack(buf, true)
+		for _, g := range strings.Split(string(buf[:n]), "\n\n") {
+			if strings.Contains(g, "[select") && strings.Contains(g, ").toolWatchPrinter(") {
+				return true
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return false
 }

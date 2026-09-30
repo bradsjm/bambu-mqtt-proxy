@@ -1,6 +1,7 @@
 package configui
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"bambu-mqtt-proxy/internal/config"
@@ -209,6 +211,129 @@ func TestCrossOriginSaveIsRejected(t *testing.T) {
 	res.Body.Close()
 	if res.StatusCode != http.StatusForbidden {
 		t.Fatalf("cross-origin save = %d, want 403", res.StatusCode)
+	}
+}
+
+// busyRename points the store's rename seam at an always-failing rename,
+// the failure a read-only or single-file bind mount target produces.
+func busyRename(t *testing.T, store *Store) {
+	t.Helper()
+	store.rename = func(_, _ string) error {
+		return syscall.EBUSY
+	}
+}
+
+// tempFilesLeft lists leftover .bambu-mqtt-proxy-* files in the config
+// directory; a failed save must clean up its temporary file.
+func tempFilesLeft(t *testing.T, path string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".bambu-mqtt-proxy-") {
+			out = append(out, e.Name())
+		}
+	}
+	return out
+}
+
+func TestRenameFailureRejectsSaveAndKeepsOldBytes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "c.yaml")
+	writeConfig(t, path)
+	store, srv := serve(t, path)
+	busyRename(t, store)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	v := get(t, srv).Config
+	v.Printers[0].PreviousSerial = v.Printers[0].Serial
+	code, body := put(t, srv, v)
+	if code != http.StatusInternalServerError {
+		t.Fatalf("save with failing rename = %d, want 500", code)
+	}
+	const remedy = "configuration saves require a writable directory mount; single-file bind mounts cannot be replaced atomically"
+	if msg, _ := body["error"].(string); !strings.Contains(msg, remedy) {
+		t.Fatalf("save error = %q, want the directory-mount guidance", msg)
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("failed save changed the config file")
+	}
+	if left := tempFilesLeft(t, path); len(left) != 0 {
+		t.Fatalf("failed save left temporary files: %v", left)
+	}
+	select {
+	case <-store.Reloads():
+		t.Fatal("failed save requested a reload")
+	default:
+	}
+
+	// The failed save must leave pending false: the next save is not a 409.
+	store.rename = os.Rename
+	if code, _ := put(t, srv, v); code != http.StatusOK {
+		t.Fatalf("save after rename recovery = %d, want 200", code)
+	}
+	if r := <-store.Reloads(); !r.Existed {
+		t.Fatal("recovered save lacks the previous file for rollback")
+	}
+}
+
+func TestWriteFileReplacesAtomicallyAndRestoreUsesSamePath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nested", "c.yaml")
+	store := NewStore(path)
+
+	// Directory creation is preserved and mode stays owner-only.
+	if err := store.writeFile([]byte("first\n")); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("mode = %v, want 0600", info.Mode().Perm())
+	}
+
+	// A failing rename keeps the old bytes and removes the temporary file.
+	busyRename(t, store)
+	if err := store.writeFile([]byte("second\n")); err == nil {
+		t.Fatal("writeFile accepted a failing rename")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "first\n" {
+		t.Fatalf("failed rename changed the file: %q", got)
+	}
+	if left := tempFilesLeft(t, path); len(left) != 0 {
+		t.Fatalf("failed writeFile left temporary files: %v", left)
+	}
+
+	// Restore goes through the same atomic path: a failing rename fails it,
+	// a working rename puts the previous bytes back.
+	if err := store.Restore(Reload{Existed: true, Previous: []byte("restored\n")}); err == nil {
+		t.Fatal("Restore accepted a failing rename")
+	}
+	store.rename = os.Rename
+	if err := store.Restore(Reload{Existed: true, Previous: []byte("restored\n")}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "restored\n" {
+		t.Fatalf("Restore wrote %q, want the previous bytes", got)
 	}
 }
 

@@ -180,6 +180,13 @@ type etPauser struct {
 	err      error
 	lights   []bool
 	lightErr error
+	speeds   []etSpeedCall
+}
+
+// etSpeedCall records one guarded speed-profile command.
+type etSpeedCall struct {
+	gen     uint64
+	profile int
 }
 
 func (p *etPauser) PausePrint(_ string, gen uint64) error {
@@ -189,7 +196,18 @@ func (p *etPauser) PausePrint(_ string, gen uint64) error {
 	return p.err
 }
 
-func (p *etPauser) SetSpeedProfile(string, uint64, int) error { return p.err }
+func (p *etPauser) SetSpeedProfile(_ string, gen uint64, profile int) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.speeds = append(p.speeds, etSpeedCall{gen: gen, profile: profile})
+	return p.err
+}
+
+func (p *etPauser) speedCalls() []etSpeedCall {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]etSpeedCall(nil), p.speeds...)
+}
 
 func (p *etPauser) SetChamberLight(_ string, _ uint64, on bool) error {
 	p.mu.Lock()
@@ -296,6 +314,389 @@ func TestEngineActivityEventsFollowLifecycle(t *testing.T) {
 		if !hasActivityKind(activities.Recent(serial), "ai_suspended") {
 			t.Fatalf("activity is missing %q: %+v", "ai_suspended", activities.Recent(serial))
 		}
+	}
+}
+
+// ---- stale-evidence gate ----
+
+// withSpeed adds speed-report evidence for the current session to the view,
+// so warning-speed authorization can pass.
+func withSpeed(w *etWorld, profile int, obs uint64) {
+	view, _ := w.sessions.Session("S1")
+	p := profile
+	view.SpeedProfile = &p
+	view.SpeedGen = 1
+	view.SpeedSessionGen = view.SessionGen
+	view.SpeedObs = obs
+	view.SpeedAt = w.clock.Now()
+	w.sessions.set(view, true)
+}
+
+// hzCleanWorld builds a world with no prior result: the observed upload is
+// the worker's first inspection, so a clean baseline isolates each boundary.
+func hzCleanWorld(t *testing.T) (*etWorld, *bytes.Buffer, *activity.Log) {
+	t.Helper()
+	w := newEtWorld(t)
+	activities := activity.New([]config.Printer{{Serial: "S1", Name: "Shop", Model: "P1S"}})
+	w.engine.SetActivity(activities)
+	var logs bytes.Buffer
+	w.worker.log = slog.New(slog.NewTextHandler(&logs, nil)).With("serial", "S1")
+	w.startSession(1, 1)
+	return w, &logs, activities
+}
+
+// gateWorld builds a world whose worker already accepted one warning
+// result, so risk counters, the published analysis, and resultAt all carry
+// baseline values a stale result must preserve.
+func gateWorld(t *testing.T) (*etWorld, *bytes.Buffer, *activity.Log) {
+	t.Helper()
+	w, logs, activities := hzCleanWorld(t)
+	w.client.queue(Result{Intervals: IntervalSec{Minimum: 5, Recommended: 20}, PrintQuality: 3, WarningSuggested: true})
+	w.worker.step(context.Background())
+	return w, logs, activities
+}
+
+// gateBoundary enumerates one way the world can move while an upload is in
+// flight. logHint is the fixed reason the discard log must carry; accepted
+// boundaries mutate nothing.
+type gateBoundary struct {
+	name     string
+	accepted bool
+	logHint  string
+	mutate   func(t *testing.T, w *etWorld)
+}
+
+func gateBoundaries() []gateBoundary {
+	reconnect := func(stateGen uint64) func(t *testing.T, w *etWorld) {
+		return func(t *testing.T, w *etWorld) {
+			w.gens.mu.Lock()
+			w.gens.gen = 2
+			w.gens.mu.Unlock()
+			view, _ := w.sessions.Session("S1")
+			view.ObsGen, view.StateGen, view.ObsAt = 2, stateGen, w.clock.Now()
+			w.sessions.set(view, true)
+		}
+	}
+	return []gateBoundary{
+		{name: "accepted", accepted: true},
+		{name: "reconnect", logHint: "reason=connection_generation_changed", mutate: reconnect(2)},
+		{name: "frame-expired", logHint: "reason=inspection_frame_expired", mutate: func(t *testing.T, w *etWorld) {
+			w.clock.Advance(31 * time.Second)
+		}},
+		{name: "telemetry-stale", logHint: "reason=printer_telemetry_stale", mutate: func(t *testing.T, w *etWorld) {
+			w.clock.Advance(20 * time.Second)
+		}},
+		// Same connection generation, but RUNNING is no longer attributed
+		// to it (fresh telemetry lacks a current-generation state).
+		{name: "running-not-on-current-connection", logHint: "reason=running_state_not_observed_on_current_connection", mutate: func(t *testing.T, w *etWorld) {
+			view, _ := w.sessions.Session("S1")
+			view.StateGen, view.ObsAt = 0, w.clock.Now()
+			w.sessions.set(view, true)
+		}},
+		{name: "session-change", logHint: "print session changed during upload", mutate: func(t *testing.T, w *etWorld) {
+			w.sessions.running(w.clock, 2, 2, "RUNNING")
+		}},
+		{name: "override-change", logHint: "detection availability changed", mutate: func(t *testing.T, w *etWorld) {
+			if _, err := w.engine.SetDetectionEnabled("S1", false, w.engine.sessionToken(1)); err != nil {
+				t.Errorf("disable during upload: %v", err)
+			}
+		}},
+	}
+}
+
+// gateBaselines snapshots every piece of state a rejected result must
+// preserve.
+type gateBaselines struct {
+	resultAt      time.Time
+	awaitingClear bool
+	riskActive    bool
+	clearCount    int
+	clearSince    time.Time
+	pauseState    string
+	speedOwned    bool
+	speedPending  bool
+	speedPrior    *int
+	pauseCommands int
+	speedCommands int
+	activities    int
+	quality       int
+	warning       bool
+	faster        bool
+	state         string
+}
+
+func gateSnapshot(w *etWorld, activities *activity.Log) gateBaselines {
+	w.worker.mu.Lock()
+	base := gateBaselines{
+		resultAt:      w.worker.resultAt,
+		awaitingClear: w.worker.awaitingClear,
+		riskActive:    w.worker.riskActive,
+		clearCount:    w.worker.clearCount,
+		clearSince:    w.worker.clearSince,
+		pauseState:    w.worker.pauseState,
+		speedOwned:    w.worker.speedOwned,
+		speedPending:  w.worker.speedPending,
+		speedPrior:    w.worker.speedPrior,
+		pauseCommands: w.pauser.calls(),
+		speedCommands: len(w.pauser.speedCalls()),
+	}
+	w.worker.mu.Unlock()
+	st := w.status()
+	base.quality, base.warning, base.faster = st.Quality, st.Warning, st.FasterInspection
+	base.state = st.State
+	base.activities = len(activities.Recent("S1"))
+	return base
+}
+
+// gateAssertUnchanged fails when a rejected result moved any guarded state.
+// strictDisplay also pins the published display state, which the user
+// override legitimately re-projects.
+func gateAssertUnchanged(t *testing.T, w *etWorld, activities *activity.Log, base gateBaselines, strictDisplay bool) {
+	t.Helper()
+	// status() re-enters w.mu through view, so snapshot it first.
+	st := w.status()
+	w.worker.mu.Lock()
+	defer w.worker.mu.Unlock()
+	if !w.worker.resultAt.Equal(base.resultAt) {
+		t.Errorf("resultAt moved: %v -> %v", base.resultAt, w.worker.resultAt)
+	}
+	if w.worker.awaitingClear != base.awaitingClear {
+		t.Errorf("awaitingClear changed: %v -> %v", base.awaitingClear, w.worker.awaitingClear)
+	}
+	if w.worker.riskActive != base.riskActive || w.worker.clearCount != base.clearCount || !w.worker.clearSince.Equal(base.clearSince) {
+		t.Errorf("risk counters changed: active %v->%v count %d->%d since %v->%v",
+			base.riskActive, w.worker.riskActive, base.clearCount, w.worker.clearCount, base.clearSince, w.worker.clearSince)
+	}
+	if w.worker.pauseState != base.pauseState {
+		t.Errorf("pauseState changed: %q -> %q", base.pauseState, w.worker.pauseState)
+	}
+	if w.worker.speedOwned != base.speedOwned || w.worker.speedPending != base.speedPending {
+		t.Errorf("speed ownership changed: owned %v->%v pending %v->%v", base.speedOwned, w.worker.speedOwned, base.speedPending, w.worker.speedPending)
+	}
+	if (w.worker.speedPrior == nil) != (base.speedPrior == nil) ||
+		(w.worker.speedPrior != nil && base.speedPrior != nil && *w.worker.speedPrior != *base.speedPrior) {
+		t.Errorf("speedPrior changed: %v -> %v", base.speedPrior, w.worker.speedPrior)
+	}
+	if w.pauser.calls() != base.pauseCommands {
+		t.Errorf("pause commands changed: %d -> %d", base.pauseCommands, w.pauser.calls())
+	}
+	if len(w.pauser.speedCalls()) != base.speedCommands {
+		t.Errorf("speed commands changed: %d -> %d", base.speedCommands, len(w.pauser.speedCalls()))
+	}
+	if st.Quality != base.quality || st.Warning != base.warning || st.FasterInspection != base.faster {
+		t.Errorf("published analysis changed: quality %d->%d warning %v->%v faster %v->%v",
+			base.quality, st.Quality, base.warning, st.Warning, base.faster, st.FasterInspection)
+	}
+	if strictDisplay && st.State != base.state {
+		t.Errorf("display state changed: %q -> %q", base.state, st.State)
+	}
+	if got := len(activities.Recent("S1")); got != base.activities {
+		t.Errorf("activity events changed: %d -> %d", base.activities, got)
+	}
+}
+
+// runGateSchedule drives one upload whose evidence may go stale in flight:
+// it becomes due again with fresh telemetry, then steps once.
+func runGateSchedule(t *testing.T, w *etWorld, boundary gateBoundary, res Result) time.Duration {
+	t.Helper()
+	w.clock.Advance(5 * time.Second)
+	w.sessions.running(w.clock, 1, 1, "RUNNING")
+	w.client.queue(res)
+	if !boundary.accepted && boundary.mutate != nil {
+		w.client.beforeReply = func() { boundary.mutate(t, w) }
+	}
+	return w.worker.step(context.Background())
+}
+
+func TestEngineResultGateRejectsStaleEvidence(t *testing.T) {
+	results := map[string]Result{
+		"clear":   {Intervals: IntervalSec{Minimum: 5, Recommended: 20}, PrintQuality: 8},
+		"warning": {Intervals: IntervalSec{Minimum: 5, Recommended: 20}, PrintQuality: 3, WarningSuggested: true},
+		"pause":   {Intervals: IntervalSec{Minimum: 5, Recommended: 20}, PrintQuality: 8, PauseSuggested: true},
+	}
+	for _, boundary := range gateBoundaries() {
+		if boundary.accepted {
+			continue
+		}
+		for name, res := range results {
+			t.Run(boundary.name+"/"+name, func(t *testing.T) {
+				w, logs, activities := gateWorld(t)
+				base := gateSnapshot(w, activities)
+				delay := runGateSchedule(t, w, boundary, res)
+				if delay != 5*time.Second {
+					t.Errorf("delay = %v, want provider-interval pacing to survive rejection", delay)
+				}
+				gateAssertUnchanged(t, w, activities, base, boundary.name != "override-change")
+				log := logs.String()
+				for _, hint := range []string{"inspection result discarded", boundary.logHint} {
+					if !strings.Contains(log, hint) {
+						t.Errorf("log missing %q: %s", hint, log)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestEngineResultGateAcceptsFreshResults(t *testing.T) {
+	w, logs, activities := gateWorld(t)
+
+	// A fresh clear publishes, starts the clear sequence, and clears the
+	// prior warning with an activity event.
+	delay := runGateSchedule(t, w, gateBoundary{}, etClearResult())
+	if delay != 5*time.Second {
+		t.Fatalf("delay = %v, want provider pacing", delay)
+	}
+	if st := w.status(); st.Quality != 8 || st.Warning {
+		t.Fatalf("clear not published: %+v", st)
+	}
+	w.worker.mu.Lock()
+	clearCount, riskActive := w.worker.clearCount, w.worker.riskActive
+	w.worker.mu.Unlock()
+	if clearCount != 1 || !riskActive {
+		t.Fatalf("clearCount/riskActive = %d/%v, want 1/true", clearCount, riskActive)
+	}
+	if !hasActivityKind(activities.Recent("S1"), "ai_warning_cleared") {
+		t.Fatalf("activity missing ai_warning_cleared: %+v", activities.Recent("S1"))
+	}
+
+	// A fresh warning refreshes the risk window and the published analysis.
+	w.clock.Advance(5 * time.Second)
+	w.sessions.running(w.clock, 1, 1, "RUNNING")
+	w.client.queue(Result{Intervals: IntervalSec{Minimum: 5, Recommended: 20}, PrintQuality: 2, WarningSuggested: true})
+	w.worker.step(context.Background())
+	w.worker.mu.Lock()
+	clearCount = w.worker.clearCount
+	w.worker.mu.Unlock()
+	if clearCount != 0 {
+		t.Fatalf("clearCount = %d, want the risk window reset", clearCount)
+	}
+	if st := w.status(); st.Quality != 2 || !st.Warning {
+		t.Fatalf("warning not published: %+v", st)
+	}
+
+	// A fresh pause suggestion still dispatches exactly one guarded pause.
+	w.clock.Advance(5 * time.Second)
+	w.sessions.running(w.clock, 1, 1, "RUNNING")
+	w.client.queue(etPauseResult())
+	w.worker.step(context.Background())
+	if calls := w.pauser.calls(); calls != 1 {
+		t.Fatalf("pause calls = %d, want one", calls)
+	}
+	if gen := w.pauser.gens[0]; gen != 1 {
+		t.Fatalf("pause generation = %d, want 1", gen)
+	}
+	if got := w.status().PauseState; got != PausePending {
+		t.Fatalf("pause_state = %q, want pending", got)
+	}
+	w.worker.mu.Lock()
+	latched := w.worker.awaitingClear
+	w.worker.mu.Unlock()
+	if !latched {
+		t.Fatal("pause latch not set after a dispatched pause")
+	}
+	if !hasActivityKind(activities.Recent("S1"), "ai_pause_sent") {
+		t.Fatalf("activity missing ai_pause_sent: %+v", activities.Recent("S1"))
+	}
+	if strings.Contains(logs.String(), "inspection result discarded") {
+		t.Fatalf("fresh results were discarded: %s", logs.String())
+	}
+}
+
+func TestEngineWarningSpeedEpisodeSendsOnceAndRestoresOnClear(t *testing.T) {
+	w := newEtWorld(t)
+	w.startSession(1, 1)
+	withSpeed(w, 3, 1)
+	w.client.queue(Result{Intervals: IntervalSec{Minimum: 5, Recommended: 20}, PrintQuality: 3, WarningSuggested: true})
+	w.worker.step(context.Background())
+
+	speeds := w.pauser.speedCalls()
+	if len(speeds) != 1 || speeds[0] != (etSpeedCall{gen: 1, profile: 1}) {
+		t.Fatalf("speed calls = %+v, want one Silent command on generation 1", speeds)
+	}
+
+	// A newer speed report on the same connection confirms the command.
+	w.sessions.running(w.clock, 1, 1, "RUNNING")
+	withSpeed(w, 1, 2)
+	snap, _ := w.sessions.Session("S1")
+	w.worker.controlMu.Lock()
+	w.worker.reconcileSpeed(snap)
+	w.worker.controlMu.Unlock()
+
+	// A fresh clear result restores the saved profile exactly once and
+	// closes the episode.
+	w.clock.Advance(5 * time.Second)
+	w.sessions.running(w.clock, 1, 1, "RUNNING")
+	withSpeed(w, 1, 2)
+	w.client.queue(etClearResult())
+	w.worker.step(context.Background())
+
+	speeds = w.pauser.speedCalls()
+	if len(speeds) != 2 || speeds[0] != (etSpeedCall{gen: 1, profile: 1}) || speeds[1] != (etSpeedCall{gen: 1, profile: 3}) {
+		t.Fatalf("speed calls = %+v, want one Silent then one restore of profile 3", speeds)
+	}
+	w.worker.controlMu.Lock()
+	owned, pending, episode, prior := w.worker.speedOwned, w.worker.speedPending, w.worker.warningEpisode, w.worker.speedPrior
+	w.worker.controlMu.Unlock()
+	if owned || pending || episode || prior != nil {
+		t.Fatalf("speed episode state = owned %v pending %v episode %v prior %v, want all clear", owned, pending, episode, prior)
+	}
+	if st := w.status(); st.Quality != 8 || st.Warning {
+		t.Fatalf("clear not published: %+v", st)
+	}
+}
+
+func TestEngineStaleClearKeepsSpeedOwnershipAndRiskCounters(t *testing.T) {
+	w := newEtWorld(t)
+	w.startSession(1, 1)
+	withSpeed(w, 3, 1)
+	w.client.queue(Result{Intervals: IntervalSec{Minimum: 5, Recommended: 20}, PrintQuality: 3, WarningSuggested: true})
+	w.worker.step(context.Background())
+	if len(w.pauser.speedCalls()) != 1 {
+		t.Fatalf("speed calls = %+v, want the initial Silent", w.pauser.speedCalls())
+	}
+
+	// Confirm the Silent profile as owned.
+	w.sessions.running(w.clock, 1, 1, "RUNNING")
+	withSpeed(w, 1, 2)
+	snap, _ := w.sessions.Session("S1")
+	w.worker.controlMu.Lock()
+	w.worker.reconcileSpeed(snap)
+	w.worker.controlMu.Unlock()
+
+	activities := activity.New([]config.Printer{{Serial: "S1", Name: "Shop", Model: "P1S"}})
+	w.engine.SetActivity(activities)
+	base := gateSnapshot(w, activities)
+
+	// The clear result goes stale during the upload: a temperature-only
+	// delta lands on a new connection.
+	w.client.queue(etClearResult())
+	w.client.beforeReply = func() {
+		w.gens.mu.Lock()
+		w.gens.gen = 2
+		w.gens.mu.Unlock()
+		view, _ := w.sessions.Session("S1")
+		view.ObsGen, view.StateGen, view.ObsAt = 2, 2, w.clock.Now()
+		w.sessions.set(view, true)
+	}
+	w.clock.Advance(5 * time.Second)
+	w.sessions.running(w.clock, 1, 1, "RUNNING")
+	withSpeed(w, 1, 2)
+	delay := w.worker.step(context.Background())
+
+	if delay != 5*time.Second {
+		t.Fatalf("delay = %v, want provider pacing on a rejected clear", delay)
+	}
+	gateAssertUnchanged(t, w, activities, base, true)
+	w.worker.mu.Lock()
+	intensive := w.worker.intensiveLocked(w.clock.Now())
+	owned, prior := w.worker.speedOwned, w.worker.speedPrior
+	w.worker.mu.Unlock()
+	if !intensive {
+		t.Fatal("rejected clear exited the risk-triggered intensive mode")
+	}
+	if !owned || prior == nil || *prior != 3 {
+		t.Fatalf("speed ownership after rejection = owned %v prior %v, want owned with profile 3 saved", owned, prior)
 	}
 }
 

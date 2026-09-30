@@ -487,7 +487,8 @@ func TestSamplerPerModeWakes(t *testing.T) {
 	f.state.setSession("P001", printingSession("P001", f.now, 7, 42))
 	f.step()
 
-	// Attention change wakes attention watchers only.
+	// An attention change wakes attention watchers, and progress watchers
+	// too: progress mode is a superset of attention.
 	_, wakeAtt := f.srv.sampler.watch("P001", "attention")
 	_, wakeProg := f.srv.sampler.watch("P001", "progress")
 	f.conn.set("P001", false)
@@ -499,8 +500,8 @@ func TestSamplerPerModeWakes(t *testing.T) {
 	}
 	select {
 	case <-wakeProg:
-		t.Fatal("progress watcher woken by attention-only change")
 	default:
+		t.Fatal("progress watcher not woken by attention change")
 	}
 
 	// Progress milestone wakes progress watchers only.
@@ -517,6 +518,126 @@ func TestSamplerPerModeWakes(t *testing.T) {
 	case <-wakeAtt:
 		t.Fatal("attention watcher woken by progress-only change")
 	default:
+	}
+}
+
+func TestSamplerSilentTransitionRefreshesBaseline(t *testing.T) {
+	f := newFixture(t)
+	f.conn.set("P001", true)
+	paused := printingSession("P001", f.now, 7, 42)
+	paused.State = "PAUSE"
+	f.state.setSession("P001", paused)
+	f.step()
+	base := f.srv.sampler.revision("P001")
+
+	// Ordinary resume: silent. No counter moves and no watcher wakes, but
+	// the stored sample must advance to RUNNING.
+	_, wakeAtt := f.srv.sampler.watch("P001", "attention")
+	_, wakeProg := f.srv.sampler.watch("P001", "progress")
+	f.state.setSession("P001", printingSession("P001", f.now, 7, 42))
+	f.step()
+	if rev := f.srv.sampler.revision("P001"); rev != base {
+		t.Fatalf("silent resume moved counters: %+v from %+v", rev, base)
+	}
+	select {
+	case <-wakeAtt:
+		t.Fatal("silent resume woke attention watcher")
+	default:
+	}
+	select {
+	case <-wakeProg:
+		t.Fatal("silent resume woke progress watcher")
+	default:
+	}
+
+	// Pausing again is real attention against the refreshed baseline; a
+	// stale baseline would swallow it.
+	f.state.setSession("P001", paused)
+	f.step()
+	ev := f.srv.sampler.lastEvents("P001")
+	if len(ev) != 1 || ev[0].Kind != kindPrintPaused {
+		t.Fatalf("second pause events = %+v, want print_paused", ev)
+	}
+	if rev := f.srv.sampler.revision("P001"); rev.attention != base.attention+1 {
+		t.Fatalf("second pause attention = %+v, base %+v", rev, base)
+	}
+}
+
+func TestSamplerClearedAlertCanRefire(t *testing.T) {
+	f := newFixture(t)
+	f.conn.set("P001", true)
+	f.state.setSession("P001", printingSession("P001", f.now, 7, 42))
+	f.step()
+	alert := telemetry.HMSAlert{Attr: 0x03000100, Code: 0x00010007}
+	f.state.setState(telemetry.State{Serial: "P001", HMS: []telemetry.HMSAlert{alert}})
+	f.step()
+	if ev := f.srv.sampler.lastEvents("P001"); len(ev) != 1 || ev[0].Kind != kindHMSAlert {
+		t.Fatalf("first alert events = %+v, want hms_alert", ev)
+	}
+	base := f.srv.sampler.revision("P001")
+
+	// Clearing is silent, but the stored sample must lose the alert.
+	f.state.setState(telemetry.State{Serial: "P001"})
+	f.step()
+	if rev := f.srv.sampler.revision("P001"); rev != base {
+		t.Fatalf("silent clear moved counters: %+v from %+v", rev, base)
+	}
+
+	// The same alert returning notifies again against the cleared
+	// baseline.
+	f.state.setState(telemetry.State{Serial: "P001", HMS: []telemetry.HMSAlert{alert}})
+	f.step()
+	if ev := f.srv.sampler.lastEvents("P001"); len(ev) != 1 || ev[0].Kind != kindHMSAlert {
+		t.Fatalf("refired alert events = %+v, want hms_alert", ev)
+	}
+}
+
+func TestWatchTokenExpiryPerMode(t *testing.T) {
+	f := newFixture(t)
+	f.conn.set("P001", true)
+	f.state.setSession("P001", printingSession("P001", f.now, 7, 10))
+	f.step()
+	token := f.srv.token(f.srv.sampler.revision("P001"))
+
+	// A progress-only milestone leaves an attention token valid: the
+	// attention watcher stays asleep.
+	f.state.setSession("P001", printingSession("P001", f.now, 7, 51))
+	f.step()
+	res, err := callWatch(t, f.srv, WatchPrinterIn{
+		Serial: "P001", AfterRevision: token, TimeoutSeconds: 0, Mode: "attention",
+	})
+	if err != nil {
+		t.Fatalf("attention poll after milestone: %v", err)
+	}
+	if res.Changed || res.ResyncRequired {
+		t.Fatalf("milestone expired attention token: %+v", res)
+	}
+
+	// The same milestone expires a progress token.
+	res, err = callWatch(t, f.srv, WatchPrinterIn{
+		Serial: "P001", AfterRevision: token, TimeoutSeconds: 0, Mode: "progress",
+	})
+	if err != nil {
+		t.Fatalf("progress poll after milestone: %v", err)
+	}
+	if res.Changed || !res.ResyncRequired {
+		t.Fatalf("milestone did not expire progress token: %+v", res)
+	}
+
+	// An attention change expires the tokens of both modes.
+	progToken := f.srv.token(f.srv.sampler.revision("P001"))
+	f.conn.set("P001", false)
+	f.step()
+	for _, mode := range []string{"attention", "progress"} {
+		res, err = callWatch(t, f.srv, WatchPrinterIn{
+			Serial: "P001", AfterRevision: progToken, TimeoutSeconds: 0, Mode: mode,
+		})
+		if err != nil {
+			t.Fatalf("%s poll after attention bump: %v", mode, err)
+		}
+		if res.Changed || !res.ResyncRequired {
+			t.Fatalf("attention bump did not expire %s token: %+v", mode, res)
+		}
 	}
 }
 

@@ -17,18 +17,26 @@ type Server struct {
 	srv *http.Server
 	mux *http.ServeMux
 	log *slog.Logger
+	// cancel ends the service root context. Request contexts derive from
+	// it, so canceling ends long-lived handlers before Shutdown waits.
+	cancel context.CancelFunc
 }
 
 // New builds the server bound to :port with the shared route mux.
 func New(port int, log *slog.Logger) *Server {
 	mux := http.NewServeMux()
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{
-		mux: mux,
-		log: log,
+		mux:    mux,
+		log:    log,
+		cancel: cancel,
 		srv: &http.Server{
 			Addr:              fmt.Sprintf(":%d", port),
 			Handler:           mux,
 			ReadHeaderTimeout: 5 * time.Second,
+			BaseContext: func(net.Listener) context.Context {
+				return ctx
+			},
 		},
 	}
 }
@@ -51,9 +59,19 @@ func (s *Server) Start() error {
 	return nil
 }
 
-// Stop shuts the HTTP server down gracefully.
+// Stop ends the HTTP service. It cancels the root context first so SSE,
+// MJPEG, and other streaming handlers observe cancellation immediately,
+// then shuts the listener down gracefully. A handler that outlives the
+// shutdown budget is closed hard, and any unexpected close error is
+// reported. Stop is safe on repeated calls and when Start never ran or
+// failed.
 func (s *Server) Stop() {
+	s.cancel()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	_ = s.srv.Shutdown(ctx)
+	if err := s.srv.Shutdown(ctx); err != nil {
+		if cerr := s.srv.Close(); cerr != nil {
+			s.log.Error("http server close returned an error", "error", cerr)
+		}
+	}
 }

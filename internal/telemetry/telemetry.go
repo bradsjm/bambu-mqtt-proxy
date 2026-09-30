@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -723,6 +724,8 @@ func stringField(obj map[string]any, key string) (string, bool) {
 
 // numberField extracts a float from a JSON number or numeric string.
 // Bambu flips between the two encodings across fields and firmwares.
+// Nonfinite values (NaN, Inf, and spellings like "Infinity") are rejected:
+// they cannot enter merged state or break status JSON serialization.
 func numberField(obj map[string]any, key string) (float64, bool) {
 	v, ok := lookup(obj, key)
 	if !ok {
@@ -730,9 +733,15 @@ func numberField(obj map[string]any, key string) (float64, bool) {
 	}
 	switch n := v.(type) {
 	case float64:
+		if math.IsNaN(n) || math.IsInf(n, 0) {
+			return 0, false
+		}
 		return n, true
 	case string:
 		if parsed, err := strconv.ParseFloat(strings.TrimSpace(n), 64); err == nil {
+			if math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+				return 0, false
+			}
 			return parsed, true
 		}
 	}

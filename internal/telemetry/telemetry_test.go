@@ -1,8 +1,10 @@
 package telemetry
 
 import (
+	"encoding/json"
 	"io"
 	"log/slog"
+	"math"
 	"testing"
 
 	"bambu-mqtt-proxy/internal/activity"
@@ -573,5 +575,60 @@ func TestAMSSubBrandPersistsAcrossMetadataOnlyDelta(t *testing.T) {
 	st, _ = c.State("S1")
 	if slot := st.AMS[0].Slots[0]; slot.SubBrand != "" || slot.NozzleTempMin != nil {
 		t.Fatalf("empty slot kept metadata: %+v", slot)
+	}
+}
+
+func TestNumberFieldRejectsNonfinite(t *testing.T) {
+	obj := map[string]any{
+		"n_nan":   "NaN",
+		"n_inf":   "Inf",
+		"n_ninf":  "-Inf",
+		"n_infty": "Infinity",
+		"f_nan":   math.NaN(),
+		"f_inf":   math.Inf(1),
+		"f_ninf":  math.Inf(-1),
+		"ok_num":  12.5,
+		"ok_str":  "42",
+	}
+	for _, key := range []string{"n_nan", "n_inf", "n_ninf", "n_infty", "f_nan", "f_inf", "f_ninf"} {
+		if v, ok := numberField(obj, key); ok {
+			t.Fatalf("numberField(%q) = %v, want rejected", key, v)
+		}
+		if _, ok := intField(obj, key); ok {
+			t.Fatalf("intField(%q) accepted, want rejected", key)
+		}
+	}
+	if v, ok := numberField(obj, "ok_num"); !ok || v != 12.5 {
+		t.Fatalf("numberField(ok_num) = %v/%v, want 12.5/true", v, ok)
+	}
+	if v, ok := intField(obj, "ok_str"); !ok || v != 42 {
+		t.Fatalf("intField(ok_str) = %v/%v, want 42/true", v, ok)
+	}
+}
+
+func TestNonfiniteFieldsLeavePriorValuesAndValidJSON(t *testing.T) {
+	c := NewCache([]config.Printer{{Serial: "S1", Name: "Garage"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	c.ObserveReport("S1", 1, 1, []byte(`{"print":{"gcode_state":"RUNNING","nozzle_temper":220.5,"bed_temper":45,"mc_percent":33.5,"print_error":0}}`))
+
+	// Nonfinite values (string and float encodings) are ignored; valid
+	// siblings in the same report still merge.
+	c.ObserveReport("S1", 2, 1, []byte(`{"print":{"gcode_state":"RUNNING","nozzle_temper":"NaN","bed_temper":50,"mc_percent":"Inf","spd_lvl":"-Infinity","layer_num":7}}`))
+	st := c.Snapshot()[0]
+	if st.NozzleTemp == nil || *st.NozzleTemp != 220.5 {
+		t.Fatalf("nozzle after NaN report = %v, want prior 220.5", st.NozzleTemp)
+	}
+	if st.BedTemp == nil || *st.BedTemp != 50 {
+		t.Fatalf("bed = %v, want 50 from the same report", st.BedTemp)
+	}
+	if st.Progress != 33.5 {
+		t.Fatalf("progress = %v, want prior 33.5", st.Progress)
+	}
+	if st.LayerNum == nil || *st.LayerNum != 7 {
+		t.Fatalf("layer = %v, want 7 from the same report", st.LayerNum)
+	}
+
+	// Fleet status JSON must stay serializable after nonfinite input.
+	if _, err := json.Marshal(c.Snapshot()); err != nil {
+		t.Fatalf("snapshot JSON: %v", err)
 	}
 }

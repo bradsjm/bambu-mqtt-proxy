@@ -3,11 +3,14 @@
 package upstream
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"net"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,13 +28,12 @@ type Injector interface {
 	PublishDownstream(topic string, payload []byte, qos byte)
 }
 
-// ObserveFunc receives every upstream report. Seq is the per-connection
-// delivery token assigned when the paho message handler was entered; paho
-// runs handlers concurrently (SetOrderMatters is false), so the token lets
-// observers order merges conservatively. Gen is the upstream connection
-// generation captured under the connection lock at the same moment: a
-// report delivered on a dying connection can never be stamped with the
-// generation of the connection that replaced it.
+// ObserveFunc receives every upstream report before downstream forwarding.
+// Seq is the per-connection delivery token assigned under the report mutex;
+// reports from one transport are serialized in wire order, and a report from
+// a retired transport is rejected before the observer runs. Gen is the
+// generation of the transport the report arrived on, so a report can never
+// be stamped with the generation of the connection that replaced it.
 type ObserveFunc func(serial string, seq, gen uint64, payload []byte)
 
 // ConnectivityObserver receives established and lost upstream connections.
@@ -70,6 +72,8 @@ type Pool struct {
 	observe      ObserveFunc
 	connectivity ConnectivityObserver // observer copied to new connections
 	log          *slog.Logger
+	// closed makes shutdown terminal: no connection is created afterwards.
+	closed bool
 }
 
 // NewPool creates a pool; connections are created lazily per printer on first
@@ -94,7 +98,10 @@ func (p *Pool) EnsureConnected(serial string, timeout time.Duration) bool {
 	c, ok := p.existing(serial)
 	if !ok {
 		// No connection yet: engage one and wait within the budget.
-		return p.conn(serial).ensure(timeout)
+		c = p.conn(serial)
+		if c == nil {
+			return false
+		}
 	}
 	return c.ensure(timeout)
 }
@@ -104,58 +111,90 @@ func (p *Pool) EnsureConnected(serial string, timeout time.Duration) bool {
 // interest on a connected printer also requests the configured warmup, so
 // the newest subscriber converges to full state.
 func (p *Pool) Subscribe(serial, filter string, qos byte) {
-	p.conn(serial).subscribe(filter, qos)
+	p.RecordSubscribe(serial, filter, qos)()
+}
+
+// RecordSubscribe is Subscribe split in two: it records the reference at
+// once without network waits, and the returned function completes the
+// upstream work (connect, wire reconciliation, warmup). Callers that
+// serialize reference ownership under their own lock record inside it and
+// complete outside it. Completions reconcile the latest recorded state, so
+// running them in any order converges.
+func (p *Pool) RecordSubscribe(serial, filter string, qos byte) func() {
+	if c := p.conn(serial); c != nil {
+		return c.recordSubscribe(filter, qos)
+	}
+	return func() {}
 }
 
 // SubscribeAsync records downstream interest without waiting for upstream
 // connectivity. It engages the connection supervisor and returns at once;
-// onConnect resubscribes the merged filter set from the recorded refs once
-// the printer answers. Use it for long-lived internal interests whose first
-// delivery may wait for a printer that is offline at startup.
+// the supervisor reconciles the merged filter set from the recorded refs
+// once the printer answers. Use it for long-lived internal interests whose
+// first delivery may wait for a printer that is offline at startup.
 func (p *Pool) SubscribeAsync(serial, filter string, qos byte) {
-	p.conn(serial).subscribeAsync(filter, qos)
+	if c := p.conn(serial); c != nil {
+		c.subscribeAsync(filter, qos)
+	}
 }
 
 // Unsubscribe removes one downstream interest; the last removal unsubscribes
 // upstream.
 func (p *Pool) Unsubscribe(serial, filter string) {
+	p.RecordUnsubscribe(serial, filter)()
+}
+
+// RecordUnsubscribe removes one reference at once; the returned function
+// reconciles the wire. See RecordSubscribe.
+func (p *Pool) RecordUnsubscribe(serial, filter string) func() {
 	if c, ok := p.existing(serial); ok {
-		c.unsubscribe(filter)
+		return c.recordUnsubscribe(filter)
 	}
+	return func() {}
 }
 
 // RaiseQoS merges a repeated downstream interest's QoS into the stored
-// maximum for an existing connection without changing refcounts or
-// re-issuing the upstream subscription; reconnects restore the merged set at
-// the highest stored request. Unknown connections create no interest.
+// maximum for an existing connection without changing refcounts; the change
+// is reconciled onto the wire while connected, and reconnects restore the
+// merged set at the highest stored request. Unknown connections create no
+// interest.
 func (p *Pool) RaiseQoS(serial, filter string, qos byte) {
+	p.RecordRaiseQoS(serial, filter, qos)()
+}
+
+// RecordRaiseQoS merges the QoS at once; the returned function reconciles
+// the wire. See RecordSubscribe.
+func (p *Pool) RecordRaiseQoS(serial, filter string, qos byte) func() {
 	if c, ok := p.existing(serial); ok {
-		c.raiseQoS(filter, qos)
+		return c.recordRaiseQoS(filter, qos)
 	}
+	return func() {}
 }
 
 // Publish forwards a client request upstream. Fire-and-forget: when the
-// upstream is unavailable the message is dropped and logged, matching the
-// behavior of a dropped printer connection.
+// upstream cannot be established within the connect budget the message is
+// dropped and logged, matching the behavior of a dropped printer connection.
 func (p *Pool) Publish(serial, topic string, payload []byte, qos byte) {
 	p.PublishWithContext(serial, topic, payload, qos, PublishContext{Origin: "internal", Action: "publish"})
 }
 
 // PublishWithContext forwards a publish and records its source metadata in
-// the upstream publish audit logs.
+// the upstream publish audit logs. The first publish on an idle connection
+// engages the single-flight supervisor and waits one connect budget for the
+// printer; a request that cannot be delivered within the budget is dropped
+// without queueing or replay.
 func (p *Pool) PublishWithContext(serial, topic string, payload []byte, qos byte, publishContext PublishContext) {
-	if c, ok := p.existing(serial); ok {
+	if c := p.conn(serial); c != nil {
 		c.publish(topic, payload, qos, publishContext)
-		return
 	}
-	// Never published before: engage the connection lazily but do not block
-	// the publish path waiting for it.
-	p.conn(serial).publish(topic, payload, qos, publishContext)
 }
 
 // Stop disconnects every upstream connection and ends all supervisors.
+// Shutdown is terminal: later calls that would create a connection are
+// no-ops.
 func (p *Pool) Stop() {
 	p.mu.Lock()
+	p.closed = true
 	conns := make([]*Conn, 0, len(p.conns))
 	for _, c := range p.conns {
 		conns = append(conns, c)
@@ -181,13 +220,22 @@ func (p *Pool) Status() map[string]bool {
 	return out
 }
 
-// conn returns the connection for serial, creating it on first use.
+// conn returns the connection for serial, creating it on first use. It
+// returns nil after shutdown or for a serial outside the configured set;
+// callers treat nil as "nothing to do".
 func (p *Pool) conn(serial string) *Conn {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.closed {
+		return nil
+	}
+	spec, ok := p.specs[serial]
+	if !ok {
+		return nil
+	}
 	c, ok := p.conns[serial]
 	if !ok {
-		c = newConn(p.specs[serial], p.behavior, p.inject, p.observe, p.connectivity, p.log)
+		c = newConn(spec, p.behavior, p.inject, p.observe, p.connectivity, p.log)
 		p.conns[serial] = c
 		p.log.Info("upstream state created", "serial", serial, "address", c.spec.Address)
 	}
@@ -223,10 +271,10 @@ func (p *Pool) Generation(serial string) uint64 {
 	return c.generation
 }
 
-// PausePrint sends the pause command upstream. It fails unless the printer
-// is connected on exactly the generation the caller validated against, so a
-// decision made before a reconnect can never act on the new connection.
-// QoS 0 and the generation guard together make a replay across a reconnect
+// PausePrint sends the pause command upstream. It fails unless the printer is
+// connected on exactly the generation the caller validated against, so a
+// decision made before a reconnect can never act on the new connection. QoS 0
+// and the generation guard together make a replay across a reconnect
 // impossible; callers own retry policy and the proxy never retries.
 func (p *Pool) PausePrint(serial string, generation uint64) error {
 	c, ok := p.existing(serial)
@@ -307,12 +355,11 @@ func speedProfilePayload(profile int) string {
 	return fmt.Sprintf(`{"print":{"sequence_id":"0","command":"print_speed","param":"%d"}}`, profile)
 }
 
-// pause publishes the pause command after re-checking the connection
-// generation under the lock, and re-checks the connection again after the
-// publish: paho silently drops QoS 0 messages while reconnecting, so a
-// connection that changed during the publish means the command may never
-// have reached the printer. All rejection paths are errors; nothing is ever
-// republished.
+// pause publishes the pause command after validating the connection
+// generation under the lock. An admitted command attempts once on the
+// captured transport's client and never on a replacement, so a connection
+// that changed before admission means the command is rejected, never
+// republished. All rejection paths are errors.
 func (c *Conn) pause(generation uint64) error {
 	return c.command(generation, "pause", pausePayload())
 }
@@ -320,12 +367,19 @@ func (c *Conn) pause(generation uint64) error {
 // command publishes one guarded QoS 0 print command. The generation and
 // connection checks are shared by pause and speed-profile control.
 func (c *Conn) command(generation uint64, name, payload string) error {
-	c.mu.Lock()
-	gen, client, connected := c.generation, c.client, c.connectedLocked()
-	c.mu.Unlock()
 	topic := c.requestTopic()
 	ctx := PublishContext{Origin: "internal", Action: name}
-	if client == nil || !connected {
+	c.mu.Lock()
+	t := c.active
+	usable := !c.stopped && transportUsable(t)
+	gen := c.generation
+	var client mqtt.Client
+	if usable {
+		client = t.client
+		gen = t.generation
+	}
+	c.mu.Unlock()
+	if client == nil {
 		attrs := publishLogAttrs(ctx, c.spec.Serial, topic, 0, false, gen, 0, "not_sent", "none", "upstream is not connected")
 		c.log.Debug("printer command payload details", publishDebugLogAttrs(ctx, c.spec.Serial, topic, []byte(payload), 0, false, gen, 0, "not_sent", "none", "upstream is not connected")...)
 		c.log.Warn("printer command not attempted", attrs...)
@@ -339,23 +393,16 @@ func (c *Conn) command(generation uint64, name, payload string) error {
 		return fmt.Errorf("%s %s: connection generation changed (have %d, want %d)",
 			name, c.spec.Serial, gen, generation)
 	}
-	attemptID, tok, completed := c.publishUpstream(client, gen, ctx, topic, []byte(payload), 0, false)
+	_, tok, completed := c.publishUpstream(client, gen, ctx, topic, []byte(payload), 0, false)
 	if !completed {
 		return fmt.Errorf("%s %s: publish timed out after %s", name, c.spec.Serial, c.connectTO)
 	}
 	if err := tok.Error(); err != nil {
 		return fmt.Errorf("%s %s: %w", name, c.spec.Serial, err)
 	}
-	c.mu.Lock()
-	genNow, clientNow, connectedNow := c.generation, c.client, c.connectedLocked()
-	c.mu.Unlock()
-	if clientNow != client || !connectedNow || genNow != gen {
-		attrs := publishLogAttrs(ctx, c.spec.Serial, topic, 0, false, gen, attemptID, "local_qos0_complete", "local_only_no_broker_ack", "connection changed during publish")
-		attrs = append(attrs, "current_generation", genNow)
-		c.log.Debug("printer command payload details", publishDebugLogAttrs(ctx, c.spec.Serial, topic, []byte(payload), 0, false, gen, attemptID, "local_qos0_complete", "local_only_no_broker_ack", "connection changed during publish")...)
-		c.log.Warn("printer command connection changed during publish", attrs...)
-		return fmt.Errorf("%s %s: connection changed during publish", name, c.spec.Serial)
-	}
+	// No post-send generation check: transport identity already guarantees
+	// the command never moved to a replacement connection. A local QoS 0
+	// success proves delivery was attempted, not that the printer executed.
 	return nil
 }
 
@@ -423,7 +470,7 @@ func (s *subRefs) raise(filter string, qos byte) {
 	s.refs[filter] = subRef{count: prev.count, qos: qos}
 }
 
-// snapshot returns a copy of the merged filter set for resubscription.
+// snapshot returns a copy of the merged filter set for reconciliation.
 func (s *subRefs) snapshot() map[string]byte {
 	out := make(map[string]byte, len(s.refs))
 	for f, r := range s.refs {
@@ -437,10 +484,110 @@ func (s *subRefs) count(filter string) int {
 	return s.refs[filter].count
 }
 
-// Conn is the single upstream MQTT connection for one printer. The supervisor
-// retries the initial connect with capped exponential backoff; after the first
-// success paho AutoReconnect owns outage recovery (bounded by
-// MaxReconnectInterval = backoff max).
+// transport owns every resource of one connection attempt: its Paho client,
+// its dialed socket, and the loss signal the supervisor waits on. A transport
+// is used by exactly one attempt and is never reused after it fails, times
+// out, or is retired.
+type transport struct {
+	client mqtt.Client
+	// generation is assigned at installation, before any handler or
+	// subscription is registered, and never changes afterwards.
+	generation uint64
+
+	lost     chan struct{} // closed once when this transport loses the connection
+	lostOnce sync.Once
+	lostMu   sync.Mutex
+	lostErr  error
+
+	ctx    context.Context // the dial/handshake context for this attempt
+	cancel context.CancelFunc
+
+	sockMu sync.Mutex
+	sock   net.Conn
+
+	// onWire records the subscriptions live on this transport, with their
+	// granted QoS. Guarded only by Conn.subMu; a replacement transport
+	// starts empty.
+	onWire map[string]byte
+
+	// connectTok joins the outstanding Connect on teardown.
+	connectTok mqtt.Token
+}
+
+// signalLoss records why this transport lost the connection and closes its
+// loss channel once. Safe to call from the Paho loss callback: it never
+// touches the connection generation and never waits on tokens.
+func (t *transport) signalLoss(err error) {
+	t.lostMu.Lock()
+	if t.lostErr == nil {
+		t.lostErr = err
+	}
+	t.lostMu.Unlock()
+	t.lostOnce.Do(func() { close(t.lost) })
+}
+
+// lossErr returns the recorded loss cause, or nil when none was recorded.
+func (t *transport) lossErr() error {
+	t.lostMu.Lock()
+	defer t.lostMu.Unlock()
+	return t.lostErr
+}
+
+// adoptSocket registers conn as this transport's owned socket unless the
+// attempt context is already canceled; a dial losing that race closes its
+// result instead of registering it.
+func (t *transport) adoptSocket(conn net.Conn) error {
+	t.sockMu.Lock()
+	defer t.sockMu.Unlock()
+	if err := t.ctx.Err(); err != nil {
+		conn.Close()
+		return err
+	}
+	t.sock = conn
+	return nil
+}
+
+// takeSocket removes and returns the registered socket, if any.
+func (t *transport) takeSocket() net.Conn {
+	t.sockMu.Lock()
+	defer t.sockMu.Unlock()
+	sock := t.sock
+	t.sock = nil
+	return sock
+}
+
+// joinConnect waits for the attempt's Connect token to settle, bounded so a
+// wedged client cannot stall retirement or the next attempt.
+func (t *transport) joinConnect(bound time.Duration) {
+	if t.connectTok == nil {
+		return
+	}
+	select {
+	case <-t.connectTok.Done():
+	case <-time.After(bound):
+	}
+}
+
+// transportUsable reports whether t may carry traffic right now: it exists,
+// has a live client, has not signaled loss, and the client connection is
+// open. The caller pairs the result with other Conn state under c.mu.
+func transportUsable(t *transport) bool {
+	if t == nil || t.client == nil {
+		return false
+	}
+	select {
+	case <-t.lost:
+		return false
+	default:
+	}
+	return t.client.IsConnectionOpen()
+}
+
+// Conn is the single upstream MQTT connection for one printer. Its supervisor
+// is the only owner of connect and loss transitions: each attempt builds a
+// fresh, non-reconnecting Paho client and a dedicated transport, and the
+// supervisor retires that transport before every reconnect, so at most one
+// printer socket and client exist per connection at any time.
 type Conn struct {
 	spec        config.Printer
 	keepalive   time.Duration
@@ -455,35 +602,47 @@ type Conn struct {
 	connectivity ConnectivityObserver // observer called at connection boundaries
 	log          *slog.Logger
 
-	stopCh    chan struct{}
-	mu        sync.Mutex
-	client    mqtt.Client
+	// newClient builds the Paho client for one transport. Production code
+	// leaves it nil and the supervisor uses pahoClient; lifecycle tests
+	// inject a deterministic fake.
+	newClient func(*transport) mqtt.Client
+
+	stopCh chan struct{}
+	mu     sync.Mutex
+	// desired records that a supervisor should run; stopped is terminal.
+	desired bool
+	stopped bool
+	// connecting is the in-flight attempt's client, registered before
+	// Connect so shutdown can always tear it down.
+	connecting mqtt.Client
+	// active is the installed transport; nil while disconnected.
+	active *transport
+	// supDone closes when the supervisor goroutine exits; nil until started.
+	supDone chan struct{}
+	// subs is the desired interest set, guarded by mu.
 	subs      *subRefs
-	desired   bool
-	stopped   bool
 	backoffN  int
 	nextRetry time.Time
-	connCh    chan struct{} // closed (and replaced) on every successful connect
-	// generation changes on every connect and loss; the detection engine's
-	// pause guard compares it to the generation a decision was validated on.
+	// connCh is closed (and replaced) on every successful install, so any
+	// waiter captured while disconnected wakes on the next install.
+	connCh chan struct{}
+	// generation changes on every connect and every loss; the detection
+	// engine's pause guard compares it to the generation a decision was
+	// validated on. A transport's generation is assigned from it at install.
 	generation uint64
-	// lastFailureAt records the latest paho failure for reconnect delay logging.
-	lastFailureAt time.Time
-	// reportSeq hands each observed report its handler-entry order token.
+	// reportSeq hands each observed report its serialized order token.
 	reportSeq atomic.Uint64
 	// publishSeq identifies publish attempts within this printer connection.
 	publishSeq atomic.Uint64
-}
-
-// bumpGeneration advances the connection generation under the lock. Every
-// connect and loss calls it, so any transition changes the value the
-// detection engine validated a decision against.
-func (c *Conn) bumpGeneration() uint64 {
-	c.mu.Lock()
-	c.generation++
-	generation := c.generation
-	c.mu.Unlock()
-	return generation
+	// reportMu serializes report observation and injection in wire order and
+	// guards the short active-pointer transitions at install and retirement.
+	// Lock order: reportMu, then mu. Never taken while holding mu or subMu.
+	reportMu sync.Mutex
+	// subMu serializes wire reconciliation and guards each transport's
+	// onWire map. Intent (subs) is guarded by mu alone, so recording an
+	// interest never waits behind a reconciliation's token waits.
+	// Lock order: subMu, then mu. Never taken while holding mu or reportMu.
+	subMu sync.Mutex
 }
 
 // newConn builds the connection state for one printer. observe may be nil.
@@ -507,17 +666,18 @@ func newConn(spec config.Printer, behavior config.Behavior, inject Injector,
 }
 
 // ensure returns true when the connection is established within timeout.
-// While the supervisor is in backoff-wait it refuses immediately, per the
-// design: subscribe hooks never wait on a scheduled future retry.
+// While the supervisor is in backoff-wait it refuses immediately when the
+// scheduled retry falls outside the budget, per the design: hooks never wait
+// on a scheduled future retry.
 func (c *Conn) ensure(timeout time.Duration) bool {
 	c.mu.Lock()
-	if c.connectedLocked() {
-		c.mu.Unlock()
-		return true
-	}
 	if c.stopped {
 		c.mu.Unlock()
 		return false
+	}
+	if transportUsable(c.active) {
+		c.mu.Unlock()
+		return true
 	}
 	if !c.desired {
 		c.desired = true
@@ -534,209 +694,372 @@ func (c *Conn) ensure(timeout time.Duration) bool {
 	defer timer.Stop()
 	select {
 	case <-ch:
-		return c.isConnected()
 	case <-timer.C:
-		return c.isConnected()
 	case <-c.stopCh:
 		return false
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return !c.stopped && transportUsable(c.active)
 }
 
-// supervise retries the initial connect with capped exponential backoff until
-// the first success, then hands outage recovery to paho AutoReconnect.
+// supervise runs the single-flight connection loop until the connection is
+// stopped. Each iteration owns one attempt end to end: build a fresh client
+// and transport, connect, install on success, and wait for that transport's
+// loss or the stop signal. Every outage — refused connect, timeout, or loss —
+// retires the attempt's resources and waits the capped, jittered backoff
+// before trying again.
 func (c *Conn) supervise() {
+	c.mu.Lock()
+	if c.stopped || !c.desired || c.supDone != nil {
+		c.mu.Unlock()
+		return
+	}
+	done := make(chan struct{})
+	c.supDone = done
+	c.mu.Unlock()
+	defer close(done)
+
 	for {
-		c.mu.Lock()
-		if c.stopped || !c.desired {
-			c.mu.Unlock()
+		if !c.attempt() {
 			return
 		}
-		if c.client == nil {
-			c.client = c.newClientLocked()
-		}
-		client := c.client
-		attempt := c.backoffN + 1
-		c.mu.Unlock()
-
-		tok := client.Connect()
-		done := tok.WaitTimeout(c.connectTO + time.Second)
-		var connErr error
-		if !done {
-			connErr = fmt.Errorf("connect timed out after %s", c.connectTO)
-		} else {
-			connErr = tok.Error()
-		}
-		ok := done && connErr == nil
-
+		// An attempt ends in one of three ways: installed and then lost
+		// (backoff and retry), failed or abandoned before installation
+		// (backoff and retry), or stopped (return, handled inside attempt).
 		c.mu.Lock()
-		if ok {
-			c.backoffN = 0
-			c.nextRetry = time.Time{}
-			c.lastFailureAt = time.Time{}
-			close(c.connCh)
-			c.connCh = make(chan struct{})
-			c.mu.Unlock()
-			c.log.Info("upstream connected", "serial", c.spec.Serial, "address", c.spec.Address, "attempt", attempt)
+		stopped := c.stopped
+		d := time.Duration(0)
+		if !stopped {
+			c.backoffN++
+			d = nextBackoff(c.backoffN, c.backoffInit, c.backoffMax)
+			c.nextRetry = time.Now().Add(d)
+		}
+		c.mu.Unlock()
+		if stopped {
 			return
 		}
-		c.backoffN++
-		d := nextBackoff(c.backoffN, c.backoffInit, c.backoffMax)
-		c.nextRetry = time.Now().Add(d)
-		c.mu.Unlock()
 		c.log.Info("upstream backoff scheduled",
 			"serial", c.spec.Serial,
 			"address", c.spec.Address,
 			"state", "BACKOFF",
-			"attempt", attempt,
-			"retry_in", d.String(),
-			"error", errString(connErr))
-
+			"attempt", c.backoffN,
+			"retry_in", d.String())
+		timer := time.NewTimer(d)
 		select {
-		case <-time.After(d):
+		case <-timer.C:
+			timer.Stop()
 		case <-c.stopCh:
+			timer.Stop()
 			return
 		}
 	}
 }
 
-// onConnect is the paho OnConnect callback: re-issue the merged subscription
-// set and send the warmup commands so clients converge to full state.
-func (c *Conn) onConnect(_ mqtt.Client) {
+// attempt runs one connect cycle. It reports false only when the connection
+// was stopped and the supervisor should exit; a failed or lost attempt
+// returns true after scheduling backoff.
+func (c *Conn) attempt() bool {
 	c.mu.Lock()
-	reconnect := c.generation > 0
-	c.generation++
-	generation := c.generation
+	if c.stopped {
+		c.mu.Unlock()
+		return false
+	}
+	attempt := c.backoffN + 1
 	c.mu.Unlock()
+	c.log.Info("upstream connection attempt",
+		"serial", c.spec.Serial,
+		"address", c.spec.Address,
+		"state", "CONNECTING",
+		"attempt", attempt)
+
+	t := &transport{lost: make(chan struct{})}
+	t.ctx, t.cancel = context.WithCancel(context.Background())
+	if c.newClient != nil {
+		t.client = c.newClient(t)
+	} else {
+		t.client = c.pahoClient(t)
+	}
+
+	// Register the in-flight client before Connect so shutdown can always
+	// reach it, even while it is dialing.
+	c.mu.Lock()
+	if c.stopped {
+		c.mu.Unlock()
+		c.abandonAttempt(t, nil)
+		return false
+	}
+	c.connecting = t.client
+	c.mu.Unlock()
+
+	tok := t.client.Connect()
+	t.connectTok = tok
+	timer := time.NewTimer(c.connectTO + time.Second)
+	var connectErr error
+	timedOut := false
+	select {
+	case <-tok.Done():
+		timer.Stop()
+		connectErr = tok.Error()
+	case <-timer.C:
+		timedOut = true
+		connectErr = fmt.Errorf("connect timed out after %s", c.connectTO)
+	case <-c.stopCh:
+		timer.Stop()
+		// Recheck stopped after a late successful Connect: the client is
+		// torn down without subscriptions or warmup, and no replacement
+		// attempt is started.
+		c.abandonAttempt(t, tok)
+		return false
+	}
+
+	c.mu.Lock()
+	stopped := c.stopped
+	c.mu.Unlock()
+	if stopped {
+		c.abandonAttempt(t, tok)
+		return false
+	}
+	if timedOut || connectErr != nil {
+		c.abandonAttempt(t, tok)
+		c.log.Info("upstream connect attempt failed",
+			"serial", c.spec.Serial,
+			"address", c.spec.Address,
+			"attempt", attempt,
+			"error", errString(connectErr))
+		return true
+	}
+
+	// Success: install the transport. The generation is assigned before any
+	// handler or subscription exists, so no report can carry a generation
+	// the connection never advertised.
+	c.reportMu.Lock()
+	c.mu.Lock()
+	if c.stopped {
+		c.mu.Unlock()
+		c.reportMu.Unlock()
+		c.abandonAttempt(t, tok)
+		return false
+	}
+	c.generation++
+	t.generation = c.generation
+	c.active = t
+	c.connecting = nil
+	c.backoffN = 0
+	c.nextRetry = time.Time{}
+	reconnect := c.generation > 1
+	close(c.connCh)
+	c.connCh = make(chan struct{})
+	c.mu.Unlock()
+	c.reportMu.Unlock()
+
+	c.log.Info("upstream connected",
+		"serial", c.spec.Serial,
+		"address", c.spec.Address,
+		"attempt", attempt)
 	if c.connectivity != nil {
 		c.connectivity(c.spec.Serial, true, nil)
 	}
-	c.mu.Lock()
-	subs := c.subs.snapshot()
-	client := c.client
-	c.mu.Unlock()
 
-	restored := 0
-	pending := 0
-	for f, q := range subs {
-		tok := client.Subscribe(f, q, c.onMessage)
-		if !tok.WaitTimeout(c.connectTO) {
-			// Fire-and-forget: the command was handed to the connection; a
-			// slow broker ack may trail the wait budget.
-			pending++
-			continue
-		}
-		if err := tok.Error(); err != nil {
-			c.log.Warn("upstream resubscribe failed", "serial", c.spec.Serial, "filter", f, "connection_generation", generation, "error", errString(err))
-			continue
-		}
-		restored++
-	}
-	if len(subs) > 0 {
-		c.log.Info("upstream subscriptions restored",
-			"serial", c.spec.Serial,
-			"connection_generation", generation,
-			"reconnect", reconnect,
-			"filters", len(subs),
-			"restored", restored,
-			"pending", pending)
-	}
-	c.log.Info("upstream connection ready", "serial", c.spec.Serial, "connection_generation", generation, "reconnect", reconnect)
+	// Restore the complete desired subscription set on the fresh transport,
+	// then warm up once so subscribers converge to full state.
+	c.subMu.Lock()
+	c.reconcileSubsLocked()
+	c.subMu.Unlock()
 	reason := "initial_connect"
 	if reconnect {
 		reason = "reconnect"
 	}
+	c.log.Info("upstream connection ready",
+		"serial", c.spec.Serial,
+		"connection_generation", t.generation,
+		"reconnect", reconnect)
 	c.sendWarmup(reason)
+
+	// Own this transport until it loses the connection or the connection is
+	// stopped.
+	select {
+	case <-t.lost:
+		// Stop may have raced the loss; prefer the silent shutdown path.
+		select {
+		case <-c.stopCh:
+			c.retire(t, false)
+			return false
+		default:
+		}
+		c.retire(t, true)
+		return true
+	case <-c.stopCh:
+		c.retire(t, false)
+		return false
+	}
 }
 
-// sendWarmup publishes the configured warmup commands so the printer pushes
-// its full state and every subscriber converges without client action. It is
-// a no-op while the upstream is disconnected: onConnect warms up on every
-// successful (re)connect, which covers interests recorded during an outage.
-func (c *Conn) sendWarmup(reason string) {
+// abandonAttempt tears down an attempt that never installed: cancel the dial
+// context, close any socket it registered, disconnect the client (a connecting
+// client may not report IsConnected), and join the outstanding Connect token
+// so the next attempt starts clean.
+func (c *Conn) abandonAttempt(t *transport, tok mqtt.Token) {
+	t.cancel()
+	if sock := t.takeSocket(); sock != nil {
+		sock.Close()
+	}
+	if t.client != nil {
+		t.client.Disconnect(250)
+	}
+	t.joinConnect(c.connectTO)
 	c.mu.Lock()
-	client, connected, generation := c.client, c.connectedLocked(), c.generation
+	if c.connecting == t.client {
+		c.connecting = nil
+	}
 	c.mu.Unlock()
-	if client == nil || !connected {
-		c.log.Debug("upstream warmup skipped", "serial", c.spec.Serial, "reason", reason, "connection_generation", generation, "cause", "upstream_unavailable")
+}
+
+// retire tears down an installed transport. notify selects whether the loss
+// reaches the connectivity observer and logs: outages report, shutdown stays
+// silent. The transport is removed under the report mutex so an in-flight
+// report callback either finishes first or is rejected, and the generation
+// advances so stale evidence goes stale.
+func (c *Conn) retire(t *transport, notify bool) {
+	t.cancel()
+	if sock := t.takeSocket(); sock != nil {
+		sock.Close()
+	}
+	t.client.Disconnect(250)
+	t.joinConnect(c.connectTO)
+
+	c.reportMu.Lock()
+	c.mu.Lock()
+	generation := t.generation
+	if c.active == t {
+		c.active = nil
+		c.generation++
+		generation = c.generation
+	}
+	if c.connecting == t.client {
+		c.connecting = nil
+	}
+	c.mu.Unlock()
+	c.reportMu.Unlock()
+
+	if !notify {
 		return
 	}
-	warmupCompleted := 0
-	for _, cmd := range c.warmup {
-		ctx := PublishContext{Origin: "internal", Action: "warmup", Reason: reason}
-		_, tok, completed := c.publishUpstream(client, generation, ctx, c.requestTopic(), []byte(cmd), 0, false)
-		if !completed || tok.Error() != nil {
-			continue
-		}
-		warmupCompleted++
+	err := t.lossErr()
+	if err == nil {
+		err = fmt.Errorf("connection lost")
 	}
-	if len(c.warmup) > 0 {
-		c.log.Info("upstream warmup publish attempts complete", "serial", c.spec.Serial, "reason", reason, "connection_generation", generation, "commands", len(c.warmup), "completed", warmupCompleted, "failed", len(c.warmup)-warmupCompleted)
-	}
-}
-
-// onLost is the paho ConnectionLost callback.
-func (c *Conn) onLost(_ mqtt.Client, err error) {
-	generation := c.bumpGeneration()
 	if c.connectivity != nil {
 		c.connectivity(c.spec.Serial, false, err)
 	}
-	c.mu.Lock()
-	c.lastFailureAt = time.Now()
-	c.mu.Unlock()
 	c.log.Warn("upstream connection lost",
 		"serial", c.spec.Serial,
-		"state", "RECONNECTING",
-		"connection_generation", generation,
+		"state", "BACKOFF",
+		"connection_generation", t.generation,
+		"current_generation", generation,
 		"backoff_max", c.backoffMax.String(),
 		"error", errString(err))
 }
 
-// onConnectionNotification logs paho connection attempts and failures,
-// including the measured delay between automatic reconnect attempts.
-func (c *Conn) onConnectionNotification(_ mqtt.Client, notification mqtt.ConnectionNotification) {
-	switch n := notification.(type) {
-	case mqtt.ConnectionNotificationConnecting:
-		state := "CONNECTING"
-		retryAfter := ""
-		if n.IsReconnect {
-			state = "RECONNECTING"
-			c.mu.Lock()
-			if !c.lastFailureAt.IsZero() {
-				retryAfter = time.Since(c.lastFailureAt).Round(time.Millisecond).String()
-			}
-			c.mu.Unlock()
-		}
-		c.log.Info("upstream connection attempt",
-			"serial", c.spec.Serial,
-			"address", c.spec.Address,
-			"state", state,
-			"attempt", n.Attempt+1,
-			"retry_after", retryAfter)
-	case mqtt.ConnectionNotificationFailed:
-		c.mu.Lock()
-		c.lastFailureAt = time.Now()
-		c.mu.Unlock()
-		c.log.Info("upstream connection attempt failed",
-			"serial", c.spec.Serial,
-			"address", c.spec.Address,
-			"state", "BACKOFF",
-			"error", errString(n.Reason))
+// pahoClient builds the non-reconnecting Paho client for one transport. The
+// loss callback only signals the transport; the supervisor owns every other
+// transition. The custom open-connection function registers the dialed socket
+// on the transport so retirement owns the printer socket, not just the client.
+func (c *Conn) pahoClient(t *transport) mqtt.Client {
+	scheme := "tcp"
+	if c.spec.TLS {
+		scheme = "ssl"
 	}
+	opts := mqtt.NewClientOptions().
+		AddBroker(scheme + "://" + c.spec.Address).
+		SetClientID("bmbpx-" + c.spec.Serial).
+		SetUsername(c.spec.Username).
+		SetPassword(c.spec.Password).
+		SetCleanSession(true).
+		SetAutoReconnect(false).
+		SetConnectRetry(false).
+		SetOrderMatters(true).
+		SetConnectTimeout(c.connectTO).
+		SetStore(mqtt.NewMemoryStore()).
+		SetKeepAlive(c.keepalive).
+		SetPingTimeout(10 * time.Second).
+		SetCustomOpenConnectionFn(func(uri *url.URL, options mqtt.ClientOptions) (net.Conn, error) {
+			return c.openSocket(t, uri, options)
+		}).
+		SetConnectionLostHandler(func(_ mqtt.Client, err error) {
+			t.signalLoss(err)
+		})
+	if c.spec.TLS {
+		opts.SetTLSConfig(&tls.Config{InsecureSkipVerify: c.spec.InsecureSkipVerify})
+	}
+	return mqtt.NewClient(opts)
 }
 
-// onMessage forwards an upstream report into the downstream broker; the broker
-// fans it out to every subscribed downstream client.
-func (c *Conn) onMessage(_ mqtt.Client, msg mqtt.Message) {
+// openSocket dials the printer with the attempt context so cancellation beats
+// any dial or handshake, and registers the result on the transport. TLS
+// verification policy is preserved from the configured options.
+func (c *Conn) openSocket(t *transport, uri *url.URL, options mqtt.ClientOptions) (net.Conn, error) {
+	timeout := options.ConnectTimeout
+	if timeout <= 0 {
+		timeout = c.connectTO
+	}
+	dialer := &net.Dialer{Timeout: timeout}
+	var conn net.Conn
+	var err error
+	switch uri.Scheme {
+	case "ssl", "tls", "mqtts", "mqtt+ssl", "tcps":
+		cfg := options.TLSConfig
+		if cfg == nil {
+			cfg = &tls.Config{}
+		}
+		cfg = cfg.Clone()
+		if cfg.ServerName == "" {
+			cfg.ServerName = uri.Hostname()
+		}
+		conn, err = (&tls.Dialer{NetDialer: dialer, Config: cfg}).DialContext(t.ctx, "tcp", uri.Host)
+	default:
+		conn, err = dialer.DialContext(t.ctx, "tcp", uri.Host)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if derr := t.adoptSocket(conn); derr != nil {
+		return nil, derr
+	}
+	return conn, nil
+}
+
+// failTransport records why a transport's subscription state can no longer be
+// trusted and signals its loss once, so the supervisor retires it and
+// reconnects to restore the complete desired set. A healthy-looking connection
+// with unknown subscription state never survives.
+func (c *Conn) failTransport(t *transport, err error) {
+	c.log.Warn("upstream subscription state unknown; reconnecting",
+		"serial", c.spec.Serial,
+		"connection_generation", t.generation,
+		"error", errString(err))
+	t.signalLoss(err)
+}
+
+// onMessage forwards an upstream report into the downstream broker under the
+// report mutex. The transport binding rejects reports from a retired
+// transport before sequence assignment, observation, or injection, so an old
+// connection's callback can never arrive after a replacement's report.
+func (c *Conn) onMessage(t *transport, msg mqtt.Message) {
+	c.reportMu.Lock()
 	c.mu.Lock()
-	seq := c.reportSeq.Add(1)
-	generation := c.generation
+	current := c.active == t
+	generation := t.generation
 	c.mu.Unlock()
+	if !current {
+		c.reportMu.Unlock()
+		return
+	}
+	seq := c.reportSeq.Add(1)
 	if c.observe != nil {
-		// Assign the ordering token and capture the connection generation
-		// at handler entry, before any waiting: entry order approximates
-		// wire order under paho's concurrent dispatch, observers drop
-		// stragglers from older reports, and the entry-time generation
-		// proves the report belongs to the connection it arrived on.
+		// Wire order is preserved: Paho dispatches synchronously
+		// (SetOrderMatters) and this mutex serializes across transports, so
+		// sequence tokens are monotonic in delivery order.
 		c.observe(c.spec.Serial, seq, generation, msg.Payload())
 	}
 	c.log.Debug("printer report received", "origin", "printer", "action", "report", "serial", c.spec.Serial, "topic", msg.Topic(), "payload", string(msg.Payload()), "qos", msg.Qos(), "retain", msg.Retained(), "dup", msg.Duplicate(), "connection_generation", generation, "sequence", seq, "delivery", "received")
@@ -745,6 +1068,14 @@ func (c *Conn) onMessage(_ mqtt.Client, msg mqtt.Message) {
 		qos = 1
 	}
 	c.inject.PublishDownstream(msg.Topic(), msg.Payload(), qos)
+	c.reportMu.Unlock()
+}
+
+// reportHandler binds the report callback to one immutable transport.
+func (c *Conn) reportHandler(t *transport) mqtt.MessageHandler {
+	return func(_ mqtt.Client, msg mqtt.Message) {
+		c.onMessage(t, msg)
+	}
 }
 
 // reportFilter maps a downstream filter to this printer's exact report topic;
@@ -756,18 +1087,23 @@ func (c *Conn) reportFilter(filter string) string {
 	return fmt.Sprintf("device/%s/report", c.spec.Serial)
 }
 
-// subscribe records the filter and subscribes upstream when connected. A new
-// downstream interest on a connected printer also requests the configured
-// warmup, so late subscribers converge to full state. At a fresh connect the
-// restore pass and this path can both issue the SUBSCRIBE and a warmup; the
-// printer treats both as idempotent.
+// subscribe records the filter and reconciles it upstream when connected. A
+// new downstream interest on a connected printer also requests the configured
+// warmup, so late subscribers converge to full state; one subscription
+// operation produces one warmup.
 func (c *Conn) subscribe(filter string, qos byte) {
+	c.recordSubscribe(filter, qos)()
+}
+
+// recordSubscribe records the interest under mu and returns the upstream
+// completion; see Pool.RecordSubscribe.
+func (c *Conn) recordSubscribe(filter string, qos byte) func() {
 	// Upstream subscriptions cover report-leaf filters only. Subscribing to
 	// request filters upstream would make the printer broker echo proxied
 	// requests back to the proxy and out to downstream subscribers.
 	filter = c.reportFilter(filter)
 	if filter == "" {
-		return
+		return func() {}
 	}
 	if qos > 1 {
 		qos = 1
@@ -775,44 +1111,38 @@ func (c *Conn) subscribe(filter string, qos byte) {
 	c.mu.Lock()
 	first := c.subs.add(filter, qos)
 	c.mu.Unlock()
+	return func() { c.completeSubscribe(first) }
+}
 
+// completeSubscribe connects, reconciles, and warms up after an interest
+// was recorded; first reports whether it was the filter's first reference.
+func (c *Conn) completeSubscribe(first bool) {
 	if !first {
-		// The interest is already merged upstream, but the new subscriber
-		// still needs full state. The first-interest path or onConnect
-		// warms again once the subscription is ready, covering subscribers
-		// registered meanwhile.
+		// The report interest is already live; this late subscriber needs
+		// full state, not another upstream subscription. Its QoS may have
+		// raised the desired maximum, so reconcile the wire first.
+		c.subMu.Lock()
+		c.reconcileSubsLocked()
+		c.subMu.Unlock()
 		c.sendWarmup("subscriber_added")
 		return
 	}
 	if !c.ensure(c.connectTO) {
-		// Recorded; paho resubscribes from the merged set in onConnect once
-		// the printer returns, and onConnect sends the warmup.
+		// Recorded; the supervisor reconciles the merged set at connect and
+		// its restoration warmup covers this subscriber.
 		return
 	}
-	c.mu.Lock()
-	client := c.client
-	c.mu.Unlock()
-
-	tok := client.Subscribe(filter, qos, c.onMessage)
-	if tok.WaitTimeout(c.connectTO) && tok.Error() == nil {
-		c.mu.Lock()
-		refs := c.subs.count(filter)
-		c.mu.Unlock()
-		c.log.Info("upstream subscribed", "serial", c.spec.Serial, "filter", filter, "refs", refs, "qos", qos)
-		// Report subscription is ready: request full state for this
-		// subscriber. At a fresh connect this can duplicate onConnect's own
-		// warmup; repeated pushall is an idempotent state snapshot.
-		c.sendWarmup("subscription_ready")
-		return
-	}
-	// Recorded; onConnect resubscribes after the next recovery.
-	c.log.Warn("upstream subscribe failed", "serial", c.spec.Serial, "filter", filter, "error", errString(tok.Error()))
+	c.subMu.Lock()
+	c.reconcileSubsLocked()
+	c.subMu.Unlock()
+	// Report subscription is ready: request full state for this subscriber.
+	c.sendWarmup("subscription_ready")
 }
 
 // subscribeAsync records the filter and engages the connection supervisor
-// without waiting for it. The recorded interest survives printer outages:
-// onConnect resubscribes the whole merged set when the printer returns,
-// which is the same path a subscribe that lost the ensure race relies on.
+// without waiting for it. The recorded interest survives printer outages: the
+// supervisor reconciles the whole merged set once the printer answers, which
+// is the same path a subscribe that lost the ensure race relies on.
 func (c *Conn) subscribeAsync(filter string, qos byte) {
 	filter = c.reportFilter(filter)
 	if filter == "" {
@@ -823,12 +1153,22 @@ func (c *Conn) subscribeAsync(filter string, qos byte) {
 	}
 	c.mu.Lock()
 	first := c.subs.add(filter, qos)
+	c.mu.Unlock()
+	c.mu.Lock()
 	alreadyDesired := c.desired || c.stopped
 	if !alreadyDesired {
 		c.desired = true
 		go c.supervise()
 	}
+	usable := !c.stopped && transportUsable(c.active)
 	c.mu.Unlock()
+	if usable {
+		// A transport may already be live (the supervisor is idle); push the
+		// new interest onto it now instead of waiting for a reconnect.
+		c.subMu.Lock()
+		c.reconcileSubsLocked()
+		c.subMu.Unlock()
+	}
 	if !first {
 		return
 	}
@@ -836,34 +1176,43 @@ func (c *Conn) subscribeAsync(filter string, qos byte) {
 		"serial", c.spec.Serial, "filter", filter, "qos", qos, "mode", "async")
 }
 
-// unsubscribe removes one interest; the last removal unsubscribes upstream.
+// unsubscribe removes one interest; the last removal unsubscribes upstream
+// through reconciliation.
 func (c *Conn) unsubscribe(filter string) {
+	c.recordUnsubscribe(filter)()
+}
+
+// recordUnsubscribe removes the reference under mu and returns the wire
+// reconciliation for a last removal.
+func (c *Conn) recordUnsubscribe(filter string) func() {
 	filter = c.reportFilter(filter)
 	if filter == "" {
-		return
+		return func() {}
 	}
 	c.mu.Lock()
 	last := c.subs.remove(filter)
-	client, connected := c.client, c.connectedLocked()
 	c.mu.Unlock()
-
-	if last && connected {
-		tok := client.Unsubscribe(filter)
-		if tok.WaitTimeout(c.connectTO) && tok.Error() == nil {
-			c.log.Info("upstream unsubscribed", "serial", c.spec.Serial, "filter", filter)
-			return
-		}
-		c.log.Warn("upstream unsubscribe failed", "serial", c.spec.Serial, "filter", filter, "error", errString(tok.Error()))
+	if !last {
+		return func() {}
 	}
+	return c.reconcileSubs
 }
 
 // raiseQoS merges a repeated interest's QoS into the stored maximum without
-// changing refcounts, so a reconnect restores the merged set at the highest
-// downstream request. Request-only filters have no upstream interest.
+// changing refcounts, then reconciles: while connected a higher stored request
+// upgrades the wire subscription; while offline the reconnect restores the
+// merged set at the highest downstream request. Request-only filters have no
+// upstream interest.
 func (c *Conn) raiseQoS(filter string, qos byte) {
+	c.recordRaiseQoS(filter, qos)()
+}
+
+// recordRaiseQoS merges the QoS under mu and returns the wire
+// reconciliation.
+func (c *Conn) recordRaiseQoS(filter string, qos byte) func() {
 	filter = c.reportFilter(filter)
 	if filter == "" {
-		return
+		return func() {}
 	}
 	if qos > 1 {
 		qos = 1
@@ -871,17 +1220,130 @@ func (c *Conn) raiseQoS(filter string, qos byte) {
 	c.mu.Lock()
 	c.subs.raise(filter, qos)
 	c.mu.Unlock()
+	return c.reconcileSubs
 }
 
-// publish forwards a client request upstream, fire-and-forget.
-func (c *Conn) publish(topic string, payload []byte, qos byte, publishContext PublishContext) {
+// reconcileSubs runs reconcileSubsLocked under subMu.
+func (c *Conn) reconcileSubs() {
+	c.subMu.Lock()
+	c.reconcileSubsLocked()
+	c.subMu.Unlock()
+}
+
+// reconcileSubsLocked converges the active transport's wire subscriptions to
+// the desired interest set: subscribe missing filters and QoS increases,
+// unsubscribe filters no longer desired, and record grants only after the
+// broker confirms them. Caller holds c.subMu. Any failure — timeout, missing
+// grant, 0x80, lower-QoS grant, or token error — retires the transport via a
+// loss signal rather than leaving unknown subscription state behind.
+func (c *Conn) reconcileSubsLocked() {
 	c.mu.Lock()
-	client, connected, generation := c.client, c.connectedLocked(), c.generation
+	if c.stopped {
+		c.mu.Unlock()
+		return
+	}
+	t := c.active
+	desired := c.subs.snapshot()
 	c.mu.Unlock()
+	if !transportUsable(t) {
+		// Nothing to reconcile onto; the supervisor restores the full set at
+		// the next install.
+		return
+	}
+	if t.onWire == nil {
+		t.onWire = make(map[string]byte)
+	}
+	subscribed, removed := 0, 0
+	for f, q := range desired {
+		cur, have := t.onWire[f]
+		if have && cur >= q {
+			continue
+		}
+		tok := t.client.Subscribe(f, q, c.reportHandler(t))
+		if !tok.WaitTimeout(c.connectTO) {
+			c.failTransport(t, fmt.Errorf("subscribe %q timed out after %s", f, c.connectTO))
+			return
+		}
+		granted, ok := subscribeGrant(tok, f, q)
+		if !ok {
+			c.failTransport(t, fmt.Errorf("subscribe %q not granted at QoS %d (granted 0x%02x)", f, q, granted))
+			return
+		}
+		t.onWire[f] = granted
+		subscribed++
+	}
+	for f := range t.onWire {
+		if _, want := desired[f]; want {
+			continue
+		}
+		tok := t.client.Unsubscribe(f)
+		if !tok.WaitTimeout(c.connectTO) {
+			c.failTransport(t, fmt.Errorf("unsubscribe %q timed out after %s", f, c.connectTO))
+			return
+		}
+		if err := tok.Error(); err != nil {
+			c.failTransport(t, fmt.Errorf("unsubscribe %q: %w", f, err))
+			return
+		}
+		delete(t.onWire, f)
+		removed++
+	}
+	if subscribed > 0 || removed > 0 {
+		c.log.Info("upstream subscriptions restored",
+			"serial", c.spec.Serial,
+			"connection_generation", t.generation,
+			"filters", len(desired),
+			"restored", subscribed,
+			"removed", removed)
+	}
+}
+
+// subscribeGrant inspects a completed Subscribe token for the broker's grant
+// of filter. Paho reports rejections through the per-filter result map, so
+// the map is authoritative when the token provides one: a missing grant, a
+// 0x80 code, or a grant below the request is a failure.
+func subscribeGrant(tok mqtt.Token, filter string, requested byte) (byte, bool) {
+	if err := tok.Error(); err != nil {
+		return 0, false
+	}
+	if gr, ok := tok.(interface{ Result() map[string]byte }); ok {
+		granted, have := gr.Result()[filter]
+		if !have || granted >= 0x80 || granted < requested {
+			return granted, false
+		}
+		return granted, true
+	}
+	// Tokens without a per-filter result report success only through the
+	// token error, already checked above.
+	return requested, true
+}
+
+// publish forwards a client request upstream, fire-and-forget. The first
+// publish engages the supervisor and waits one connect budget; a request that
+// cannot be delivered in time is logged and dropped, never queued or replayed.
+func (c *Conn) publish(topic string, payload []byte, qos byte, publishContext PublishContext) {
 	if qos > 1 {
 		qos = 1
 	}
-	if client == nil || !connected {
+	if !c.ensure(c.connectTO) {
+		c.mu.Lock()
+		generation := c.generation
+		c.mu.Unlock()
+		c.log.Warn("upstream publish not attempted", publishLogAttrs(publishContext, c.spec.Serial, topic, qos, false, generation, 0, "not_sent", "none", "upstream is unavailable")...)
+		c.log.Debug("upstream publish payload details", publishDebugLogAttrs(publishContext, c.spec.Serial, topic, payload, qos, false, generation, 0, "not_sent", "none", "upstream is unavailable")...)
+		return
+	}
+	c.mu.Lock()
+	t := c.active
+	usable := !c.stopped && transportUsable(t)
+	generation := c.generation
+	var client mqtt.Client
+	if usable {
+		client = t.client
+		generation = t.generation
+	}
+	c.mu.Unlock()
+	if client == nil {
 		c.log.Warn("upstream publish not attempted", publishLogAttrs(publishContext, c.spec.Serial, topic, qos, false, generation, 0, "not_sent", "none", "upstream is unavailable")...)
 		c.log.Debug("upstream publish payload details", publishDebugLogAttrs(publishContext, c.spec.Serial, topic, payload, qos, false, generation, 0, "not_sent", "none", "upstream is unavailable")...)
 		return
@@ -889,8 +1351,9 @@ func (c *Conn) publish(topic string, payload []byte, qos byte, publishContext Pu
 	c.publishUpstream(client, generation, publishContext, topic, payload, qos, false)
 }
 
-// publishUpstream logs the publish attempt before handing it to Paho. Its
-// token completes locally for QoS 0, and after broker PUBACK for QoS 1.
+// publishUpstream logs the publish attempt before handing it to Paho, then
+// sends only through the captured client. Its token completes locally for
+// QoS 0, and after broker PUBACK for QoS 1.
 func (c *Conn) publishUpstream(client mqtt.Client, generation uint64, publishContext PublishContext, topic string, payload []byte, qos byte, retain bool) (uint64, mqtt.Token, bool) {
 	attemptID := c.publishSeq.Add(1)
 	c.log.Debug("upstream publish attempt", publishDebugLogAttrs(publishContext, c.spec.Serial, topic, payload, qos, retain, generation, attemptID, "attempted", "not_yet_observed", "")...)
@@ -979,28 +1442,66 @@ func publishDebugLogAttrs(publishContext PublishContext, serial, topic string, p
 	return attrs
 }
 
-// stop ends the supervisor and disconnects the upstream session.
-func (c *Conn) stop() {
+// sendWarmup publishes the configured warmup commands through the active
+// transport's client so the printer pushes its full state and every
+// subscriber converges without client action. It is a no-op while the
+// upstream is unavailable.
+func (c *Conn) sendWarmup(reason string) {
 	c.mu.Lock()
-	if c.stopped {
-		c.mu.Unlock()
+	t := c.active
+	usable := !c.stopped && transportUsable(t)
+	generation := c.generation
+	var client mqtt.Client
+	if usable {
+		client = t.client
+		generation = t.generation
+	}
+	c.mu.Unlock()
+	if client == nil {
+		c.log.Debug("upstream warmup skipped", "serial", c.spec.Serial, "reason", reason, "connection_generation", generation, "cause", "upstream_unavailable")
 		return
 	}
-	c.stopped = true
-	c.desired = false
-	client := c.client
-	close(c.stopCh)
+	warmupCompleted := 0
+	for _, cmd := range c.warmup {
+		ctx := PublishContext{Origin: "internal", Action: "warmup", Reason: reason}
+		_, tok, completed := c.publishUpstream(client, generation, ctx, c.requestTopic(), []byte(cmd), 0, false)
+		if !completed || tok.Error() != nil {
+			continue
+		}
+		warmupCompleted++
+	}
+	if len(c.warmup) > 0 {
+		c.log.Info("upstream warmup publish attempts complete", "serial", c.spec.Serial, "reason", reason, "connection_generation", generation, "commands", len(c.warmup), "completed", warmupCompleted, "failed", len(c.warmup)-warmupCompleted)
+	}
+}
+
+// stop ends the supervisor and disconnects the upstream session. Repeated
+// calls wait for the same completion, so callers never observe a connection
+// that is still tearing down. A never-started supervisor has an
+// already-complete shutdown path.
+func (c *Conn) stop() {
+	c.mu.Lock()
+	if !c.stopped {
+		c.stopped = true
+		c.desired = false
+		close(c.stopCh)
+	}
+	client := c.connecting
+	done := c.supDone
 	c.mu.Unlock()
-	if client != nil && client.IsConnected() {
+	// An in-flight client is disconnected even though IsConnected is false:
+	// only the supervisor knows whether it is mid-connect.
+	if client != nil {
 		client.Disconnect(250)
+	}
+	if done != nil {
+		<-done
 	}
 }
 
 // connectedLocked reports session state; caller must hold c.mu.
 func (c *Conn) connectedLocked() bool {
-	// IsConnectionOpen, not IsConnected: paho reports IsConnected=true while
-	// auto-reconnecting, which would wrongly pass availability gates.
-	return c.client != nil && c.client.IsConnectionOpen()
+	return !c.stopped && transportUsable(c.active)
 }
 
 // isConnected reports session state.
@@ -1013,34 +1514,6 @@ func (c *Conn) isConnected() bool {
 // requestTopic is the command topic for this printer.
 func (c *Conn) requestTopic() string {
 	return fmt.Sprintf("device/%s/request", c.spec.Serial)
-}
-
-// newClientLocked builds the paho client; caller must hold c.mu.
-func (c *Conn) newClientLocked() mqtt.Client {
-	scheme := "tcp"
-	if c.spec.TLS {
-		scheme = "ssl"
-	}
-	opts := mqtt.NewClientOptions().
-		AddBroker(scheme + "://" + c.spec.Address).
-		SetClientID("bmbpx-" + c.spec.Serial).
-		SetUsername(c.spec.Username).
-		SetPassword(c.spec.Password).
-		SetCleanSession(true).
-		SetAutoReconnect(true).
-		SetMaxReconnectInterval(c.backoffMax).
-		SetConnectTimeout(c.connectTO).
-		SetStore(mqtt.NewMemoryStore()).
-		SetKeepAlive(c.keepalive).
-		SetPingTimeout(10 * time.Second).
-		SetOrderMatters(false).
-		SetOnConnectHandler(c.onConnect).
-		SetConnectionNotificationHandler(c.onConnectionNotification).
-		SetConnectionLostHandler(c.onLost)
-	if c.spec.TLS {
-		opts.SetTLSConfig(&tls.Config{InsecureSkipVerify: c.spec.InsecureSkipVerify})
-	}
-	return mqtt.NewClient(opts)
 }
 
 // nextBackoff doubles the initial delay per consecutive failure, caps at max,

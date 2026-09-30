@@ -41,6 +41,7 @@ type Reload struct {
 type Store struct {
 	path    string
 	reloads chan Reload
+	rename  func(string, string) error
 
 	mu         sync.Mutex
 	generation uint64
@@ -51,7 +52,7 @@ type Store struct {
 
 // NewStore returns a store for the YAML file at path.
 func NewStore(path string) *Store {
-	return &Store{path: path, reloads: make(chan Reload, 1)}
+	return &Store{path: path, rename: os.Rename, reloads: make(chan Reload, 1)}
 }
 
 // Reloads delivers one request per successful save.
@@ -82,7 +83,7 @@ func (s *Store) Restore(r Reload) error {
 		}
 		return nil
 	}
-	return writeFile(s.path, r.Previous)
+	return s.writeFile(r.Previous)
 }
 
 // Register adds GET /config (page), GET /config/api (settings) and
@@ -217,7 +218,7 @@ func (s *Store) handlePut(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, err.Error())
 		return
 	}
-	if err := writeFile(s.path, out); err != nil {
+	if err := s.writeFile(out); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -401,28 +402,46 @@ func readFile(path string) ([]byte, bool, error) {
 	return raw, true, nil
 }
 
-// writeFile replaces path atomically with owner-only permissions, creating
-// the directory when needed. A bind-mounted single file cannot be renamed
-// over, so that case falls back to rewriting the file in place.
-func writeFile(path string, data []byte) error {
+// writeFile replaces the config file atomically: it writes a sibling
+// temporary file, syncs it, and renames it over the destination, keeping
+// owner-only permissions and creating the directory when needed. The
+// previous file survives every failure: an error removes only the temporary
+// file. A rename failure — a bind-mounted single file cannot be replaced —
+// is reported with the remedy instead of falling back to an in-place write,
+// which a crash could leave half written.
+func (s *Store) writeFile(data []byte) error {
+	path := s.path
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create %s: %w", dir, err)
 	}
+
 	tmp, err := os.CreateTemp(dir, ".bambu-mqtt-proxy-*.yaml")
-	if err == nil {
-		name := tmp.Name()
-		_, werr := tmp.Write(data)
-		cerr := tmp.Close()
-		if werr == nil && cerr == nil {
-			if err := os.Rename(name, path); err == nil {
-				return nil
-			}
-		}
+	if err != nil {
+		return fmt.Errorf("create temporary file in %s: %w", dir, err)
+	}
+	name := tmp.Name()
+	discard := func() {
+		_ = tmp.Close()
 		_ = os.Remove(name)
 	}
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		return fmt.Errorf("write %s: %w", path, err)
+
+	if _, err := tmp.Write(data); err != nil {
+		discard()
+		return fmt.Errorf("write %s: %w", name, err)
+	}
+	if err := tmp.Sync(); err != nil {
+		discard()
+		return fmt.Errorf("sync %s: %w", name, err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(name)
+		return fmt.Errorf("close %s: %w", name, err)
+	}
+	if err := s.rename(name, path); err != nil {
+		_ = os.Remove(name)
+		return fmt.Errorf("rename %s to %s: %w: %s", name, path, err,
+			"configuration saves require a writable directory mount; single-file bind mounts cannot be replaced atomically")
 	}
 	return nil
 }

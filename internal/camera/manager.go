@@ -32,6 +32,9 @@ type Manager struct {
 	ffmpegPath string
 	// webEnabled allows RTSPS models only for managers serving web routes.
 	webEnabled bool
+	// closed is terminal: set before captures shut down, and every
+	// accessor afterwards refuses work instead of dialing new transports.
+	closed bool
 	// cameraEndpoint resolves a printer's camera address. Production code
 	// uses cameraAddress; tests inject loopback fakes so they never fight
 	// over the fixed camera port.
@@ -123,6 +126,9 @@ func (m *Manager) supported(serial string) (config.Printer, bool) {
 func (m *Manager) get(serial string) *capture {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closed {
+		return nil
+	}
 	if c, ok := m.captures[serial]; ok {
 		return c
 	}
@@ -188,6 +194,9 @@ func (m *Manager) Snapshot(serial string, wait func(*capture) (*Frame, bool)) (*
 	}
 	_ = p
 	c := m.get(serial)
+	if c == nil {
+		return nil, StatusUnavailable
+	}
 	frame, okFrame := wait(c)
 	if !okFrame || frame == nil {
 		return nil, StatusUnavailable
@@ -206,7 +215,11 @@ func (m *Manager) WebSnapshot(serial string, wait func(*capture) (*Frame, bool))
 	if m.WebUnavailableReason(serial) != "" {
 		return nil, StatusUnavailable
 	}
-	frame, ok := wait(m.get(serial))
+	c := m.get(serial)
+	if c == nil {
+		return nil, StatusUnavailable
+	}
+	frame, ok := wait(c)
 	if !ok || frame == nil {
 		return nil, StatusUnavailable
 	}
@@ -224,6 +237,9 @@ func (m *Manager) Acquire(serial string) (chan struct{}, Status) {
 		return nil, StatusUnknownSerial
 	}
 	c := m.get(serial)
+	if c == nil {
+		return nil, StatusUnavailable
+	}
 	return c.acquire(), StatusOK
 }
 
@@ -239,7 +255,11 @@ func (m *Manager) AcquireWeb(serial string) (chan struct{}, Status) {
 	if m.WebUnavailableReason(serial) != "" {
 		return nil, StatusUnavailable
 	}
-	return m.get(serial).acquire(), StatusOK
+	c := m.get(serial)
+	if c == nil {
+		return nil, StatusUnavailable
+	}
+	return c.acquire(), StatusOK
 }
 
 // Release drops one consumer interest previously taken with Acquire.
@@ -276,6 +296,10 @@ func requiresFFmpeg(model, serial string) bool {
 // that render a fallback instead of blocking (the camera wall).
 func (m *Manager) Latest(serial string) *Frame {
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil
+	}
 	c, ok := m.captures[serial]
 	m.mu.Unlock()
 	if !ok {
@@ -290,6 +314,10 @@ func (m *Manager) Latest(serial string) *Frame {
 // takes a temporary capture reference that the call itself balances.
 func (m *Manager) Wait(serial string, ctx context.Context, after uint64, timeout time.Duration) *Frame {
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil
+	}
 	c, ok := m.captures[serial]
 	m.mu.Unlock()
 	if !ok {
@@ -298,9 +326,25 @@ func (m *Manager) Wait(serial string, ctx context.Context, after uint64, timeout
 	return c.wait(ctx, after, timeout)
 }
 
-// Close shuts every capture down. Streams end and waiters wake.
+// isClosed reports whether Close has run; streaming handlers end instead
+// of waiting through another heartbeat.
+func (m *Manager) isClosed() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.closed
+}
+
+// Close shuts every capture down. It is terminal: later Acquire, Snapshot,
+// and Wait calls report the capture unavailable or return nil instead of
+// starting new transports, and streams end. Close is idempotent, and the
+// owning shutdown call waits synchronously for every capture loop to exit.
 func (m *Manager) Close() {
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return
+	}
+	m.closed = true
 	captures := make([]*capture, 0, len(m.captures))
 	for _, c := range m.captures {
 		captures = append(captures, c)

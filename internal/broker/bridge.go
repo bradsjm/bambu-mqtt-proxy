@@ -17,25 +17,46 @@ import (
 	"bambu-mqtt-proxy/internal/upstream"
 )
 
+// poolHooks is the upstream surface the bridge needs. *upstream.Pool
+// satisfies it; tests substitute a recording fake.
+type poolHooks interface {
+	EnsureConnected(serial string, timeout time.Duration) bool
+	RecordSubscribe(serial, filter string, qos byte) func()
+	RecordUnsubscribe(serial, filter string) func()
+	RecordRaiseQoS(serial, filter string, qos byte) func()
+	PublishWithContext(serial, topic string, payload []byte, qos byte, publishContext upstream.PublishContext)
+}
+
+// sessionInterest records one client ID's merged subscriptions. The owner is
+// the last connected client with that ID; a persistent disconnect leaves the
+// entry in place so a resuming session keeps its upstream interests without
+// re-subscribing. Every release is guarded by owner identity, so late hooks
+// from a replaced connection can never release a successor's interests.
+type sessionInterest struct {
+	owner   *mqtt.Client
+	filters map[string]struct{}
+}
+
 // Bridge is the mochi hook coupling the downstream broker to the upstream
-// pool: it authenticates clients, enforces the topic ACL, gates subscriptions
-// on upstream availability, merges subscriptions upstream, and forwards
-// requests. It never rewrites payloads.
+// pool: it authenticates clients, enforces the topic ACL, suppresses printer
+// wills, gates subscriptions on upstream availability, merges subscriptions
+// upstream, and forwards requests. It never rewrites payloads.
 type Bridge struct {
 	mqtt.HookBase
-	pool        *upstream.Pool
+	pool        poolHooks
 	table       *routing.Table
 	authMode    string
 	accessCodes map[string]struct{}
 	gateTimeout time.Duration
 	log         *slog.Logger
 
-	mu      sync.Mutex
-	clients map[*mqtt.Client]map[string]struct{} // client pointer -> granted filters
+	mu       sync.Mutex
+	sessions map[string]*sessionInterest // client ID -> owned filters
 }
 
-// newBridge builds the routing bridge hook.
-func newBridge(cfg *config.Config, table *routing.Table, pool *upstream.Pool, log *slog.Logger) *Bridge {
+// newBridge builds the routing bridge hook. *upstream.Pool satisfies
+// poolHooks.
+func newBridge(cfg *config.Config, table *routing.Table, pool poolHooks, log *slog.Logger) *Bridge {
 	codes := make(map[string]struct{}, len(cfg.Printers))
 	for _, p := range cfg.Printers {
 		codes[p.Password] = struct{}{}
@@ -47,7 +68,7 @@ func newBridge(cfg *config.Config, table *routing.Table, pool *upstream.Pool, lo
 		accessCodes: codes,
 		gateTimeout: time.Duration(cfg.Behavior.UpstreamConnectTimeoutSeconds) * time.Second,
 		log:         log,
-		clients:     make(map[*mqtt.Client]map[string]struct{}),
+		sessions:    make(map[string]*sessionInterest),
 	}
 }
 
@@ -62,9 +83,12 @@ func (b *Bridge) Provides(k byte) bool {
 		mqtt.OnConnectAuthenticate,
 		mqtt.OnACLCheck,
 		mqtt.OnConnect,
+		mqtt.OnSessionEstablished,
 		mqtt.OnSubscribed,
 		mqtt.OnUnsubscribed,
 		mqtt.OnDisconnect,
+		mqtt.OnClientExpired,
+		mqtt.OnWill,
 		mqtt.OnPublish,
 	}, []byte{k})
 }
@@ -89,6 +113,19 @@ func (b *Bridge) OnConnect(cl *mqtt.Client, _ packets.Packet) error {
 	}
 	b.log.Info("client connected", "client", cl.ID, "remote", cl.Net.Remote)
 	return nil
+}
+
+// OnWill suppresses every downstream client's last-will message: a printer
+// will must not fan out to subscribers or become retained, including
+// request-topic wills that would otherwise surface as commands. Inline
+// clients (upstream report injection) keep their wills. It never returns an
+// error: mochi keeps the original will when a hook errors.
+func (b *Bridge) OnWill(cl *mqtt.Client, will mqtt.Will) (mqtt.Will, error) {
+	if cl.Net.Inline {
+		return will, nil
+	}
+	b.log.Info("will suppressed", "client", cl.ID, "topic", will.TopicName)
+	return mqtt.Will{}, nil
 }
 
 // OnACLCheck enforces the topic contract. Writes must be
@@ -117,28 +154,97 @@ func (b *Bridge) OnACLCheck(cl *mqtt.Client, topic string, write bool) bool {
 	return true
 }
 
-// OnSubscribed records the client's granted filters and merges each new
-// interest upstream (refcounted per printer and filter). A filter the client
-// already holds must not merge again: upstream interests count one per
-// client filter, so repeated SUBSCRIBEs stay refcount-neutral; a higher
-// requested QoS still raises the stored maximum for reconnect restores.
-func (b *Bridge) OnSubscribed(cl *mqtt.Client, pk packets.Packet, reasonCodes []byte) {
+// OnSessionEstablished reconciles the client ID's retained interests with the
+// subscriptions mochi has just inherited into the new session. Inherited
+// filters keep their upstream references without incrementing them; inherited
+// filters the bridge never merged are adopted; retained filters absent from
+// the inherited set (a clean reconnect inherits nothing) are released once.
+func (b *Bridge) OnSessionEstablished(cl *mqtt.Client, pk packets.Packet) {
 	if cl.Net.Inline {
 		return
 	}
+	inherited := cl.State.Subscriptions.GetAll()
+	settle := new([]func())
+	defer b.settle(settle)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	// A connection taken over while this hook waited must not reclaim
+	// ownership from its successor.
+	if cl.IsTakenOver() {
+		return
+	}
+	entry := b.sessions[cl.ID]
+	if entry == nil {
+		if len(inherited) == 0 {
+			return // empty session: no entry until it subscribes
+		}
+		entry = &sessionInterest{owner: cl, filters: make(map[string]struct{}, len(inherited))}
+		b.sessions[cl.ID] = entry
+	}
+	entry.owner = cl // establishment always replaces a retained owner
+	for filter, sub := range inherited {
+		if _, held := entry.filters[filter]; held {
+			// Adopted interest: the upstream reference already exists.
+			for _, serial := range b.table.PrintersFor(filter) {
+				*settle = append(*settle, b.pool.RecordRaiseQoS(serial, filter, sub.Qos))
+			}
+			continue
+		}
+		entry.filters[filter] = struct{}{}
+		printers := b.table.PrintersFor(filter)
+		for _, serial := range printers {
+			*settle = append(*settle, b.pool.RecordSubscribe(serial, filter, sub.Qos))
+		}
+		b.log.Info("session inherited subscription",
+			"client", cl.ID, "filter", filter,
+			"printers", strings.Join(printers, ","), "qos", sub.Qos)
+	}
+	var absent []string
+	for filter := range entry.filters {
+		if _, ok := inherited[filter]; !ok {
+			absent = append(absent, filter)
+		}
+	}
+	for _, filter := range absent {
+		b.releaseLocked(cl, filter, settle)
+	}
+}
+
+// OnSubscribed records the client's granted filters and merges each new
+// interest upstream (refcounted per printer and filter). A filter the client
+// ID already holds must not merge again: upstream interests count one per
+// client filter, so repeated SUBSCRIBEs stay refcount-neutral; a higher
+// requested QoS still raises the stored maximum for reconnect restores.
+func (b *Bridge) OnSubscribed(cl *mqtt.Client, pk packets.Packet, reasonCodes []byte) {
+	// A connection already taken over must not reclaim ownership from its
+	// successor; the successor adopts any inherited filters itself.
+	if cl.Net.Inline {
+		return
+	}
+	settle := new([]func())
+	defer b.settle(settle)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	// Checked under the lock: a takeover that completed while this hook
+	// waited must not hand ownership back to the replaced connection.
+	if cl.IsTakenOver() {
+		return
+	}
+	entry := b.ownedLocked(cl)
 	for i, sub := range pk.Filters {
 		if i >= len(reasonCodes) || reasonCodes[i] >= 0x80 {
 			continue
 		}
-		if !b.recordFilter(cl, sub.Filter, true) {
+		if _, held := entry.filters[sub.Filter]; held {
 			for _, serial := range b.table.PrintersFor(sub.Filter) {
-				b.pool.RaiseQoS(serial, sub.Filter, sub.Qos)
+				*settle = append(*settle, b.pool.RecordRaiseQoS(serial, sub.Filter, sub.Qos))
 			}
 			continue
 		}
+		entry.filters[sub.Filter] = struct{}{}
 		printers := b.table.PrintersFor(sub.Filter)
 		for _, serial := range printers {
-			b.pool.Subscribe(serial, sub.Filter, sub.Qos)
+			*settle = append(*settle, b.pool.RecordSubscribe(serial, sub.Filter, sub.Qos))
 		}
 		b.log.Info("client subscribed",
 			"client", cl.ID,
@@ -148,41 +254,62 @@ func (b *Bridge) OnSubscribed(cl *mqtt.Client, pk packets.Packet, reasonCodes []
 	}
 }
 
-// OnUnsubscribed removes the client's interest in the filters.
+// OnUnsubscribed releases one explicitly unsubscribed filter for the current
+// owner. Takeover cleanup runs in mochi with stale ownership and must not
+// release the successor's interests.
 func (b *Bridge) OnUnsubscribed(cl *mqtt.Client, pk packets.Packet) {
-	if cl.Net.Inline {
+	if cl.Net.Inline || cl.IsTakenOver() {
 		return
 	}
+	settle := new([]func())
+	defer b.settle(settle)
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	for _, sub := range pk.Filters {
-		if b.recordFilter(cl, sub.Filter, false) {
-			printers := b.table.PrintersFor(sub.Filter)
-			for _, serial := range printers {
-				b.pool.Unsubscribe(serial, sub.Filter)
-			}
-			b.log.Info("client unsubscribed", "client", cl.ID, "filter", sub.Filter, "printers", strings.Join(printers, ","))
-		}
+		b.releaseLocked(cl, sub.Filter, settle)
 	}
 }
 
-// OnDisconnect reconciles refcounts for the dropped client, covering
-// ungraceful disconnects that never send UNSUBSCRIBE.
+// OnDisconnect reconciles ownership for the dropped client. A session that
+// survives (expire=false) keeps its retained owner and interests so a
+// resuming client inherits them without re-merging; an expiring session
+// releases everything once. Owner identity guards both paths: late hooks
+// from a replaced connection never release the successor's interests.
 func (b *Bridge) OnDisconnect(cl *mqtt.Client, err error, expire bool) {
 	if cl.Net.Inline {
 		return
 	}
-	b.mu.Lock()
-	filters, ok := b.clients[cl]
-	delete(b.clients, cl)
-	b.mu.Unlock()
-	b.log.Info("client disconnected", "client", cl.ID, "reason", cleanErr(err), "filters", len(filters))
-	if !ok {
+	b.log.Info("client disconnected", "client", cl.ID, "reason", cleanErr(err), "expire", expire)
+	if !expire {
 		return
 	}
-	for filter := range filters {
-		for _, serial := range b.table.PrintersFor(filter) {
-			b.pool.Unsubscribe(serial, filter)
-		}
+	settle := new([]func())
+	defer b.settle(settle)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.releaseSessionLocked(cl, settle)
+}
+
+// OnClientExpired releases the interests of a session mochi just expired.
+// Owner identity guards against a delayed expiry callback for a replaced
+// connection releasing a successor's interests under the same client ID.
+func (b *Bridge) OnClientExpired(cl *mqtt.Client) {
+	if cl.Net.Inline {
+		return
 	}
+	settle := new([]func())
+	defer b.settle(settle)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.releaseSessionLocked(cl, settle)
+}
+
+// cleanErr renders a disconnect reason without a nil error string.
+func cleanErr(err error) string {
+	if err == nil {
+		return "clean"
+	}
+	return err.Error()
 }
 
 // OnPublish forwards a client request to the owning printer's upstream
@@ -210,33 +337,66 @@ func (b *Bridge) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, 
 	return pk, packets.CodeSuccessIgnore
 }
 
-// cleanErr renders a disconnect reason without a nil error string.
-func cleanErr(err error) string {
-	if err == nil {
-		return "clean"
+// settle runs the upstream completions recorded under b.mu, after the
+// deferred unlock: references change atomically with ownership, while
+// connection and wire waits never hold the fleet-wide ownership lock.
+// Completions reconcile the latest recorded state, so their order is free.
+func (b *Bridge) settle(fns *[]func()) {
+	for _, fn := range *fns {
+		fn()
 	}
-	return err.Error()
 }
 
-// recordFilter adds or removes filter in the client's granted set; it reports
-// whether the set changed for the caller's refcount action.
-func (b *Bridge) recordFilter(cl *mqtt.Client, filter string, add bool) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	set, ok := b.clients[cl]
-	if !ok {
-		set = make(map[string]struct{})
-		b.clients[cl] = set
+// ownedLocked returns the session entry owned by cl, replacing a retained
+// owner for the same client ID and creating the entry when absent. Called
+// with b.mu held.
+func (b *Bridge) ownedLocked(cl *mqtt.Client) *sessionInterest {
+	entry := b.sessions[cl.ID]
+	if entry == nil {
+		entry = &sessionInterest{owner: cl, filters: make(map[string]struct{})}
+		b.sessions[cl.ID] = entry
+		return entry
 	}
-	if add {
-		_, have := set[filter]
-		set[filter] = struct{}{}
-		return !have
+	entry.owner = cl
+	return entry
+}
+
+// releaseLocked removes filter from the entry cl owns and drops the merged
+// upstream interest once. It is a no-op when cl is not the retained owner or
+// the filter is not held. Called with b.mu held; pool calls never reenter it.
+func (b *Bridge) releaseLocked(cl *mqtt.Client, filter string, settle *[]func()) {
+	entry := b.sessions[cl.ID]
+	if entry == nil || entry.owner != cl {
+		return
 	}
-	_, have := set[filter]
-	delete(set, filter)
-	if len(set) == 0 {
-		delete(b.clients, cl)
+	if _, held := entry.filters[filter]; !held {
+		return
 	}
-	return have
+	delete(entry.filters, filter)
+	if len(entry.filters) == 0 {
+		delete(b.sessions, cl.ID)
+	}
+	printers := b.table.PrintersFor(filter)
+	for _, serial := range printers {
+		*settle = append(*settle, b.pool.RecordUnsubscribe(serial, filter))
+	}
+	b.log.Info("client unsubscribed",
+		"client", cl.ID, "filter", filter, "printers", strings.Join(printers, ","))
+}
+
+// releaseSessionLocked releases every filter of the entry cl owns and removes
+// the entry. It is a no-op when cl is not the retained owner. Called with
+// b.mu held.
+func (b *Bridge) releaseSessionLocked(cl *mqtt.Client, settle *[]func()) {
+	entry := b.sessions[cl.ID]
+	if entry == nil || entry.owner != cl {
+		return
+	}
+	filters := make([]string, 0, len(entry.filters))
+	for filter := range entry.filters {
+		filters = append(filters, filter)
+	}
+	for _, filter := range filters {
+		b.releaseLocked(cl, filter, settle)
+	}
 }

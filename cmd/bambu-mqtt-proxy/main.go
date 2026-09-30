@@ -196,16 +196,19 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	// returns. Block on signals instead.
 	if err := srv.Serve(); err != nil {
 		pool.Stop()
+		_ = srv.Close()
 		return nil, fmt.Errorf("broker: %w", err)
 	}
 
 	// The broker is up. Defer every teardown from here so both the signal
 	// path and later startup errors (a raw camera or HTTP bind failure) stop
-	// the detector, the raw camera listener, camera captures, upstream pool,
-	// HTTP server, and broker — in that order. The raw listener closes
-	// before the capture manager so its camera sockets never outlive the
-	// captures they read. Each stop is idempotent, so the single deferred
-	// call never double-stops a service.
+	// the detector, MCP, HTTP server, raw camera listener, camera captures,
+	// upstream pool, and broker — in that order. HTTP stops first among the
+	// shared services so its streaming handlers end before the captures and
+	// connections they read. The raw listener closes before the capture
+	// manager so its camera sockets never outlive the captures they read.
+	// Each stop is idempotent, so the single deferred call never
+	// double-stops a service.
 	var httpSrv *httpsrv.Server
 	var raw *camera.RawServer
 	defer func() {
@@ -220,6 +223,9 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		if mcpsrv != nil {
 			mcpsrv.Close()
 		}
+		if httpSrv != nil {
+			httpSrv.Stop()
+		}
 		if raw != nil {
 			raw.Close()
 		}
@@ -227,9 +233,6 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 			cameras.Close()
 		}
 		pool.Stop()
-		if httpSrv != nil {
-			httpSrv.Stop()
-		}
 		_ = srv.Close()
 	}()
 
@@ -255,7 +258,8 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	// Hold one report interest per printer when anything consumes live
 	// state: the camera wall (HTTP on) or detection. Async on purpose: the
 	// interest is recorded while printers may still be offline, and
-	// onConnect restores the recorded interests on reconnect. MCP counts
+	// the connection supervisor restores the recorded interests on each
+	// (re)connect. MCP counts
 	// as a live-state consumer even with cameras disabled.
 	if (cfg.CameraEnabled() && (cfg.HTTP.Port > 0 || detector != nil)) || cfg.MCPEnabled() {
 		for _, p := range cfg.Printers {

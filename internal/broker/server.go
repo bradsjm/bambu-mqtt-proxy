@@ -53,10 +53,17 @@ func New(cfg *config.Config, table *routing.Table, pool *upstream.Pool, inject *
 	srv := mqtt.New(&mqtt.Options{InlineClient: true, Logger: log})
 	srv.Options.Capabilities.MaximumQos = cfg.Behavior.QoSMax
 
-	if err := srv.AddHook(newBridge(cfg, table, pool, log), nil); err != nil {
-		return nil, fmt.Errorf("add bridge hook: %w", err)
+	// fail closes the partially constructed server exactly once and returns
+	// its error: a construction failure must release every bound port, and
+	// no Server escapes New on this path, so nothing else can close it again.
+	fail := func(err error) (*Server, error) {
+		_ = srv.Close()
+		return nil, err
 	}
-	inject.srv = srv
+
+	if err := srv.AddHook(newBridge(cfg, table, pool, log), nil); err != nil {
+		return fail(fmt.Errorf("add bridge hook: %w", err))
+	}
 
 	s := &Server{srv: srv, log: log}
 	for i, ln := range cfg.Listen {
@@ -68,7 +75,7 @@ func New(cfg *config.Config, table *routing.Table, pool *upstream.Pool, inject *
 		if ln.TLS {
 			cert, err := tlsutil.Ensure(ln.CertFile, ln.KeyFile)
 			if err != nil {
-				return nil, fmt.Errorf("listener %d: %w", i, err)
+				return fail(fmt.Errorf("listener %d: %w", i, err))
 			}
 			lc.TLSConfig = &tls.Config{
 				Certificates: []tls.Certificate{cert},
@@ -76,9 +83,12 @@ func New(cfg *config.Config, table *routing.Table, pool *upstream.Pool, inject *
 			}
 		}
 		if err := srv.AddListener(listeners.NewTCP(lc)); err != nil {
-			return nil, fmt.Errorf("add listener %d: %w", i, err)
+			return fail(fmt.Errorf("add listener %d: %w", i, err))
 		}
 	}
+	// Every listener is bound. Publishing the server into the injector is
+	// the last step, so a failed construction never leaves a live target.
+	inject.srv = srv
 	return s, nil
 }
 

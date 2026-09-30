@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -403,6 +404,31 @@ func TestProcessResponseContract(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name:    "quality null treated as absent",
+			body:    `{"NextProcessIntervalSec":{"Minimum":5,"Recommended":20},"PrintQuality":null,"WarningSuggested":false,"PauseSuggested":false}`,
+			wantErr: true,
+		},
+		{
+			name:    "warning null treated as absent",
+			body:    `{"NextProcessIntervalSec":{"Minimum":5,"Recommended":20},"PrintQuality":7,"WarningSuggested":null,"PauseSuggested":false}`,
+			wantErr: true,
+		},
+		{
+			name:    "pause null treated as absent",
+			body:    `{"NextProcessIntervalSec":{"Minimum":5,"Recommended":20},"PrintQuality":7,"WarningSuggested":false,"PauseSuggested":null}`,
+			wantErr: true,
+		},
+		{
+			name: "faster null defaults false",
+			body: `{"NextProcessIntervalSec":{"Minimum":5,"Recommended":20},"FasterInspectionSuggested":null,"PrintQuality":7,"WarningSuggested":false,"PauseSuggested":false}`,
+			want: Result{Intervals: IntervalSec{5, 20}, PrintQuality: 7},
+		},
+		{
+			name: "score null defaults zero",
+			body: `{"NextProcessIntervalSec":{"Minimum":5,"Recommended":20},"PrintQuality":7,"WarningSuggested":false,"PauseSuggested":false,"Score":null}`,
+			want: Result{Intervals: IntervalSec{5, 20}, PrintQuality: 7},
+		},
+		{
 			name:    "malformed json",
 			body:    `{"PrintQuality":`,
 			wantErr: true,
@@ -672,6 +698,212 @@ func TestTransportErrorSanitized(t *testing.T) {
 	if m := err.Error(); m != "gadget request failed" && m != "gadget request timed out" && m != "gadget request canceled" {
 		t.Fatalf("create transport error = %q, want a generic class message", m)
 	}
+}
+
+// TestProcessNullFieldsAreAbsent pins the null-as-absent rule: a JSON null
+// in a required field fails with the same safe error as an absent field,
+// while a null in an optional field keeps its missing-value default.
+func TestProcessNullFieldsAreAbsent(t *testing.T) {
+	run := func(t *testing.T, body string) (Result, error) {
+		t.Helper()
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(body))
+		}))
+		defer server.Close()
+		client := routeClient(t, server)
+		return client.Process(context.Background(),
+			"https://gadget-regional.octoeverywhere.com/api/gadget/v1/process/C", []byte{0xFF, 0xD8, 0xFF, 0xD9})
+	}
+
+	t.Run("required nulls fail with missing-field errors", func(t *testing.T) {
+		cases := []struct {
+			name    string
+			body    string
+			wantErr string
+		}{
+			{
+				name:    "quality null",
+				body:    `{"NextProcessIntervalSec":{"Minimum":5,"Recommended":20},"PrintQuality":null,"WarningSuggested":false,"PauseSuggested":false}`,
+				wantErr: "gadget process response: missing required PrintQuality",
+			},
+			{
+				name:    "warning null",
+				body:    `{"NextProcessIntervalSec":{"Minimum":5,"Recommended":20},"PrintQuality":7,"WarningSuggested":null,"PauseSuggested":false}`,
+				wantErr: "gadget process response: missing required WarningSuggested or PauseSuggested",
+			},
+			{
+				name:    "pause null",
+				body:    `{"NextProcessIntervalSec":{"Minimum":5,"Recommended":20},"PrintQuality":7,"WarningSuggested":false,"PauseSuggested":null}`,
+				wantErr: "gadget process response: missing required WarningSuggested or PauseSuggested",
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				res, err := run(t, tc.body)
+				if err == nil || err.Error() != tc.wantErr {
+					t.Fatalf("err = %v, want %q", err, tc.wantErr)
+				}
+				// Valid timing intervals still ride along with the partial
+				// result so the engine can retain the provider pacing.
+				if res.Intervals != (IntervalSec{Minimum: 5, Recommended: 20}) {
+					t.Fatalf("intervals = %+v, want the parsed guidance", res.Intervals)
+				}
+			})
+		}
+	})
+
+	t.Run("optional nulls keep defaults", func(t *testing.T) {
+		res, err := run(t, `{"NextProcessIntervalSec":{"Minimum":5,"Recommended":20},"FasterInspectionSuggested":null,"PrintQuality":7,"WarningSuggested":false,"PauseSuggested":false,"Score":null}`)
+		if err != nil {
+			t.Fatalf("Process: %v", err)
+		}
+		want := Result{Intervals: IntervalSec{Minimum: 5, Recommended: 20}, PrintQuality: 7}
+		if !reflect.DeepEqual(res, want) {
+			t.Fatalf("result = %+v, want %+v", res, want)
+		}
+	})
+}
+
+// debugLogClient builds a routed client whose debug logs land in a buffer.
+func debugLogClient(t *testing.T, handler http.HandlerFunc) (*Client, *bytes.Buffer) {
+	t.Helper()
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	client := routeClient(t, server)
+	var logs bytes.Buffer
+	client.setLogger(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	return client, &logs
+}
+
+// assertNoProviderText fails when the debug log carries any URL context,
+// provider body text, provider-controlled header text, or raw log keys the
+// sanitized format removed.
+func assertNoProviderText(t *testing.T, logs *bytes.Buffer) {
+	t.Helper()
+	log := logs.String()
+	for _, leak := range []string{ctxSecret, "://", "/api/gadget"} {
+		if strings.Contains(log, leak) {
+			t.Fatalf("debug log leaks url context %q: %s", leak, log)
+		}
+	}
+	for _, key := range []string{"request_url=", "http_status_line=", "response_content_type=", "response_body=", "response_body_base64=", "read_error=", "close_error=", "transport_error="} {
+		if strings.Contains(log, key) {
+			t.Fatalf("debug log contains removed key %q: %s", key, log)
+		}
+	}
+}
+
+// TestGadgetDebugLogsSanitized asserts debug logs for successes, provider
+// error bodies, read failures, transport failures, and canceled requests
+// keep marker secrets, URLs, bodies, and provider-controlled text out while
+// numeric status and duration metadata remain.
+func TestGadgetDebugLogsSanitized(t *testing.T) {
+	const bodySecret = "TOPSECRETRESPONSE"
+	jpeg := []byte{0xFF, 0xD8, 0xFF, 0xD9}
+	processURL := "https://gadget-regional.octoeverywhere.com/api/gadget/v1/process/" + ctxSecret
+
+	t.Run("success keeps numeric metadata only", func(t *testing.T) {
+		client, logs := debugLogClient(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/evil")
+			_, _ = w.Write([]byte(`{"PrintQuality":8,"WarningSuggested":false,"PauseSuggested":false,` +
+				`"NextProcessIntervalSec":{"Minimum":5,"Recommended":20},"note":"` + bodySecret + `"}`))
+		})
+		if _, err := client.Process(context.Background(), processURL, jpeg); err != nil {
+			t.Fatalf("Process: %v", err)
+		}
+		assertNoProviderText(t, logs)
+		if strings.Contains(logs.String(), bodySecret) {
+			t.Fatalf("debug log contains the response body: %s", logs.String())
+		}
+		log := logs.String()
+		for _, field := range []string{
+			"request_host=gadget-regional.octoeverywhere.com",
+			"http_status=200", "duration_ms=", "response_body_bytes=", "response_content_length=",
+		} {
+			if !strings.Contains(log, field) {
+				t.Errorf("debug log missing %q: %s", field, log)
+			}
+		}
+	})
+
+	t.Run("read failure keeps a fixed class", func(t *testing.T) {
+		client, logs := debugLogClient(t, func(w http.ResponseWriter, _ *http.Request) {
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Error("response does not support hijacking")
+				return
+			}
+			conn, buf, err := hj.Hijack()
+			if err != nil {
+				t.Errorf("hijack: %v", err)
+				return
+			}
+			_, _ = buf.WriteString("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort")
+			buf.Flush()
+			conn.Close()
+		})
+		_, err := client.Process(context.Background(), processURL, jpeg)
+		if err == nil || !isTransportError(err) {
+			t.Fatalf("err = %v, want a transport read failure", err)
+		}
+		assertNoProviderText(t, logs)
+		log := logs.String()
+		if !strings.Contains(log, `read_error_class="gadget response read failed"`) {
+			t.Errorf("debug log missing the fixed read class: %s", log)
+		}
+		for _, raw := range []string{"unexpected EOF", "EOF", "reset"} {
+			if strings.Contains(log, raw) {
+				t.Errorf("debug log exposes raw read error text %q: %s", raw, log)
+			}
+		}
+	})
+
+	t.Run("transport failure keeps a fixed class", func(t *testing.T) {
+		dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		deadURL := dead.URL
+		dead.Close()
+		client := routeClient(t, dead)
+		// Rebuild the client against the dead server URL and attach debug logs.
+		client.http = &http.Client{
+			Timeout:   5 * time.Second,
+			Transport: &rerouteTransport{base: http.DefaultTransport, target: deadURL},
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
+		var logs bytes.Buffer
+		client.setLogger(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+		_, err := client.Process(context.Background(), processURL, jpeg)
+		if err == nil {
+			t.Fatal("Process = nil error, want transport failure")
+		}
+		assertNoProviderText(t, &logs)
+		log := logs.String()
+		if !strings.Contains(log, `transport_class="gadget request failed"`) {
+			t.Errorf("debug log missing the fixed transport class: %s", log)
+		}
+		for _, raw := range []string{"refused", "reset", "EOF", "connect:"} {
+			if strings.Contains(log, raw) {
+				t.Errorf("debug log exposes raw transport error text %q: %s", raw, log)
+			}
+		}
+	})
+
+	t.Run("canceled request keeps a fixed class", func(t *testing.T) {
+		client, logs := debugLogClient(t, func(http.ResponseWriter, *http.Request) {
+			t.Error("server must not observe a canceled request")
+		})
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, err := client.Process(ctx, processURL, jpeg)
+		if err == nil || !isTransportError(err) {
+			t.Fatalf("err = %v, want a canceled transport error", err)
+		}
+		assertNoProviderText(t, logs)
+		if !strings.Contains(logs.String(), `transport_class="gadget request canceled"`) {
+			t.Errorf("debug log missing the canceled class: %s", logs.String())
+		}
+	})
 }
 
 // quoteGoString renders s as a JSON string literal; test inputs are fixed
