@@ -195,6 +195,8 @@ disabled.
 
 Open `http://<host>:8080/camwall`.
 
+![Camera wall dashboard showing multiple printers](docs/camwall.png)
+
 - **Controls** — each tile carries buttons for chamber light, pause/resume,
   and emergency stop, plus a speed-profile selector. They `POST` to
   `/control/{serial}` with a JSON body:
