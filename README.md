@@ -89,6 +89,7 @@ docker compose up -d
 **From source**
 
 ```sh
+scripts/setup-toolchain.sh               # installs the Go version pinned by go.mod
 go build -o bambu-mqtt-proxy ./cmd/bambu-mqtt-proxy
 ./bambu-mqtt-proxy -config bambu-mqtt-proxy.yaml
 ```
