@@ -226,6 +226,11 @@ func (m *Manager) WebSnapshot(serial string, wait func(*capture) (*Frame, bool))
 	return frame, StatusOK
 }
 
+// SnapshotContext returns a fresh web-camera frame or stops when ctx ends.
+func (m *Manager) SnapshotContext(ctx context.Context, serial string) (*Frame, Status) {
+	return m.WebSnapshot(serial, func(c *capture) (*Frame, bool) { return c.snapshot(ctx) })
+}
+
 // Acquire starts (or joins) the shared capture for serial and returns the
 // frame notification channel. It reports StatusOK only for eligible serials;
 // callers own the matching Release.

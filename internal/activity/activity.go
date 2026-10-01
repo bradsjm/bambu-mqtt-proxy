@@ -39,10 +39,11 @@ type Entry struct {
 // Log holds one ring buffer per configured printer. A nil *Log is valid and
 // records nothing, so producers need no feature checks.
 type Log struct {
-	mu     sync.Mutex       // guards IDs and printer rings
-	nextID uint64           // ID assigned to the next event
-	rings  map[string]*ring // configured printer event buffers
-	now    func() time.Time // event clock; replaceable by package tests
+	mu       sync.Mutex          // guards IDs, printer rings, and the observer
+	nextID   uint64              // ID assigned to the next event
+	rings    map[string]*ring    // configured printer event buffers
+	now      func() time.Time    // event clock; replaceable by package tests
+	observer func(string, Entry) // optional callback for newly recorded entries
 }
 
 // ring is a fixed-capacity circular buffer; next is the slot the following
@@ -68,9 +69,9 @@ func (l *Log) Record(serial, kind, severity, message string) {
 		return
 	}
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	r, ok := l.rings[serial]
 	if !ok {
+		l.mu.Unlock()
 		return
 	}
 	l.nextID++
@@ -83,10 +84,28 @@ func (l *Log) Record(serial, kind, severity, message string) {
 	}
 	if len(r.buf) < Capacity {
 		r.buf = append(r.buf, e)
+	} else {
+		r.buf[r.next] = e
+		r.next = (r.next + 1) % len(r.buf)
+	}
+	observer := l.observer
+	l.mu.Unlock()
+	// Report processing calls this method, so the observer runs unlocked
+	// and must not block.
+	if observer != nil {
+		observer(serial, e)
+	}
+}
+
+// SetObserver registers a non-blocking callback for newly recorded entries.
+// A nil function clears the observer; a nil log ignores the call.
+func (l *Log) SetObserver(fn func(serial string, e Entry)) {
+	if l == nil {
 		return
 	}
-	r.buf[r.next] = e
-	r.next = (r.next + 1) % len(r.buf)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.observer = fn
 }
 
 // Recent returns serial's entries newest first, with ages filled in. Unknown

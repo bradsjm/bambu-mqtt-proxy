@@ -338,6 +338,48 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
       </fieldset>
     </div>
   </section>
+
+  <section aria-labelledby="notifications-h">
+    <div class="sec-head"><h2 id="notifications-h">Notifications</h2></div>
+    <p class="sec-lede">Optional alerts about your prints, delivered to one Pushover account.</p>
+    <div class="groups">
+      <fieldset class="group">
+        <legend>Alerts</legend>
+        <div class="row">
+          <div><label for="f-notifications">Notifications</label>
+            <span class="hint">Sends print errors, warnings, AI alerts, and completion to your phone. Print alerts include a camera snapshot when available. Set up Pushover at <a href="https://pushover.net/" rel="noreferrer">pushover.net</a>.</span></div>
+          <div class="control"><input id="f-notifications" class="switch" type="checkbox" role="switch" data-field="notifications.enabled"></div>
+        </div>
+        <div class="row">
+          <div><label for="f-provider">Service</label>
+            <span class="hint">Pushover is the only supported service today.</span></div>
+          <div class="control"><select id="f-provider" data-field="notifications.provider">
+            <option value="pushover">Pushover</option>
+          </select></div>
+        </div>
+      </fieldset>
+
+      <fieldset class="group" data-provider="pushover">
+        <legend>Pushover credentials</legend>
+        <div class="row">
+          <div><label for="f-pushover-token">App token</label>
+            <span class="hint">From the application you created on pushover.net.</span></div>
+          <div class="control"><input id="f-pushover-token" type="password" autocomplete="off" spellcheck="false" data-field="notifications.pushover.app_token"></div>
+        </div>
+        <div class="row">
+          <div><label for="f-pushover-user">User key</label>
+            <span class="hint">Shown on your pushover.net dashboard.</span></div>
+          <div class="control"><input id="f-pushover-user" type="password" autocomplete="off" spellcheck="false" data-field="notifications.pushover.user_key"></div>
+        </div>
+        <div class="row">
+          <div><span class="label">Test</span>
+            <span class="hint">Sends one message to confirm delivery. Nothing is saved.</span></div>
+          <div class="control"><button class="btn quiet" type="button" id="notify-test">Send test notification</button>
+            <span id="notify-test-status" role="status" aria-live="polite"></span></div>
+        </div>
+      </fieldset>
+    </div>
+  </section>
 </main>
 
 <div class="savebar" id="savebar" data-state="idle" role="status" aria-live="polite">
@@ -505,13 +547,24 @@ function renderFields() {
     if (el.type === "radio") el.checked = String(v) === el.value;
     else if (el.type === "checkbox") el.checked = !!v;
     else if (el.dataset.type === "lines") el.value = (v || []).join("\n");
-    else el.value = v;
+    else el.value = v ?? "";
   }
   for (const el of document.querySelectorAll("[data-env]")) {
     const env = meta.env_overrides[el.dataset.env];
     el.hidden = !env;
     if (env) el.innerHTML = `Set by <code>${esc(env)}</code>, which takes precedence over this value.`;
   }
+  pushoverHints();
+}
+
+/* The sanitized API never returns notification credentials; the stored
+   hint marks fields the backend will refill on save. */
+function pushoverHints() {
+  if (!cfg) return;
+  const n = cfg.notifications.pushover;
+  const token = $("#f-pushover-token"), user = $("#f-pushover-user");
+  token.placeholder = n.has_app_token && !token.value ? "Stored. Leave blank to keep it" : "";
+  user.placeholder = n.has_user_key && !user.value ? "Stored. Leave blank to keep it" : "";
 }
 
 function render() {
@@ -564,6 +617,12 @@ function validateForm() {
   if (bad >= 0) { setBar("error", `Warmup command ${bad + 1} is not valid JSON.`); $("#f-warmup").focus(); return false; }
   const missing = cfg.printers.find(p => !p.access_code && !p.has_access_code);
   if (missing) { setBar("error", `Enter the access code for printer ${missing.serial}.`); return false; }
+  if (cfg.notifications.enabled) {
+    const n = cfg.notifications.pushover;
+    const blank = (v, has) => !has && !String(v || "").trim();
+    if (blank(n.app_token, n.has_app_token)) { setBar("error", "Enter the Pushover app token."); $("#f-pushover-token").focus(); return false; }
+    if (blank(n.user_key, n.has_user_key)) { setBar("error", "Enter the Pushover user key."); $("#f-pushover-user").focus(); return false; }
+  }
   return true;
 }
 
@@ -684,7 +743,7 @@ $("#dlg-form").addEventListener("submit", submitPrinter);
 $("#dlg-cancel").addEventListener("click", () => dlg.close());
 $("#p-address").addEventListener("input", codeHint);
 
-document.querySelector(".groups").addEventListener("input", e => {
+$("#main").addEventListener("input", e => {
   const el = e.target;
   if (el.dataset.field) {
     const t = el.dataset.type;
@@ -692,12 +751,32 @@ document.querySelector(".groups").addEventListener("input", e => {
     if (t === "int") v = el.value === "" ? 0 : Number(el.value);
     if (t === "lines") v = el.value.split("\n").map(s => s.trim()).filter(Boolean);
     setPath(el.dataset.field, v);
+    if (el.dataset.field.startsWith("notifications.pushover.")) pushoverHints();
   } else if (el.dataset.l) {
     const l = cfg.listen[Number(el.dataset.l)], k = el.dataset.k;
     l[k] = k === "tls" ? el.checked : k === "port" ? Number(el.value) : el.value;
     if (k === "tls") renderListeners();
   }
   refreshDirty();
+});
+$("#notify-test").addEventListener("click", async () => {
+  const b = $("#notify-test"), out = $("#notify-test-status");
+  b.disabled = true;
+  out.textContent = "Sending…";
+  try {
+    const res = await fetch("/config/notifications/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(cfg.notifications),
+    });
+    const body = await res.json().catch(() => ({}));
+    out.textContent = res.ok ? "Sent. Check your phone." :
+      body.error || `The test failed with status ${res.status}.`;
+  } catch {
+    out.textContent = "The proxy could not be reached.";
+  } finally {
+    b.disabled = false;
+  }
 });
 $("#listeners").addEventListener("click", e => {
   const b = e.target.closest("[data-drop]");

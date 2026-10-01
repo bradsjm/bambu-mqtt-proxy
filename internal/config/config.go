@@ -128,17 +128,52 @@ type MCP struct {
 	Enabled *bool `yaml:"enabled"`
 }
 
+// Notifications configures optional print alerts sent to one recipient.
+type Notifications struct {
+	Enabled  bool     `yaml:"enabled"`
+	Provider string   `yaml:"provider"`
+	Pushover Pushover `yaml:"pushover"`
+}
+
+// Pushover holds the Pushover application token and user key.
+type Pushover struct {
+	AppToken string `yaml:"app_token"`
+	UserKey  string `yaml:"user_key"`
+}
+
+// Validate rejects notification settings that cannot run. An empty provider
+// means pushover; any other provider is unsupported. Disabled notifications
+// may keep blank or stale credentials; enabled notifications require both.
+func (n Notifications) Validate() error {
+	switch n.Provider {
+	case "", "pushover":
+	default:
+		return fmt.Errorf("notifications: unsupported provider %q", n.Provider)
+	}
+	if !n.Enabled {
+		return nil
+	}
+	if strings.TrimSpace(n.Pushover.AppToken) == "" {
+		return fmt.Errorf("notifications: pushover app token is required")
+	}
+	if strings.TrimSpace(n.Pushover.UserKey) == "" {
+		return fmt.Errorf("notifications: pushover user key is required")
+	}
+	return nil
+}
+
 // Config is the top-level proxy configuration.
 type Config struct {
 	Listen []Listener `yaml:"listen"`
 	Auth   Auth       `yaml:"auth"`
 	// Printers is the upstream printer list.
-	Printers []Printer `yaml:"printers"`
-	Behavior Behavior  `yaml:"behavior"`
-	Log      Log       `yaml:"log"`
-	HTTP     HTTP      `yaml:"http"`
-	Camera   Camera    `yaml:"camera"`
-	MCP      MCP       `yaml:"mcp"`
+	Printers      []Printer     `yaml:"printers"`
+	Behavior      Behavior      `yaml:"behavior"`
+	Log           Log           `yaml:"log"`
+	HTTP          HTTP          `yaml:"http"`
+	Camera        Camera        `yaml:"camera"`
+	MCP           MCP           `yaml:"mcp"`
+	Notifications Notifications `yaml:"notifications"`
 	// OctoEverywhereAPIKey is the Gadget API key applied from
 	// BMBPX_OCTOEVERYWHERE_API_KEY only; yaml:"-" keeps it out of files.
 	OctoEverywhereAPIKey string `yaml:"-"`
@@ -438,6 +473,9 @@ func (c *Config) ApplyDefaults() {
 			c.Printers[i].Username = "bblp"
 		}
 	}
+	if c.Notifications.Provider == "" {
+		c.Notifications.Provider = "pushover"
+	}
 }
 
 // Validate rejects configurations that cannot run. An empty printer list is
@@ -487,7 +525,7 @@ func (c *Config) Validate() error {
 	if (c.HTTP.Port < 0 && c.HTTP.Port != PortUnset) || c.HTTP.Port > 65535 {
 		return fmt.Errorf("http: port %d out of range (0 disables)", c.HTTP.Port)
 	}
-	return nil
+	return c.Notifications.Validate()
 }
 
 // DisplayModel names a printer model: explicit model configuration first,

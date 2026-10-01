@@ -26,6 +26,7 @@ import (
 	"bambu-mqtt-proxy/internal/health"
 	"bambu-mqtt-proxy/internal/httpsrv"
 	"bambu-mqtt-proxy/internal/mcpserver"
+	"bambu-mqtt-proxy/internal/notification"
 	"bambu-mqtt-proxy/internal/routing"
 	"bambu-mqtt-proxy/internal/telemetry"
 	"bambu-mqtt-proxy/internal/upstream"
@@ -160,6 +161,14 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		renderer.SetDetection(detector)
 		renderer.SetDetectionControl(detector)
 	}
+	// Optional Pushover print notifications. The notifier registers as an
+	// activity observer before the broker serves, so entries recorded
+	// during startup reach it; upstream connections are lazy.
+	var notifier *notification.Service
+	if cfg.Notifications.Enabled {
+		notifier = notification.New(cfg.Notifications, state, cameras, logger)
+		activities.SetObserver(notifier.Observe)
+	}
 	// MCP endpoint on the shared HTTP listener, on by default and disabled
 	// with mcp.enabled: false / BMBPX_MCP_ENABLED=false. Its sampler reads
 	// cached state for every configured printer; printer commands go only
@@ -199,6 +208,9 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		_ = srv.Close()
 		return nil, fmt.Errorf("broker: %w", err)
 	}
+	if notifier != nil {
+		notifier.Start()
+	}
 
 	// The broker is up. Defer every teardown from here so both the signal
 	// path and later startup errors (a raw camera or HTTP bind failure) stop
@@ -228,6 +240,9 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		}
 		if raw != nil {
 			raw.Close()
+		}
+		if notifier != nil {
+			notifier.Close()
 		}
 		if cameras != nil {
 			cameras.Close()
@@ -259,9 +274,10 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	// state: the camera wall (HTTP on) or detection. Async on purpose: the
 	// interest is recorded while printers may still be offline, and
 	// the connection supervisor restores the recorded interests on each
-	// (re)connect. MCP counts
-	// as a live-state consumer even with cameras disabled.
-	if (cfg.CameraEnabled() && (cfg.HTTP.Port > 0 || detector != nil)) || cfg.MCPEnabled() {
+	// (re)connect. MCP counts as a live-state consumer even with cameras
+	// disabled, and notifications need the reports that produce activity
+	// events even with no dashboard or MQTT client attached.
+	if (cfg.CameraEnabled() && (cfg.HTTP.Port > 0 || detector != nil)) || cfg.MCPEnabled() || cfg.Notifications.Enabled {
 		for _, p := range cfg.Printers {
 			pool.SubscribeAsync(p.Serial, fmt.Sprintf("device/%s/report", p.Serial))
 		}
