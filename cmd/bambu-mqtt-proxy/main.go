@@ -263,7 +263,7 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	// as a live-state consumer even with cameras disabled.
 	if (cfg.CameraEnabled() && (cfg.HTTP.Port > 0 || detector != nil)) || cfg.MCPEnabled() {
 		for _, p := range cfg.Printers {
-			pool.SubscribeAsync(p.Serial, fmt.Sprintf("device/%s/report", p.Serial), 1)
+			pool.SubscribeAsync(p.Serial, fmt.Sprintf("device/%s/report", p.Serial))
 		}
 	}
 

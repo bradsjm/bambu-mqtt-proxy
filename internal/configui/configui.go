@@ -137,7 +137,6 @@ type ListenerView struct {
 
 // BehaviorView holds the upstream connection settings.
 type BehaviorView struct {
-	QoSMax                int      `json:"qos_max"`
 	WarmupCommands        []string `json:"warmup_commands"`
 	KeepaliveSeconds      int      `json:"keepalive_seconds"`
 	ConnectTimeoutSeconds int      `json:"connect_timeout_seconds"`
@@ -266,7 +265,6 @@ func toView(c *config.Config) View {
 		Printers:      []PrinterView{},
 		Listen:        []ListenerView{},
 		Behavior: BehaviorView{
-			QoSMax:                int(c.Behavior.QoSMax),
 			WarmupCommands:        c.Behavior.WarmupCommands,
 			KeepaliveSeconds:      c.Behavior.UpstreamKeepaliveSeconds,
 			ConnectTimeoutSeconds: c.Behavior.UpstreamConnectTimeoutSeconds,
@@ -296,9 +294,6 @@ func toView(c *config.Config) View {
 // stored code of the printer the edit started from, but only while its
 // address is unchanged: a stored code is never sent to a new host.
 func (v View) toConfig(stored []config.Printer) (*config.Config, error) {
-	if v.Behavior.QoSMax < 0 || v.Behavior.QoSMax > 2 {
-		return nil, errors.New("Maximum QoS must be 0, 1 or 2.")
-	}
 	byserial := make(map[string]config.Printer, len(stored))
 	for _, p := range stored {
 		byserial[p.Serial] = p
@@ -312,7 +307,6 @@ func (v View) toConfig(stored []config.Printer) (*config.Config, error) {
 		Log:      config.Log{Level: v.LogLevel},
 		Printers: []config.Printer{},
 		Behavior: config.Behavior{
-			QoSMax:                        byte(v.Behavior.QoSMax),
 			UpstreamKeepaliveSeconds:      v.Behavior.KeepaliveSeconds,
 			UpstreamConnectTimeoutSeconds: v.Behavior.ConnectTimeoutSeconds,
 			UpstreamBackoffInitialSeconds: v.Behavior.BackoffInitialSeconds,

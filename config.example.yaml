@@ -58,7 +58,6 @@ mcp:
   # enabled: false
 
 behavior:
-  qos_max: 1
   warmup_commands:
     - '{"pushing":{"sequence_id":"0","command":"pushall"}}'
   upstream_keepalive_seconds: 30

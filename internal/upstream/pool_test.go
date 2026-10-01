@@ -33,7 +33,7 @@ func TestConnectivityObserverReceivesConnectionLoss(t *testing.T) {
 		t1 = tr
 		return fake
 	}
-	c.subscribeAsync("device/S1/report", 1)
+	c.subscribeAsync("device/S1/report")
 	waitChannel(t, 2*time.Second, hit)
 	if t1 == nil || t1.generation == 0 {
 		t.Fatalf("transport installed = %v with generation %d, want an installed generation", t1 != nil, t1.generation)
@@ -81,63 +81,43 @@ func TestNextBackoff(t *testing.T) {
 	}
 }
 
-func TestSubRefTransitions(t *testing.T) {
-	s := &subRefs{refs: make(map[string]subRef)}
-
-	if first := s.add("device/A/report", 1); !first {
-		t.Fatal("first add should report first")
-	}
-	if first := s.add("device/A/report", 1); first {
-		t.Fatal("second add should not report first")
-	}
-	if first := s.add("device/A/report", 0); first {
-		t.Fatal("third add should not report first")
-	}
-	// QoS must only ever rise, never fall, across merged subscribers.
-	if got := s.refs["device/A/report"].qos; got != 1 {
-		t.Fatalf("qos after adds = %d, want 1", got)
+func TestReportInterestCountTransitions(t *testing.T) {
+	// No active transport: recording works, completions reconcile to a
+	// no-op, and the count is the only observable state.
+	c := &Conn{spec: config.Printer{Serial: "A"}}
+	c.recordSubscribe("device/A/report")
+	c.recordSubscribe("device/+/report")
+	c.recordSubscribe("device/A/report")
+	if got := c.lockReportRefs(); got != 3 {
+		t.Fatalf("count after adds = %d, want 3 (distinct filters share one report interest)", got)
 	}
 
-	if last := s.remove("device/A/report"); last {
-		t.Fatal("remove with remaining subscribers should not report last")
+	c.recordUnsubscribe("device/A/report")
+	c.recordUnsubscribe("device/+/report")
+	if got := c.lockReportRefs(); got != 1 {
+		t.Fatalf("count with remaining subscribers = %d, want 1", got)
 	}
-	if last := s.remove("device/A/report"); last {
-		t.Fatal("second-to-last remove should not report last")
+	c.recordUnsubscribe("device/A/report")
+	if got := c.lockReportRefs(); got != 0 {
+		t.Fatalf("count after final remove = %d, want 0", got)
 	}
-	if last := s.remove("device/A/report"); !last {
-		t.Fatal("final remove should report last")
-	}
-	if _, have := s.refs["device/A/report"]; have {
-		t.Fatal("filter should be deleted at zero count")
+	// A remove past zero stays balanced at zero instead of going negative.
+	c.recordUnsubscribe("device/A/report")
+	if got := c.lockReportRefs(); got != 0 {
+		t.Fatalf("count after remove past zero = %d, want 0", got)
 	}
 }
 
-func TestRaiseQoS(t *testing.T) {
-	c := &Conn{spec: config.Printer{Serial: "S1"}, subs: newSubRefs()}
-	c.subs.add("device/S1/report", 0)
-
-	// A repeated interest raises the stored maximum without adding a
-	// refcount.
-	c.raiseQoS("device/S1/report", 1)
-	refs := c.subs.snapshot()
-	if len(refs) != 1 || refs["device/S1/report"] != 1 {
-		t.Fatalf("snapshot after raise = %v, want device/S1/report at qos 1", refs)
+// TestRequestOnlyFilterRecordsNoInterest pins that request-only filters
+// produce no report interest and no upstream work at all.
+func TestRequestOnlyFilterRecordsNoInterest(t *testing.T) {
+	c := &Conn{spec: config.Printer{Serial: "A"}}
+	if done := c.recordSubscribe("device/A/request"); done == nil {
+		t.Fatal("request-only subscribe must still return a completion")
 	}
-	if got := c.subs.count("device/S1/report"); got != 1 {
-		t.Fatalf("count after raise = %d, want unchanged 1", got)
-	}
-
-	// Lower or equal requests keep the stored maximum.
-	c.raiseQoS("device/S1/report", 0)
-	if got := c.subs.snapshot()["device/S1/report"]; got != 1 {
-		t.Fatalf("qos after lower raise = %d, want 1", got)
-	}
-
-	// Request-only filters have no upstream interest to raise, and absent
-	// filters stay absent.
-	c.raiseQoS("device/S1/request", 1)
-	c.raiseQoS("device/S2/report", 1)
-	if got := c.subs.snapshot(); len(got) != 1 {
-		t.Fatalf("snapshot after ignored raises = %v, want only device/S1/report", got)
+	done := c.recordUnsubscribe("device/A/request")
+	done()
+	if got := c.lockReportRefs(); got != 0 {
+		t.Fatalf("report interest count = %d, want 0 for request-only filters", got)
 	}
 }

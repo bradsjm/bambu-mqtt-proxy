@@ -15,6 +15,19 @@
 
 Keep dependencies explicit at constructors and preserve package ownership. The broker injector is attached after construction to break its callback cycle with the upstream pool.
 
+## Printer MQTT Contract
+
+The upstream device is a printer with a bare-bones ESP32 MQTT broker, not a general-purpose messaging service.
+
+- Use QoS 0 for every subscription and publish on both proxy hops, including warmups and controls.
+- Do not propose or add QoS 1/2 support, QoS negotiation, upgrade tracking, configurable QoS, or message replay queues.
+- Each printer has one serial number and one fixed upstream subscription: `device/{serial}/report`.
+- Represent upstream subscription state with one interest count and one subscribed flag for the current transport. Do not propose or add multiple upstream subscriptions per printer, filter maps, or generic per-filter reconciliation.
+- Keep wildcard routing and overlapping client-filter ownership on the downstream side. These interests share the printer's single report subscription.
+- Send one warmup batch when the upstream report subscription is established. Keep full-state requests for genuinely late subscribers; do not duplicate startup warmups.
+- Preserve byte-exact payload forwarding, one upstream socket per printer, bounded reconnects, and correct shutdown. QoS 0 does not remove MQTT subscription acknowledgements or proxy-side concurrency requirements.
+- Configure fake printer brokers for QoS 0 only. Verify that startup stays connected and reports reach downstream clients.
+
 ## Key Directories
 
 | Path | Purpose |

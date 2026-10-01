@@ -88,7 +88,6 @@ type Printer struct {
 
 // Behavior holds routing and upstream connection tuning knobs.
 type Behavior struct {
-	QoSMax                        byte     `yaml:"qos_max"`
 	WarmupCommands                []string `yaml:"warmup_commands"`
 	UpstreamKeepaliveSeconds      int      `yaml:"upstream_keepalive_seconds"`
 	UpstreamConnectTimeoutSeconds int      `yaml:"upstream_connect_timeout_seconds"`
@@ -422,9 +421,6 @@ func (c *Config) ApplyDefaults() {
 	setIfZero(&c.Behavior.UpstreamConnectTimeoutSeconds, 5)
 	setIfZero(&c.Behavior.UpstreamBackoffInitialSeconds, 1)
 	setIfZero(&c.Behavior.UpstreamBackoffMaxSeconds, 30)
-	if c.Behavior.QoSMax == 0 {
-		c.Behavior.QoSMax = 1
-	}
 	if c.Log.Level == "" {
 		c.Log.Level = "info"
 	}
@@ -480,9 +476,6 @@ func (c *Config) Validate() error {
 		if p.Password == "" {
 			return fmt.Errorf("printers[%d] (%s): password (LAN access code) is required", i, p.Serial)
 		}
-	}
-	if c.Behavior.QoSMax > 2 {
-		return fmt.Errorf("behavior: qos_max %d out of range (0-2)", c.Behavior.QoSMax)
 	}
 	if c.Behavior.UpstreamKeepaliveSeconds <= 0 ||
 		c.Behavior.UpstreamConnectTimeoutSeconds <= 0 ||

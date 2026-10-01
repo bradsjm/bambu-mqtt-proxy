@@ -24,7 +24,7 @@ type recordingInject struct {
 	items []string
 }
 
-func (r *recordingInject) PublishDownstream(topic string, payload []byte, _ byte) {
+func (r *recordingInject) PublishDownstream(topic string, payload []byte) {
 	r.mu.Lock()
 	r.items = append(r.items, topic+"|"+string(payload))
 	r.mu.Unlock()
@@ -50,7 +50,6 @@ func newSupervisedConn(t *testing.T) (c *Conn, inject *recordingInject, latest f
 		inject:      inject,
 		log:         discardLogger(),
 		stopCh:      make(chan struct{}),
-		subs:        newSubRefs(),
 		connCh:      make(chan struct{}),
 	}
 	var (
@@ -170,7 +169,7 @@ func TestStopDuringInitialConnectThenLateCompletion(t *testing.T) {
 	gate := make(chan struct{})
 	tune(func(f *fakePaho) { f.connectGate = gate })
 
-	c.subscribeAsync("device/S1/report", 1)
+	c.subscribeAsync("device/S1/report")
 	var fake *fakePaho
 	waitForCondition(t, time.Second, func() bool {
 		fake = latest()
@@ -222,7 +221,6 @@ func TestCallsAfterPoolStopCreateNoClient(t *testing.T) {
 			inject:      &recordingInject{},
 			log:         discardLogger(),
 			stopCh:      make(chan struct{}),
-			subs:        newSubRefs(),
 			connCh:      make(chan struct{}),
 		}
 		c.newClient = func(tr *transport) mqtt.Client {
@@ -230,18 +228,17 @@ func TestCallsAfterPoolStopCreateNoClient(t *testing.T) {
 			return newFakePaho(true)
 		}
 		p.conns["S1"] = c
-		c.subscribeAsync("device/S1/report", 1)
+		c.subscribeAsync("device/S1/report")
 		waitForCondition(t, time.Second, func() bool { return c.lockActive() != nil })
 	}
 
 	p.Stop()
 	before := builds.Load()
 
-	p.Subscribe("S1", "device/S1/report", 1)
-	p.SubscribeAsync("S1", "device/S1/report", 1)
+	p.Subscribe("S1", "device/S1/report")
+	p.SubscribeAsync("S1", "device/S1/report")
 	p.Unsubscribe("S1", "device/S1/report")
-	p.RaiseQoS("S1", "device/S1/report", 1)
-	p.PublishWithContext("S1", "device/S1/request", []byte(`{}`), 0, PublishContext{})
+	p.PublishWithContext("S1", "device/S1/request", []byte(`{}`), PublishContext{})
 	p.EnsureConnected("S1", 10*time.Millisecond)
 	if err := p.PausePrint("S1", 1); err == nil {
 		t.Fatal("commands must fail after stop")
@@ -259,7 +256,7 @@ func TestCallsAfterPoolStopCreateNoClient(t *testing.T) {
 // completed.
 func TestReplacementWaitsForPreviousAttemptTeardown(t *testing.T) {
 	c, _, latest, _ := newSupervisedConn(t)
-	c.subscribeAsync("device/S1/report", 1)
+	c.subscribeAsync("device/S1/report")
 	var first *fakePaho
 	waitForCondition(t, time.Second, func() bool {
 		first = latest()
@@ -376,40 +373,36 @@ func TestRetireClosesRegisteredSocketAndBumpsGeneration(t *testing.T) {
 }
 
 // TestSubscribeGrantFailuresForceReconnect pins the SUBACK contract: a
-// missing grant, a 0x80 grant, a lower-QoS grant, a token error, and a token
-// timeout each fail reconciliation, leave the upgrade unestablished on the
-// failed transport, and drive a reconnect that restores the full desired set
-// without deadlock. A QoS upgrade is the reconcile trigger because every
-// downstream report filter merges onto the one report topic.
+// refused (0x80) grant, a token error, and a token timeout each fail
+// reconciliation, leave the subscription unestablished on the failed
+// transport, and drive a reconnect that restores the report interest without
+// deadlock. A first subscribe is the reconcile trigger: the printer broker
+// serves the one QoS 0 report topic.
 func TestSubscribeGrantFailuresForceReconnect(t *testing.T) {
 	cases := []struct {
 		name  string
 		token *fakeToken
 	}{
-		{"missing grant", &fakeToken{grants: map[string]byte{}}},
 		{"0x80 grant", &fakeToken{grants: map[string]byte{"device/S1/report": 0x80}}},
-		{"lower qos grant", &fakeToken{grants: map[string]byte{"device/S1/report": 0}}},
 		{"token error", &fakeToken{err: errors.New("not authorized")}},
 		{"token timeout", &fakeToken{done: make(chan struct{})}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			c, _, latest, _ := newSupervisedConn(t)
-			c.subscribeAsync("device/S1/report", 0)
-			// Wait for the install's QoS 0 restore to be confirmed, so the
-			// failing token below replaces only the upgrade's SUBACK.
-			waitForCondition(t, time.Second, func() bool {
-				_, on := c.lockOnWire()["device/S1/report"]
-				return on
-			})
+			// Connect with no recorded interest, so the first subscribe
+			// below is the failing reconcile.
+			if !c.ensure(time.Second) {
+				t.Fatal("initial connect failed")
+			}
 			first := latest()
 			firstGen := c.lockGeneration()
 			t1 := c.lockActive()
 
-			// The upgrade SUBSCRIBE issued by raiseQoS reconciliation on the
-			// live transport fails with the case's token.
+			// The first subscribe's SUBSCRIBE on the live transport fails
+			// with the case's token.
 			first.setSubToken(tc.token)
-			c.raiseQoS("device/S1/report", 1)
+			c.subscribe("device/S1/report")
 
 			// The failed transport is retired with the filter unestablished,
 			// and the supervisor recovers on a fresh transport with the full
@@ -418,24 +411,22 @@ func TestSubscribeGrantFailuresForceReconnect(t *testing.T) {
 				a := c.lockActive()
 				return a != nil && a.generation > firstGen
 			})
-			// Two calls on the failed transport: the QoS 0 subscribe at
-			// install and the failed QoS 1 upgrade.
-			if got := first.subCount(); got != 2 {
-				t.Fatalf("subscribe calls on failed transport = %d, want install plus the failed upgrade", got)
+			// One call on the failed transport: the failed first subscribe.
+			if got := first.subCount(); got != 1 {
+				t.Fatalf("subscribe calls on failed transport = %d, want the failed subscribe only", got)
 			}
-			if q := c.transportOnWire(t1)["device/S1/report"]; q != 0 {
-				t.Fatalf("upgrade recorded granted QoS %d on the failed transport, want the QoS 0 install only", q)
+			if c.transportSubscribed(t1) {
+				t.Fatal("the failed subscribe was recorded on the failed transport")
 			}
 			second := latest()
 			if second == first {
 				t.Fatal("no replacement client was built")
 			}
 			waitForCondition(t, 2*time.Second, func() bool {
-				onWire := c.lockOnWire()
-				return onWire["device/S1/report"] == 1
+				return c.lockSubscribed()
 			})
-			// The install warmup follows the restore reconcile, so poll for
-			// it rather than checking immediately.
+			// The establishment warmup follows the restore reconcile, so
+			// poll for it rather than checking immediately.
 			waitForCondition(t, 2*time.Second, func() bool {
 				return second.publishCount() > 0
 			})
@@ -447,23 +438,31 @@ func TestSubscribeGrantFailuresForceReconnect(t *testing.T) {
 // interest disappears and re-adds it when a new one arrives.
 func TestUnsubscribeReconcilesWire(t *testing.T) {
 	c, _, _, _ := newSupervisedConn(t)
-	c.subscribeAsync("device/S1/report", 1)
+	c.subscribeAsync("device/S1/report")
 	waitForCondition(t, time.Second, func() bool { return c.lockActive() != nil })
 
 	waitForCondition(t, time.Second, func() bool {
-		return c.lockOnWire()["device/S1/report"] == 1
+		return c.lockSubscribed()
 	})
+	if got := c.lockReportRefs(); got != 1 {
+		t.Fatalf("report interest count = %d, want 1", got)
+	}
 	// The install established the only reference; removing it unsubscribes
 	// upstream, and a later subscribe re-establishes the wire subscription.
 	c.unsubscribe("device/S1/report")
 	waitForCondition(t, time.Second, func() bool {
-		_, on := c.lockOnWire()["device/S1/report"]
-		return !on
+		return !c.lockSubscribed()
 	})
-	c.subscribe("device/S1/report", 1)
+	if got := c.lockReportRefs(); got != 0 {
+		t.Fatalf("report interest count = %d, want 0", got)
+	}
+	c.subscribe("device/S1/report")
 	waitForCondition(t, time.Second, func() bool {
-		return c.lockOnWire()["device/S1/report"] == 1
+		return c.lockSubscribed()
 	})
+	if got := c.lockReportRefs(); got != 1 {
+		t.Fatalf("report interest count = %d, want 1", got)
+	}
 }
 
 // TestPublishEngagesSupervisorAndDropsWhenOffline pins the publish-only
@@ -476,7 +475,7 @@ func TestPublishEngagesSupervisorAndDropsWhenOffline(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		c.publish("device/S1/request", []byte(`{}`), 0, PublishContext{Origin: "internal", Action: "publish"})
+		c.publish("device/S1/request", []byte(`{}`), PublishContext{Origin: "internal", Action: "publish"})
 		close(done)
 	}()
 	// The gated connect means the publish waits one connect budget (250ms).
@@ -493,30 +492,55 @@ func TestPublishEngagesSupervisorAndDropsWhenOffline(t *testing.T) {
 	// Ungate the connect: a new publish reaches the printer exactly once.
 	close(gate)
 	waitForCondition(t, 2*time.Second, func() bool { return c.lockActive() != nil })
-	c.publish("device/S1/request", []byte(`{"cmd":1}`), 0, PublishContext{Origin: "internal", Action: "publish"})
-	// The install also warms up, so match the exact request payload instead
-	// of the total count.
+	// A publish-only connection records no report interest: the install
+	// subscribes nothing and warms up nothing.
+	waitForCondition(t, time.Second, func() bool { return !c.lockSubscribed() })
+	if got := latest().publishCount(); got != 0 {
+		t.Fatalf("warmup publishes with no report interest = %d, want 0", got)
+	}
+	c.publish("device/S1/request", []byte(`{"cmd":1}`), PublishContext{Origin: "internal", Action: "publish"})
 	waitForCondition(t, 2*time.Second, func() bool {
 		return publishCountOf(latest(), `{"cmd":1}`) == 1
 	})
 	if got := publishCountOf(latest(), `{"cmd":1}`); got != 1 {
 		t.Fatalf("request publishes = %d, want exactly one (never queued or replayed)", got)
 	}
+	if got := latest().publishCount(); got != 1 {
+		t.Fatalf("total publishes = %d, want exactly the one request (no warmup without a report interest)", got)
+	}
 }
 
-// TestSecondSubscriberRaisesWireQoS pins that a later subscriber whose QoS
-// raises the merged maximum upgrades the live upstream subscription.
-func TestSecondSubscriberRaisesWireQoS(t *testing.T) {
-	c, _, _, _ := newSupervisedConn(t)
-	c.subscribe("device/S1/report", 0)
-	waitForCondition(t, time.Second, func() bool {
-		q, on := c.lockOnWire()["device/S1/report"]
-		return on && q == 0
-	})
-	c.subscribe("device/S1/report", 1)
-	if q := c.lockOnWire()["device/S1/report"]; q != 1 {
-		t.Fatalf("wire QoS after second subscriber = %d, want 1", q)
+// TestSubscribeQoS0GrantEstablishesInPlace pins the success contract: a QoS
+// 0 grant — the only kind the printer's broker gives — establishes the
+// subscription on the live transport with no reconnect, and the SUBSCRIBE
+// requested QoS 0.
+func TestSubscribeQoS0GrantEstablishesInPlace(t *testing.T) {
+	c, _, latest, _ := newSupervisedConn(t)
+	if !c.ensure(time.Second) {
+		t.Fatal("initial connect failed")
 	}
+	first := latest()
+	firstGen := c.lockGeneration()
+
+	c.subscribe("device/S1/report")
+	waitForCondition(t, time.Second, func() bool {
+		return c.lockSubscribed()
+	})
+	if got := c.lockGeneration(); got != firstGen {
+		t.Fatalf("generation after subscribe = %d, want unchanged %d", got, firstGen)
+	}
+	if got := first.subCount(); got != 1 {
+		t.Fatalf("subscribe calls = %d, want exactly one", got)
+	}
+	subs := first.subSnapshot()
+	if subs[0].qos != 0 {
+		t.Fatalf("upstream subscribe requested QoS %d, want 0", subs[0].qos)
+	}
+	// The false→true establishment owns exactly one warmup batch on the
+	// same transport.
+	waitForCondition(t, time.Second, func() bool {
+		return publishCountOf(first, `{"pushall":1}`) == 1
+	})
 }
 
 // TestEnsureWaiterWakesOnReconnectAfterLoss pins that a waiter captured
@@ -548,13 +572,12 @@ func TestEnsureWaiterWakesOnReconnectAfterLoss(t *testing.T) {
 // recording never blocks on a reconciliation stalled in token waits, so
 // callers holding their own ownership lock stay responsive.
 func TestRecordingDoesNotWaitBehindReconciliation(t *testing.T) {
-	c := &Conn{spec: config.Printer{Serial: "S1"}, subs: newSubRefs()}
+	c := &Conn{spec: config.Printer{Serial: "S1"}}
 	c.subMu.Lock() // a reconciliation parked in a SUBACK wait
 	defer c.subMu.Unlock()
 	done := make(chan struct{})
 	go func() {
-		c.recordSubscribe("device/S1/report", 1)
-		c.recordRaiseQoS("device/S1/report", 1)
+		c.recordSubscribe("device/S1/report")
 		c.recordUnsubscribe("device/S1/report")
 		close(done)
 	}()

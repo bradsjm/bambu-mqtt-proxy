@@ -25,10 +25,9 @@ type fakePool struct {
 
 // refOp is one recorded upstream reference operation.
 type refOp struct {
-	kind   string // subscribe | unsubscribe | raise
+	kind   string // subscribe | unsubscribe
 	serial string
 	filter string
-	qos    byte
 }
 
 func (f *fakePool) EnsureConnected(string, time.Duration) bool { return true }
@@ -45,19 +44,15 @@ func (f *fakePool) record(op refOp) func() {
 	}
 }
 
-func (f *fakePool) RecordSubscribe(serial, filter string, qos byte) func() {
-	return f.record(refOp{"subscribe", serial, filter, qos})
+func (f *fakePool) RecordSubscribe(serial, filter string) func() {
+	return f.record(refOp{"subscribe", serial, filter})
 }
 
 func (f *fakePool) RecordUnsubscribe(serial, filter string) func() {
-	return f.record(refOp{"unsubscribe", serial, filter, 0})
+	return f.record(refOp{"unsubscribe", serial, filter})
 }
 
-func (f *fakePool) RecordRaiseQoS(serial, filter string, qos byte) func() {
-	return f.record(refOp{"raise", serial, filter, qos})
-}
-
-func (f *fakePool) PublishWithContext(string, string, []byte, byte, upstream.PublishContext) {}
+func (f *fakePool) PublishWithContext(string, string, []byte, upstream.PublishContext) {}
 
 // count reports how many ops of a kind hit serial+filter.
 func (f *fakePool) count(kind, serial, filter string) int {
@@ -142,7 +137,7 @@ func TestOnWillSuppressesDownstreamPreservesInline(t *testing.T) {
 	}
 }
 
-func TestSubscribeMergeRefCountAndQoSRaise(t *testing.T) {
+func TestSubscribeMergeRefCount(t *testing.T) {
 	b, pool := newTestBridge()
 	filter := "device/S1/report"
 	cl := mkClient("c1", false, nil)
@@ -152,13 +147,10 @@ func TestSubscribeMergeRefCountAndQoSRaise(t *testing.T) {
 		t.Fatalf("first subscribe merged %d times, want 1", got)
 	}
 
-	// Repeated SUBSCRIBE: refcount-neutral, QoS raise only.
+	// Repeated SUBSCRIBE: refcount-neutral, no upstream activity.
 	b.OnSubscribed(cl, subscribedPacket(filter), []byte{1})
 	if got := pool.count("subscribe", "S1", filter); got != 1 {
 		t.Fatalf("repeated subscribe merged %d times, want 1", got)
-	}
-	if got := pool.count("raise", "S1", filter); got != 1 {
-		t.Fatalf("repeated subscribe raised QoS %d times, want 1", got)
 	}
 
 	// Explicit unsubscribe by the current owner releases once.
@@ -172,11 +164,11 @@ func TestSubscribeMergeRefCountAndQoSRaise(t *testing.T) {
 	if got := pool.count("unsubscribe", "S1", filter); got != 1 {
 		t.Fatalf("stale unsubscribe released %d times, want 1", got)
 	}
-	subs, raises := pool.count("subscribe", "S1", filter), pool.count("raise", "S1", filter)
+	subs := pool.count("subscribe", "S1", filter)
 
 	// Denied filters (0x80) never merge.
 	b.OnSubscribed(cl, subscribedPacket(filter), []byte{0x80})
-	if pool.count("subscribe", "S1", filter) != subs || pool.count("raise", "S1", filter) != raises {
+	if pool.count("subscribe", "S1", filter) != subs {
 		t.Fatal("denied filter merged upstream")
 	}
 }
@@ -246,10 +238,6 @@ func TestSessionEstablishedReconcilesInheritedSet(t *testing.T) {
 	if got := pool.count("unsubscribe", "S1", f2); got != 1 {
 		t.Fatalf("absent interest released %d times, want 1", got)
 	}
-	if got := pool.count("raise", "S1", f1); got != 1 {
-		t.Fatalf("adopted interest raised QoS %d times, want 1", got)
-	}
-
 	// Clean reconnect with an empty inherited set releases the rest.
 	clean := mkClient("s", false, nil)
 	b.OnSessionEstablished(clean, packets.Packet{})
@@ -340,7 +328,7 @@ func TestUpstreamCompletionsRunOutsideOwnershipLock(t *testing.T) {
 	persistent := mkClient("p", false, map[string]byte{filter: 1})
 	b.OnSessionEstablished(persistent, packets.Packet{})
 	b.OnDisconnect(persistent, nil, true)
-	if runs != 5 {
-		t.Fatalf("completions run = %d, want 5 (subscribe, raise, unsubscribe, inherit, expire)", runs)
+	if runs != 4 {
+		t.Fatalf("completions run = %d, want 4 (subscribe, unsubscribe, inherit, expire)", runs)
 	}
 }

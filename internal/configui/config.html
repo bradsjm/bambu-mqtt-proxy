@@ -317,15 +317,6 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
             <input type="number" min="1" required aria-label="Longest retry delay" data-field="behavior.backoff_max_seconds" data-type="int">
           </div>
         </div>
-        <div class="row">
-          <div><span class="label" id="qos-l">Maximum QoS</span>
-            <span class="hint">Bambu printers use 0 and 1.</span></div>
-          <div class="control"><div class="seg" role="radiogroup" aria-labelledby="qos-l">
-            <label><input type="radio" name="qos" value="0" data-field="behavior.qos_max" data-type="int">0</label>
-            <label><input type="radio" name="qos" value="1" data-field="behavior.qos_max" data-type="int">1</label>
-            <label><input type="radio" name="qos" value="2" data-field="behavior.qos_max" data-type="int">2</label>
-          </div></div>
-        </div>
         <div class="row wide">
           <div><label for="f-warmup">Warmup commands</label>
             <span class="hint">Sent to a printer when it connects, one JSON message per line. The default asks for its full state.</span>

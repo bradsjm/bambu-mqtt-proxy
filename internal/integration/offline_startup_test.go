@@ -65,7 +65,7 @@ func TestHTTPStartsBeforeOfflinePrinters(t *testing.T) {
 	// The camera feature's startup path: one async interest per printer.
 	// Must return immediately; the blocking Subscribe would spend the
 	// connect timeout here.
-	pool.SubscribeAsync(offline.Serial, "device/"+offline.Serial+"/report", 1)
+	pool.SubscribeAsync(offline.Serial, "device/"+offline.Serial+"/report")
 	elapsed := time.Since(started)
 	if elapsed > 500*time.Millisecond {
 		t.Fatalf("startup subscriptions blocked %s; must be non-blocking", elapsed)

@@ -127,7 +127,7 @@ func remainLen(n int) []byte {
 // rawWillConnect completes a raw MQTT 3.1.1 CONNECT with a will over TLS and
 // returns the connection. Closing the returned connection without DISCONNECT
 // makes the broker fire the will, which paho cannot express.
-func rawWillConnect(t *testing.T, p *proxy, id, willTopic, willPayload string, willQos byte, willRetain bool) net.Conn {
+func rawWillConnect(t *testing.T, p *proxy, id, willTopic, willPayload string, willRetain bool) net.Conn {
 	t.Helper()
 	conn, err := tls.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", p.port), &tls.Config{InsecureSkipVerify: true})
 	if err != nil {
@@ -135,13 +135,8 @@ func rawWillConnect(t *testing.T, p *proxy, id, willTopic, willPayload string, w
 	}
 	t.Cleanup(func() { conn.Close() })
 
-	flags := byte(0x02 | 0x04 | 0x80 | 0x40) // clean session, will, username, password
-	if willQos == 1 {
-		flags |= 0x08
-	}
-	if willQos == 2 {
-		flags |= 0x10
-	}
+	// clean session, QoS 0 will, username, password
+	flags := byte(0x02 | 0x04 | 0x80 | 0x40)
 	if willRetain {
 		flags |= 0x20
 	}
@@ -184,8 +179,8 @@ func TestWillNeverFansOutOrRetains(t *testing.T) {
 			p1 := newFakePrinter(t, freePort(t))
 			p := startProxyAuth(t, mode, []config.Printer{printerSpec(p1.port, serial1)})
 			sub := connect(t, p, "sub-"+mode, "bblp", accessCode, false)
-			if got := sub.subscribe(t, reportTopic(serial1), 1); got > 1 {
-				t.Fatalf("granted qos %#x, want <= 1", got)
+			if got := sub.subscribe(t, reportTopic(serial1), 1); got != 0 {
+				t.Fatalf("granted qos %#x, want 0 (broker caps at the printer's QoS 0)", got)
 			}
 			waitFor(t, 5*time.Second, func() bool {
 				return p1.rec.subCount(reportTopic(serial1)) >= 1
@@ -193,16 +188,16 @@ func TestWillNeverFansOutOrRetains(t *testing.T) {
 			// Mochi publishes wills straight to subscribers, bypassing
 			// OnPublish, so a leaked request will surfaces here.
 			reqSub := connect(t, p, "reqsub-"+mode, "bblp", accessCode, false)
-			if got := reqSub.subscribe(t, requestTopic(serial1), 1); got > 1 {
-				t.Fatalf("request subscribe granted %#x, want <= 1", got)
+			if got := reqSub.subscribe(t, requestTopic(serial1), 1); got != 0 {
+				t.Fatalf("request subscribe granted %#x, want 0 (broker caps at the printer's QoS 0)", got)
 			}
 
 			// Retained report-topic will.
-			retained := rawWillConnect(t, p, "willer-r-"+mode, reportTopic(serial1), "WILL-RETAINED", 1, true)
+			retained := rawWillConnect(t, p, "willer-r-"+mode, reportTopic(serial1), "WILL-RETAINED", true)
 			time.Sleep(200 * time.Millisecond)
 			retained.Close() // ungraceful: fires the will
 			// Request-topic will: a leak would surface as a command.
-			req := rawWillConnect(t, p, "willer-q-"+mode, requestTopic(serial1), "WILL-REQ", 1, false)
+			req := rawWillConnect(t, p, "willer-q-"+mode, requestTopic(serial1), "WILL-REQ", false)
 			time.Sleep(200 * time.Millisecond)
 			req.Close()
 
@@ -220,8 +215,8 @@ func TestWillNeverFansOutOrRetains(t *testing.T) {
 
 			// A later subscriber receives no retained will.
 			late := connect(t, p, "late-"+mode, "bblp", accessCode, false)
-			if got := late.subscribe(t, reportTopic(serial1), 1); got > 1 {
-				t.Fatalf("granted qos %#x, want <= 1", got)
+			if got := late.subscribe(t, reportTopic(serial1), 1); got != 0 {
+				t.Fatalf("granted qos %#x, want 0 (broker caps at the printer's QoS 0)", got)
 			}
 			time.Sleep(300 * time.Millisecond)
 			if late.box.has(reportTopic(serial1), "WILL-RETAINED") {
@@ -237,18 +232,19 @@ func TestWillNeverFansOutOrRetains(t *testing.T) {
 	}
 }
 
-// TestPersistentSessionKeepsInterestAndQueuesQoS pins session resumption: a
-// CleanSession=false disconnect keeps the merged upstream interest, offline
-// QoS 1 reports queue for the session, and the resume delivers them without
-// a new upstream SUBSCRIBE.
-func TestPersistentSessionKeepsInterestAndQueuesQoS(t *testing.T) {
+// TestPersistentSessionKeepsInterestAcrossResume pins session resumption: a
+// CleanSession=false disconnect keeps the merged upstream interest, and the
+// resumed session receives live reports without a new upstream SUBSCRIBE.
+// Reports published while the session is offline are dropped, not queued:
+// every delivery is QoS 0, like the printer's own broker.
+func TestPersistentSessionKeepsInterestAcrossResume(t *testing.T) {
 	p1 := newFakePrinter(t, freePort(t))
 	p := startProxy(t, []config.Printer{printerSpec(p1.port, serial1)})
 	filter := reportTopic(serial1)
 
 	c1 := connectResume(t, p, "persist")
-	if got := c1.subscribe(t, filter, 1); got > 1 {
-		t.Fatalf("granted qos %#x, want <= 1", got)
+	if got := c1.subscribe(t, filter, 1); got != 0 {
+		t.Fatalf("granted qos %#x, want 0 (broker caps at the printer's QoS 0)", got)
 	}
 	waitFor(t, 5*time.Second, func() bool {
 		return p1.rec.subCount(filter) >= 1
@@ -256,19 +252,26 @@ func TestPersistentSessionKeepsInterestAndQueuesQoS(t *testing.T) {
 	time.Sleep(300 * time.Millisecond) // let the merge settle
 	baseline := p1.rec.subCount(filter)
 
+	// A live report arrives before the disconnect.
+	p1.publish(t, filter, "before-offline")
+	waitFor(t, 5*time.Second, func() bool {
+		return c1.box.has(filter, "before-offline")
+	})
+
 	// Graceful persistent disconnect: the interest and owner are retained.
 	c1.cl.Disconnect(100)
 	time.Sleep(200 * time.Millisecond)
 
-	// While offline, the printer publishes: the proxy queues it.
-	p1.publish(t, filter, "queued-offline")
+	// While offline, the printer publishes: QoS 0 delivery has no session
+	// queue, so the proxy drops the report instead of replaying it.
+	p1.publish(t, filter, "dropped-offline")
 
-	// Resuming reconnect: SessionPresent resume, queued message delivered,
-	// and no upstream re-subscribe.
+	// Resuming reconnect: SessionPresent resume and no upstream re-subscribe.
 	c2 := connectResume(t, p, "persist")
-	waitFor(t, 5*time.Second, func() bool {
-		return c2.box.has(filter, "queued-offline")
-	})
+	time.Sleep(300 * time.Millisecond) // replay window
+	if c2.box.has(filter, "dropped-offline") {
+		t.Fatal("offline report was queued and replayed; QoS 0 delivery must drop it")
+	}
 	if got := p1.rec.subCount(filter); got != baseline {
 		t.Fatalf("resume changed upstream subscribes: %d -> %d", baseline, got)
 	}
@@ -287,8 +290,8 @@ func TestSameIDTakeoverKeepsSingleReference(t *testing.T) {
 	filter := reportTopic(serial1)
 
 	c1 := connectResume(t, p, "dupe")
-	if got := c1.subscribe(t, filter, 1); got > 1 {
-		t.Fatalf("granted qos %#x, want <= 1", got)
+	if got := c1.subscribe(t, filter, 1); got != 0 {
+		t.Fatalf("granted qos %#x, want 0 (broker caps at the printer's QoS 0)", got)
 	}
 	waitFor(t, 5*time.Second, func() bool {
 		return p1.rec.subCount(filter) >= 1
@@ -328,8 +331,8 @@ func TestCleanReconnectReleasesOnce(t *testing.T) {
 	filter := reportTopic(serial1)
 
 	c1 := connect(t, p, "cr", "bblp", accessCode, false)
-	if got := c1.subscribe(t, filter, 1); got > 1 {
-		t.Fatalf("granted qos %#x, want <= 1", got)
+	if got := c1.subscribe(t, filter, 1); got != 0 {
+		t.Fatalf("granted qos %#x, want 0 (broker caps at the printer's QoS 0)", got)
 	}
 	waitFor(t, 5*time.Second, func() bool {
 		return p1.rec.subCount(filter) >= 1
@@ -356,8 +359,8 @@ func TestCleanReconnectReleasesOnce(t *testing.T) {
 	}
 
 	// The fresh session subscribes again: exactly one new reference.
-	if got := c2.subscribe(t, filter, 1); got > 1 {
-		t.Fatalf("granted qos %#x, want <= 1", got)
+	if got := c2.subscribe(t, filter, 1); got != 0 {
+		t.Fatalf("granted qos %#x, want 0 (broker caps at the printer's QoS 0)", got)
 	}
 	waitFor(t, 5*time.Second, func() bool {
 		return p1.rec.subCount(filter) == baseline+1

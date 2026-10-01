@@ -25,7 +25,7 @@ import (
 // Injector publishes upstream reports into the downstream broker, where the
 // broker fans them out to subscribed clients.
 type Injector interface {
-	PublishDownstream(topic string, payload []byte, qos byte)
+	PublishDownstream(topic string, payload []byte)
 }
 
 // ObserveFunc receives every upstream report before downstream forwarding.
@@ -40,8 +40,8 @@ type ObserveFunc func(serial string, seq, gen uint64, payload []byte)
 type ConnectivityObserver func(serial string, connected bool, err error)
 
 // PublishContext identifies the source and action for an upstream publish.
-// SourcePacket is true when SourceQoS, SourceDup, and SourceRetain describe an
-// incoming downstream MQTT PUBLISH packet.
+// SourcePacket is true when SourceDup and SourceRetain describe an incoming
+// downstream MQTT PUBLISH packet.
 type PublishContext struct {
 	// Origin identifies the source of the publish.
 	Origin string
@@ -53,8 +53,6 @@ type PublishContext struct {
 	Reason string
 	// SourcePacket indicates that the source fields describe an incoming MQTT PUBLISH.
 	SourcePacket bool
-	// SourceQoS is the QoS of the incoming source packet.
-	SourceQoS byte
 	// SourceDup is the DUP flag of the incoming source packet.
 	SourceDup bool
 	// SourceRetain is the RETAIN flag of the incoming source packet.
@@ -107,34 +105,35 @@ func (p *Pool) EnsureConnected(serial string, timeout time.Duration) bool {
 }
 
 // Subscribe records downstream interest in filter on the printer's upstream
-// connection, subscribing upstream when connected. Each new downstream
-// interest on a connected printer also requests the configured warmup, so
-// the newest subscriber converges to full state.
-func (p *Pool) Subscribe(serial, filter string, qos byte) {
-	p.RecordSubscribe(serial, filter, qos)()
+// connection, subscribing the printer's one report topic upstream when the
+// interest count rises from zero. Each subscriber joining an already-live
+// report subscription requests one warmup batch, so the newest subscriber
+// converges to full state.
+func (p *Pool) Subscribe(serial, filter string) {
+	p.RecordSubscribe(serial, filter)()
 }
 
 // RecordSubscribe is Subscribe split in two: it records the reference at
 // once without network waits, and the returned function completes the
 // upstream work (connect, wire reconciliation, warmup). Callers that
 // serialize reference ownership under their own lock record inside it and
-// complete outside it. Completions reconcile the latest recorded state, so
+// complete outside it. Completions reconcile the latest recorded count, so
 // running them in any order converges.
-func (p *Pool) RecordSubscribe(serial, filter string, qos byte) func() {
+func (p *Pool) RecordSubscribe(serial, filter string) func() {
 	if c := p.conn(serial); c != nil {
-		return c.recordSubscribe(filter, qos)
+		return c.recordSubscribe(filter)
 	}
 	return func() {}
 }
 
 // SubscribeAsync records downstream interest without waiting for upstream
 // connectivity. It engages the connection supervisor and returns at once;
-// the supervisor reconciles the merged filter set from the recorded refs
-// once the printer answers. Use it for long-lived internal interests whose
-// first delivery may wait for a printer that is offline at startup.
-func (p *Pool) SubscribeAsync(serial, filter string, qos byte) {
+// the supervisor reconciles the recorded interest count once the printer
+// answers. Use it for long-lived internal interests whose first delivery may
+// wait for a printer that is offline at startup.
+func (p *Pool) SubscribeAsync(serial, filter string) {
 	if c := p.conn(serial); c != nil {
-		c.subscribeAsync(filter, qos)
+		c.subscribeAsync(filter)
 	}
 }
 
@@ -145,7 +144,7 @@ func (p *Pool) Unsubscribe(serial, filter string) {
 }
 
 // RecordUnsubscribe removes one reference at once; the returned function
-// reconciles the wire. See RecordSubscribe.
+// reconciles the wire when the count reaches zero. See RecordSubscribe.
 func (p *Pool) RecordUnsubscribe(serial, filter string) func() {
 	if c, ok := p.existing(serial); ok {
 		return c.recordUnsubscribe(filter)
@@ -153,29 +152,11 @@ func (p *Pool) RecordUnsubscribe(serial, filter string) func() {
 	return func() {}
 }
 
-// RaiseQoS merges a repeated downstream interest's QoS into the stored
-// maximum for an existing connection without changing refcounts; the change
-// is reconciled onto the wire while connected, and reconnects restore the
-// merged set at the highest stored request. Unknown connections create no
-// interest.
-func (p *Pool) RaiseQoS(serial, filter string, qos byte) {
-	p.RecordRaiseQoS(serial, filter, qos)()
-}
-
-// RecordRaiseQoS merges the QoS at once; the returned function reconciles
-// the wire. See RecordSubscribe.
-func (p *Pool) RecordRaiseQoS(serial, filter string, qos byte) func() {
-	if c, ok := p.existing(serial); ok {
-		return c.recordRaiseQoS(filter, qos)
-	}
-	return func() {}
-}
-
 // Publish forwards a client request upstream. Fire-and-forget: when the
 // upstream cannot be established within the connect budget the message is
 // dropped and logged, matching the behavior of a dropped printer connection.
-func (p *Pool) Publish(serial, topic string, payload []byte, qos byte) {
-	p.PublishWithContext(serial, topic, payload, qos, PublishContext{Origin: "internal", Action: "publish"})
+func (p *Pool) Publish(serial, topic string, payload []byte) {
+	p.PublishWithContext(serial, topic, payload, PublishContext{Origin: "internal", Action: "publish"})
 }
 
 // PublishWithContext forwards a publish and records its source metadata in
@@ -183,9 +164,9 @@ func (p *Pool) Publish(serial, topic string, payload []byte, qos byte) {
 // engages the single-flight supervisor and waits one connect budget for the
 // printer; a request that cannot be delivered within the budget is dropped
 // without queueing or replay.
-func (p *Pool) PublishWithContext(serial, topic string, payload []byte, qos byte, publishContext PublishContext) {
+func (p *Pool) PublishWithContext(serial, topic string, payload []byte, publishContext PublishContext) {
 	if c := p.conn(serial); c != nil {
-		c.publish(topic, payload, qos, publishContext)
+		c.publish(topic, payload, publishContext)
 	}
 }
 
@@ -380,20 +361,20 @@ func (c *Conn) command(generation uint64, name, payload string) error {
 	}
 	c.mu.Unlock()
 	if client == nil {
-		attrs := publishLogAttrs(ctx, c.spec.Serial, topic, 0, false, gen, 0, "not_sent", "none", "upstream is not connected")
-		c.log.Debug("printer command payload details", publishDebugLogAttrs(ctx, c.spec.Serial, topic, []byte(payload), 0, false, gen, 0, "not_sent", "none", "upstream is not connected")...)
+		attrs := publishLogAttrs(ctx, c.spec.Serial, topic, gen, 0, "not_sent", "none", "upstream is not connected")
+		c.log.Debug("printer command payload details", publishDebugLogAttrs(ctx, c.spec.Serial, topic, []byte(payload), gen, 0, "not_sent", "none", "upstream is not connected")...)
 		c.log.Warn("printer command not attempted", attrs...)
 		return fmt.Errorf("%s %s: upstream is not connected", name, c.spec.Serial)
 	}
 	if gen != generation {
-		attrs := publishLogAttrs(ctx, c.spec.Serial, topic, 0, false, gen, 0, "not_sent", "none", "connection generation changed")
+		attrs := publishLogAttrs(ctx, c.spec.Serial, topic, gen, 0, "not_sent", "none", "connection generation changed")
 		attrs = append(attrs, "expected_generation", generation)
-		c.log.Debug("printer command payload details", publishDebugLogAttrs(ctx, c.spec.Serial, topic, []byte(payload), 0, false, gen, 0, "not_sent", "none", "connection generation changed")...)
+		c.log.Debug("printer command payload details", publishDebugLogAttrs(ctx, c.spec.Serial, topic, []byte(payload), gen, 0, "not_sent", "none", "connection generation changed")...)
 		c.log.Warn("printer command not attempted", attrs...)
 		return fmt.Errorf("%s %s: connection generation changed (have %d, want %d)",
 			name, c.spec.Serial, gen, generation)
 	}
-	_, tok, completed := c.publishUpstream(client, gen, ctx, topic, []byte(payload), 0, false)
+	_, tok, completed := c.publishUpstream(client, gen, ctx, topic, []byte(payload))
 	if !completed {
 		return fmt.Errorf("%s %s: publish timed out after %s", name, c.spec.Serial, c.connectTO)
 	}
@@ -412,76 +393,6 @@ func (p *Pool) existing(serial string) (*Conn, bool) {
 	defer p.mu.Unlock()
 	c, ok := p.conns[serial]
 	return c, ok
-}
-
-// subRef tracks how many downstream clients share one merged upstream filter
-// and the highest requested QoS.
-type subRef struct {
-	count int
-	qos   byte
-}
-
-// subRefs tracks downstream interest counts and the highest requested QoS per
-// merged upstream filter.
-type subRefs struct {
-	refs map[string]subRef
-}
-
-// newSubRefs creates an empty interest set.
-func newSubRefs() *subRefs {
-	return &subRefs{refs: make(map[string]subRef)}
-}
-
-// add records one interest; it reports whether this is the first for the filter.
-func (s *subRefs) add(filter string, qos byte) bool {
-	prev, have := s.refs[filter]
-	next := subRef{count: prev.count + 1, qos: prev.qos}
-	if !have {
-		next = subRef{count: 1, qos: qos}
-	} else if qos > next.qos {
-		next.qos = qos
-	}
-	s.refs[filter] = next
-	return !have
-}
-
-// remove drops one interest; it reports whether this was the last.
-func (s *subRefs) remove(filter string) bool {
-	prev, have := s.refs[filter]
-	if !have {
-		return false
-	}
-	prev.count--
-	if prev.count <= 0 {
-		delete(s.refs, filter)
-		return true
-	}
-	s.refs[filter] = prev
-	return false
-}
-
-// raise merges a higher requested QoS into an existing interest without
-// changing its refcount; absent filters stay absent.
-func (s *subRefs) raise(filter string, qos byte) {
-	prev, have := s.refs[filter]
-	if !have || qos <= prev.qos {
-		return
-	}
-	s.refs[filter] = subRef{count: prev.count, qos: qos}
-}
-
-// snapshot returns a copy of the merged filter set for reconciliation.
-func (s *subRefs) snapshot() map[string]byte {
-	out := make(map[string]byte, len(s.refs))
-	for f, r := range s.refs {
-		out[f] = r.qos
-	}
-	return out
-}
-
-// count returns the number of downstream clients sharing one filter.
-func (s *subRefs) count(filter string) int {
-	return s.refs[filter].count
 }
 
 // transport owns every resource of one connection attempt: its Paho client,
@@ -505,10 +416,11 @@ type transport struct {
 	sockMu sync.Mutex
 	sock   net.Conn
 
-	// onWire records the subscriptions live on this transport, with their
-	// granted QoS. Guarded only by Conn.subMu; a replacement transport
-	// starts empty.
-	onWire map[string]byte
+	// subscribed records whether the transport's one report subscription is
+	// live on the wire. Written only by wire reconciliation under
+	// Conn.subMu with Conn.mu held, so either lock reads it safely; a
+	// replacement transport starts false.
+	subscribed bool
 
 	// connectTok joins the outstanding Connect on teardown.
 	connectTok mqtt.Token
@@ -619,10 +531,12 @@ type Conn struct {
 	active *transport
 	// supDone closes when the supervisor goroutine exits; nil until started.
 	supDone chan struct{}
-	// subs is the desired interest set, guarded by mu.
-	subs      *subRefs
-	backoffN  int
-	nextRetry time.Time
+	// reportRefs counts downstream interests sharing the printer's one
+	// report topic, guarded by mu. Every upstream subscription is QoS 0,
+	// like the printer's own broker.
+	reportRefs int
+	backoffN   int
+	nextRetry  time.Time
 	// connCh is closed (and replaced) on every successful install, so any
 	// waiter captured while disconnected wakes on the next install.
 	connCh chan struct{}
@@ -638,8 +552,8 @@ type Conn struct {
 	// guards the short active-pointer transitions at install and retirement.
 	// Lock order: reportMu, then mu. Never taken while holding mu or subMu.
 	reportMu sync.Mutex
-	// subMu serializes wire reconciliation and guards each transport's
-	// onWire map. Intent (subs) is guarded by mu alone, so recording an
+	// subMu serializes wire reconciliation and the warmup batches tied to
+	// it. Intent (reportRefs) is guarded by mu alone, so recording an
 	// interest never waits behind a reconciliation's token waits.
 	// Lock order: subMu, then mu. Never taken while holding mu or reportMu.
 	subMu sync.Mutex
@@ -660,7 +574,6 @@ func newConn(spec config.Printer, behavior config.Behavior, inject Injector,
 		connectivity: connectivity,
 		log:          log,
 		stopCh:       make(chan struct{}),
-		subs:         newSubRefs(),
 		connCh:       make(chan struct{}),
 	}
 }
@@ -861,20 +774,17 @@ func (c *Conn) attempt() bool {
 		c.connectivity(c.spec.Serial, true, nil)
 	}
 
-	// Restore the complete desired subscription set on the fresh transport,
-	// then warm up once so subscribers converge to full state.
+	// Restore the report interest on the fresh transport. The false→true
+	// establishment there owns the one warmup batch whenever an interest is
+	// recorded; with no interest the fresh transport stays unsubscribed and
+	// nothing is published.
 	c.subMu.Lock()
 	c.reconcileSubsLocked()
 	c.subMu.Unlock()
-	reason := "initial_connect"
-	if reconnect {
-		reason = "reconnect"
-	}
 	c.log.Info("upstream connection ready",
 		"serial", c.spec.Serial,
 		"connection_generation", t.generation,
 		"reconnect", reconnect)
-	c.sendWarmup(reason)
 
 	// Own this transport until it loses the connection or the connection is
 	// stopped.
@@ -1062,12 +972,8 @@ func (c *Conn) onMessage(t *transport, msg mqtt.Message) {
 		// sequence tokens are monotonic in delivery order.
 		c.observe(c.spec.Serial, seq, generation, msg.Payload())
 	}
-	c.log.Debug("printer report received", "origin", "printer", "action", "report", "serial", c.spec.Serial, "topic", msg.Topic(), "payload", string(msg.Payload()), "qos", msg.Qos(), "retain", msg.Retained(), "dup", msg.Duplicate(), "connection_generation", generation, "sequence", seq, "delivery", "received")
-	qos := msg.Qos()
-	if qos > 1 {
-		qos = 1
-	}
-	c.inject.PublishDownstream(msg.Topic(), msg.Payload(), qos)
+	c.log.Debug("printer report received", "origin", "printer", "action", "report", "serial", c.spec.Serial, "topic", msg.Topic(), "payload", string(msg.Payload()), "retain", msg.Retained(), "dup", msg.Duplicate(), "connection_generation", generation, "sequence", seq, "delivery", "received")
+	c.inject.PublishDownstream(msg.Topic(), msg.Payload())
 	c.reportMu.Unlock()
 }
 
@@ -1084,20 +990,25 @@ func (c *Conn) reportFilter(filter string) string {
 	if strings.HasSuffix(filter, "/request") {
 		return ""
 	}
+	return c.reportTopic()
+}
+
+// reportTopic is the one fixed report topic for this printer.
+func (c *Conn) reportTopic() string {
 	return fmt.Sprintf("device/%s/report", c.spec.Serial)
 }
 
 // subscribe records the filter and reconciles it upstream when connected. A
-// new downstream interest on a connected printer also requests the configured
-// warmup, so late subscribers converge to full state; one subscription
-// operation produces one warmup.
-func (c *Conn) subscribe(filter string, qos byte) {
-	c.recordSubscribe(filter, qos)()
+// subscriber joining an already-live report subscription requests one warmup
+// batch; one recorded before the subscription is established is covered by
+// that establishment's batch instead.
+func (c *Conn) subscribe(filter string) {
+	c.recordSubscribe(filter)()
 }
 
 // recordSubscribe records the interest under mu and returns the upstream
 // completion; see Pool.RecordSubscribe.
-func (c *Conn) recordSubscribe(filter string, qos byte) func() {
+func (c *Conn) recordSubscribe(filter string) func() {
 	// Upstream subscriptions cover report-leaf filters only. Subscribing to
 	// request filters upstream would make the printer broker echo proxied
 	// requests back to the proxy and out to downstream subscribers.
@@ -1105,58 +1016,68 @@ func (c *Conn) recordSubscribe(filter string, qos byte) func() {
 	if filter == "" {
 		return func() {}
 	}
-	if qos > 1 {
-		qos = 1
-	}
 	c.mu.Lock()
-	first := c.subs.add(filter, qos)
+	t := c.active
+	// A subscriber recorded while the report subscription is already live on
+	// the active transport is genuinely late and requests its own full
+	// state. One recorded earlier is covered by the establishment that its
+	// completion drives or joins, so no duplicate startup warmup runs.
+	late := !c.stopped && transportUsable(t) && t.subscribed
+	c.reportRefs++
 	c.mu.Unlock()
-	return func() { c.completeSubscribe(first) }
+	if late {
+		return func() { c.completeLateSubscribe(t) }
+	}
+	return c.coveredSubscribeComplete
 }
 
-// completeSubscribe connects, reconciles, and warms up after an interest
-// was recorded; first reports whether it was the filter's first reference.
-func (c *Conn) completeSubscribe(first bool) {
-	if !first {
-		// The report interest is already live; this late subscriber needs
-		// full state, not another upstream subscription. Its QoS may have
-		// raised the desired maximum, so reconcile the wire first.
-		c.subMu.Lock()
-		c.reconcileSubsLocked()
-		c.subMu.Unlock()
-		c.sendWarmup("subscriber_added")
-		return
-	}
+// coveredSubscribeComplete serves a subscriber recorded before the report
+// subscription was established: engage the supervisor and wait one connect
+// budget so an idle printer connects, then reconcile. Every subscriber this
+// completion covers is warmed by the establishment it drives or joins,
+// never by a second batch.
+func (c *Conn) coveredSubscribeComplete() {
 	if !c.ensure(c.connectTO) {
-		// Recorded; the supervisor reconciles the merged set at connect and
-		// its restoration warmup covers this subscriber.
+		// Recorded; the supervisor reconciles the interest at connect and
+		// its establishment warmup covers this subscriber.
 		return
 	}
+	c.reconcileSubs()
+}
+
+// completeLateSubscribe serves a subscriber that joined an already-live
+// report subscription: it sends one full-state batch on the transport the
+// record was keyed to. When that transport has moved on — replaced after a
+// loss, lost itself, stopped, or the interest removed again — any
+// establishment after the record already covered this subscriber, and plain
+// reconciliation converges instead.
+func (c *Conn) completeLateSubscribe(recorded *transport) {
 	c.subMu.Lock()
+	defer c.subMu.Unlock()
+	c.mu.Lock()
+	t := c.active
+	late := t == recorded && !c.stopped && transportUsable(t) && t.subscribed && c.reportRefs > 0
+	c.mu.Unlock()
+	if late {
+		c.warmupOn(recorded, "subscriber_added")
+		return
+	}
 	c.reconcileSubsLocked()
-	c.subMu.Unlock()
-	// Report subscription is ready: request full state for this subscriber.
-	c.sendWarmup("subscription_ready")
 }
 
 // subscribeAsync records the filter and engages the connection supervisor
-// without waiting for it. The recorded interest survives printer outages: the
-// supervisor reconciles the whole merged set once the printer answers, which
-// is the same path a subscribe that lost the ensure race relies on.
-func (c *Conn) subscribeAsync(filter string, qos byte) {
+// without waiting for it. The recorded interest survives printer outages:
+// the supervisor reconciles the interest count once the printer answers,
+// which is the same path a subscribe that lost the ensure race relies on.
+func (c *Conn) subscribeAsync(filter string) {
 	filter = c.reportFilter(filter)
 	if filter == "" {
 		return
 	}
-	if qos > 1 {
-		qos = 1
-	}
 	c.mu.Lock()
-	first := c.subs.add(filter, qos)
-	c.mu.Unlock()
-	c.mu.Lock()
-	alreadyDesired := c.desired || c.stopped
-	if !alreadyDesired {
+	c.reportRefs++
+	first := c.reportRefs == 1
+	if !c.desired && !c.stopped {
 		c.desired = true
 		go c.supervise()
 	}
@@ -1164,7 +1085,9 @@ func (c *Conn) subscribeAsync(filter string, qos byte) {
 	c.mu.Unlock()
 	if usable {
 		// A transport may already be live (the supervisor is idle); push the
-		// new interest onto it now instead of waiting for a reconnect.
+		// interest onto it now instead of waiting for a reconnect. Only a
+		// false→true establishment warms up, so this is free when the
+		// interest is already on the wire.
 		c.subMu.Lock()
 		c.reconcileSubsLocked()
 		c.subMu.Unlock()
@@ -1173,7 +1096,7 @@ func (c *Conn) subscribeAsync(filter string, qos byte) {
 		return
 	}
 	c.log.Info("upstream interest recorded",
-		"serial", c.spec.Serial, "filter", filter, "qos", qos, "mode", "async")
+		"serial", c.spec.Serial, "filter", filter, "mode", "async")
 }
 
 // unsubscribe removes one interest; the last removal unsubscribes upstream
@@ -1190,36 +1113,14 @@ func (c *Conn) recordUnsubscribe(filter string) func() {
 		return func() {}
 	}
 	c.mu.Lock()
-	last := c.subs.remove(filter)
+	if c.reportRefs > 0 {
+		c.reportRefs--
+	}
+	zero := c.reportRefs == 0
 	c.mu.Unlock()
-	if !last {
+	if !zero {
 		return func() {}
 	}
-	return c.reconcileSubs
-}
-
-// raiseQoS merges a repeated interest's QoS into the stored maximum without
-// changing refcounts, then reconciles: while connected a higher stored request
-// upgrades the wire subscription; while offline the reconnect restores the
-// merged set at the highest downstream request. Request-only filters have no
-// upstream interest.
-func (c *Conn) raiseQoS(filter string, qos byte) {
-	c.recordRaiseQoS(filter, qos)()
-}
-
-// recordRaiseQoS merges the QoS under mu and returns the wire
-// reconciliation.
-func (c *Conn) recordRaiseQoS(filter string, qos byte) func() {
-	filter = c.reportFilter(filter)
-	if filter == "" {
-		return func() {}
-	}
-	if qos > 1 {
-		qos = 1
-	}
-	c.mu.Lock()
-	c.subs.raise(filter, qos)
-	c.mu.Unlock()
 	return c.reconcileSubs
 }
 
@@ -1230,107 +1131,105 @@ func (c *Conn) reconcileSubs() {
 	c.subMu.Unlock()
 }
 
-// reconcileSubsLocked converges the active transport's wire subscriptions to
-// the desired interest set: subscribe missing filters and QoS increases,
-// unsubscribe filters no longer desired, and record grants only after the
-// broker confirms them. Caller holds c.subMu. Any failure — timeout, missing
-// grant, 0x80, lower-QoS grant, or token error — retires the transport via a
-// loss signal rather than leaving unknown subscription state behind.
+// reconcileSubsLocked converges the active transport's single report
+// subscription to the latest interest count: subscribe once at QoS 0 when
+// the count is positive and the transport is not yet subscribed, unsubscribe
+// when the count is zero and it is, and recheck the latest intent after each
+// successful wire transition until the two agree. The false→true
+// establishment owns one warmup batch on the captured transport; the
+// subscribed flag is set after SUBACK and before the batch, so a subscriber
+// recorded while the batch runs is genuinely late — a report triggered by
+// the batch may already have passed downstream — and sends its own batch,
+// while interests recorded before SUBACK are covered by this establishment.
+// Caller holds c.subMu; c.mu is never held across a token wait. A timeout,
+// token error, or refused (0x80) grant retires the transport via a loss
+// signal rather than leaving unknown subscription state behind.
 func (c *Conn) reconcileSubsLocked() {
-	c.mu.Lock()
-	if c.stopped {
+	for {
+		c.mu.Lock()
+		stopped := c.stopped
+		t := c.active
+		refs := c.reportRefs
+		subscribed := t != nil && t.subscribed
 		c.mu.Unlock()
-		return
-	}
-	t := c.active
-	desired := c.subs.snapshot()
-	c.mu.Unlock()
-	if !transportUsable(t) {
-		// Nothing to reconcile onto; the supervisor restores the full set at
-		// the next install.
-		return
-	}
-	if t.onWire == nil {
-		t.onWire = make(map[string]byte)
-	}
-	subscribed, removed := 0, 0
-	for f, q := range desired {
-		cur, have := t.onWire[f]
-		if have && cur >= q {
-			continue
-		}
-		tok := t.client.Subscribe(f, q, c.reportHandler(t))
-		if !tok.WaitTimeout(c.connectTO) {
-			c.failTransport(t, fmt.Errorf("subscribe %q timed out after %s", f, c.connectTO))
+		if stopped || !transportUsable(t) {
+			// Nothing to reconcile onto; the supervisor restores the
+			// interest at the next install.
 			return
 		}
-		granted, ok := subscribeGrant(tok, f, q)
-		if !ok {
-			c.failTransport(t, fmt.Errorf("subscribe %q not granted at QoS %d (granted 0x%02x)", f, q, granted))
+		topic := c.reportTopic()
+		switch {
+		case refs > 0 && !subscribed:
+			tok := t.client.Subscribe(topic, 0, c.reportHandler(t))
+			if !tok.WaitTimeout(c.connectTO) {
+				c.failTransport(t, fmt.Errorf("subscribe %q timed out after %s", topic, c.connectTO))
+				return
+			}
+			if err := subscribeError(tok, topic); err != nil {
+				c.failTransport(t, fmt.Errorf("subscribe %q: %w", topic, err))
+				return
+			}
+			c.log.Info("upstream report subscription established",
+				"serial", c.spec.Serial,
+				"connection_generation", t.generation,
+				"topic", topic,
+				"interests", refs)
+			// The flag flips before the batch: from here a new subscriber
+			// may have missed a report the subscription already delivered,
+			// so it is genuinely late and requests its own batch.
+			c.mu.Lock()
+			t.subscribed = true
+			c.mu.Unlock()
+			// One warmup batch per establishment, on this captured
+			// transport.
+			c.warmupOn(t, "subscription_established")
+		case refs == 0 && subscribed:
+			tok := t.client.Unsubscribe(topic)
+			if !tok.WaitTimeout(c.connectTO) {
+				c.failTransport(t, fmt.Errorf("unsubscribe %q timed out after %s", topic, c.connectTO))
+				return
+			}
+			if err := tok.Error(); err != nil {
+				c.failTransport(t, fmt.Errorf("unsubscribe %q: %w", topic, err))
+				return
+			}
+			c.log.Info("upstream report subscription removed",
+				"serial", c.spec.Serial,
+				"connection_generation", t.generation,
+				"topic", topic)
+			c.mu.Lock()
+			t.subscribed = false
+			c.mu.Unlock()
+		default:
 			return
 		}
-		t.onWire[f] = granted
-		subscribed++
-	}
-	for f := range t.onWire {
-		if _, want := desired[f]; want {
-			continue
-		}
-		tok := t.client.Unsubscribe(f)
-		if !tok.WaitTimeout(c.connectTO) {
-			c.failTransport(t, fmt.Errorf("unsubscribe %q timed out after %s", f, c.connectTO))
-			return
-		}
-		if err := tok.Error(); err != nil {
-			c.failTransport(t, fmt.Errorf("unsubscribe %q: %w", f, err))
-			return
-		}
-		delete(t.onWire, f)
-		removed++
-	}
-	if subscribed > 0 || removed > 0 {
-		c.log.Info("upstream subscriptions restored",
-			"serial", c.spec.Serial,
-			"connection_generation", t.generation,
-			"filters", len(desired),
-			"restored", subscribed,
-			"removed", removed)
 	}
 }
 
-// subscribeGrant inspects a completed Subscribe token for the broker's grant
-// of filter. Paho reports rejections through the per-filter result map, so
-// the map is authoritative when the token provides one: a missing grant, a
-// 0x80 code, or a grant below the request is a failure.
-func subscribeGrant(tok mqtt.Token, filter string, requested byte) (byte, bool) {
+// subscribeError reports a failed Subscribe: a token error, or a refusal
+// (0x80) in the per-filter result.
+func subscribeError(tok mqtt.Token, filter string) error {
 	if err := tok.Error(); err != nil {
-		return 0, false
+		return err
 	}
 	if gr, ok := tok.(interface{ Result() map[string]byte }); ok {
-		granted, have := gr.Result()[filter]
-		if !have || granted >= 0x80 || granted < requested {
-			return granted, false
+		if code, have := gr.Result()[filter]; have && code >= 0x80 {
+			return fmt.Errorf("refused by broker (0x%02x)", code)
 		}
-		return granted, true
 	}
-	// Tokens without a per-filter result report success only through the
-	// token error, already checked above.
-	return requested, true
+	return nil
 }
 
 // publish forwards a client request upstream, fire-and-forget. The first
 // publish engages the supervisor and waits one connect budget; a request that
 // cannot be delivered in time is logged and dropped, never queued or replayed.
-func (c *Conn) publish(topic string, payload []byte, qos byte, publishContext PublishContext) {
-	if qos > 1 {
-		qos = 1
-	}
+func (c *Conn) publish(topic string, payload []byte, publishContext PublishContext) {
 	if !c.ensure(c.connectTO) {
 		c.mu.Lock()
 		generation := c.generation
 		c.mu.Unlock()
-		c.log.Warn("upstream publish not attempted", publishLogAttrs(publishContext, c.spec.Serial, topic, qos, false, generation, 0, "not_sent", "none", "upstream is unavailable")...)
-		c.log.Debug("upstream publish payload details", publishDebugLogAttrs(publishContext, c.spec.Serial, topic, payload, qos, false, generation, 0, "not_sent", "none", "upstream is unavailable")...)
+		c.log.Warn("upstream publish not attempted", publishLogAttrs(publishContext, c.spec.Serial, topic, generation, 0, "not_sent", "none", "upstream is unavailable")...)
+		c.log.Debug("upstream publish payload details", publishDebugLogAttrs(publishContext, c.spec.Serial, topic, payload, generation, 0, "not_sent", "none", "upstream is unavailable")...)
 		return
 	}
 	c.mu.Lock()
@@ -1344,73 +1243,47 @@ func (c *Conn) publish(topic string, payload []byte, qos byte, publishContext Pu
 	}
 	c.mu.Unlock()
 	if client == nil {
-		c.log.Warn("upstream publish not attempted", publishLogAttrs(publishContext, c.spec.Serial, topic, qos, false, generation, 0, "not_sent", "none", "upstream is unavailable")...)
-		c.log.Debug("upstream publish payload details", publishDebugLogAttrs(publishContext, c.spec.Serial, topic, payload, qos, false, generation, 0, "not_sent", "none", "upstream is unavailable")...)
+		c.log.Warn("upstream publish not attempted", publishLogAttrs(publishContext, c.spec.Serial, topic, generation, 0, "not_sent", "none", "upstream is unavailable")...)
+		c.log.Debug("upstream publish payload details", publishDebugLogAttrs(publishContext, c.spec.Serial, topic, payload, generation, 0, "not_sent", "none", "upstream is unavailable")...)
 		return
 	}
-	c.publishUpstream(client, generation, publishContext, topic, payload, qos, false)
+	c.publishUpstream(client, generation, publishContext, topic, payload)
 }
 
 // publishUpstream logs the publish attempt before handing it to Paho, then
-// sends only through the captured client. Its token completes locally for
-// QoS 0, and after broker PUBACK for QoS 1.
-func (c *Conn) publishUpstream(client mqtt.Client, generation uint64, publishContext PublishContext, topic string, payload []byte, qos byte, retain bool) (uint64, mqtt.Token, bool) {
+// sends only through the captured client. Every publish is QoS 0 and never
+// retained, so the token completes once the packet is written locally.
+func (c *Conn) publishUpstream(client mqtt.Client, generation uint64, publishContext PublishContext, topic string, payload []byte) (uint64, mqtt.Token, bool) {
 	attemptID := c.publishSeq.Add(1)
-	c.log.Debug("upstream publish attempt", publishDebugLogAttrs(publishContext, c.spec.Serial, topic, payload, qos, retain, generation, attemptID, "attempted", "not_yet_observed", "")...)
-	tok := client.Publish(topic, qos, retain, payload)
+	c.log.Debug("upstream publish attempt", publishDebugLogAttrs(publishContext, c.spec.Serial, topic, payload, generation, attemptID, "attempted", "not_yet_observed", "")...)
+	tok := client.Publish(topic, 0, false, payload)
 	completed := tok.WaitTimeout(c.connectTO)
 	if !completed {
-		c.log.Warn("upstream publish completion wait timed out", publishLogAttrs(publishContext, c.spec.Serial, topic, qos, retain, generation, attemptID, "pending", "pending", "completion wait timed out")...)
-		c.log.Debug("upstream publish timeout payload details", publishDebugLogAttrs(publishContext, c.spec.Serial, topic, payload, qos, retain, generation, attemptID, "pending", "pending", "completion wait timed out")...)
+		c.log.Warn("upstream publish completion wait timed out", publishLogAttrs(publishContext, c.spec.Serial, topic, generation, attemptID, "pending", "pending", "completion wait timed out")...)
+		c.log.Debug("upstream publish timeout payload details", publishDebugLogAttrs(publishContext, c.spec.Serial, topic, payload, generation, attemptID, "pending", "pending", "completion wait timed out")...)
 		return attemptID, tok, false
 	}
 	if err := tok.Error(); err != nil {
-		c.log.Warn("upstream publish failed", publishLogAttrs(publishContext, c.spec.Serial, topic, qos, retain, generation, attemptID, "error", "unknown", errString(err))...)
-		c.log.Debug("upstream publish failure payload details", publishDebugLogAttrs(publishContext, c.spec.Serial, topic, payload, qos, retain, generation, attemptID, "error", "unknown", errString(err))...)
+		c.log.Warn("upstream publish failed", publishLogAttrs(publishContext, c.spec.Serial, topic, generation, attemptID, "error", "unknown", errString(err))...)
+		c.log.Debug("upstream publish failure payload details", publishDebugLogAttrs(publishContext, c.spec.Serial, topic, payload, generation, attemptID, "error", "unknown", errString(err))...)
 		return attemptID, tok, true
 	}
-	completion := "local_qos0_complete"
-	delivery := "local_only_no_broker_ack"
-	if qos > 0 {
-		completion = "broker_acknowledged"
-		delivery = "mqtt_puback_received"
-	}
-	c.log.Debug("upstream publish complete", publishDebugLogAttrs(publishContext, c.spec.Serial, topic, payload, qos, retain, generation, attemptID, completion, delivery, "")...)
+	c.log.Debug("upstream publish complete", publishDebugLogAttrs(publishContext, c.spec.Serial, topic, payload, generation, attemptID, "local_qos0_complete", "local_only_no_broker_ack", "")...)
 	return attemptID, tok, completed
 }
 
 // publishLogAttrs builds structured attributes for an upstream publish log.
-func publishLogAttrs(publishContext PublishContext, serial, topic string, qos byte, retain bool, generation, attemptID uint64, completion, delivery, err string) []any {
-	replayEligibility := "not_replayable_qos0"
-	if qos > 0 {
-		switch completion {
-		case "not_sent":
-			replayEligibility = "not_queued"
-		case "broker_acknowledged":
-			replayEligibility = "no_replay_pending_after_puback"
-		case "pending":
-			replayEligibility = "possible_paho_qos1_replay"
-		case "error":
-			replayEligibility = "unknown_after_publish_error"
-		case "attempted":
-			replayEligibility = "not_yet_observed"
-		default:
-			replayEligibility = "unknown"
-		}
-	}
+func publishLogAttrs(publishContext PublishContext, serial, topic string, generation, attemptID uint64, completion, delivery, err string) []any {
 	attrs := []any{
 		"origin", publishContext.Origin,
 		"action", publishContext.Action,
 		"serial", serial,
 		"topic", topic,
-		"qos", qos,
-		"retain", retain,
 		"connection_generation", generation,
 		"publish_attempt", attemptID,
 		"completion", completion,
 		"delivery_confirmation", delivery,
 		"printer_execution", "unconfirmed",
-		"replay_eligibility", replayEligibility,
 		"wire_replay_observable", false,
 	}
 	if publishContext.ClientID != "" {
@@ -1421,7 +1294,6 @@ func publishLogAttrs(publishContext PublishContext, serial, topic string, qos by
 	}
 	if publishContext.SourcePacket {
 		attrs = append(attrs,
-			"source_qos", publishContext.SourceQoS,
 			"source_dup", publishContext.SourceDup,
 			"source_retain", publishContext.SourceRetain,
 		)
@@ -1433,8 +1305,8 @@ func publishLogAttrs(publishContext PublishContext, serial, topic string, qos by
 }
 
 // publishDebugLogAttrs adds payload details to upstream publish log attributes.
-func publishDebugLogAttrs(publishContext PublishContext, serial, topic string, payload []byte, qos byte, retain bool, generation, attemptID uint64, completion, delivery, err string) []any {
-	attrs := publishLogAttrs(publishContext, serial, topic, qos, retain, generation, attemptID, completion, delivery, err)
+func publishDebugLogAttrs(publishContext PublishContext, serial, topic string, payload []byte, generation, attemptID uint64, completion, delivery, err string) []any {
+	attrs := publishLogAttrs(publishContext, serial, topic, generation, attemptID, completion, delivery, err)
 	attrs = append(attrs, "payload", string(payload))
 	if !utf8.Valid(payload) {
 		attrs = append(attrs, "payload_base64", base64.StdEncoding.EncodeToString(payload))
@@ -1442,37 +1314,45 @@ func publishDebugLogAttrs(publishContext PublishContext, serial, topic string, p
 	return attrs
 }
 
-// sendWarmup publishes the configured warmup commands through the active
+// warmupOn publishes the configured warmup commands through the captured
 // transport's client so the printer pushes its full state and every
-// subscriber converges without client action. It is a no-op while the
-// upstream is unavailable.
-func (c *Conn) sendWarmup(reason string) {
-	c.mu.Lock()
-	t := c.active
-	usable := !c.stopped && transportUsable(t)
-	generation := c.generation
-	var client mqtt.Client
-	if usable {
-		client = t.client
-		generation = t.generation
-	}
-	c.mu.Unlock()
-	if client == nil {
-		c.log.Debug("upstream warmup skipped", "serial", c.spec.Serial, "reason", reason, "connection_generation", generation, "cause", "upstream_unavailable")
+// subscriber converges without client action. The caller captures t and
+// serializes the call with the wire transitions under c.subMu. Each command
+// is admitted under c.mu — not stopped, still the active transport, still
+// usable — and mu is released before the publish, so a command already
+// admitted may finish while nothing is admitted after stop or transport
+// replacement. A warmup failure never retires the transport because the
+// subscription itself is healthy.
+func (c *Conn) warmupOn(t *transport, reason string) {
+	if len(c.warmup) == 0 {
 		return
 	}
-	warmupCompleted := 0
+	attempted, warmupCompleted := 0, 0
 	for _, cmd := range c.warmup {
+		if !c.warmupAdmitted(t) {
+			break
+		}
+		attempted++
 		ctx := PublishContext{Origin: "internal", Action: "warmup", Reason: reason}
-		_, tok, completed := c.publishUpstream(client, generation, ctx, c.requestTopic(), []byte(cmd), 0, false)
+		_, tok, completed := c.publishUpstream(t.client, t.generation, ctx, c.requestTopic(), []byte(cmd))
 		if !completed || tok.Error() != nil {
 			continue
 		}
 		warmupCompleted++
 	}
-	if len(c.warmup) > 0 {
-		c.log.Info("upstream warmup publish attempts complete", "serial", c.spec.Serial, "reason", reason, "connection_generation", generation, "commands", len(c.warmup), "completed", warmupCompleted, "failed", len(c.warmup)-warmupCompleted)
+	if attempted == 0 {
+		c.log.Debug("upstream warmup skipped", "serial", c.spec.Serial, "reason", reason, "connection_generation", t.generation, "cause", "upstream_unavailable")
+		return
 	}
+	c.log.Info("upstream warmup publish attempts complete", "serial", c.spec.Serial, "reason", reason, "connection_generation", t.generation, "commands", attempted, "completed", warmupCompleted, "failed", attempted-warmupCompleted)
+}
+
+// warmupAdmitted reports whether the captured transport may carry the next
+// warmup command right now. The caller releases mu before publishing.
+func (c *Conn) warmupAdmitted(t *transport) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return !c.stopped && c.active == t && transportUsable(t)
 }
 
 // stop ends the supervisor and disconnects the upstream session. Repeated

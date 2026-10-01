@@ -52,7 +52,7 @@ Many Bambu integrations (Bambu Studio, Home Assistant, xtouch, OctoPrint plugins
 - Topics: `device/{serial}/report` (printer → clients), `device/{serial}/request` (clients → printer).
 - Handshake on subscribe: clients publish `{"pushing":{"sequence_id":"0","command":"pushall"}}` to get full state. P1 series sends only deltas afterwards; a fresh subscriber MUST trigger `pushall` to see full state.
 - Commands (`get_version`, `pushall`, `project_file`, `pause`, `gcode_line`, `ledctrl`, ...) are JSON on `/request`; responses and state arrive as JSON on `/report`.
-- Observed broker behavior (community-verified; not formally documented by Bambu): MQTT 3.1.1, clean session, keepalive 30-60 s, QoS 0 for routine and 1 for critical traffic, unique client IDs per connection. Concurrent-connection limits are real and model-dependent: about 4 on P1/X1, ONE on A1 series. Without Developer Mode the broker accepts connections but silently drops write commands. The TLS certificate is Bambu-issued with CN = printer serial; all community clients disable verification.
+- Observed broker behavior (community-verified; not formally documented by Bambu): MQTT 3.1.1, clean session, keepalive 30-60 s, QoS 0 only (the ESP32 broker supports nothing higher), unique client IDs per connection. Concurrent-connection limits are real and model-dependent: about 4 on P1/X1, ONE on A1 series. Without Developer Mode the broker accepts connections but silently drops write commands. The TLS certificate is Bambu-issued with CN = printer serial; all community clients disable verification.
 - Stock firmware exposes NO plain-text MQTT port 1883. The listener-side port 8883 is the real printer endpoint. The proxy therefore makes the upstream transport configurable (see §5).
 - Sources: https://github.com/Doridian/OpenBambuAPI/blob/main/mqtt.md , https://github.com/sksat/bambu-rs/blob/main/docs/protocol.md , https://github.com/karaktaka/pandaproxy (ports/auth table), https://contentnation.net/en/grumpydevelop/bl-knowledge (keepalive/QoS observations), https://deepwiki.com/synman/bambu-printer-manager/9-troubleshooting-and-faq (model connection limits).
 
@@ -91,7 +91,7 @@ Gap: no existing project combines ONE MQTT endpoint + serial-based routing to MU
 
 Four parts, one process:
 
-1. **Downstream broker** — mochi-mqtt v2 with a TLS listener on 1883. Mochi owns all MQTT protocol mechanics for clients (CONNECT/CONNACK, keepalive per client, SUBACK/PUBACK, session takeover).
+1. **Downstream broker** — mochi-mqtt v2 with a TLS listener on 1883. Mochi owns all MQTT protocol mechanics for clients (CONNECT/CONNACK, keepalive per client, SUBACK, session takeover).
 2. **Upstream pool** — one paho.mqtt.golang client per configured printer, created lazily, reconnected automatically. A routing table maps serial → upstream connection and tracks merged subscriptions.
 3. **HTTP service** — one `net/http` listener (`http.port`, default 8080) for the health endpoints and, when cameras are enabled, the camera snapshot/stream endpoints and the embedded camera wall.
 4. **Raw camera endpoint** — a TLS listener on printer camera port 6000 serving the chamber-image protocol to camera clients; the access code a client authenticates with selects the printer (§6). It starts whenever cameras are enabled, independent of the HTTP port.
@@ -113,7 +113,7 @@ The listener MUST behave at the same protocol level as the broker in the printer
 | Behavior | Printer (observed) | Proxy |
 |---|---|---|
 | Protocol version | MQTT 3.1.1; apps use no v5 features | Serves v3.1.1; v5 clients tolerated but unused |
-| QoS | 0 and 1 only | Capped at 1 on every hop via mochi `Capabilities.MaximumQos = 1`; SUBACK grants max 1 |
+| QoS | 0 only | QoS 0 on every hop: mochi `Capabilities.MaximumQos = 0` grants 0 on every SUBACK and downgrades every PUBLISH; upstream subscribes and publishes at 0 |
 | Keepalive | Apps use 30-60 s | Per client, enforced by mochi |
 | Client ID takeover | Same-ID reconnect kicks the old session | Same (mochi default) |
 | Clean session | Apps use true | Accepted; sessions are not persisted across proxy restart (same as a printer reboot) |
@@ -122,7 +122,7 @@ The listener MUST behave at the same protocol level as the broker in the printer
 | Connection limit | ~4 concurrent (P1/X1), 1 on A1 series | Intentionally raised — removing this limit is the proxy's purpose |
 | Auth failure | Connection refused | CONNACK code 4 (bad username or password) in `printer` mode |
 | Unknown serial subscription | n/a (printer serves one serial) | SUBACK 0x80 for that filter only; connection stays open (v3-clamped, verified in mochi source) |
-| Publish to `/report` or unknown topics | Printer broker is permissive | QoS 0 dropped silently; QoS ≥ 1 client disconnected (mochi ACL behavior) — protects other apps from injected state |
+| Publish to `/report` or unknown topics | Printer broker is permissive | Dropped silently (mochi ACL behavior) — protects other apps from injected state |
 | TLS | Bambu-issued cert, CN = serial; clients skip verify | Self-signed leaf; clients skip verify; pinning possible via config |
 
 ## 5. Upstream connections
@@ -133,7 +133,7 @@ Per configured printer:
 - Credentials: `username` (default `bblp`) + `password` (LAN access code).
 - ONE `paho.mqtt.golang` client per printer, client ID `bmbpx-<serial>` (random suffix appended on connect rejection due to duplicate ID).
 - `SetAutoReconnect(true)`, `SetMaxReconnectInterval(30s)`, `CleanSession(true)`, keepalive 30 s, ping timeout 10 s. `SetResumeSubs` is NOT used — CleanSession discards broker state anyway; the pool re-issues the merged subscription set explicitly in `OnConnect` (see §5.1). On every successful (re)connect, the pool also sends the warmup command.
-- Publishes are serialized through paho's thread-safe `Publish`; QoS capped at 1.
+- Publishes are serialized through paho's thread-safe `Publish`, always at QoS 0.
 
 ### 5.1 Connection lifecycle and retry policy
 
@@ -435,26 +435,26 @@ client SUBSCRIBE device/{sn}/report
 ```
 client PUBLISH device/{sn}/request
   → OnPublish hook:
-      sn unknown or off-grammar → deny (mochi ACL: QoS 0 dropped, QoS ≥ 1 disconnects)
-      known sn                  → upstream.Publish(same topic, same payload, QoS≤1, retain stripped)
+      sn unknown or off-grammar → deny (mochi ACL: dropped)
+      known sn                  → upstream.Publish(same topic, same payload, QoS 0, retain stripped)
                                   → return packets.CodeSuccessIgnore
 ```
 
-`CodeSuccessIgnore` (verified in mochi source) suppresses LOCAL fan-out — requests never reach other downstream clients — while the normal QoS flow completes: the publishing client gets its PUBACK. This matters: denying the packet instead would withhold PUBACK, the client would retransmit, and the printer would receive DUPLICATE commands.
+`CodeSuccessIgnore` (verified in mochi source) suppresses LOCAL fan-out — requests never reach other downstream clients.
 
 - Payload bytes pass through untouched (signing-compatible); only the retain bit is stripped.
-- The upstream publish is fire-and-forget: PUBACK is issued after the bytes are handed to paho, not after printer acknowledgment. If the printer is unreachable at that moment, the command is lost and the app retries at application level — the same behavior an app sees when a printer drops mid-command today.
+- The upstream publish is fire-and-forget QoS 0, like a direct connection. If the printer is unreachable at that moment, the command is lost and the app retries at application level — the same behavior an app sees when a printer drops mid-command today.
 
 ### 7.3 Report path (upstream → downstream)
 
 ```
 printer PUBLISH device/{sn}/report
   → paho MessageHandler on the sn's upstream connection
-      → server.Publish(topic, payload, retain=false, qos=1)   (mochi inline client)
+      → server.Publish(topic, payload, retain=false, qos=0)   (mochi inline client)
       → mochi fans out to every subscribed downstream client
 ```
 
-Mochi owns per-client QoS delivery and PUBACK handling. Retain is never set: Bambu reports are ephemeral state, and stale snapshots must not survive reconnects.
+Retain is never set: Bambu reports are ephemeral state, and stale snapshots must not survive reconnects.
 
 Serial-level wildcard subscribers (`device/+/report`) receive reports from ALL printers — inherent to the single-endpoint design. Clients demux by the serial in the topic, which every Bambu app already parses.
 
@@ -471,12 +471,12 @@ P1 printers push deltas only after the first `pushall`. The proxy sends `{"pushi
 
 | Concern | Decision |
 |---|---|
-| QoS | Cap all hops at QoS 1. Bambu uses 0/1; QoS 2 adds state for no benefit. |
+| QoS | QoS 0 on every hop, matching the printer's broker. |
 | Downstream keepalive | Per client, owned by mochi. |
 | Upstream keepalive | 30 s, owned by paho. |
 | Ordering | Per serial, upstream publish and report delivery are FIFO (single paho connection). Cross-serial ordering is not guaranteed and not needed. |
 | Message loss windows | Upstream disconnect: reports in flight are lost; next warmup `pushall` restores full state. Accepted for v1. |
-| Duplicate suppression | Exactly ONE upstream publish per downstream publish; the broker hop completes the QoS flow so clients never retransmit into the proxy. |
+| Duplicate suppression | Exactly ONE upstream publish per downstream publish. |
 
 ## 9. Configuration
 
@@ -510,7 +510,6 @@ printers:
     password: "87654321"
 
 behavior:
-  qos_max: 1
   warmup_commands: ["pushall"]
   upstream_keepalive_seconds: 30
   upstream_connect_timeout_seconds: 5
@@ -577,8 +576,8 @@ Dependencies: `github.com/mochi-mqtt/server/v2`, `github.com/eclipse/paho.mqtt.g
 | Unauthenticated HTTP exposure | Camera, camera wall, status endpoints, the camera wall `POST /control/{serial}` endpoint, and the `/mcp` endpoint (default on) have no login | Anyone who can reach `http.port` sees cameras and telemetry, and can pause, resume, change speed, toggle the chamber light, and **emergency-stop** prints through the camera wall control endpoint or the MCP control tools, without login. Heater and temperature commands are never exposed. Bind accordingly (state responses carry no credentials); set `BMBPX_MCP_ENABLED=false` or `BMBPX_CAMERA_ENABLED=false` to remove part of the surface |
 | Bambu Studio "add printer by IP" | Studio probes camera/FTP ports in addition to MQTT; probe failure can block discovery | MQTT control and status work; camera/FTP passthrough is future work |
 | Tools that pin the printer TLS certificate | The self-signed proxy cert fails pinning | Load a custom cert/key via config, or disable pinning (clients must already skip verify against the real printer) |
-| Downstream QoS 1 command while printer offline | PUBACK was already issued; command does not reach the printer | App-level retry, identical to a direct-connection drop |
-| Malicious/buggy client publishes to `/report` | Denied by ACL | QoS 0 silently dropped; QoS ≥ 1 client disconnected; other clients never see injected state |
+| Downstream command while printer offline | Command does not reach the printer | App-level retry, identical to a direct-connection drop |
+| Malicious/buggy client publishes to `/report` | Denied by ACL | Silently dropped; other clients never see injected state |
 | Gadget API unreachable or transiently failing (optional integration) | Inspection retries use exponential backoff (20 s initial, 10 min cap, jittered), with the latest provider interval as a floor; the last good result stays visible; the context switches to the fallback URL on connection/server failure | Detection lags; printing, MQTT proxying, and camera serving are unaffected |
 | Gadget bad-arguments error (`OE_BAD_ARGS`, `OE_ARGS_PARSE_FAILED`) | Detection for that printer is blocked until proxy restart | Inspection and automatic pauses stop for that printer; other printers are unaffected |
 | Gadget account error: invalid/disabled key, billing failure, IP restriction, or free allowance exhausted | Detection suspends account-wide until proxy restart; logs use safe structured reasons | Warnings and automatic pauses stop; everything else is unaffected |
@@ -595,7 +594,7 @@ Dependencies: `github.com/mochi-mqtt/server/v2`, `github.com/eclipse/paho.mqtt.g
 ## 13. Verification plan
 
 1. **Unit**: filter resolution tables (exact serial → one printer, serial wildcard → all printers, off-grammar/unknown → deny); refcount transitions (first subscribe → upstream sub, last unsubscribe → upstream unsub, disconnect reconciliation); deny paths (unknown serial, off-grammar topic).
-2. **Integration** (fake printer): run a mochi broker with `bblp` auth + TLS as a stand-in printer; drive 3 fake clients; assert merged upstream subscriptions, report fan-out to exactly the subscribed clients, SUBACK 0x80 on unknown serial, warmup pushall on first subscribe and after forced upstream reconnect. Assert printer-parity behavior: CONNACK code 4 on wrong access code, QoS cap on SUBACK grants, retain stripping, same-ID session takeover. Assert routing correctness: exactly ONE upstream publish per downstream QoS 1 publish (no retransmit duplicates), `device/+/report` fans out from all printers, publishes to `/report` are denied, requests never fan out to other downstream clients. Assert availability lifecycle: SUBACK 0x80 while the printer is stopped, background retries follow the configured backoff schedule (no tight loop), and the proxy reconnects, resubscribes, and sends warmup pushall when the printer returns — with no client action.
+2. **Integration** (fake printer): run a mochi broker with `bblp` auth + TLS as a stand-in printer; drive 3 fake clients; assert merged upstream subscriptions, report fan-out to exactly the subscribed clients, SUBACK 0x80 on unknown serial, warmup pushall on first subscribe and after forced upstream reconnect. Assert printer-parity behavior: CONNACK code 4 on wrong access code, QoS 0 on every SUBACK grant, retain stripping, same-ID session takeover. Assert routing correctness: exactly ONE upstream publish per downstream publish, `device/+/report` fans out from all printers, publishes to `/report` are denied, requests never fan out to other downstream clients. Assert availability lifecycle: SUBACK 0x80 while the printer is stopped, background retries follow the configured backoff schedule (no tight loop), and the proxy reconnects, resubscribes, and sends warmup pushall when the printer returns — with no client action.
 3. **Camera unit/integration** (fake TLS camera on :6000): auth payload shape (80 bytes, 0x40/0x3000, `bblp` at 16, code at 48); frame header parsing, length bounds, JPEG SOI/EOI validation; eligibility gates (unknown serial → 404, unsupported/missing model → 422, no socket opened); snapshot freshness and shared-buffer reuse; MJPEG framing and slow-client isolation; concurrent consumers sharing one upstream session; HTTP startup while printers are offline (non-blocking interests). RTSPS acceptance (fake `ffmpeg` executable on PATH): missing-binary gate (one warning, 503 with tile reason, no process); six-prefix eligibility with explicit-model override and legacy P1/A1-only raw/Gadget/MCP paths; two HTTP viewers sharing one child process; context cancel kills and reaps a stalled child; oversized and non-JPEG parts rejected and retried.
 4. **Smoke (manual, performed)**: real P1S in LAN Mode at `10.10.20.141` — MQTT upstream connected on first attempt with `pushall` warmup; snapshot returned a valid 1280×720 JPEG (~87 KB); 4-second stream sample contained 3 complete multipart JPEG parts; 404/422 gates answered without opening a camera socket; overlay served. This smoke run caught and fixed a real defect: the camera endpoint derived from the MQTT port instead of always using 6000.
 5. **Smoke (manual, remaining)**: Bambu Studio and Home Assistant connected through the proxy on `:8883` with the printer's access code, observing `pushall` warmup and delta flow in debug logs.

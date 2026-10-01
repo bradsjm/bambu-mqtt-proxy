@@ -141,7 +141,6 @@ printers:
     username: "bblp"
     password: "87654321"
 behavior:
-  qos_max: 1
   warmup_commands:
     - '{"pushing":{"sequence_id":"0","command":"pushall"}}'
 http:

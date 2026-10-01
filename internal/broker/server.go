@@ -30,11 +30,11 @@ func NewInjector(log *slog.Logger) *Injector {
 // PublishDownstream injects one upstream report into the broker; the broker
 // fans it out to every subscribed client. Retain is never set: Bambu reports
 // are live pushes and must not survive reconnects.
-func (i *Injector) PublishDownstream(topic string, payload []byte, qos byte) {
+func (i *Injector) PublishDownstream(topic string, payload []byte) {
 	if i.srv == nil {
 		return
 	}
-	if err := i.srv.Publish(topic, payload, false, qos); err != nil {
+	if err := i.srv.Publish(topic, payload, false, 0); err != nil {
 		i.log.Warn("downstream inject failed", "topic", topic, "error", err)
 	}
 }
@@ -51,7 +51,9 @@ type Server struct {
 // certificate where enabled).
 func New(cfg *config.Config, table *routing.Table, pool *upstream.Pool, inject *Injector, log *slog.Logger) (*Server, error) {
 	srv := mqtt.New(&mqtt.Options{InlineClient: true, Logger: log})
-	srv.Options.Capabilities.MaximumQos = cfg.Behavior.QoSMax
+	// The printer's broker speaks QoS 0 only; so does the proxy. Mochi
+	// grants QoS 0 on every SUBACK and downgrades every PUBLISH to QoS 0.
+	srv.Options.Capabilities.MaximumQos = 0
 
 	// fail closes the partially constructed server exactly once and returns
 	// its error: a construction failure must release every bound port, and

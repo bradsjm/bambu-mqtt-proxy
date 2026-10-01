@@ -21,10 +21,9 @@ import (
 // satisfies it; tests substitute a recording fake.
 type poolHooks interface {
 	EnsureConnected(serial string, timeout time.Duration) bool
-	RecordSubscribe(serial, filter string, qos byte) func()
+	RecordSubscribe(serial, filter string) func()
 	RecordUnsubscribe(serial, filter string) func()
-	RecordRaiseQoS(serial, filter string, qos byte) func()
-	PublishWithContext(serial, topic string, payload []byte, qos byte, publishContext upstream.PublishContext)
+	PublishWithContext(serial, topic string, payload []byte, publishContext upstream.PublishContext)
 }
 
 // sessionInterest records one client ID's merged subscriptions. The owner is
@@ -182,22 +181,18 @@ func (b *Bridge) OnSessionEstablished(cl *mqtt.Client, pk packets.Packet) {
 		b.sessions[cl.ID] = entry
 	}
 	entry.owner = cl // establishment always replaces a retained owner
-	for filter, sub := range inherited {
+	for filter := range inherited {
 		if _, held := entry.filters[filter]; held {
-			// Adopted interest: the upstream reference already exists.
-			for _, serial := range b.table.PrintersFor(filter) {
-				*settle = append(*settle, b.pool.RecordRaiseQoS(serial, filter, sub.Qos))
-			}
-			continue
+			continue // adopted: the upstream reference already exists
 		}
 		entry.filters[filter] = struct{}{}
 		printers := b.table.PrintersFor(filter)
 		for _, serial := range printers {
-			*settle = append(*settle, b.pool.RecordSubscribe(serial, filter, sub.Qos))
+			*settle = append(*settle, b.pool.RecordSubscribe(serial, filter))
 		}
 		b.log.Info("session inherited subscription",
 			"client", cl.ID, "filter", filter,
-			"printers", strings.Join(printers, ","), "qos", sub.Qos)
+			"printers", strings.Join(printers, ","))
 	}
 	var absent []string
 	for filter := range entry.filters {
@@ -213,8 +208,7 @@ func (b *Bridge) OnSessionEstablished(cl *mqtt.Client, pk packets.Packet) {
 // OnSubscribed records the client's granted filters and merges each new
 // interest upstream (refcounted per printer and filter). A filter the client
 // ID already holds must not merge again: upstream interests count one per
-// client filter, so repeated SUBSCRIBEs stay refcount-neutral; a higher
-// requested QoS still raises the stored maximum for reconnect restores.
+// client filter, so repeated SUBSCRIBEs stay refcount-neutral.
 func (b *Bridge) OnSubscribed(cl *mqtt.Client, pk packets.Packet, reasonCodes []byte) {
 	// A connection already taken over must not reclaim ownership from its
 	// successor; the successor adopts any inherited filters itself.
@@ -236,21 +230,17 @@ func (b *Bridge) OnSubscribed(cl *mqtt.Client, pk packets.Packet, reasonCodes []
 			continue
 		}
 		if _, held := entry.filters[sub.Filter]; held {
-			for _, serial := range b.table.PrintersFor(sub.Filter) {
-				*settle = append(*settle, b.pool.RecordRaiseQoS(serial, sub.Filter, sub.Qos))
-			}
 			continue
 		}
 		entry.filters[sub.Filter] = struct{}{}
 		printers := b.table.PrintersFor(sub.Filter)
 		for _, serial := range printers {
-			*settle = append(*settle, b.pool.RecordSubscribe(serial, sub.Filter, sub.Qos))
+			*settle = append(*settle, b.pool.RecordSubscribe(serial, sub.Filter))
 		}
 		b.log.Info("client subscribed",
 			"client", cl.ID,
 			"filter", sub.Filter,
-			"printers", strings.Join(printers, ","),
-			"qos", sub.Qos)
+			"printers", strings.Join(printers, ","))
 	}
 }
 
@@ -313,8 +303,7 @@ func cleanErr(err error) string {
 }
 
 // OnPublish forwards a client request to the owning printer's upstream
-// connection and suppresses local fan-out via CodeSuccessIgnore, which keeps
-// the QoS flow (PUBACK) intact so clients never retransmit into the proxy.
+// connection and suppresses local fan-out via CodeSuccessIgnore.
 // The inline-client guard is essential: injected upstream reports re-enter
 // this hook, and forwarding them again would loop.
 func (b *Bridge) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, error) {
@@ -325,12 +314,11 @@ func (b *Bridge) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, 
 	if len(serials) == 0 {
 		return pk, packets.CodeSuccessIgnore
 	}
-	b.pool.PublishWithContext(serials[0], pk.TopicName, pk.Payload, pk.FixedHeader.Qos, upstream.PublishContext{
+	b.pool.PublishWithContext(serials[0], pk.TopicName, pk.Payload, upstream.PublishContext{
 		Origin:       "client",
 		Action:       "request",
 		ClientID:     cl.ID,
 		SourcePacket: true,
-		SourceQoS:    pk.FixedHeader.Qos,
 		SourceDup:    pk.FixedHeader.Dup,
 		SourceRetain: pk.FixedHeader.Retain,
 	})

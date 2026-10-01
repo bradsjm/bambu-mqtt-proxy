@@ -242,7 +242,6 @@ func newFakePaho(open bool) *fakePaho { return &fakePaho{open: open} }
 func newTestTransport(client pahomqtt.Client, generation uint64) *transport {
 	t := &transport{client: client, generation: generation, lost: make(chan struct{})}
 	t.ctx, t.cancel = context.WithCancel(context.Background())
-	t.onWire = make(map[string]byte)
 	return t
 }
 
@@ -274,7 +273,6 @@ func newTestConn(client pahomqtt.Client, generation uint64) *Conn {
 		inject:      nopInject{},
 		log:         discardLogger(),
 		stopCh:      make(chan struct{}),
-		subs:        newSubRefs(),
 		connCh:      make(chan struct{}),
 		generation:  generation,
 	}
@@ -286,7 +284,7 @@ func newTestConn(client pahomqtt.Client, generation uint64) *Conn {
 
 type nopInject struct{}
 
-func (nopInject) PublishDownstream(string, []byte, byte) {}
+func (nopInject) PublishDownstream(string, []byte) {}
 
 func TestPausePublishesExactGuardedCommand(t *testing.T) {
 	fake := newFakePaho(true)
@@ -455,29 +453,28 @@ func (c *Conn) lockGeneration() uint64 {
 	return c.generation
 }
 
-// lockOnWire returns a copy of the active transport's onWire map for
-// assertions. Production writers guard onWire with subMu, so readers take it
-// too (subMu before mu, the production order).
-func (c *Conn) lockOnWire() map[string]byte {
+// lockSubscribed reports whether the active transport's report subscription
+// is on the wire. Writers hold subMu with mu, so readers take both (subMu
+// before mu, the production order).
+func (c *Conn) lockSubscribed() bool {
 	c.subMu.Lock()
 	defer c.subMu.Unlock()
-	return copyOnWire(c.lockActive())
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	t := c.active
+	return t != nil && t.subscribed
 }
 
-// transportOnWire returns a copy of one transport's onWire map under subMu.
-func (c *Conn) transportOnWire(t *transport) map[string]byte {
+// transportSubscribed reports one transport's subscribed flag under subMu.
+func (c *Conn) transportSubscribed(t *transport) bool {
 	c.subMu.Lock()
 	defer c.subMu.Unlock()
-	return copyOnWire(t)
+	return t.subscribed
 }
 
-func copyOnWire(t *transport) map[string]byte {
-	if t == nil {
-		return nil
-	}
-	out := make(map[string]byte, len(t.onWire))
-	for f, q := range t.onWire {
-		out[f] = q
-	}
-	return out
+// lockReportRefs returns the report interest count under mu, for assertions.
+func (c *Conn) lockReportRefs() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.reportRefs
 }
