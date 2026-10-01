@@ -35,6 +35,7 @@ topic path.
 | **Apps work unchanged** | Same port 8883, `bblp` username, printer access code, skipped certificate verification; payloads forwarded byte-for-byte (compatible with 2025+ signed-firmware printers). |
 | **Printer connection limits stop mattering** | Any number of clients share one merged subscription per printer. |
 | **One endpoint for the whole fleet** | MQTT topics route by serial (`device/{serial}/report`, `device/{serial}/request`); only raw camera connections route by access code instead. |
+| **Optional Pushover notifications** | Print errors, HMS warnings, AI detection alerts, stopped or failed prints, and completions reach one Pushover account, with a camera snapshot when available. |
 | **Printer outages ride out** | Capped exponential backoff with jitter, automatic reconnect and resubscribe, and a `pushall` warmup. Late joiners get full state (P1 printers otherwise send deltas only). |
 | **Cameras, two ways** | A live multi-printer dashboard wall — P1/A1 cameras natively, X1/P2S/H2-series cameras through bundled FFmpeg — and a printer-compatible raw passthrough on port 6000. |
 | **Optional AI failure detection** | With an OctoEverywhere Gadget key, snapshots from active prints are analyzed and the proxy pauses likely failures. No key, no uploads, no automatic pauses. |
@@ -149,6 +150,12 @@ camera:
   enabled: true                      # false removes camera routes, the camera wall, and the raw camera listener on port 6000
 mcp:
   enabled: true                      # default; set false to remove the MCP endpoint at /mcp
+notifications:
+  enabled: false                     # optional Pushover print alerts; see below
+  provider: pushover
+  pushover:
+    app_token: ""                    # from pushover.net
+    user_key: ""
 log:
   level: info
 ```
@@ -324,6 +331,10 @@ On by default; disable with `BMBPX_MCP_ENABLED=false`. MCP protocol
   and changing a printer's address requires entering its code again.
 - Marks each setting overridden by a `BMBPX_*` variable; those still win.
   Saving rewrites the file, so comments in it are not kept.
+- Handles Pushover credentials the same way in the Notifications section:
+  they are never displayed or returned, a blank field keeps the stored
+  value, and **Send test notification** sends one test message without
+  saving.
 
 ## Gadget AI print-failure detection (optional)
 
@@ -390,11 +401,37 @@ Only**, so inspections stop at the allowance instead of incurring charges.
 Full policy, retry, and state-machine detail lives in
 [DESIGN.md §6.1](DESIGN.md).
 
+## Pushover notifications (optional)
+
+Enable the Notifications section on `/config` (or the `notifications` YAML
+block) to send print alerts to one [Pushover](https://pushover.net/) account.
+
+- **What notifies** — a print finishing, failing, or stopping before it
+  finishes; printer errors and HMS warnings; AI detection warnings and AI
+  pause attempts, including failed or unconfirmed ones; and a pause that
+  leaves an active printer alert. Starts, resumes, reconnects, and cleared
+  alerts do not notify.
+- **What arrives** — events within 2 seconds group into one message per
+  printer: the event summaries, the running file, and each active alert with
+  its error code and suggested fix. The title is the printer's name or
+  serial. A camera snapshot attaches when one is available.
+- **Setup** — create a Pushover application for the app token, enter both
+  values on `/config`, save, and use **Send test notification**. Pushover
+  messages arrive from your own application, so you can filter them.
+- **Delivery is best-effort** — one attempt per message, no retry queue, and
+  nothing is stored; a busy queue or failed delivery logs a warning and the
+  proxy moves on. A restart may repeat one active alert. No `BMBPX_*`
+  variable exists for this feature: YAML and `/config` own it.
+- **Privacy** — enabling this sends print metadata (event text, file name,
+  error codes) and, when a camera is available, camera frames to Pushover's
+  servers. Leave notifications disabled to keep everything local.
+
 ## Security notes
 
 - Runs as a non-root user in the container. The config file and environment
-  contain printer access codes — protect them accordingly, and never commit
-  `bambu-mqtt-proxy.yaml`.
+  contain printer access codes, and the config file also holds the Pushover
+  app token and user key when notifications are configured — protect them
+  accordingly, and never commit `bambu-mqtt-proxy.yaml`.
 - TLS certificates are unverified on both hops, matching Bambu's own LAN
   protocol; the proxy is intended for trusted home LANs.
 - The camera endpoints, `/mcp`, and the `/config` page are unauthenticated:

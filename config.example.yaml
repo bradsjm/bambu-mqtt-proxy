@@ -57,6 +57,18 @@ mcp:
   # http.port is 0.
   # enabled: false
 
+notifications:
+  # Optional print alerts to one Pushover account (https://pushover.net/):
+  # completions, failures and stops, printer errors and HMS warnings, AI
+  # detection alerts, and pauses that leave an active alert. Also editable
+  # on the /config page, where credentials are write-only: a blank value
+  # keeps the stored one. No BMBPX_* variable exists for this section.
+  # enabled: true
+  # provider: pushover
+  # pushover:
+  #   app_token: "your-pushover-app-token"
+  #   user_key: "your-pushover-user-key"
+
 behavior:
   warmup_commands:
     - '{"pushing":{"sequence_id":"0","command":"pushall"}}'

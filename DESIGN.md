@@ -98,6 +98,8 @@ Four parts, one process:
 
 A custom mochi hook is the only coupling between the broker and the pool. The hook rewrites where packets go; it does not rewrite packets. The telemetry cache observes reports through the pool without changing forwarding.
 
+An optional notifier (§9) observes recorded activity and delivers Pushover messages off the forwarding path; delivery is best-effort and never blocks the broker.
+
 ## 4. Downstream endpoint (printer-compatible)
 
 - Listener: TCP + TLS on `:8883` (default) — the port every Bambu app already targets. Certificate: self-signed, ECDSA P-256, 10-year validity, generated on first start and persisted to `cert_file`/`key_file` paths. Apps skip certificate verification exactly as they do against the printer; the file paths also let an operator load a specific cert for tools that pin.
@@ -529,11 +531,31 @@ camera:
   enabled: true             # false removes camera routes and the camera wall
 mcp:
   enabled: true             # default; false removes the MCP endpoint at /mcp
+notifications:              # optional print alerts to one Pushover account
+  enabled: false
+  provider: pushover        # only pushover today
+  pushover:
+    app_token: ""           # write-only through /config; blank keeps the stored value
+    user_key: ""
 ```
 
-Validation at startup: unique serials, resolvable addresses, TLS flag consistency, HTTP port range. Startup fails fast on invalid config.
+Validation at startup: unique serials, resolvable addresses, TLS flag consistency, HTTP port range and, when notifications are enabled, a supported provider plus non-blank Pushover credentials. Startup fails fast on invalid config.
 
 The config file contains printer access codes in plain text. Deploy with restrictive file permissions (e.g. chmod 600) and never log passwords; connection logs redact credentials.
+
+Notifications are owned by the YAML file and the `/config` page; no
+`BMBPX_*` override exists. `/config` treats both Pushover credentials as
+write-only secrets like printer access codes: the API reports only whether a
+value is stored, and a blank submitted value keeps the stored one. The
+notifier is enabled by `notifications.enabled` and holds one report interest
+per printer so events exist with no dashboard or MQTT client attached. It
+batches recorded activity for 2 seconds, sends at most one message per
+printer per batch (summaries, file name, active alert lines), and attaches a
+camera snapshot when the camera answers with a fresh frame. Delivery makes
+one attempt with no retry or persistence; a full queue or failed send logs a
+warning and drops the event. The `POST /config/notifications/test` endpoint
+sends one message from the submitted section merged with stored credentials,
+forced enabled; it never saves or reloads.
 
 ## 10. Package layout and dependencies
 
@@ -548,6 +570,7 @@ internal/routing/topic.go      serial extraction, wildcard expansion, filter↔s
 internal/telemetry/            delta-merging display-state cache fed by upstream reports
 internal/camera/               P1/A1 chamber-image capture, X1/P2S/H2-series RTSPS capture via FFmpeg, raw TLS camera endpoint, snapshot/stream/camera wall handlers
 internal/mcpserver/            MCP endpoint (tools, state resource, subscriptions, shared sampler)
+internal/notification/         Pushover sender + batched best-effort notifier over recorded activity
 internal/httpsrv/              shared health + camera HTTP listener
 internal/tlsutil/              self-signed certificate generation and persistence
 ```
@@ -582,6 +605,9 @@ Dependencies: `github.com/mochi-mqtt/server/v2`, `github.com/eclipse/paho.mqtt.g
 | Gadget bad-arguments error (`OE_BAD_ARGS`, `OE_ARGS_PARSE_FAILED`) | Detection for that printer is blocked until proxy restart | Inspection and automatic pauses stop for that printer; other printers are unaffected |
 | Gadget account error: invalid/disabled key, billing failure, IP restriction, or free allowance exhausted | Detection suspends account-wide until proxy restart; logs use safe structured reasons | Warnings and automatic pauses stop; everything else is unaffected |
 | Gadget-triggered pause rejected or lost (printer offline, signed firmware) | One pause command per suggestion (§7.2); up to 30 s wait for a confirming PAUSE report; no retry, no auto-resume | Pause failure is logged; the print continues; pausing re-arms after a later clear result |
+| Notification queue full (activity burst) | The observer drops the new event and logs `notification dropped` | That event never notifies; forwarding and printing are unaffected |
+| Pushover unreachable, slow, or rejecting | One send attempt per message (15 s client timeout inside a 20 s context), no retry; the failure is logged with a credential-safe error | The message is lost; every other service is unaffected |
+| Camera unavailable when a notification sends | The message goes out text-only | The alert still arrives without the image |
 
 ## 12. Alternatives considered
 
@@ -601,6 +627,7 @@ Dependencies: `github.com/mochi-mqtt/server/v2`, `github.com/eclipse/paho.mqtt.g
 6. **Gadget integration (optional feature)**: designed coverage — unit and integration tests against a fake Gadget HTTP server for create-context URL validation, response contract enforcement (quality bounds, required flags, and positive interval validation), error taxonomy (per-printer bad-arguments blocking, account-wide suspension, transient backoff, and fallback-URL switch), local 6 MiB frame rejection, policy timing and interval retention across discarded analysis and detection toggles, backoff reset on success, and status-object shape. No real-printer smoke and no live-API call back the detection feature, and no real printer report fixtures are available; hardware behavior is unverified.
 7. **Cmd wiring** (subprocess, real `run()`): cameras enabled with `BMBPX_HTTP_PORT=0` must answer a TLS handshake on 127.0.0.1:6000 and exit cleanly on SIGTERM; `BMBPX_CAMERA_ENABLED=false` must serve health while port 6000 is held, proving it never binds; a pre-held port 6000 must fail startup with the wrapped `raw camera endpoint` error.
 8. **MCP unit/wire acceptance** (`internal/mcpserver`): tool discovery and typed calls against the SDK client and raw HTTP; subscription acknowledge/update/cancel over `subscriptions/listen`; legacy-protocol subscribe refusal (2025-06-18, 2025-11-25, headerless, and current-header-without-`_meta` shapes) with zero slot usage; revision-before-state ordering with deterministic mid-read injection; camera acquire/release balance; freshness ACK exclusion; cancellation releasing waits and camera interests; body/origin/limit rejections.
+9. **Notifications** (`internal/notification`, `internal/config`, `internal/configui`, `internal/activity`): Pushover sender against an `httptest` server (multipart fields, JPEG attachment bounds, rune truncation, `status` gate, credential-safe errors); validation matrix (unsupported provider, blank credentials only while enabled); config UI tests for write-only GET, credential preservation and trimming on save, and a test endpoint proven not to save or reload; activity observer delivery and re-entrancy without deadlock; batching (finished print → one message with image, lone pause → none, pause plus error in one window → one combined message). A temporary generated-input harness covered the kind/severity/alert matrix and the bounded gather window and was removed after passing. No live Pushover call or real-print smoke backs delivery; hardware and service behavior are unverified.
 
 ## 14. Future work (explicitly out of scope for v1)
 
