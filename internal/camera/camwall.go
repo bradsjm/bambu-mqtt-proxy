@@ -17,6 +17,7 @@ import (
 	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/control"
 	"bambu-mqtt-proxy/internal/detection"
+	"bambu-mqtt-proxy/internal/jobpreview"
 	"bambu-mqtt-proxy/internal/printerview"
 	"bambu-mqtt-proxy/internal/telemetry"
 )
@@ -62,6 +63,14 @@ type Tile struct {
 	Controls []string `json:"controls"`
 	FrameAge float64  `json:"frame_age_seconds,omitempty"`
 	FrameSeq uint64   `json:"frame_seq,omitempty"`
+	// JobPreview is the shared archived preview of the current print and
+	// JobMetadata carries its accepted archive facts; both come from the
+	// job preview service and are present whenever the feature runs, with
+	// status disabled when it does not. These are display-only archived
+	// values: they never feed printerview's live projection and never
+	// become alerts.
+	JobPreview  jobpreview.View      `json:"job_preview"`
+	JobMetadata *jobpreview.Metadata `json:"job_metadata"`
 }
 
 // statusPayload is the shared /camera/status and /camera/events body.
@@ -80,8 +89,9 @@ type StatusRenderer struct {
 	status    connectivitySource
 	detection detectionSource
 	control   detectionControl
-	printer   controlService // optional printer controls
-	activity  *activity.Log  // optional recent-event source
+	printer   controlService      // optional printer controls
+	activity  *activity.Log       // optional recent-event source
+	previews  *jobpreview.Service // optional archived print preview
 }
 
 // NewStatusRenderer builds the /camera/status payload renderer.
@@ -131,6 +141,12 @@ func (r *StatusRenderer) SetActivity(log *activity.Log) {
 	r.activity = log
 }
 
+// SetJobPreview attaches the shared job preview service; nil keeps the
+// disabled projection in every tile.
+func (r *StatusRenderer) SetJobPreview(s *jobpreview.Service) {
+	r.previews = s
+}
+
 // connectivitySource reports upstream MQTT connectivity per serial, so the
 // camera wall can distinguish an idle printer from a disconnected one.
 type connectivitySource interface {
@@ -163,6 +179,16 @@ func (r *StatusRenderer) Tiles() []Tile {
 		if r.detection != nil {
 			t.Detection = r.detection.DetectionStatus(st.Serial)
 		}
+		preview := jobpreview.Disabled()
+		if r.previews != nil {
+			// Cache-only read: Lookup never performs network work and the
+			// false flag keeps the PNG bytes out of the status payload.
+			if res, ok := r.previews.Lookup(st.Serial, false); ok {
+				preview = res
+			}
+		}
+		t.JobPreview = preview.Preview
+		t.JobMetadata = preview.Metadata
 		t.Activity = r.activity.Recent(st.Serial)
 		tiles = append(tiles, t)
 	}

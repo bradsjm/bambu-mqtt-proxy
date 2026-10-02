@@ -25,6 +25,7 @@ import (
 	"bambu-mqtt-proxy/internal/detection"
 	"bambu-mqtt-proxy/internal/health"
 	"bambu-mqtt-proxy/internal/httpsrv"
+	"bambu-mqtt-proxy/internal/jobpreview"
 	"bambu-mqtt-proxy/internal/mcpserver"
 	"bambu-mqtt-proxy/internal/notification"
 	"bambu-mqtt-proxy/internal/routing"
@@ -125,6 +126,17 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	pool.SetObserver(func(serial string, seq, gen uint64, payload []byte) {
 		state.ObserveReport(serial, seq, gen, payload)
 	})
+	// Printer job preview: one best-effort FTPS retrieval of the current
+	// print's sliced 3MF render and metadata per settled job, shared by the
+	// camera wall and MCP. It serves through the shared HTTP listener and
+	// needs at least one consumer; with neither consumer the service must
+	// not exist, so no FTPS socket can ever open. Like the other optional
+	// dependencies, a disabled feature must leave the consumer side truly
+	// nil.
+	var previews *jobpreview.Service
+	if cfg.JobPreviewEnabled() && cfg.HTTP.Port > 0 && (cfg.CameraEnabled() || cfg.MCPEnabled()) {
+		previews = jobpreview.New(cfg.Printers, state, pool, logger)
+	}
 
 	var cameras *camera.Manager
 	var renderer *camera.StatusRenderer
@@ -161,6 +173,9 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		renderer.SetDetection(detector)
 		renderer.SetDetectionControl(detector)
 	}
+	if renderer != nil && previews != nil {
+		renderer.SetJobPreview(previews)
+	}
 	// Optional Pushover print notifications. The notifier registers as an
 	// activity observer before the broker serves, so entries recorded
 	// during startup reach it; upstream connections are lazy.
@@ -193,6 +208,9 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 			deps.Detector = detector
 			deps.DetectorControl = detector
 		}
+		if previews != nil {
+			deps.JobPreviews = previews
+		}
 		mcpsrv = mcpserver.New(deps)
 	}
 
@@ -214,13 +232,15 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 
 	// The broker is up. Defer every teardown from here so both the signal
 	// path and later startup errors (a raw camera or HTTP bind failure) stop
-	// the detector, MCP, HTTP server, raw camera listener, camera captures,
-	// upstream pool, and broker — in that order. HTTP stops first among the
-	// shared services so its streaming handlers end before the captures and
-	// connections they read. The raw listener closes before the capture
-	// manager so its camera sockets never outlive the captures they read.
-	// Each stop is idempotent, so the single deferred call never
-	// double-stops a service.
+	// the detector, MCP, HTTP server, preview scheduler, raw camera
+	// listener, camera captures, upstream pool, and broker — in that order.
+	// HTTP stops first among the shared services so its streaming handlers
+	// end before the captures and connections they read, and the preview
+	// scheduler closes after both of its consumers (MCP and the HTTP
+	// handlers) stop but before the cameras and pool it reads. The raw
+	// listener closes before the capture manager so its camera sockets never
+	// outlive the captures they read. Each stop is idempotent, so the single
+	// deferred call never double-stops a service.
 	var httpSrv *httpsrv.Server
 	var raw *camera.RawServer
 	defer func() {
@@ -238,6 +258,9 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		if httpSrv != nil {
 			httpSrv.Stop()
 		}
+		if previews != nil {
+			previews.Close()
+		}
 		if raw != nil {
 			raw.Close()
 		}
@@ -250,6 +273,13 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		pool.Stop()
 		_ = srv.Close()
 	}()
+
+	// The preview scheduler starts only after the broker is serving and the
+	// deferred teardown is installed, so any later startup failure still
+	// closes it on the single shutdown path.
+	if previews != nil {
+		previews.Start()
+	}
 
 	// Raw camera endpoint: the camera feature keeps its printer-compatible
 	// listener even when the HTTP port is off. Starting it after the
@@ -292,6 +322,10 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 			mcpsrv.Register(httpSrv.Mux())
 			mcpsrv.Start()
 			logger.Info("mcp endpoint serving", "path", "/mcp")
+		}
+		if previews != nil {
+			previews.Register(httpSrv.Mux())
+			logger.Info("job preview image route serving", "port", cfg.HTTP.Port)
 		}
 		if cfg.CameraEnabled() {
 			camera.Register(httpSrv.Mux(), cameras)

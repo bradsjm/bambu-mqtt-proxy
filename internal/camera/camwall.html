@@ -216,6 +216,22 @@ body.kiosk .bar { display: none; }
 .job-line .ic { flex: none; color: var(--dim); font-size: .85rem; }
 .job-line .job { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .job-line.past { color: var(--dim); }
+/* Archived plate render beside the identity: decorative, never the camera.
+   It paints only after the cached PNG has loaded; its click follows the
+   existing details cycle. */
+.job-thumb { flex: none; width: 40px; height: 40px; object-fit: contain; background: var(--panel-2);
+             border: 1px solid var(--line); border-radius: 8px; }
+.job-thumb.past { opacity: .7; }
+/* Sliced material needs on one ellipsized line under the job name, at
+   every detail level. Swatches carry the sliced colors, never the
+   installed spool. */
+.job-materials { min-width: 0; font-size: .74rem; color: var(--dim); white-space: nowrap;
+                 overflow: hidden; text-overflow: ellipsis; }
+.job-materials .swatch { display: inline-block; width: .7rem; height: .7rem; margin-right: .22rem;
+                         border: 1px solid var(--line); border-radius: 3px;
+                         background: var(--sw, transparent); vertical-align: -.06rem; }
+.job-materials .jm-more { color: var(--faint); }
+.job-materials.past { opacity: .7; }
 .kpi { display: flex; flex-direction: column; align-items: flex-end; text-align: right; white-space: nowrap; }
 .kpi-main { font-size: 1.3rem; font-size: clamp(1.1rem, .75rem + 3.2cqi, 1.75rem); font-weight: 700;
             line-height: 1.1; font-variant-numeric: tabular-nums; color: var(--accent); }
@@ -249,6 +265,21 @@ body.kiosk .bar { display: none; }
           letter-spacing: .12em; text-transform: uppercase; }
 .job-full { margin: 0; font-size: .8rem; overflow-wrap: anywhere; }
 .job-meta { margin: .15rem 0 0; }
+/* Full-detail archive facts from the sliced 3MF: advisory slicing-time
+   values under a rule, never live state and never alert material. Past
+   jobs dim the block without hiding it. */
+.job-archive { display: grid; gap: .3rem; margin-top: .55rem; padding-top: .55rem;
+               border-top: 1px solid var(--line); font-size: .78rem; color: var(--dim); }
+.job-archive p { margin: 0; overflow-wrap: anywhere; }
+.job-archive .ja-title { color: var(--text); }
+.job-archive .ja-body { display: grid; gap: .3rem; min-width: 0; }
+.job-archive.past { opacity: .72; }
+.job-archive details { min-width: 0; }
+.job-archive summary { cursor: pointer; color: var(--text); }
+.job-archive ul { margin: .25rem 0 0; padding-left: 1.1rem; display: grid; gap: .15rem; }
+.job-archive .ja-note-head { margin: .1rem 0 0; color: var(--faint); font: 600 .62rem/1.6 var(--mono);
+                             letter-spacing: .12em; text-transform: uppercase; }
+.job-description p { max-height: 9rem; overflow-y: auto; white-space: pre-wrap; }
 .act-list { max-height: 14rem; overflow-y: auto; display: grid; gap: .25rem; margin: 0; padding: 0; list-style: none; }
 .act-list li { display: flex; align-items: baseline; gap: .4rem; font-size: .76rem; }
 .act-list li::before { content: ""; width: .45rem; height: .45rem; margin-top: .2rem; border-radius: 50%;
@@ -312,6 +343,12 @@ body.kiosk .bar { display: none; }
 .progress-row { display: flex; flex-wrap: wrap; align-items: center; gap: .35rem 1rem; font-size: .8rem;
                 color: var(--dim); font-variant-numeric: tabular-nums; }
 .stat b { color: var(--text); font-weight: 600; }
+/* Vitals-level archive facts: the sliced first-layer duration and one line
+   naming the plate, its bed, and the object count at slicing time. Muted
+   archive data next to the live numbers. */
+.job-vitals { display: grid; gap: .2rem; font-size: .78rem; color: var(--dim);
+              font-variant-numeric: tabular-nums; }
+.job-vitals.past { opacity: .7; }
 .detect-l2 { --tone: var(--dim); display: flex; align-items: center; gap: .45rem; font-size: .8rem;
              color: var(--dim); font-variant-numeric: tabular-nums; }
 .detect-l2 .ic { color: var(--tone); font-size: 1rem; }
@@ -366,6 +403,7 @@ select.speed { min-height: 1.9rem; padding: 0 .35rem; border-radius: 6px; border
 
 @container tile (width < 300px) {
   .pill .label, .pill.state .stage, .serial { display: none; }
+  .job-thumb { width: 32px; height: 32px; border-radius: 6px; }
   /* The detection badge is the only place this state lives, so its label survives narrow tiles. */
   .pill.detect .label { display: initial; }
   /* Two slot columns; the external spool flows after the first unit. */
@@ -514,7 +552,7 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
   <article class="tile">
     <div class="cam">
       <div class="placeholder"><svg class="ic ph-icon" aria-hidden="true"><use/></svg><span class="ph-text"></span></div>
-      <img alt="" decoding="async" hidden>
+      <img class="camera-frame" alt="" decoding="async" hidden>
       <button class="cam-hit" type="button" aria-pressed="false"></button>
       <span class="pill state"><svg class="ic" aria-hidden="true"><use/></svg><span class="label"></span><span class="stage" hidden></span></span>
       <span class="pill feed" hidden><span class="dot" aria-hidden="true"></span><svg class="ic" aria-hidden="true"><use href="#i-camera"/></svg><span class="feed-label"></span></span>
@@ -529,9 +567,11 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
     <div class="details">
       <div class="head">
         <button class="grip" type="button"><svg class="ic" aria-hidden="true"><use href="#i-grip"/></svg></button>
+        <img class="job-thumb" alt="" decoding="async" hidden>
         <div class="ident">
           <div class="id-line"><span class="model"></span><span class="serial"></span></div>
           <div class="job-line" hidden><svg class="ic" aria-hidden="true"><use href="#i-file"/></svg><span class="job"></span></div>
+          <div class="job-materials" hidden></div>
         </div>
         <div class="kpi"><span class="kpi-main"></span><span class="kpi-sub"></span></div>
         <button class="level" type="button"><svg class="ic" aria-hidden="true"><use href="#i-chevron"/></svg></button>
@@ -547,6 +587,10 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
             <option value="sport">Sport</option><option value="ludicrous">Ludicrous</option>
           </select><span class="speed-pct"></span></label>
         </div>
+        <div class="job-vitals" hidden>
+          <span class="fl-stat" hidden></span>
+          <span class="plate-fact" hidden></span>
+        </div>
         <div class="detect-l2" hidden><svg class="ic" aria-hidden="true"><use href="#i-ai"/></svg><b class="d-q"></b><span class="d-text"></span></div>
         <div class="temps"></div>
         <div class="active-fil" hidden><i class="swatch"></i><b class="af-slot"></b><span class="af-mat"></span>
@@ -560,6 +604,7 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
           <dl class="facts job-facts">
             <dt class="dt-detect" hidden><svg class="ic" aria-hidden="true"><use href="#i-ai"/></svg>AI</dt><dd class="f-detect" hidden></dd>
           </dl>
+          <div class="job-archive" hidden></div>
         </section>
         <section class="sec ams" aria-label="Filament" hidden>
           <h3>Filament</h3>
@@ -953,9 +998,15 @@ function createTile(p) {
     serial: p.serial, el, data: p, feed: "none", hasFrame: false, liveError: false, blobURL: "",
     snap: { ctrl: null, pending: false, requested: 0, at: 0, error: false },
     detPending: false, detError: "", ctlPending: false, ctlError: "",
+    // Archived preview state: the metadata serialization that last built
+    // the archive DOM, whether that DOM carries visible facts, and the
+    // ready-image episode (key, currently assigned URL, failed URL,
+    // request token).
+    jobMetaKey: null, jobArchHead: null, jobArchBody: null, jobArchBodyShown: false, jobArchShown: false,
+    jobEpKey: null, jobEpUrl: "", jobEpFailed: "", jobTok: 0,
     level: [1, 2, 3].includes(prefs.levels[p.serial]) ? prefs.levels[p.serial] : 1,
     r: {
-      cam: q(".cam"), img: q("img"), phUse: q(".ph-icon use"), phText: q(".ph-text"), hit: q(".cam-hit"),
+      cam: q(".cam"), img: q(".camera-frame"), phUse: q(".ph-icon use"), phText: q(".ph-text"), hit: q(".cam-hit"),
       stateUse: q(".pill.state use"), stateLabel: q(".pill.state .label"),
       feed: q(".pill.feed"), feedLabel: q(".feed-label"), camBar: q(".cam-progress"),
       details: q(".details"), grip: q(".grip"), model: q(".model"), serial: q(".serial"),
@@ -965,7 +1016,10 @@ function createTile(p) {
       l2: q(".l2"), l3: q(".l3"), progressRow: q(".progress-row"),
       eta: q(".eta b"), temps: q(".temps"),
       jobLine: q(".job-line"), job: q(".job-line .job"),
+      jobThumb: q(".job-thumb"), jobMaterials: q(".job-materials"),
+      jobVitals: q(".job-vitals"), flStat: q(".fl-stat"), plateFact: q(".plate-fact"),
       jobSec: q(".job-sec"), jobFull: q(".job-full"), jobMeta: q(".job-meta"), jobFacts: q(".job-facts"),
+      jobArchive: q(".job-archive"),
       printerSec: q(".printer-sec"), speedPct: q(".speed-pct"),
       af: q(".active-fil"), afSwatch: q(".active-fil .swatch"), afSlot: q(".af-slot"), afMat: q(".af-mat"),
       afBar: q(".active-fil .remain-bar"), afPct: q(".af-pct"),
@@ -1013,7 +1067,7 @@ function createTile(p) {
   details.addEventListener("click", e => {
     // The activity and filament sections stay readable, so clicks there
     // must not cycle the detail level.
-    if (e.target.closest("a, .grip, .activity, .ams, .alert-full, .ctl-bar, .speed-wrap, .speed") ||
+    if (e.target.closest("a, .grip, .activity, .ams, .alert-full, .job-archive, .ctl-bar, .speed-wrap, .speed") ||
         getSelection()?.toString()) return;
     t.level = t.level % 3 + 1;
     prefs.levels[t.serial] = t.level;
@@ -1314,6 +1368,316 @@ function offChip(p) {
   return el;
 }
 
+// Archived job preview: the sliced 3MF's plate render and material facts.
+// Everything here is advisory archive data: it renders through DOM nodes
+// and textContent only, never becomes an alert, and never replaces the
+// camera or the live job name. The DOM-heavy renders are keyed by the
+// serialized metadata, so routine SSE ticks — ages, temperatures, progress
+// — rebuild nothing and open disclosures stay open.
+const mdText = v => typeof v === "string" ? v.trim() : "";
+const mdNum = v => Number.isFinite(v) ? v : null;
+const mdMass = v => String(Math.round(v * 10) / 10);
+// Lengths keep three significant decimals: a 0.16 mm layer height must
+// not round to 0.2, while float-noisy 0.20000000298 collapses to 0.2.
+const mdLen = v => String(Number(v.toPrecision(3)));
+// Friendly plate-surface names; unknown values keep their content with
+// underscores as spaces, with no guessing about installed plates.
+const BED_LABELS = {
+  textured_plate: "Textured PEI",
+  hot_plate: "High-temperature plate",
+  cool_plate: "Cool plate",
+  engineering_plate: "Engineering plate",
+};
+const bedLabel = v => BED_LABELS[v] || String(v).replaceAll("_", " ");
+// Display-only extension strip; grouping keeps the full archive name.
+const objectWord = n => n.replace(/\.(stl|obj|3mf)$/i, "");
+
+function renderJobPreview(t, b) {
+  const p = t.data, r = t.r;
+  const jp = p.job_preview && typeof p.job_preview === "object"
+    ? p.job_preview : { status: "disabled", job_name: "", current: false, retrieved_at: null, image_url: null };
+  const md = p.job_metadata && typeof p.job_metadata === "object" ? p.job_metadata : null;
+  // Past jobs dim the archived fields; live state keeps its own colors.
+  const past = jp.current !== true;
+  const metaKey = md ? JSON.stringify(md) : "";
+  if (metaKey !== t.jobMetaKey) {
+    t.jobMetaKey = metaKey;
+    renderJobMaterials(t, md);
+    t.jobArchBodyShown = renderJobArchive(t, md);
+  }
+  // The archive head also depends on the live job name, so it refreshes
+  // outside the keyed rebuild; disclosures stay untouched either way.
+  updateJobArchiveHead(t, md);
+  t.jobArchShown = t.jobArchBodyShown || !!(t.jobArchHead && !t.jobArchHead.hidden);
+  r.jobArchive.hidden = !t.jobArchShown;
+  r.jobThumb.classList.toggle("past", past);
+  r.jobMaterials.classList.toggle("past", past);
+  r.jobArchive.classList.toggle("past", past);
+  renderJobVitals(t, jp, md, b, past);
+  renderJobThumb(t, jp);
+}
+
+// Sliced material needs on one line under the job name, at every detail
+// level. Up to three chips show swatch, type, and weight; a longer list
+// collapses to a count, or to "more" when the archive array itself was
+// truncated and an exact remainder cannot be claimed.
+function renderJobMaterials(t, md) {
+  const r = t.r, line = r.jobMaterials;
+  line.replaceChildren();
+  const mats = md && md.plate && Array.isArray(md.materials) ? md.materials : [];
+  if (!mats.length) { line.hidden = true; return; }
+  line.append("Sliced: ");
+  mats.slice(0, 3).forEach((m, i) => {
+    if (i) line.append(" · ");
+    const chip = document.createElement("span");
+    const sw = document.createElement("i");
+    sw.className = "swatch";
+    const color = typeof m.color === "string" && /^#[0-9a-fA-F]{6}(?:[0-9a-fA-F]{2})?$/.test(m.color) ? m.color : "";
+    sw.style.setProperty("--sw", color || "transparent");
+    chip.append(sw);
+    // A known zero weight is still a known value and shows as ≈0 g.
+    chip.append([mdText(m.type), mdNum(m.used_g) != null ? `≈${mdMass(m.used_g)} g` : ""]
+      .filter(Boolean).join(" "));
+    line.append(chip);
+  });
+  if (mats.length > 3) {
+    const rest = document.createElement("span");
+    rest.className = "jm-more";
+    rest.textContent = md.truncated ? "more" : `+${mats.length - 3}`;
+    line.append(" · ", rest);
+  }
+  line.hidden = false;
+}
+
+// Vitals-level archive facts. The first-layer line shows only while the
+// printer is genuinely on layer 1 of a running, current print: it is the
+// sliced total for that layer, never a countdown or a promise of time
+// remaining, and never shown for a past job. The plate line names the
+// sliced plate, its bed, and the object count as it was at slicing time.
+function renderJobVitals(t, jp, md, b, past) {
+  const r = t.r, p = t.data;
+  const plate = md && md.plate && typeof md.plate === "object" ? md.plate : null;
+  const flSec = plate ? mdNum(plate.first_layer_seconds) : null;
+  // Bucket "printing" already implies a fresh report; the exact RUNNING
+  // state check keeps the estimate tied to the live state alone.
+  const showFL = b === "printing" && String(p.print_state || "").toUpperCase() === "RUNNING" &&
+    jp.current === true && p.layer_num === 1 && flSec != null && flSec > 0;
+  r.flStat.hidden = !showFL;
+  if (showFL) r.flStat.textContent =
+    `Sliced first layer: ≈${Math.max(1, Math.round(flSec / 60))} min`;
+  const bits = [];
+  if (plate) {
+    const name = mdText(plate.name);
+    if (mdNum(plate.index) > 0) bits.push(`Plate ${plate.index}${name ? ` · ${name}` : ""}`);
+    const bed = mdText(plate.bed_type);
+    if (bed) bits.push(bedLabel(bed));
+  }
+  if (md && md.object_count != null) bits.push(`Sliced objects: ${md.object_count}`);
+  r.plateFact.hidden = !bits.length;
+  if (bits.length) r.plateFact.textContent = bits.join(" · ");
+  r.jobVitals.hidden = !showFL && !bits.length;
+  r.jobVitals.classList.toggle("past", past);
+}
+
+// Full-detail archive facts in the approved order, each line hiding
+// independently when its value is missing. Every string is untrusted
+// archive text: textContent and DOM nodes only, never innerHTML and never
+// URL interpolation. Rebuilt only when the serialized metadata changes.
+function renderJobArchive(t, md) {
+  const box = t.r.jobArchive;
+  box.replaceChildren();
+  if (!md) {
+    t.jobArchHead = null;
+    t.jobArchBody = null;
+    return false;
+  }
+  // The box keeps two parts: a head that follows the live job name, and a
+  // keyed body that never rebuilds across routine SSE ticks.
+  const head = document.createElement("p");
+  head.className = "ja-title";
+  const body = document.createElement("div");
+  body.className = "ja-body";
+  box.append(head, body);
+  t.jobArchHead = head;
+  t.jobArchBody = body;
+  let shown = false;
+  const add = node => { body.append(node); shown = true; };
+  const line = text => {
+    const p = document.createElement("p");
+    p.textContent = text;
+    add(p);
+  };
+  updateJobArchiveHead(t, md);
+  const plate = md.plate && typeof md.plate === "object" ? md.plate : null;
+  if (plate && mdNum(plate.index) > 0) {
+    const name = mdText(plate.name);
+    line(`Plate ${plate.index}${name ? ` · ${name}` : ""}`);
+  }
+  const objects = Array.isArray(md.objects) ? md.objects : [];
+  if (objects.length) {
+    const word = o => `${objectWord(mdText(o.name))} ×${o.count}`;
+    line(objects.slice(0, 3).map(word).join(" · "));
+    if (objects.length > 3) {
+      const det = document.createElement("details");
+      det.className = "job-objects";
+      const sum = document.createElement("summary");
+      sum.textContent = "Show all sliced objects";
+      const ul = document.createElement("ul");
+      for (const o of objects) {
+        const li = document.createElement("li");
+        li.textContent = word(o);
+        ul.append(li);
+      }
+      det.append(sum, ul);
+      add(det);
+    }
+  }
+  const mats = Array.isArray(md.materials) ? md.materials : [];
+  const words = mats.map(m => {
+    const type = mdText(m.type), g = mdNum(m.used_g);
+    if (type && g != null) return `${type} ≈${mdMass(g)} g`;
+    return type || (g != null ? `≈${mdMass(g)} g` : "");
+  }).filter(Boolean);
+  if (words.length) line(`Sliced materials: ${words.join(" · ")}`);
+  // Estimate and bed come from the selected plate.
+  const bits = [];
+  if (plate) {
+    const est = [];
+    const secs = mdNum(plate.estimated_seconds);
+    if (secs != null && secs > 0) est.push(`≈${fmtDuration(secs / 60)}`);
+    const g = mdNum(plate.weight_g);
+    if (g != null) est.push(`≈${mdMass(g)} g`);
+    if (est.length) line(`Sliced estimate: ${est.join(" · ")}`);
+    const bed = mdText(plate.bed_type);
+    if (bed) line(`Sliced bed: ${bedLabel(bed)}`);
+  }
+  // Defaults order follows the plan: layer height, infill, then supports;
+  // supports is a selected-plate value, not the global enable_support flag.
+  const proc = md.process && typeof md.process === "object" ? md.process : null;
+  if (proc) {
+    const lh = mdNum(proc.layer_height_mm);
+    if (lh != null && lh > 0) bits.push(`${mdLen(lh)} mm`);
+    const inf = mdNum(proc.infill_percent);
+    if (inf != null && inf >= 0 && inf <= 100) bits.push(`${mdLen(inf)}% infill`);
+  }
+  if (plate) {
+    if (plate.supports === true) bits.push("Supports used");
+    else if (plate.supports === false) bits.push("No supports");
+  }
+  if (bits.length) line(`Sliced defaults: ${bits.join(" · ")}`);
+  // Slicer notes are neutral advisories from slicing time: muted, headed,
+  // and never merged into the live alert system.
+  const warns = Array.isArray(md.warnings) ? md.warnings : [];
+  const notes = warns.map(w => mdText(w.message) || mdText(w.code)).filter(Boolean);
+  if (notes.length) {
+    const label = document.createElement("p");
+    label.className = "ja-note-head";
+    label.textContent = "Slicer notes · At slicing time";
+    const ul = document.createElement("ul");
+    ul.className = "job-warnings";
+    for (const note of notes) {
+      const li = document.createElement("li");
+      li.textContent = note;
+      ul.append(li);
+    }
+    add(label);
+    add(ul);
+  }
+  const desc = mdText(md.description);
+  if (desc) {
+    const det = document.createElement("details");
+    det.className = "job-description";
+    const sum = document.createElement("summary");
+    sum.textContent = "Description";
+    const body = document.createElement("p");
+    body.textContent = desc;
+    det.append(sum, body);
+    add(det);
+  }
+  const lic = mdText(md.license);
+  if (lic) line(`License: ${lic}`);
+  return shown;
+}
+
+// The archive head repeats the project title only when it differs from
+// the MQTT job name and adds the designer; because it reads the live job
+// name, it refreshes on every render without rebuilding the keyed body.
+function updateJobArchiveHead(t, md) {
+  const head = t.jobArchHead;
+  if (!head) return;
+  head.replaceChildren();
+  const title = mdText(md?.title), designer = mdText(md?.designer);
+  const jobName = mdText(t.data.job_name);
+  if (title && title !== jobName) head.append(title);
+  if (designer) {
+    if (head.textContent) head.append(" · ");
+    head.append(`By ${designer}`);
+  }
+  head.hidden = !head.textContent;
+}
+
+// The plate thumb is a cached, versioned PNG, assigned once per
+// uninterrupted ready episode. A new job/retrieval key or readiness
+// ending (pending, invalidated, new generation) clears the episode's URL
+// bookkeeping, and a key change also drops the old render immediately so
+// a superseded image is never displayed while a new one loads; a later
+// ready episode may therefore assign the same URL again. Within an
+// episode a URL is assigned only when it differs from the one already on
+// the element, a failed URL is never retried, and a new assignment first
+// hides and clears whatever was on the element. Each assignment takes a
+// fresh token, and its load/error closures check both that token and the
+// element's current URL, so an obsolete A->B->A callback can never affect
+// the current image.
+function renderJobThumb(t, jp) {
+  const r = t.r, thumb = r.jobThumb;
+  const url = typeof jp.image_url === "string" ? jp.image_url : "";
+  const readyNow = jp.status === "ready" && url !== "";
+  const key = `${jp.job_name || ""}\u0000${jp.retrieved_at || ""}`;
+  if (key !== t.jobEpKey || !readyNow) {
+    // A new episode begins here: a key change also drops the old render
+    // immediately, and readiness ending ends the episode regardless of
+    // the key. The full reset must precede the equality checks, or a
+    // later ready episode with the same URL would stay hidden forever.
+    thumb.hidden = true;
+    thumb.removeAttribute("src");
+    t.jobEpKey = key;
+    t.jobEpUrl = "";
+    t.jobEpFailed = "";
+    t.jobTok++;
+  }
+  if (!readyNow) return;
+  if (url === t.jobEpUrl || url === t.jobEpFailed) return;
+  // Every assignment takes a fresh token; closures from earlier
+  // assignments can then never match the current one.
+  const tok = ++t.jobTok;
+  // A callback owns the element only while its token is current and the
+  // element still shows the URL it was created for.
+  const owns = () => t.jobTok === tok && thumb.getAttribute("src") === url;
+  const onLoad = () => {
+    thumb.removeEventListener("load", onLoad);
+    thumb.removeEventListener("error", onErr);
+    if (owns()) thumb.hidden = false;
+  };
+  const onErr = () => {
+    thumb.removeEventListener("error", onErr);
+    thumb.removeEventListener("load", onLoad);
+    if (owns()) {
+      // A failure ends this URL for the episode: hidden, no retry.
+      t.jobEpFailed = url;
+      thumb.hidden = true;
+      thumb.removeAttribute("src");
+    }
+  };
+  thumb.addEventListener("load", onLoad);
+  thumb.addEventListener("error", onErr);
+  // A new URL never displays over the previous render: drop it first and
+  // wait for the new image to load.
+  thumb.hidden = true;
+  thumb.removeAttribute("src");
+  t.jobEpUrl = url;
+  thumb.src = url;
+}
+
 function renderTile(t) {
   const p = t.data, r = t.r, b = bucket(p), s = STATES[b];
   const pct = Math.max(0, Math.min(100, Math.round(p.progress || 0)));
@@ -1356,6 +1720,10 @@ function renderTile(t) {
   r.jobLine.classList.toggle("past", !jobLive);
   r.job.textContent = job;
   r.jobLine.title = job ? `${jobLive ? "Printing" : "Last job"}: ${job}` : "";
+  // Archived preview of this print: head thumb, sliced materials, vitals
+  // facts, and the full-detail archive block. Display-only, keyed by
+  // metadata, and independent of the camera and alert paths.
+  renderJobPreview(t, b);
   r.grip.setAttribute("aria-label", `Reorder ${nameOf(t)}. Drag, or use arrow keys.`);
   r.hit.setAttribute("aria-label", `${t.serial === spotlight ? "Exit focus view for" : "Focus camera of"} ${nameOf(t)}`);
   r.hit.setAttribute("aria-pressed", String(t.serial === spotlight));
@@ -1473,7 +1841,8 @@ function renderTile(t) {
   r.fDetectDt.hidden = r.fDetect.hidden = !fact;
   r.fDetect.textContent = fact;
   r.jobFacts.hidden = !fact;
-  r.jobSec.hidden = !job && !fact;
+  // Archive-only results stay visible when the MQTT job name is absent.
+  r.jobSec.hidden = !job && !fact && !t.jobArchShown;
   const sig = detSig(d, b);
   if (t.detSig === undefined) t.detSig = sig;
   else if (sig !== t.detSig) { announceDetect(t, t.detSig, sig); t.detSig = sig; }

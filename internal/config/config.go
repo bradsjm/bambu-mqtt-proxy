@@ -42,6 +42,14 @@ const (
 	// shared HTTP port. MCP is enabled by default; an explicit false
 	// disables it.
 	EnvMCPEnable = "BMBPX_MCP_ENABLED"
+	// EnvJobPreview controls the printer job preview feature: the
+	// best-effort retrieval of the current print's sliced 3MF plate image
+	// and metadata from the printer. Job preview is enabled by default;
+	// an explicit false disables it. The switch is environment-only:
+	// there is no YAML field and no configuration-page control, and
+	// resolveConfig re-applies the environment after every
+	// configuration-page save.
+	EnvJobPreview = "BMBPX_JOB_PREVIEW"
 	// EnvOctoEverywhereAPIKey enables the optional OctoEverywhere Gadget AI
 	// print failure detection. The key is environment-only: there is no YAML
 	// field, no other setting, and an empty or unset value keeps the proxy
@@ -177,6 +185,10 @@ type Config struct {
 	// OctoEverywhereAPIKey is the Gadget API key applied from
 	// BMBPX_OCTOEVERYWHERE_API_KEY only; yaml:"-" keeps it out of files.
 	OctoEverywhereAPIKey string `yaml:"-"`
+	// JobPreview is the printer job preview switch applied from
+	// BMBPX_JOB_PREVIEW only; yaml:"-" keeps it out of files. Nil means
+	// enabled.
+	JobPreview *bool `yaml:"-"`
 }
 
 // DefaultConfigName is the file probed when no -config flag is given.
@@ -283,6 +295,14 @@ func (c *Config) MCPEnabled() bool {
 	return c.MCP.Enabled == nil || *c.MCP.Enabled
 }
 
+// JobPreviewEnabled reports whether the printer job preview feature should
+// run: the scheduler that retrieves the current print's sliced 3MF, the
+// cached plate image route, and the MCP preview tool. It defaults to on;
+// an explicit false (from BMBPX_JOB_PREVIEW only) disables it.
+func (c *Config) JobPreviewEnabled() bool {
+	return c.JobPreview == nil || *c.JobPreview
+}
+
 // Load reads and parses the YAML configuration at path. Defaults and
 // validation are applied by the caller after environment overrides.
 func Load(path string) (*Config, error) {
@@ -370,6 +390,18 @@ func (c *Config) ApplyEnv() (bool, error) {
 			return false, fmt.Errorf("%s: invalid bool %q", EnvMCPEnable, v)
 		}
 		c.MCP.Enabled = &b
+	}
+	// The job preview switch is environment-only: clear any previous
+	// application first so a re-apply after a configuration-page save
+	// follows a removed variable back to the default, then apply a
+	// nonempty value. Unset or empty keeps the enabled default.
+	c.JobPreview = nil
+	if v, ok := os.LookupEnv(EnvJobPreview); ok && v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return false, fmt.Errorf("%s: invalid bool %q", EnvJobPreview, v)
+		}
+		c.JobPreview = &b
 	}
 	if v, ok := os.LookupEnv(EnvOctoEverywhereAPIKey); ok {
 		c.OctoEverywhereAPIKey = strings.TrimSpace(v)

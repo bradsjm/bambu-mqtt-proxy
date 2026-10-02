@@ -9,6 +9,7 @@ import (
 
 	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/detection"
+	"bambu-mqtt-proxy/internal/jobpreview"
 	"bambu-mqtt-proxy/internal/printerview"
 )
 
@@ -77,6 +78,13 @@ type PrinterState struct {
 	// when a feature is switched off.
 	Camera    string        `json:"camera"`
 	Detection DetectionView `json:"detection"`
+	// JobPreview is the job preview feature state: the selected plate's
+	// archived render projection. It reads disabled when the feature is
+	// switched off and pending before the settled job attempt completes.
+	JobPreview jobpreview.View `json:"job_preview"`
+	// JobMetadata carries the accepted archive facts for the selected
+	// plate; nil when no archive field has been accepted.
+	JobMetadata *jobpreview.Metadata `json:"job_metadata"`
 	// Activity lists recent printer events, newest first.
 	Activity []activity.Entry `json:"activity"`
 	// Controls lists the control actions currently available.
@@ -208,12 +216,15 @@ func (s *Server) buildPrinterState(serial string, now time.Time) (PrinterState, 
 	st, _ := s.state.State(serial)
 	st.Serial, st.Name, st.Model = info.serial, info.name, info.model
 	sv, _ := s.state.Session(serial)
+	preview, jobMeta := s.jobPreview(serial)
 	out := PrinterState{
-		View:      printerview.Build(st, sv, s.connStatus(serial), s.generation(serial), now),
-		Camera:    s.cameraState(serial),
-		Detection: s.detectionView(serial),
-		Activity:  []activity.Entry{},
-		Controls:  []string{},
+		View:        printerview.Build(st, sv, s.connStatus(serial), s.generation(serial), now),
+		Camera:      s.cameraState(serial),
+		Detection:   s.detectionView(serial),
+		JobPreview:  preview,
+		JobMetadata: jobMeta,
+		Activity:    []activity.Entry{},
+		Controls:    []string{},
 	}
 	if s.control != nil {
 		out.Controls = s.control.Available(serial)
@@ -224,4 +235,21 @@ func (s *Server) buildPrinterState(serial string, now time.Time) (PrinterState, 
 		}
 	}
 	return out, true
+}
+
+// jobPreview projects the optional preview service. A nil service, like a
+// serial the service does not carry, reads as the explicit disabled state.
+// The projection never carries image bytes, so Lookup runs with
+// includeImage=false.
+func (s *Server) jobPreview(serial string) (jobpreview.View, *jobpreview.Metadata) {
+	if s.previews == nil {
+		v := jobpreview.Disabled()
+		return v.Preview, v.Metadata
+	}
+	res, ok := s.previews.Lookup(serial, false)
+	if !ok {
+		v := jobpreview.Disabled()
+		return v.Preview, v.Metadata
+	}
+	return res.Preview, res.Metadata
 }

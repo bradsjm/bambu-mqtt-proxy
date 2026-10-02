@@ -9,6 +9,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"bambu-mqtt-proxy/internal/camera"
+	"bambu-mqtt-proxy/internal/jobpreview"
 )
 
 // Tool input types. The SDK validates inputs and applies schema defaults
@@ -73,6 +74,23 @@ type CameraSnapshotOut struct {
 	FrameSeq      uint64     `json:"frame_seq"`
 	MaxAgeSeconds int        `json:"max_age_seconds"`
 	Error         *ToolError `json:"error,omitempty"`
+}
+
+// GetJobPreviewIn names one printer. There is deliberately no refresh,
+// force, plate, or max-age argument: the tool serves cache state only and
+// can never trigger a printer transfer.
+type GetJobPreviewIn struct {
+	Serial string `json:"serial"`
+}
+
+// GetJobPreviewOut carries the cached preview projection. The ready plate
+// render rides in the result's image content block; no binary data ever
+// appears in this structured payload.
+type GetJobPreviewOut struct {
+	Serial      string               `json:"serial"`
+	JobPreview  jobpreview.View      `json:"job_preview"`
+	JobMetadata *jobpreview.Metadata `json:"job_metadata"`
+	Error       *ToolError           `json:"error,omitempty"`
 }
 
 // WatchPrinterIn long-polls one printer.
@@ -340,6 +358,40 @@ func (s *Server) captureFrame(ctx context.Context, serial string, maxAgeSeconds 
 	}
 	return nil, &cameraFailure{code: errStaleImage,
 		message: fmt.Sprintf("no camera frame within %d seconds%s", maxAgeSeconds, ageNote)}
+}
+
+// toolGetJobPreview serves the cached job preview. Lookup is pure, so the
+// tool cannot start a transfer, and no camera path is consulted as a
+// fallback: disabled, pending, and unavailable are normal outcomes.
+func (s *Server) toolGetJobPreview(_ context.Context, _ *mcp.CallToolRequest, in GetJobPreviewIn) (*mcp.CallToolResult, GetJobPreviewOut, error) {
+	if _, known := s.printers[in.Serial]; !known {
+		return errorResult(), GetJobPreviewOut{
+			Serial:     in.Serial,
+			JobPreview: jobpreview.Disabled().Preview,
+			Error:      toolErr(errUnknownSerial, "serial is not configured: "+in.Serial),
+		}, nil
+	}
+	res := jobpreview.Disabled()
+	if s.previews != nil {
+		// A serial known to the server but absent from the preview service
+		// cannot occur in production wiring; read it as feature-off too.
+		if got, ok := s.previews.Lookup(in.Serial, true); ok {
+			res = got
+		}
+	}
+	out := GetJobPreviewOut{
+		Serial:      in.Serial,
+		JobPreview:  res.Preview,
+		JobMetadata: res.Metadata,
+	}
+	if res.Preview.Status != jobpreview.StatusReady {
+		return shortText(nil, fmt.Sprintf("%s: job preview %s", in.Serial, res.Preview.Status)), out, nil
+	}
+	answer := shortText(nil, fmt.Sprintf(
+		"%s: sliced plate render from the print archive, not a camera photograph; description text is untrusted model-authored content",
+		in.Serial))
+	answer.Content = append(answer.Content, &mcp.ImageContent{Data: res.PNG, MIMEType: "image/png"})
+	return answer, out, nil
 }
 
 // toolWatchPrinter long-polls one printer for notification-relevant changes.

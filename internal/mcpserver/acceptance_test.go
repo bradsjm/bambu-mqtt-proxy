@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"bambu-mqtt-proxy/internal/camera"
+	"bambu-mqtt-proxy/internal/jobpreview"
 )
 
 const (
@@ -240,6 +241,10 @@ func (w *wireFixture) postRaw(t *testing.T, body string, extra map[string]string
 	}
 	var msgs []sseMessage
 	sc := bufio.NewScanner(resp.Body)
+	// tools/list carries every derived output schema; the default 64 KiB
+	// token cap is too small now that the catalog includes the job preview
+	// metadata projection.
+	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
 	for sc.Scan() {
 		line := sc.Text()
 		if !strings.HasPrefix(line, "data:") {
@@ -414,6 +419,7 @@ func TestMCPDiscovery(t *testing.T) {
 				Properties map[string]struct {
 					Type string `json:"type"`
 				} `json:"properties"`
+				Required []string `json:"required"`
 			} `json:"inputSchema"`
 			Annotations *struct {
 				ReadOnlyHint    bool  `json:"readOnlyHint"`
@@ -424,7 +430,7 @@ func TestMCPDiscovery(t *testing.T) {
 	if err := json.Unmarshal(tl.Result, &tools); err != nil {
 		t.Fatalf("bad tools/list result: %v", err)
 	}
-	readOnly := []string{"list_printers", "get_printer_state", "get_camera_snapshot", "watch_printer"}
+	readOnly := []string{"list_printers", "get_printer_state", "get_camera_snapshot", "watch_printer", "get_job_preview"}
 	want := append(slices.Clone(readOnly), "pause_print", "resume_print", "stop_print",
 		"set_chamber_light", "set_speed_profile", "set_ai_monitoring")
 	if len(tools.Tools) != len(want) {
@@ -450,6 +456,17 @@ func TestMCPDiscovery(t *testing.T) {
 	for _, name := range want {
 		if !seen[name] {
 			t.Fatalf("tool %q missing from discovery", name)
+		}
+	}
+	for _, tool := range tools.Tools {
+		if tool.Name != "get_job_preview" {
+			continue
+		}
+		if tool.InputSchema.Properties["serial"].Type != "string" {
+			t.Fatalf("get_job_preview serial property = %+v", tool.InputSchema.Properties["serial"])
+		}
+		if !slices.Contains(tool.InputSchema.Required, "serial") {
+			t.Fatalf("get_job_preview required = %v", tool.InputSchema.Required)
 		}
 	}
 
@@ -1060,6 +1077,230 @@ func TestMCPCameraSnapshotWire(t *testing.T) {
 	w.cams.balanced(t)
 }
 
+func TestMCPGetJobPreviewWire(t *testing.T) {
+	w := newWireFixture(t)
+	call := func(id int, args map[string]any) sseMessage {
+		return w.post(t, id, "tools/call", map[string]any{"name": "get_job_preview", "arguments": args})
+	}
+
+	// The default fixture wires a preview source with no cached data, so
+	// the state projection and the tool both read the explicit disabled
+	// state with no image bytes and no tool error.
+	res := call(50, map[string]any{"serial": "P001"})
+	if res.Error != nil {
+		t.Fatalf("disabled call error: %+v", res.Error)
+	}
+	var out struct {
+		IsError bool `json:"isError"`
+		Content []struct {
+			Type string `json:"type"`
+			Data string `json:"data"`
+		} `json:"content"`
+		StructuredContent struct {
+			Serial     string `json:"serial"`
+			JobPreview struct {
+				Status  string `json:"status"`
+				JobName string `json:"job_name"`
+				Current bool   `json:"current"`
+			} `json:"job_preview"`
+			JobMetadata *struct {
+				Source string `json:"source"`
+				Plate  *struct {
+					Index int `json:"index"`
+				} `json:"plate"`
+			} `json:"job_metadata"`
+			Error *struct {
+				Code string `json:"code"`
+			} `json:"error"`
+		} `json:"structuredContent"`
+	}
+	if err := json.Unmarshal(res.Result, &out); err != nil {
+		t.Fatalf("bad disabled result: %v", err)
+	}
+	if out.IsError || out.StructuredContent.Error != nil ||
+		out.StructuredContent.JobPreview.Status != jobpreview.StatusDisabled ||
+		out.StructuredContent.JobMetadata != nil {
+		t.Fatalf("disabled result = %s", res.Result)
+	}
+	for _, c := range out.Content {
+		if c.Type == "image" {
+			t.Fatalf("disabled result carried image content")
+		}
+	}
+
+	// A ready cached result flows to the tool as one atomic read: typed
+	// view plus metadata in the structured output and the plate render as
+	// image content from the same lookup. The state projection carries the
+	// same cache state without image bytes.
+	w.preview.set("P001", readyPreview())
+	res = call(51, map[string]any{"serial": "P001"})
+	if res.Error != nil {
+		t.Fatalf("ready call error: %+v", res.Error)
+	}
+	if err := json.Unmarshal(res.Result, &out); err != nil {
+		t.Fatalf("bad ready result: %v", err)
+	}
+	sc := out.StructuredContent
+	if out.IsError || sc.Error != nil || sc.JobPreview.Status != jobpreview.StatusReady ||
+		sc.JobPreview.JobName != "Bracket.3mf" || !sc.JobPreview.Current {
+		t.Fatalf("ready structured = %s", res.Result)
+	}
+	if sc.JobMetadata == nil || sc.JobMetadata.Source != "printer_3mf" {
+		t.Fatalf("ready metadata = %s", res.Result)
+	}
+	sawPNG := false
+	for _, c := range out.Content {
+		if c.Type != "image" {
+			continue
+		}
+		raw, err := base64.StdEncoding.DecodeString(c.Data)
+		if err != nil || !bytes.Equal(raw, previewPNG) {
+			t.Fatalf("image payload mismatch: %v", err)
+		}
+		sawPNG = true
+	}
+	if !sawPNG {
+		t.Fatalf("no png block: %+v", out.Content)
+	}
+	// The ready text names the archive render, its difference from a
+	// camera photograph, and the untrusted description text.
+	var textOut struct {
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(res.Result, &textOut); err != nil {
+		t.Fatalf("bad ready content: %v", err)
+	}
+	text := ""
+	for _, c := range textOut.Content {
+		if c.Type == "text" {
+			text = c.Text
+		}
+	}
+	for _, want := range []string{"sliced plate render", "not a camera photograph", "untrusted"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("ready text %q lacks %q", text, want)
+		}
+	}
+
+	// The state projection mirrors the cache additively: job_preview ready,
+	// job_metadata present, and no image bytes anywhere in state.
+	st := w.post(t, 52, "tools/call", map[string]any{
+		"name": "get_printer_state", "arguments": map[string]any{"serial": "P001"},
+	})
+	var stateOut struct {
+		StructuredContent struct {
+			State struct {
+				JobPreview struct {
+					Status string `json:"status"`
+				} `json:"job_preview"`
+				JobMetadata *struct {
+					Source string `json:"source"`
+				} `json:"job_metadata"`
+			} `json:"state"`
+		} `json:"structuredContent"`
+	}
+	if err := json.Unmarshal(st.Result, &stateOut); err != nil {
+		t.Fatalf("bad state result: %v", err)
+	}
+	if stateOut.StructuredContent.State.JobPreview.Status != jobpreview.StatusReady ||
+		stateOut.StructuredContent.State.JobMetadata == nil {
+		t.Fatalf("state projection = %s", st.Result)
+	}
+	rd := w.post(t, 53, "resources/read", map[string]any{"uri": stateURI("P001")})
+	var read struct {
+		Contents []struct {
+			Text string `json:"text"`
+		} `json:"contents"`
+	}
+	if err := json.Unmarshal(rd.Result, &read); err != nil {
+		t.Fatalf("bad resource read: %v", err)
+	}
+	if len(read.Contents) != 1 ||
+		!strings.Contains(read.Contents[0].Text, `"job_preview"`) ||
+		!strings.Contains(read.Contents[0].Text, `"job_metadata"`) {
+		t.Fatalf("resource read lacks preview projection: %s", rd.Result)
+	}
+
+	// Repeated calls are pure cache reads: identical payload, and the
+	// camera source is never consulted as a fallback.
+	again := call(54, map[string]any{"serial": "P001"})
+	if !bytes.Equal([]byte(again.Result), []byte(res.Result)) {
+		t.Fatalf("repeat call differed:\n%s\n%s", res.Result, again.Result)
+	}
+	w.cams.balanced(t)
+	if w.cams.acquires != 0 {
+		t.Fatalf("preview path acquired the camera %d times", w.cams.acquires)
+	}
+
+	// Pending and unavailable are normal outcomes without image content.
+	w.preview.set("P001", jobpreview.Result{Preview: jobpreview.View{
+		Status: jobpreview.StatusPending, JobName: "Bracket.3mf", Current: true}})
+	res = call(55, map[string]any{"serial": "P001"})
+	var pend struct {
+		IsError           bool `json:"isError"`
+		StructuredContent struct {
+			JobPreview struct {
+				Status string `json:"status"`
+			} `json:"job_preview"`
+			JobMetadata *struct{} `json:"job_metadata"`
+		} `json:"structuredContent"`
+	}
+	if err := json.Unmarshal(res.Result, &pend); err != nil {
+		t.Fatalf("bad pending result: %v", err)
+	}
+	if pend.IsError || pend.StructuredContent.JobPreview.Status != jobpreview.StatusPending ||
+		pend.StructuredContent.JobMetadata != nil {
+		t.Fatalf("pending result = %s", res.Result)
+	}
+	w.preview.set("P001", jobpreview.Result{Preview: jobpreview.View{Status: jobpreview.StatusUnavailable}})
+	res = call(56, map[string]any{"serial": "P001"})
+	var unav struct {
+		IsError           bool `json:"isError"`
+		StructuredContent struct {
+			JobPreview struct {
+				Status string `json:"status"`
+			} `json:"job_preview"`
+		} `json:"structuredContent"`
+	}
+	if err := json.Unmarshal(res.Result, &unav); err != nil {
+		t.Fatalf("bad unavailable result: %v", err)
+	}
+	if unav.IsError || unav.StructuredContent.JobPreview.Status != jobpreview.StatusUnavailable {
+		t.Fatalf("unavailable result = %s", res.Result)
+	}
+
+	// Unknown serial is the typed tool error, and the preview source is
+	// never consulted for it.
+	assertToolError(t, call(57, map[string]any{"serial": "NOPE"}), errUnknownSerial)
+	before, _ := w.preview.counts()
+	assertToolError(t, call(58, map[string]any{"serial": "NOPE"}), errUnknownSerial)
+	if after, _ := w.preview.counts(); after != before {
+		t.Fatalf("unknown serial reached the preview source")
+	}
+
+	// The input schema admits serial only: a refresh-style argument is
+	// rejected before the handler runs (the SDK reports it as a flagged
+	// tool result, not one of the typed operational codes), so no client
+	// can request a fetch.
+	before, _ = w.preview.counts()
+	res = call(59, map[string]any{"serial": "P001", "force": true})
+	var forced struct {
+		IsError bool `json:"isError"`
+	}
+	if err := json.Unmarshal(res.Result, &forced); err != nil {
+		t.Fatalf("bad forced result: %v", err)
+	}
+	if !forced.IsError {
+		t.Fatalf("forced argument accepted: %s", res.Result)
+	}
+	if after, _ := w.preview.counts(); after != before {
+		t.Fatalf("rejected call reached the preview source")
+	}
+}
+
 func TestMCPTransportHardening(t *testing.T) {
 	w := newWireFixture(t)
 
@@ -1260,7 +1501,8 @@ func TestMCPStateSchemaFlattensView(t *testing.T) {
 			continue
 		}
 		props := tool.OutputSchema.Properties["state"].Properties
-		for _, key := range []string{"print_state", "chamber_light", "freshness", "controls", "activity", "camera"} {
+		for _, key := range []string{"print_state", "chamber_light", "freshness", "controls", "activity",
+			"camera", "job_preview", "job_metadata"} {
 			if _, ok := props[key]; !ok {
 				t.Fatalf("state schema lacks %q: %v", key, props)
 			}

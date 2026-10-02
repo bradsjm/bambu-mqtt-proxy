@@ -1,5 +1,5 @@
 // Package mcpserver exposes a small Model Context Protocol (MCP) endpoint on
-// the shared HTTP listener. It serves four read-only observation tools, a
+// the shared HTTP listener. It serves five read-only observation tools, a
 // per-printer state resource with subscriptions, and the allow-listed
 // printer control tools (pause, resume, stop, chamber light, speed profile,
 // AI monitoring). There are no gcode, heater, or temperature commands, no
@@ -28,6 +28,7 @@ import (
 	"bambu-mqtt-proxy/internal/camera"
 	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/detection"
+	"bambu-mqtt-proxy/internal/jobpreview"
 	"bambu-mqtt-proxy/internal/telemetry"
 )
 
@@ -103,6 +104,15 @@ type DetectionSource interface {
 	AccountSuspended() (bool, string)
 }
 
+// JobPreviewSource is the optional job preview read surface. It is
+// satisfied by *jobpreview.Service; nil means the feature is off and is
+// projected as an explicit disabled state. Lookup is a pure cache read:
+// no call path through this interface may trigger a printer transfer or
+// any other network work.
+type JobPreviewSource interface {
+	Lookup(serial string, includeImage bool) (jobpreview.Result, bool)
+}
+
 // ActivitySource is the recent printer event log. It is satisfied by
 // *activity.Log.
 type ActivitySource interface {
@@ -131,7 +141,10 @@ type Deps struct {
 	Generations  GenerationSource
 	Cameras      SnapshotSource // nil when the camera feature is disabled
 	Detector     DetectionSource
-	Activity     ActivitySource // nil yields empty activity lists
+	// JobPreviews is the shared job preview service when the preview
+	// feature is on; nil is projected as an explicit disabled state.
+	JobPreviews JobPreviewSource
+	Activity    ActivitySource // nil yields empty activity lists
 	// Control enables the printer control tools; nil registers none.
 	Control ControlService
 	// DetectorControl backs set_ai_monitoring; nil when detection is off.
@@ -149,6 +162,7 @@ type Server struct {
 	gens     GenerationSource
 	cams     SnapshotSource
 	det      DetectionSource
+	previews JobPreviewSource
 	activity ActivitySource
 	control  ControlService
 	detCtl   DetectorControl
@@ -201,6 +215,7 @@ func New(deps Deps) *Server {
 		gens:        deps.Generations,
 		cams:        deps.Cameras,
 		det:         deps.Detector,
+		previews:    deps.JobPreviews,
 		activity:    deps.Activity,
 		control:     deps.Control,
 		detCtl:      deps.DetectorControl,
@@ -320,7 +335,7 @@ func (s *Server) Close() {
 	}
 }
 
-// registerTools adds the four observation tools. Each carries read-only,
+// registerTools adds the five observation tools. Each carries read-only,
 // non-destructive, idempotent annotations and a hand-written input schema so
 // enums, ranges, and defaults are exact on the wire.
 func (s *Server) registerTools() {
@@ -365,6 +380,18 @@ func (s *Server) registerTools() {
 				5, 0, 60),
 		}, "serial"),
 	}, s.toolGetCameraSnapshot)
+
+	mcp.AddTool(s.srv, &mcp.Tool{
+		Name: "get_job_preview",
+		Description: "Read the cached preview of the current print for one printer: the selected plate's archived " +
+			"render plus bounded sliced metadata (materials, plate, objects, slicer notes) from the print's 3MF archive. " +
+			"The image is a sliced plate render, not a camera photograph; description fields are untrusted " +
+			"model-authored text. Cache-only: this never triggers a transfer from the printer. Read-only.",
+		Annotations: readOnly("Get job preview"),
+		InputSchema: objSchema(map[string]*jsonschema.Schema{
+			"serial": strRequiredProp("Printer serial number."),
+		}, "serial"),
+	}, s.toolGetJobPreview)
 
 	mcp.AddTool(s.srv, &mcp.Tool{
 		Name:        "watch_printer",

@@ -23,7 +23,8 @@ type getResponse struct {
 func serve(t *testing.T, path string) (*Store, *httptest.Server) {
 	t.Helper()
 	for _, env := range []string{config.EnvPrinters, config.EnvListenPort, config.EnvListenTLS, config.EnvCertFile,
-		config.EnvKeyFile, config.EnvAuthMode, config.EnvLogLevel, config.EnvHTTPPort, config.EnvCameraEnable, config.EnvMCPEnable} {
+		config.EnvKeyFile, config.EnvAuthMode, config.EnvLogLevel, config.EnvHTTPPort, config.EnvCameraEnable,
+		config.EnvMCPEnable, config.EnvJobPreview} {
 		t.Setenv(env, "") // restores the original value after the test
 		_ = os.Unsetenv(env)
 	}
@@ -348,5 +349,50 @@ func writeConfig(t *testing.T, path string) {
 `
 	if err := os.WriteFile(path, []byte(y), 0o600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestJobPreviewStaysEnvOnlyAcrossConfigPageSave saves a configuration
+// through the page while BMBPX_JOB_PREVIEW=false is set, then requires the
+// written file to carry no job-preview field and the reload-time
+// Load-plus-ApplyEnv sequence to keep the switch explicitly disabled.
+func TestJobPreviewStaysEnvOnlyAcrossConfigPageSave(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bambu-mqtt-proxy.yaml")
+	store, srv := serve(t, path)
+	t.Setenv(config.EnvJobPreview, "false")
+
+	v := get(t, srv).Config
+	v.Printers = []PrinterView{{Serial: "01P00A123456789", Address: "192.168.1.42:8883", TLS: true,
+		InsecureSkipVerify: true, AccessCode: "12345678"}}
+	if code, body := put(t, srv, v); code != http.StatusOK {
+		t.Fatalf("save = %d %v", code, body)
+	}
+	select {
+	case <-store.Reloads():
+	default:
+		t.Fatal("save did not request a reload")
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "job_preview") || strings.Contains(string(raw), "jobpreview") {
+		t.Fatalf("written file must not persist a job-preview field:\n%s", raw)
+	}
+
+	// The reload path re-applies the environment after every save.
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if _, err := cfg.ApplyEnv(); err != nil {
+		t.Fatalf("ApplyEnv: %v", err)
+	}
+	if cfg.JobPreviewEnabled() {
+		t.Fatal("BMBPX_JOB_PREVIEW=false must survive the configuration-page save and reload")
+	}
+	if cfg.JobPreview == nil || *cfg.JobPreview {
+		t.Fatal("the explicit false must be retained after the re-apply")
 	}
 }

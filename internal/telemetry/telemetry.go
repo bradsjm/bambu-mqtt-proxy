@@ -96,6 +96,11 @@ type State struct {
 	obsGen           uint64    // upstream connection generation of the last report
 	obsAt            time.Time // time of the last real report
 	lastSeq          uint64    // paho delivery order token of the last merge
+	// job is the private preview-job projection (job.go). It shares the
+	// report stream but never feeds detection or display values: it
+	// tracks preview generations, identity revisions and RUNNING settling
+	// evidence for the optional job preview service.
+	job jobTrack
 }
 
 // Fans holds fan speeds in percent; nil means never reported.
@@ -142,6 +147,10 @@ type Cache struct {
 	seq        atomic.Uint64
 	log        *slog.Logger
 	activity   *activity.Log // optional recent-event log
+	// now is the preview-job timing clock. Production uses time.Now;
+	// package-local preview-job tests replace it to drive gap and settling
+	// boundaries deterministically. Detection timing stays on time.Now.
+	now func() time.Time
 }
 
 // NewCache indexes the configured printers; serials without reports still
@@ -151,7 +160,7 @@ func NewCache(printers []config.Printer, log *slog.Logger) *Cache {
 	for _, p := range printers {
 		states[p.Serial] = &State{Serial: p.Serial, Name: p.Name, Model: p.Model}
 	}
-	return &Cache{states: states, watch: make(map[string]chan struct{}), log: log}
+	return &Cache{states: states, watch: make(map[string]chan struct{}), log: log, now: time.Now}
 }
 
 // SetActivity attaches the optional in-memory event log. Call before observing
@@ -195,7 +204,7 @@ func (c *Cache) ObserveReport(serial string, seq, gen uint64, payload []byte) {
 		}
 		st.lastSeq = seq
 		before := activitySnapshot{state: st.PrintingState, sessionGen: st.sessionGen, printError: st.PrintError, hms: append([]HMSAlert(nil), st.HMS...), chamberLight: st.ChamberLight}
-		real = mergeReport(st, gen, payload)
+		real = mergeReport(st, gen, payload, c.now())
 		if real {
 			events = collectActivityEvents(before, st)
 		} else {
@@ -469,8 +478,10 @@ func (c *Cache) State(serial string) (State, bool) {
 // mergeReport applies one report payload onto st and reports whether the
 // payload carried real print state. Bambu reports nest under a type key
 // ("print"); values change type between prints (number or string), so
-// extraction goes through generic maps instead of a fixed struct.
-func mergeReport(st *State, gen uint64, payload []byte) bool {
+// extraction goes through generic maps instead of a fixed struct. now is
+// the preview clock time, taken once per report for the preview-job
+// projection; detection timing is untouched.
+func mergeReport(st *State, gen uint64, payload []byte, now time.Time) bool {
 	var report map[string]json.RawMessage
 	if err := json.Unmarshal(payload, &report); err != nil {
 		return false // not a JSON report (health probes, tests); ignore
@@ -488,7 +499,12 @@ func mergeReport(st *State, gen uint64, payload []byte) bool {
 	// rejecting for detection. Merging first changes neither the marker
 	// list nor the gate's freshness decisions.
 	mergeDisplay(st, printObj)
-	if !isRealPrintReport(printObj) {
+	real := isRealPrintReport(printObj)
+	// Preview-job tracking runs for real and metadata-only reports alike:
+	// the projection keeps its own identity and freshness evidence, and
+	// metadata-only deltas never refresh detection's.
+	st.trackJob(printObj, gen, now, real)
+	if !real {
 		// Command ACK objects (sequence_id/command/result) and other control
 		// payloads carry no print state. Ignoring them entirely keeps them
 		// from refreshing the action freshness the detection worker relies
