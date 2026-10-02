@@ -50,10 +50,10 @@ const (
 	// resolveConfig re-applies the environment after every
 	// configuration-page save.
 	EnvJobPreview = "BMBPX_JOB_PREVIEW"
-	// EnvOctoEverywhereAPIKey enables the optional OctoEverywhere Gadget AI
-	// print failure detection. The key is environment-only: there is no YAML
-	// field, no other setting, and an empty or unset value keeps the proxy
-	// fully unchanged.
+	// EnvOctoEverywhereAPIKey overrides the stored Gadget API key for the
+	// optional OctoEverywhere Gadget AI print failure detection. Whenever
+	// the variable exists it replaces detection.api_key — an empty value
+	// clears a stored key — while unset leaves the file value in place.
 	EnvOctoEverywhereAPIKey = "BMBPX_OCTOEVERYWHERE_API_KEY"
 	defaultFileName         = "bambu-mqtt-proxy.yaml"
 )
@@ -149,6 +149,17 @@ type Pushover struct {
 	UserKey  string `yaml:"user_key"`
 }
 
+// Detection configures the optional OctoEverywhere Gadget AI print failure
+// detection: one global switch plus the stored API key. A nil Enabled keeps
+// the historical key-based default — detection runs exactly when a key is
+// configured — so existing environment-only deployments are unchanged. An
+// explicit false disables the feature even when a key exists; an explicit
+// true requires a key after environment overrides (ValidateDetection).
+type Detection struct {
+	Enabled *bool  `yaml:"enabled"`
+	APIKey  string `yaml:"api_key"`
+}
+
 // Validate rejects notification settings that cannot run. An empty provider
 // means pushover; any other provider is unsupported. Disabled notifications
 // may keep blank or stale credentials; enabled notifications require both.
@@ -182,9 +193,10 @@ type Config struct {
 	Camera        Camera        `yaml:"camera"`
 	MCP           MCP           `yaml:"mcp"`
 	Notifications Notifications `yaml:"notifications"`
-	// OctoEverywhereAPIKey is the Gadget API key applied from
-	// BMBPX_OCTOEVERYWHERE_API_KEY only; yaml:"-" keeps it out of files.
-	OctoEverywhereAPIKey string `yaml:"-"`
+	// Detection is the optional Gadget AI failure detection section. The
+	// BMBPX_OCTOEVERYWHERE_API_KEY environment variable overrides the
+	// stored key whenever the variable exists.
+	Detection Detection `yaml:"detection"`
 	// JobPreview is the printer job preview switch applied from
 	// BMBPX_JOB_PREVIEW only; yaml:"-" keeps it out of files. Nil means
 	// enabled.
@@ -278,10 +290,36 @@ func (c *Config) CameraEnabled() bool {
 }
 
 // DetectionEnabled reports whether the OctoEverywhere Gadget detection
-// feature is configured. The key exists only in the environment; an empty
-// value keeps every pre-existing behavior unchanged.
+// feature should run. An explicit enabled flag wins. Without one, the
+// historical key-based default applies: detection runs exactly when an
+// API key is configured. The field is a snapshot: callers resolve
+// BMBPX_OCTOEVERYWHERE_API_KEY through ApplyEnv first; the /config page
+// resolves the environment locally for display only.
 func (c *Config) DetectionEnabled() bool {
-	return c.OctoEverywhereAPIKey != ""
+	if c.Detection.Enabled != nil {
+		return *c.Detection.Enabled
+	}
+	return c.DetectionKey() != ""
+}
+
+// DetectionKey returns the configured API key, trimmed. ApplyEnv has
+// already resolved the environment when this matters at runtime.
+func (c *Config) DetectionKey() string {
+	return strings.TrimSpace(c.Detection.APIKey)
+}
+
+// ValidateDetection rejects a configuration that enables detection without
+// any usable API key. It is an effective-configuration check, applied after
+// ApplyEnv: file validation deliberately accepts detection.enabled with a
+// blank api_key because the environment can supply the key, so an
+// environment-only deployment can enable detection from the /config page
+// without persisting the secret. A set-but-empty environment value clears
+// the stored key and therefore also rejects enabling.
+func (c *Config) ValidateDetection() error {
+	if c.DetectionEnabled() && c.DetectionKey() == "" {
+		return fmt.Errorf("detection: enabled requires an API key (detection.api_key or %s)", EnvOctoEverywhereAPIKey)
+	}
+	return nil
 }
 
 // MCPEnabled reports whether the read-only MCP endpoint should be served on
@@ -404,7 +442,7 @@ func (c *Config) ApplyEnv() (bool, error) {
 		c.JobPreview = &b
 	}
 	if v, ok := os.LookupEnv(EnvOctoEverywhereAPIKey); ok {
-		c.OctoEverywhereAPIKey = strings.TrimSpace(v)
+		c.Detection.APIKey = strings.TrimSpace(v)
 	}
 	return printersFromEnv, nil
 }

@@ -509,3 +509,108 @@ func TestResolveConfigJobPreviewEnvSwitch(t *testing.T) {
 		}
 	})
 }
+
+// TestResolveConfigDetectionKeyPrecedence covers the startup and reload
+// path for the persisted detection section: the YAML key enables on its
+// own, a set environment variable overrides it on every resolve (the
+// post-save reload included), an empty variable disables without failing
+// startup, and an explicit enabled: false stays off while its stored key
+// stays usable.
+func TestResolveConfigDetectionKeyPrecedence(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bambu-mqtt-proxy.yaml")
+	const keyed = `printers:
+  - serial: "01P00ADETECTION1"
+    address: "127.0.0.1:1883"
+    password: "00008888"
+detection:
+  api_key: "file-key"
+`
+	if err := os.WriteFile(path, []byte(keyed), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	unsetOcto := func(t *testing.T) {
+		t.Helper()
+		t.Setenv(config.EnvOctoEverywhereAPIKey, "")
+		if err := os.Unsetenv(config.EnvOctoEverywhereAPIKey); err != nil {
+			t.Fatalf("unset %s: %v", config.EnvOctoEverywhereAPIKey, err)
+		}
+	}
+
+	t.Run("yaml key enables without environment", func(t *testing.T) {
+		unsetOcto(t)
+		cfg, found, err := resolveConfig(path)
+		if err != nil || !found {
+			t.Fatalf("resolveConfig: found=%v err=%v", found, err)
+		}
+		if !cfg.DetectionEnabled() || cfg.DetectionKey() != "file-key" {
+			t.Fatalf("enabled=%v key=%q, want the yaml key in effect",
+				cfg.DetectionEnabled(), cfg.DetectionKey())
+		}
+	})
+
+	t.Run("environment key wins across reloads", func(t *testing.T) {
+		t.Setenv(config.EnvOctoEverywhereAPIKey, "env-key")
+		// The second resolve mirrors the post-save reload: the environment
+		// is re-applied over the same file and must keep precedence.
+		for pass := 0; pass < 2; pass++ {
+			cfg, _, err := resolveConfig(path)
+			if err != nil {
+				t.Fatalf("resolveConfig pass %d: %v", pass, err)
+			}
+			if !cfg.DetectionEnabled() || cfg.DetectionKey() != "env-key" {
+				t.Fatalf("pass %d: enabled=%v key=%q, want the environment key",
+					pass, cfg.DetectionEnabled(), cfg.DetectionKey())
+			}
+		}
+	})
+
+	t.Run("empty environment clears the yaml key", func(t *testing.T) {
+		t.Setenv(config.EnvOctoEverywhereAPIKey, "")
+		cfg, _, err := resolveConfig(path)
+		if err != nil {
+			t.Fatalf("an empty override must not fail startup: %v", err)
+		}
+		if cfg.DetectionEnabled() || cfg.DetectionKey() != "" {
+			t.Fatalf("enabled=%v key=%q, want detection off",
+				cfg.DetectionEnabled(), cfg.DetectionKey())
+		}
+	})
+
+	t.Run("global false stays off while the yaml key stays usable", func(t *testing.T) {
+		offPath := filepath.Join(dir, "off.yaml")
+		const offDoc = `printers:
+  - serial: "01P00ADETECTION1"
+    address: "127.0.0.1:1883"
+    password: "00008888"
+detection:
+  enabled: false
+  api_key: "file-key"
+`
+		if err := os.WriteFile(offPath, []byte(offDoc), 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+		t.Setenv(config.EnvOctoEverywhereAPIKey, "env-key")
+		cfg, _, err := resolveConfig(offPath)
+		if err != nil {
+			t.Fatalf("resolveConfig: %v", err)
+		}
+		if cfg.DetectionEnabled() {
+			t.Fatal("enabled: false must win over the environment key")
+		}
+
+		// Without the override the stored file key is still usable, but the
+		// persisted switch keeps detection off.
+		unsetOcto(t)
+		cfg, _, err = resolveConfig(offPath)
+		if err != nil {
+			t.Fatalf("resolveConfig: %v", err)
+		}
+		if cfg.DetectionEnabled() {
+			t.Fatal("the persisted false must survive a reload")
+		}
+		if cfg.DetectionKey() != "file-key" {
+			t.Fatalf("key = %q, want the stored file key preserved", cfg.DetectionKey())
+		}
+	})
+}

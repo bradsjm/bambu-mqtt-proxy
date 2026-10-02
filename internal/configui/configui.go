@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -120,9 +121,21 @@ type View struct {
 	HTTPPort      int               `json:"http_port"`
 	CameraEnabled bool              `json:"camera_enabled"`
 	MCPEnabled    bool              `json:"mcp_enabled"`
+	Detection     DetectionView     `json:"detection"`
 	LogLevel      string            `json:"log_level"`
 	Behavior      BehaviorView      `json:"behavior"`
 	Notifications NotificationsView `json:"notifications"`
+}
+
+// DetectionView is the Gadget AI detection section. APIKey is accepted on
+// save and never returned; has_api_key reports an effective key — the
+// stored file key or the BMBPX_OCTOEVERYWHERE_API_KEY environment value —
+// without revealing it. A blank submitted key keeps the stored file key,
+// and the environment secret is never written to the file.
+type DetectionView struct {
+	Enabled   bool   `json:"enabled"`
+	HasAPIKey bool   `json:"has_api_key"`
+	APIKey    string `json:"api_key,omitempty"`
 }
 
 // PrinterView is one printer. AccessCode is accepted on save and never
@@ -175,18 +188,31 @@ type PushoverView struct {
 }
 
 type meta struct {
-	Path         string            `json:"path"`
-	FileExists   bool              `json:"file_exists"`
-	FileError    string            `json:"file_error,omitempty"`
-	Generation   uint64            `json:"generation"`
-	ApplyError   string            `json:"apply_error,omitempty"`
-	EnvOverrides map[string]string `json:"env_overrides"`
+	Path       string `json:"path"`
+	FileExists bool   `json:"file_exists"`
+	FileError  string `json:"file_error,omitempty"`
+	Generation uint64 `json:"generation"`
+	ApplyError string `json:"apply_error,omitempty"`
+	// CameraEnabled appears only while BMBPX_CAMERA_ENABLED overrides the
+	// stored value: it carries the parsed effective switch so the page can
+	// describe detection against the cameras that will actually run. The
+	// editable stored switch stays in config.camera_enabled.
+	CameraEnabled *bool             `json:"camera_enabled,omitempty"`
+	EnvOverrides  map[string]string `json:"env_overrides"`
 }
 
 func (s *Store) handleGet(w http.ResponseWriter, _ *http.Request) {
 	s.mu.Lock()
 	m := meta{Path: s.path, Generation: s.generation, ApplyError: s.applyErr, EnvOverrides: envOverrides()}
 	s.mu.Unlock()
+	// Same presence rule as ApplyEnv: a nonempty value overrides the file.
+	// An unparseable value is left alone here — startup already rejects it
+	// — rather than guessing an effective state for display.
+	if v := os.Getenv(config.EnvCameraEnable); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			m.CameraEnabled = &b
+		}
+	}
 
 	cfg := &config.Config{HTTP: config.HTTP{Port: config.PortUnset}}
 	raw, existed, err := readFile(s.path)
@@ -323,18 +349,37 @@ func check(raw []byte) (*config.Config, error) {
 	if err := eff.Validate(); err != nil {
 		return nil, fmt.Errorf("with environment overrides: %w", err)
 	}
+	// The detection key requirement is effective-only: the file alone may
+	// enable detection with a blank key because the environment can supply
+	// it, so an environment-only deployment can enable detection from the
+	// page without persisting the secret.
+	if err := eff.ValidateDetection(); err != nil {
+		return nil, err
+	}
 	return eff, nil
 }
 
 func toView(c *config.Config) View {
+	// Effective detection flags for display: the environment key overrides
+	// the stored key without mutating the stored config. ApplyEnv stays the
+	// only runtime resolver; this copy exists so the page shows the state a
+	// restart would serve.
+	detEff := *c
+	if v, ok := os.LookupEnv(config.EnvOctoEverywhereAPIKey); ok {
+		detEff.Detection.APIKey = strings.TrimSpace(v)
+	}
 	v := View{
 		AuthMode:      c.Auth.Mode,
 		HTTPPort:      c.HTTP.Port,
 		CameraEnabled: c.CameraEnabled(),
 		MCPEnabled:    c.MCP.Enabled == nil || *c.MCP.Enabled,
-		LogLevel:      c.Log.Level,
-		Printers:      []PrinterView{},
-		Listen:        []ListenerView{},
+		Detection: DetectionView{
+			Enabled:   detEff.DetectionEnabled(),
+			HasAPIKey: detEff.DetectionKey() != "",
+		},
+		LogLevel: c.Log.Level,
+		Printers: []PrinterView{},
+		Listen:   []ListenerView{},
 		Behavior: BehaviorView{
 			WarmupCommands:        c.Behavior.WarmupCommands,
 			KeepaliveSeconds:      c.Behavior.UpstreamKeepaliveSeconds,
@@ -384,13 +429,24 @@ func (v View) toConfig(stored *config.Config) (*config.Config, error) {
 		byserial[p.Serial] = p
 	}
 	camera, mcp := v.CameraEnabled, v.MCPEnabled
+	enabled := v.Detection.Enabled
+	detection := config.Detection{Enabled: &enabled}
+	if key := strings.TrimSpace(v.Detection.APIKey); key != "" {
+		detection.APIKey = key
+	} else if stored != nil {
+		// The page never receives stored or environment secrets back, so a
+		// blank key keeps the stored file key. Disabling preserves it too:
+		// the switch, not a key removal, is the off action.
+		detection.APIKey = stored.Detection.APIKey
+	}
 	c := &config.Config{
-		Auth:     config.Auth{Mode: v.AuthMode},
-		HTTP:     config.HTTP{Port: v.HTTPPort},
-		Camera:   config.Camera{Enabled: &camera},
-		MCP:      config.MCP{Enabled: &mcp},
-		Log:      config.Log{Level: v.LogLevel},
-		Printers: []config.Printer{},
+		Auth:      config.Auth{Mode: v.AuthMode},
+		HTTP:      config.HTTP{Port: v.HTTPPort},
+		Camera:    config.Camera{Enabled: &camera},
+		MCP:       config.MCP{Enabled: &mcp},
+		Detection: detection,
+		Log:       config.Log{Level: v.LogLevel},
+		Printers:  []config.Printer{},
 		Behavior: config.Behavior{
 			UpstreamKeepaliveSeconds:      v.Behavior.KeepaliveSeconds,
 			UpstreamConnectTimeoutSeconds: v.Behavior.ConnectTimeoutSeconds,
@@ -501,6 +557,12 @@ func envOverrides() map[string]string {
 	set("http_port", config.EnvHTTPPort)
 	set("camera_enabled", config.EnvCameraEnable)
 	set("mcp_enabled", config.EnvMCPEnable)
+	// The key override applies by presence, even when the value is empty:
+	// an empty variable clears a stored key, so the page must lock the
+	// field either way.
+	if _, ok := os.LookupEnv(config.EnvOctoEverywhereAPIKey); ok {
+		out["detection_api_key"] = config.EnvOctoEverywhereAPIKey
+	}
 	return out
 }
 

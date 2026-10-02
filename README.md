@@ -115,7 +115,7 @@ override file values per field.
 | Source | Best for |
 |---|---|
 | [`/config`](#configuration-page-config) web page | Adding or editing printers in a browser; saving applies changes without a container restart |
-| `BMBPX_*` variables | Container deployments and secrets — the Gadget API key is environment-only |
+| `BMBPX_*` variables | Container deployments and secret overrides |
 | YAML file | Full control over listeners, TLS, and behavior tuning — see [`config.example.yaml`](config.example.yaml) and [DESIGN.md §9](DESIGN.md) for the full reference |
 
 ```yaml
@@ -171,7 +171,7 @@ log:
 | `BMBPX_HTTP_PORT` | `8080` | Shared health, camera, and MCP HTTP port; `0` disables HTTP (the raw camera listener on 6000 keeps serving while cameras are enabled) |
 | `BMBPX_CAMERA_ENABLED` | `true` | `false` removes the camera routes, the camera wall, their MQTT report subscriptions, and the raw camera listener on port 6000 |
 | `BMBPX_MCP_ENABLED` | `true` | `false` removes the MCP endpoint at `/mcp`; the endpoint is also off when `http.port` is `0` |
-| `BMBPX_OCTOEVERYWHERE_API_KEY` | *(empty)* | OctoEverywhere Gadget API key; empty = detection off. Setting it consents to external snapshot uploads and automatic pauses — see [Gadget AI print-failure detection](#gadget-ai-print-failure-detection-optional) |
+| `BMBPX_OCTOEVERYWHERE_API_KEY` | *(empty)* | Overrides the stored Gadget API key whenever the variable exists — an empty value clears the stored key. Setting a key consents to external snapshot uploads and automatic pauses — see [Gadget AI print-failure detection](#gadget-ai-print-failure-detection-optional) |
 
 ## HTTP endpoints
 
@@ -186,7 +186,7 @@ disabled.
 |---|---|
 | `/` | Redirects to `/config` until a printer is configured, then to `/camwall` (no redirect while cameras are disabled) |
 | `/livez`, `/readyz` | `200 ok` once serving (printer state deliberately excluded — clients stay connected while printers recover) |
-| `/status` | JSON: `{"status":"ok","upstreams":{"<serial>":true\|false}}`, plus a `detection` map per printer when the Gadget key is set |
+| `/status` | JSON: `{"status":"ok","upstreams":{"<serial>":true\|false}}`, plus a `detection` map per printer when AI detection is enabled |
 | `/activity`, `/activity/{serial}` | Recent per-printer events (in memory; cleared when the proxy restarts) |
 | `/camera/{serial}/snapshot` | Single JPEG frame (P1/A1 native; X1/P2S/H2-series converted server-side with FFmpeg) |
 | `/camera/{serial}/stream` | Live multipart MJPEG stream (same model support as the snapshot) |
@@ -338,11 +338,23 @@ On by default; disable with `BMBPX_MCP_ENABLED=false`. MCP protocol
 
 ## Gadget AI print-failure detection (optional)
 
-Set `BMBPX_OCTOEVERYWHERE_API_KEY` to an
+Detection is configured in the `detection` section of the config file
+(editable on the `/config` page): `enabled` switches the feature, and
+`api_key` stores an
 [OctoEverywhere Gadget API key](https://octoeverywhere.com/gadgetapi)
 ([API documentation](https://docs.octoeverywhere.com/ai-failure-detection-apis/overview/)).
-The key is the only setting — there is no YAML field and no usage
-bookkeeping; the proxy stays stateless. While a print is active on a
+The stored key never leaves the server: the configuration API reports only
+whether a key exists, a blank value on save keeps the stored key, and the
+config file is written with owner-only permissions (0600). Without an
+explicit `enabled`, detection follows the key: it runs when a key is
+configured and stays off otherwise. `enabled: false` disables the feature
+even when a key exists, and enabling without any key fails validation. The
+key cannot be removed from the page — use the switch. There is no usage
+bookkeeping; the proxy stays stateless.
+
+`BMBPX_OCTOEVERYWHERE_API_KEY` overrides the stored key whenever the
+variable exists, including set-but-empty, which clears it. While a print is
+active on a
 camera-capable printer, the proxy uploads the current camera snapshot to the
 Gadget service at a policy-selected pace, based on the minimum and recommended
 intervals the service returns, and receives a print-quality score (1–10) plus
@@ -361,7 +373,8 @@ warning and pause recommendations:
   never resumes the print.
 - The AI badge on a camera wall tile toggles detection for that printer.
 
-**Consent.** Adding the key is an explicit opt-in to the service: camera
+**Consent.** Enabling detection with a key is an explicit opt-in to the
+service: camera
 snapshots leave your LAN for OctoEverywhere's servers, and the proxy can
 temporarily set print speed to Silent and pause prints without asking. Leave
 the key unset to keep every image local and automatic printer controls off.

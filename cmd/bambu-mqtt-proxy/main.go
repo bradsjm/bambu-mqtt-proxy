@@ -150,14 +150,15 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		renderer.SetActivity(activities)
 		renderer.SetControl(controls)
 	}
-	// Optional OctoEverywhere Gadget detection. The key is env-only; with a
-	// key but the camera feature disabled the engine stays visible in the
-	// blocked state and performs no camera or API activity.
+	// Optional OctoEverywhere Gadget detection: the YAML detection section
+	// with the BMBPX_OCTOEVERYWHERE_API_KEY override. With a key but the
+	// camera feature disabled the engine stays visible in the blocked state
+	// and performs no camera or API activity.
 	// The engine is constructed here but started only after the broker is
 	// serving: a broker startup failure must not leave workers running.
 	var detector *detection.Engine
 	if cfg.DetectionEnabled() {
-		client := detection.NewGadgetClient(cfg.OctoEverywhereAPIKey)
+		client := detection.NewGadgetClient(cfg.DetectionKey())
 		if !cfg.CameraEnabled() {
 			detector = detection.New(cfg.Printers, client, idleFrames{}, state, pool, pool, logger)
 			detector.SetBlocked(detection.ReasonCameraDisabled)
@@ -412,6 +413,11 @@ func resolveConfig(configPath string) (*config.Config, bool, error) {
 	}
 	cfg.ApplyDefaults()
 	if err := cfg.Validate(); err != nil {
+		return nil, false, err
+	}
+	// Effective-only: the file alone may enable detection with a blank key
+	// because the environment can supply it.
+	if err := cfg.ValidateDetection(); err != nil {
 		return nil, false, err
 	}
 	return cfg, fileFound, nil

@@ -228,16 +228,25 @@ P1P/P1S and A1/A1 MINI do not have this sensor, and their reported
 Only known chamber-sensor models expose it. Unknown model capability defaults
 to hidden rather than displaying a possibly invalid reading.
 
-### 6.1 Gadget AI failure detection (optional, key-only)
+### 6.1 Gadget AI failure detection (optional)
 
 An optional integration with OctoEverywhere's Gadget AI failure detection
 (developer docs: https://docs.octoeverywhere.com/ai-failure-detection-apis/developer-docs/overview/)
 adds automatic print-failure monitoring on top of the camera pipeline. The
-feature has exactly one configuration input: the `BMBPX_OCTOEVERYWHERE_API_KEY`
-environment variable. There is no YAML field, no threshold settings, and no
-quota bookkeeping — the proxy stays stateless and the key-only surface keeps
-the opt-in unambiguous. An unset key means the feature is completely off: no
-context creation, no uploads, no automatic pauses.
+feature is configured by the `detection` section: `enabled` switches it and
+`api_key` stores the Gadget API key. There are no threshold settings and no
+quota bookkeeping — the proxy stays stateless. A nil `enabled` keeps the
+historical key-based default: detection runs exactly when a key is
+configured, and an explicit `enabled: false` disables it even when a key
+exists. Enabling without any key fails validation on the effective
+configuration, so the file alone may carry `enabled: true` with a blank key
+only because the environment can supply it. The stored key never leaves the
+server: the configuration API reports only whether a key exists, a blank
+value on save keeps the stored key, and the config file is written with
+owner-only permissions (0600). `BMBPX_OCTOEVERYWHERE_API_KEY` overrides the
+stored key whenever the variable exists, including set-but-empty, which
+clears it. Detection that is off — no key and no explicit enable — is
+completely off: no context creation, no uploads, no automatic pauses.
 
 Setting the key is the operator's documented consent for two things: camera
 snapshots leave the LAN for OctoEverywhere's servers, and the proxy may pause

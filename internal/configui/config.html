@@ -154,7 +154,7 @@ main input:user-invalid { border-color: var(--error); }
             padding: .55rem; border: 1px solid var(--line); border-radius: 9px; background: var(--bg); }
 .listener input[type=number] { max-width: none; }
 .listener .tls { display: inline-flex; align-items: center; gap: .4rem; font-size: .85rem; color: var(--dim); }
-.listener input[type=text]:disabled { opacity: .4; }
+.listener input[type=text]:disabled, #f-ai-key:disabled { opacity: .4; }
 
 .btn { display: inline-flex; align-items: center; justify-content: center; gap: .45rem; padding: .5rem .95rem;
        border-radius: 9px; border: 1px solid var(--line); background: var(--panel-2); cursor: pointer;
@@ -334,6 +334,28 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
             <option value="debug">Debug</option><option value="info">Info</option>
             <option value="warn">Warn</option><option value="error">Error</option>
           </select></div>
+        </div>
+      </fieldset>
+    </div>
+  </section>
+
+  <section aria-labelledby="ai-h">
+    <div class="sec-head"><h2 id="ai-h">AI detection</h2></div>
+    <p class="sec-lede">Optional print-failure detection through OctoEverywhere's Gadget service.</p>
+    <div class="groups">
+      <fieldset class="group">
+        <legend>Gadget AI</legend>
+        <div class="row">
+          <div><label for="f-ai">AI detection</label>
+            <span class="hint">Checks camera snapshots of active prints on P1P, P1S, A1, and A1 mini, and can warn or pause a likely failure. The AI badge on a camera wall tile turns detection off for the current print only; this switch controls all printers.</span>
+            <span class="env" id="ai-blocked" hidden></span></div>
+          <div class="control"><input id="f-ai" class="switch" type="checkbox" role="switch" data-field="detection.enabled"></div>
+        </div>
+        <div class="row">
+          <div><label for="f-ai-key">Gadget API key</label>
+            <span class="hint">From <a href="https://octoeverywhere.com/gadgetapi" rel="noreferrer">octoeverywhere.com</a>. With detection on, the proxy uploads camera snapshots from active prints to OctoEverywhere's servers and can slow a print to Silent or pause it without asking. Turn detection off to keep every image local.</span>
+            <span class="env" data-env="detection_api_key" hidden></span></div>
+          <div class="control"><input id="f-ai-key" type="password" autocomplete="new-password" spellcheck="false" data-field="detection.api_key"></div>
         </div>
       </fieldset>
     </div>
@@ -555,6 +577,7 @@ function renderFields() {
     if (env) el.innerHTML = `Set by <code>${esc(env)}</code>, which takes precedence over this value.`;
   }
   pushoverHints();
+  aiHints();
 }
 
 /* The sanitized API never returns notification credentials; the stored
@@ -565,6 +588,29 @@ function pushoverHints() {
   const token = $("#f-pushover-token"), user = $("#f-pushover-user");
   token.placeholder = n.has_app_token && !token.value ? "Stored. Leave blank to keep it" : "";
   user.placeholder = n.has_user_key && !user.value ? "Stored. Leave blank to keep it" : "";
+}
+
+/* The sanitized API never returns the Gadget key; has_api_key marks an
+   EFFECTIVE key (stored file key or BMBPX_OCTOEVERYWHERE_API_KEY). The
+   environment wins whenever the variable exists — even empty — so the
+   field locks and the env badge explains. Disabling keeps the key. */
+function aiHints() {
+  if (!cfg) return;
+  const key = $("#f-ai-key");
+  const overridden = !!meta.env_overrides.detection_api_key;
+  key.disabled = overridden;
+  key.placeholder = !overridden && cfg.detection.has_api_key && !key.value ? "Stored. Leave blank to keep it" : "";
+  const blocked = $("#ai-blocked"), camEnv = meta.env_overrides.camera_enabled;
+  // Under BMBPX_CAMERA_ENABLED the stored camera switch lies: the backend
+  // sends the effective state only while the variable validly applies.
+  const forced = meta.camera_enabled;
+  const camerasOn = forced === undefined ? !!cfg.camera_enabled : !!forced;
+  blocked.hidden = camerasOn || !cfg.detection.enabled;
+  if (!blocked.hidden) {
+    blocked.innerHTML = camEnv
+      ? `Cameras are off and set by <code>${esc(camEnv)}</code>, so AI detection is blocked: no uploads and no automatic pauses.`
+      : `Cameras are off, so AI detection is blocked: no uploads and no automatic pauses. Turn on Cameras under Web and extras.`;
+  }
 }
 
 function render() {
@@ -622,6 +668,16 @@ function validateForm() {
     const blank = (v, has) => !has && !String(v || "").trim();
     if (blank(n.app_token, n.has_app_token)) { setBar("error", "Enter the Pushover app token."); $("#f-pushover-token").focus(); return false; }
     if (blank(n.user_key, n.has_user_key)) { setBar("error", "Enter the Pushover user key."); $("#f-pushover-user").focus(); return false; }
+  }
+  if (cfg.detection.enabled && !cfg.detection.has_api_key && !String(cfg.detection.api_key || "").trim()) {
+    if (meta.env_overrides.detection_api_key) {
+      setBar("error", `${meta.env_overrides.detection_api_key} is set but empty, so there is no API key. Set the variable or turn AI detection off.`);
+      $("#f-ai").focus();
+    } else {
+      setBar("error", "Enter the Gadget API key or turn AI detection off.");
+      $("#f-ai-key").focus();
+    }
+    return false;
   }
   return true;
 }
@@ -752,6 +808,7 @@ $("#main").addEventListener("input", e => {
     if (t === "lines") v = el.value.split("\n").map(s => s.trim()).filter(Boolean);
     setPath(el.dataset.field, v);
     if (el.dataset.field.startsWith("notifications.pushover.")) pushoverHints();
+    if (el.dataset.field === "camera_enabled" || el.dataset.field.startsWith("detection.")) aiHints();
   } else if (el.dataset.l) {
     const l = cfg.listen[Number(el.dataset.l)], k = el.dataset.k;
     l[k] = k === "tls" ? el.checked : k === "port" ? Number(el.value) : el.value;
