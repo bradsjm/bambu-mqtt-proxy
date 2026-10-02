@@ -963,6 +963,38 @@ func (w *worker) onRunning(ctx context.Context, snap telemetry.SessionView) time
 
 	now := w.e.now()
 	freshAuthorized := w.authorized(snap, w.e.gens.Generation(w.serial))
+
+	// Layer gate: never acquire frames or upload while the current print's
+	// layer is unknown or zero. The session view exposes layer_num only when
+	// telemetry observed it on this print session and connection, so a
+	// previous job's sticky layer can never authorize a new print. While
+	// waiting, the degrade below sets a poll, and the freshness recovery
+	// under it fires immediately on the first report that carries an
+	// eligible layer. The wait releases the camera hold, so a print that
+	// cannot be inspected yet does not retain the capture.
+	if layerValue(snap.LayerNum) <= 0 {
+		if w.log.Enabled(context.Background(), slog.LevelDebug) {
+			w.log.Debug("detection inspection deferred", append(w.diagnosticAttrs(),
+				"operation", "process", "reason", "layer_unknown")...)
+		}
+		w.releaseCamera()
+		return w.degrade(ReasonAwaitingTelemetry, "waiting for the printer's current layer report", w.e.kStalePoll, false)
+	}
+
+	// Authorization gate: stale telemetry or an old transport generation is
+	// rejected here, before the camera hold or any request, so a print
+	// waiting for fresh evidence never takes the camera. inspect keeps its
+	// own recheck as the defense for the race between this gate and the
+	// capture.
+	if !freshAuthorized {
+		if w.log.Enabled(context.Background(), slog.LevelDebug) {
+			w.log.Debug("detection inspection deferred", append(w.diagnosticAttrs(),
+				"operation", "process", "reason", "telemetry_not_authorized")...)
+		}
+		w.releaseCamera()
+		return w.degrade(ReasonAwaitingTelemetry, "waiting for fresh printer telemetry", w.e.kStalePoll, false)
+	}
+
 	w.mu.Lock()
 	// A fresh current-generation state observation can arrive before the
 	// stale-telemetry poll expires. No upload was made while authorization was
@@ -1216,8 +1248,36 @@ func (w *worker) inspect(ctx context.Context, snap telemetry.SessionView) time.D
 	// authorization anchor, so a session change after this point still
 	// invalidates the result below.
 	layer := snap.LayerNum
-	if cur, ok := w.e.sessions.Session(w.serial); ok {
+	cur, ok := w.e.sessions.Session(w.serial)
+	if ok {
 		layer = cur.LayerNum
+	}
+	// Capture-time recheck: the world moved while the camera waited. The
+	// frame may only upload against the print and connection it was
+	// captured for: the pool generation must still match the generation
+	// captured at entry (a reconnect must not ride a restated state), the
+	// current view must keep the same print session and epoch, the full
+	// entry authorization must still hold for the current view — authorized
+	// covers RUNNING on the current connection, its generations, and the
+	// ObsAt freshness bound at the capture moment — and the layer the frame
+	// captured must be known and positive. onResult would discard such a
+	// result anyway; catching it here also keeps the request from happening.
+	if !ok ||
+		w.e.gens.Generation(w.serial) != gen ||
+		cur.Epoch != snap.Epoch || cur.SessionGen != snap.SessionGen ||
+		!w.authorized(cur, gen) ||
+		layerValue(layer) <= 0 {
+		if w.log.Enabled(context.Background(), slog.LevelDebug) {
+			w.log.Debug("detection inspection deferred", append(w.diagnosticAttrs(),
+				"operation", "process", "reason", "print_changed_during_capture",
+				"inspection_epoch", snap.Epoch, "current_epoch", cur.Epoch,
+				"current_session_generation", cur.SessionGen,
+				"current_connection_generation", w.e.gens.Generation(w.serial),
+				"captured_connection_generation", gen,
+				"current_telemetry_generation", cur.ObsGen,
+				"current_layer", layerValue(layer))...)
+		}
+		return w.degrade(ReasonAwaitingTelemetry, "waiting for a fresh printer report during frame capture", w.e.kStalePoll, false)
 	}
 	w.mu.Lock()
 	w.sessionGen = snap.SessionGen

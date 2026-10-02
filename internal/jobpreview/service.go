@@ -150,6 +150,21 @@ const (
 	catCancelled = "cancelled"
 )
 
+// Fixed failure phases for the one debug record per attempt. The phase
+// names the protocol step where the attempt stopped, independently of the
+// outcome category: none covers a success and any failure before a
+// protocol step started. These are fixed identifiers, never reply text.
+const (
+	phaseNone     = "none"
+	phaseConnect  = "connect"
+	phaseTLS      = "tls"
+	phaseLogin    = "login"
+	phaseSize     = "size"
+	phaseRetr     = "retr"
+	phaseDownload = "download"
+	phaseArchive  = "archive"
+)
+
 // Scheduler policy. settleDelay is the continuous fresh RUNNING interval
 // one job generation must show before its single attempt; freshnessWindow
 // bounds the age of the last real report at admission and publish;
@@ -178,6 +193,13 @@ type Connectivity interface {
 // filenames, or credentials.
 type categorizer interface {
 	category() string
+}
+
+// phaser is implemented by errors carrying the fixed protocol phase that
+// produced them, so the scheduler record can name where the attempt
+// stopped without exposing reply text or filenames.
+type phaser interface {
+	phase() string
 }
 
 // entry is one published preview for one serial. gen and rev pin the entry
@@ -474,12 +496,22 @@ func (s *Service) finish(adm *admission, res Result, err error) {
 	}
 	s.mu.Lock()
 	delete(s.inflight, adm.printer.Serial)
-	if publish && !s.closed {
+	published := publish && !s.closed
+	if published {
 		s.entries[adm.printer.Serial] = &entry{gen: adm.gen, rev: adm.rev, result: stamped}
 	}
 	s.mu.Unlock()
+	// Exactly one fixed-field debug record per attempt: outcome is the
+	// fetched result's category, phase names the protocol step that
+	// stopped a failed attempt, and published separates a served result
+	// from a fetched-but-discarded one (ready with published=false was
+	// never served). No reply text, filename, credential, or error text
+	// ever joins the record.
 	s.log.Debug("job preview attempt finished",
-		"serial", adm.printer.Serial, "outcome", outcomeCategory(err))
+		"serial", adm.printer.Serial,
+		"outcome", outcomeCategory(err),
+		"phase", outcomePhase(err),
+		"published", published)
 }
 
 // eligible reports whether one preview attempt may start for this job
@@ -757,4 +789,22 @@ func outcomeCategory(err error) string {
 		return c.category()
 	}
 	return catTransport
+}
+
+// outcomePhase maps one attempt outcome to its fixed failure phase:
+// archive parse failures report the archive phase, transport errors
+// report the phase stamped at their failure site, and a success or a
+// failure before any protocol step reports none.
+func outcomePhase(err error) string {
+	if err == nil {
+		return phaseNone
+	}
+	if errorCategory(err) != "" {
+		return phaseArchive
+	}
+	var p phaser
+	if errors.As(err, &p) && p.phase() != "" {
+		return p.phase()
+	}
+	return phaseNone
 }

@@ -91,13 +91,22 @@ var (
 	errFtpsSizeMismatch = errors.New("downloaded size differs from the SIZE reply")
 	errFtpsEmptyMatch   = errors.New("matched archive is empty")
 	errFtpsAttemptEnded = errors.New("attempt already ended")
+	// errBare550 is the exact ProtocolError Go's textproto produces for a
+	// bare "550" status line with no space and no message. The live
+	// diagnostic recorded the printers' empty 550 replies without their
+	// exact wire spacing, so the SIZE classifier accepts this exact value
+	// as the same definite file-missing answer; no other protocol error
+	// text is ever matched.
+	errBare550 = textproto.ProtocolError(`short response: "550"`)
 )
 
-// ftpsError is a fixed-category transfer failure. The scheduler logs the
-// category once per attempt; the wrapped cause is for diagnosis only and
+// ftpsError is a fixed-category transfer failure tagged with the fixed
+// protocol phase that produced it. The scheduler logs the category and
+// phase once per attempt; the wrapped cause is for diagnosis only and
 // never reaches users or logs.
 type ftpsError struct {
 	outcome string
+	step    string
 	err     error
 }
 
@@ -107,8 +116,16 @@ func (e *ftpsError) Unwrap() error { return e.err }
 
 func (e *ftpsError) category() string { return e.outcome }
 
+func (e *ftpsError) phase() string { return e.step }
+
 func ftpsErr(category string, err error) error {
 	return &ftpsError{outcome: category, err: err}
+}
+
+// ftpsErrAt tags a transport failure with the protocol phase it surfaced
+// in. phase is always one of the fixed phase identifiers.
+func ftpsErrAt(phase, category string, err error) error {
+	return &ftpsError{outcome: category, step: phase, err: err}
 }
 
 // fetch is the production transfer behind the service's fetch field:
@@ -122,6 +139,8 @@ func ftpsErr(category string, err error) error {
 // listing, no second archive, no TCP6000 fallback, and no reconnect.
 // parseArchive's accepted partial results pass through unchanged, so a
 // valid plate image stays ready even when a metadata entry failed.
+// Failures carry their fixed protocol phase — connect, tls, login, size,
+// retr, download — for the scheduler's single outcome record.
 func fetch(ctx context.Context, printer config.Printer, job telemetry.JobView) (Result, error) {
 	candidates := transferCandidates(job)
 	if len(candidates) == 0 {
@@ -160,11 +179,11 @@ func fetch(ctx context.Context, printer config.Printer, job telemetry.JobView) (
 		ftp.DialWithTLS(tlsCfg),
 		ftp.DialWithDialFunc(d.dial))
 	if err != nil {
-		return Result{}, classifyAttempt(attemptCtx, err)
+		return Result{}, classifyAttempt(attemptCtx, err, d.lastPhase())
 	}
 	defer func() { _ = conn.Quit() }()
 	if err := conn.Login(printer.Username, printer.Password); err != nil {
-		return Result{}, classifyAttempt(attemptCtx, err)
+		return Result{}, classifyAttempt(attemptCtx, err, phaseLogin)
 	}
 	remote, size, err := probeArchive(conn, candidates)
 	if err != nil {
@@ -260,11 +279,12 @@ func gcodeFileBasename(gcodeFile string) (string, bool) {
 }
 
 // probeArchive asks SIZE for every candidate under /cache and then /,
-// stopping at the first definite hit. Only a definite file-missing 550
-// advances to the next candidate; unsupported SIZE, permission wording,
-// and every ambiguous reply end the attempt. A matched size must be
-// positive and within the archive cap; an invalid match is terminal and
-// never falls through to an older alternative.
+// stopping at the first definite hit. Only a definite file-missing 550 —
+// the studied printers' bare reply or worded missing-file text — advances
+// to the next candidate; unsupported SIZE, permission wording, and every
+// ambiguous reply end the attempt. A matched size must be positive and
+// within the archive cap; an invalid match is terminal and never falls
+// through to an older alternative.
 func probeArchive(conn *ftp.ServerConn, candidates []string) (string, int64, error) {
 	for _, dir := range ftpsProbeDirs {
 		for _, name := range candidates {
@@ -282,37 +302,56 @@ func probeArchive(conn *ftp.ServerConn, candidates []string) (string, int64, err
 				continue
 			}
 			if size <= 0 {
-				return "", 0, ftpsErr(catNotFound, errFtpsEmptyMatch)
+				return "", 0, ftpsErrAt(phaseSize, catNotFound, errFtpsEmptyMatch)
 			}
 			if size > ftpsArchiveMax {
-				return "", 0, ftpsErr(catOversized, nil)
+				return "", 0, ftpsErrAt(phaseSize, catOversized, nil)
 			}
 			return remote, size, nil
 		}
 	}
-	return "", 0, ftpsErr(catNotFound, nil)
+	return "", 0, ftpsErrAt(phaseSize, catNotFound, nil)
 }
 
 // classifySize interprets one failed SIZE probe over its full bounded
 // reply text and returns nil only for a definite file-missing 550 that
-// may advance to the next candidate. A reply longer than the
-// classification bound is rejected outright, so denial wording cannot
-// hide past the inspected portion and read as missing. A 550 with
-// permission wording, a 550 with anything else, and every other reply
-// are terminal. Reply text is inspected for classification only and is
-// never logged or returned.
+// may advance to the next candidate. The studied printers answer a
+// missing file with a 550 carrying no message, which this client sees in
+// one of two forms; both are the same definite miss: a parsed 550 whose
+// message is truly empty or whitespace-only, and the exact bare-"550"
+// short-response ProtocolError emitted when the wire line carried no
+// space at all. Worded missing-file replies stay misses too. A reply
+// longer than the classification bound is rejected outright, so denial
+// wording cannot hide past the inspected portion and read as missing. A
+// 550 with permission wording, a 550 with any other nonempty text, and
+// every other reply — including every other protocol error — are
+// terminal. Reply text is inspected for classification only and is never
+// logged or returned.
 func classifySize(err error) error {
 	var reply *textproto.Error
-	if !errors.As(err, &reply) || reply.Code != ftp.StatusFileUnavailable {
-		return ftpsErr(catTransport, err)
+	if !errors.As(err, &reply) {
+		// Exact-constant match only: any other short response, and any
+		// other protocol error, stays terminal.
+		if errors.Is(err, errBare550) {
+			return nil
+		}
+		return ftpsErrAt(phaseSize, catTransport, err)
+	}
+	if reply.Code != ftp.StatusFileUnavailable {
+		return ftpsErrAt(phaseSize, catTransport, err)
 	}
 	if len(reply.Msg) > ftpsClassifyBytes {
-		return ftpsErr(catTransport, err)
+		return ftpsErrAt(phaseSize, catTransport, err)
+	}
+	if strings.TrimSpace(reply.Msg) == "" {
+		// This printer family's definite file-missing answer: a bare
+		// 550 with nothing after the code.
+		return nil
 	}
 	low := strings.ToLower(reply.Msg)
 	for _, denied := range [...]string{"denied", "permission", "not allowed"} {
 		if strings.Contains(low, denied) {
-			return ftpsErr(catTransport, err)
+			return ftpsErrAt(phaseSize, catTransport, err)
 		}
 	}
 	for _, absent := range [...]string{"no such file", "not found", "could not get file size"} {
@@ -320,7 +359,21 @@ func classifySize(err error) error {
 			return nil
 		}
 	}
-	return ftpsErr(catTransport, err)
+	return ftpsErrAt(phaseSize, catTransport, err)
+}
+
+// dataStreamPhase names the failure phase of a data-channel read or
+// close error: an identifiable data TLS handshake failure — a rejected
+// alert or a non-TLS record header on a plaintext data port — reports
+// tls, while a dropped or reset stream during the lazy handshake is
+// indistinguishable from a mid-transfer drop and reports download.
+func dataStreamPhase(err error) string {
+	var rh tls.RecordHeaderError
+	var alert tls.AlertError
+	if errors.As(err, &rh) || errors.As(err, &alert) {
+		return phaseTLS
+	}
+	return phaseDownload
 }
 
 // downloadArchive issues the single RETR and streams the response into a
@@ -332,12 +385,12 @@ func classifySize(err error) error {
 func downloadArchive(ctx context.Context, conn *ftp.ServerConn, remote string, size int64, job telemetry.JobView) (Result, error) {
 	resp, err := conn.Retr(remote)
 	if err != nil {
-		return Result{}, classifyAttempt(ctx, err)
+		return Result{}, classifyAttempt(ctx, err, phaseRetr)
 	}
 	tmp, err := os.CreateTemp("", "bmbpx-preview-*.3mf")
 	if err != nil {
 		_ = resp.Close()
-		return Result{}, ftpsErr(catTransport, err)
+		return Result{}, ftpsErrAt(phaseDownload, catTransport, err)
 	}
 	tmpPath := tmp.Name()
 	defer os.Remove(tmpPath)
@@ -346,34 +399,35 @@ func downloadArchive(ctx context.Context, conn *ftp.ServerConn, remote string, s
 	closeErr := tmp.Close()
 	switch {
 	case copyErr != nil:
-		return Result{}, classifyAttempt(ctx, copyErr)
+		return Result{}, classifyAttempt(ctx, copyErr, dataStreamPhase(copyErr))
 	case written > ftpsArchiveMax:
-		return Result{}, ftpsErr(catOversized, nil)
+		return Result{}, ftpsErrAt(phaseDownload, catOversized, nil)
 	case written != size:
-		return Result{}, ftpsErr(catTransport, errFtpsSizeMismatch)
+		return Result{}, ftpsErrAt(phaseDownload, catTransport, errFtpsSizeMismatch)
 	case shutErr != nil:
-		return Result{}, classifyAttempt(ctx, shutErr)
+		return Result{}, classifyAttempt(ctx, shutErr, dataStreamPhase(shutErr))
 	case closeErr != nil:
-		return Result{}, ftpsErr(catTransport, closeErr)
+		return Result{}, ftpsErrAt(phaseDownload, catTransport, closeErr)
 	}
 	return parseArchive(tmpPath, job)
 }
 
-// classifyAttempt maps one attempt failure onto the fixed categories.
-// Cancellation of the caller's context and the attempt deadline are
-// distinct outcomes; socket-level timeouts land on the timeout category.
-func classifyAttempt(ctx context.Context, err error) error {
+// classifyAttempt maps one attempt failure onto the fixed categories and
+// stamps the protocol phase it surfaced in. Cancellation of the caller's
+// context and the attempt deadline are distinct outcomes; socket-level
+// timeouts land on the timeout category.
+func classifyAttempt(ctx context.Context, err error, phase string) error {
 	if err == nil {
 		return nil
 	}
 	if errors.Is(err, context.Canceled) || ctx.Err() == context.Canceled {
-		return ftpsErr(catCancelled, err)
+		return ftpsErrAt(phase, catCancelled, err)
 	}
 	if errors.Is(err, context.DeadlineExceeded) || ctx.Err() == context.DeadlineExceeded ||
 		errors.Is(err, os.ErrDeadlineExceeded) || isNetTimeout(err) {
-		return ftpsErr(catTimeout, err)
+		return ftpsErrAt(phase, catTimeout, err)
 	}
-	return ftpsErr(catTransport, err)
+	return ftpsErrAt(phase, catTransport, err)
 }
 
 // isNetTimeout reports network timeouts, including expired socket
@@ -394,6 +448,7 @@ type ftpsDialer struct {
 
 	mu        sync.Mutex
 	firstDial bool
+	phase     string
 	sockets   map[net.Conn]struct{}
 	closed    bool
 
@@ -408,12 +463,32 @@ func newFtpsDialer(ctx context.Context, deadline time.Time, tlsCfg *tls.Config) 
 		deadline:  deadline,
 		tlsCfg:    tlsCfg,
 		firstDial: true,
+		phase:     phaseNone,
 		sockets:   make(map[net.Conn]struct{}),
 		done:      make(chan struct{}),
 		watchDone: make(chan struct{}),
 	}
 	go d.watch()
 	return d
+}
+
+// markPhase records the protocol phase the dialer is about to run, so a
+// dial-path failure is attributed to TCP establishment or to the control
+// TLS handshake.
+func (d *ftpsDialer) markPhase(phase string) {
+	d.mu.Lock()
+	d.phase = phase
+	d.mu.Unlock()
+}
+
+// lastPhase reports the most recent protocol phase the dialer entered.
+// A control-session failure after the handshake reports connect again:
+// greeting and protocol establishment belong to the connection, not to
+// TLS.
+func (d *ftpsDialer) lastPhase() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.phase
 }
 
 // watch sweeps every registered socket when the attempt context ends or
@@ -487,6 +562,7 @@ func (d *ftpsDialer) dial(network, address string) (net.Conn, error) {
 	}
 	first := d.firstDial
 	d.firstDial = false
+	d.phase = phaseConnect
 	d.mu.Unlock()
 	if err := d.ctx.Err(); err != nil {
 		return nil, err
@@ -520,9 +596,11 @@ func (d *ftpsDialer) dial(network, address string) (net.Conn, error) {
 	// the rest of the session (greeting, replies, QUIT).
 	_ = raw.SetDeadline(bound)
 	tlsConn := tls.Client(raw, d.tlsCfg)
+	d.markPhase(phaseTLS)
 	if err := tlsConn.HandshakeContext(dialCtx); err != nil {
 		return nil, err
 	}
+	d.markPhase(phaseConnect)
 	_ = raw.SetDeadline(d.deadline)
 	// The cumulative response budget wraps the completed TLS
 	// connection, so it counts plaintext protocol responses, not

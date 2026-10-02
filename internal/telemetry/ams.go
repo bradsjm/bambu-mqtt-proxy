@@ -1,6 +1,8 @@
 package telemetry
 
 import (
+	"context"
+	"log/slog"
 	"math"
 	"sort"
 	"strconv"
@@ -19,9 +21,14 @@ type AMSUnit struct {
 	// Humidity is the raw humidity sensor percentage (1..100); power-on
 	// placeholder values keep the field omitted instead of showing a
 	// meaningless 0.
-	Humidity *int      `json:"humidity,omitempty"`
-	Temp     *float64  `json:"temp,omitempty"`
-	Slots    []AMSSlot `json:"slots"`
+	Humidity *int `json:"humidity,omitempty"`
+	// Temp is the AMS ambient temperature in degrees Celsius. Only finite
+	// plausible readings (0..100 Celsius) merge: the firmware's
+	// out-of-range sentinels (an observed 6503.6) are bogus startup
+	// readings, so a rejected value retains the prior valid one and a unit
+	// that never reported a plausible value stays unknown.
+	Temp  *float64  `json:"temp,omitempty"`
+	Slots []AMSSlot `json:"slots"`
 }
 
 // AMSSlot is one filament slot: a member slot of an AMS unit (ids 0-3) or,
@@ -69,8 +76,9 @@ const (
 // and AMS deltas ride in payloads whose print object the gate must keep
 // rejecting for detection. It reads and writes only display fields, so
 // freshness evidence and session bookkeeping stay exactly as the gate and
-// trackSession left them.
-func mergeDisplay(st *State, printObj map[string]any) {
+// trackSession left them. log is the cache logger, threaded only for the
+// DEBUG sensor diagnostic in mergeAMS.
+func mergeDisplay(st *State, printObj map[string]any, log *slog.Logger) {
 	if v, ok := intField(printObj, "stg_cur"); ok {
 		st.Stage = &v
 	}
@@ -80,7 +88,7 @@ func mergeDisplay(st *State, printObj map[string]any) {
 			if v, ok := intField(amsObj, "tray_now"); ok {
 				st.trayNow = &v
 			}
-			mergeAMS(st, amsObj)
+			mergeAMS(st, amsObj, log)
 		}
 	}
 	if raw, ok := lookup(printObj, "vt_tray"); ok {
@@ -195,8 +203,12 @@ func boolField(obj map[string]any, key string) (bool, bool) {
 // mergeAMS merges one report's AMS unit deltas into st by unit and slot id.
 // Units and slots the report omits keep their merged values. A unit appears
 // on first sight with four never-reported slots and is never removed: the
-// delta stream offers no sufficient unit-removal evidence.
-func mergeAMS(st *State, amsObj map[string]any) {
+// delta stream offers no sufficient unit-removal evidence. The cache logger
+// receives one DEBUG sensor record per report unit that carries
+// humidity_raw or temp; the record observes already-parsed report fields
+// and the retained merge result, never fetches, and is the only
+// diagnostic in the merge path.
+func mergeAMS(st *State, amsObj map[string]any, log *slog.Logger) {
 	raw, ok := lookup(amsObj, "ams")
 	if !ok {
 		return
@@ -228,11 +240,53 @@ func mergeAMS(st *State, amsObj map[string]any) {
 		}
 		unit := merged[at]
 		unit.Slots = append([]AMSSlot(nil), unit.Slots...)
-		if h, ok := intField(obj, "humidity_raw"); ok && h >= 1 && h <= 100 {
-			unit.Humidity = &h
+		_, humidityPresent := lookup(obj, "humidity_raw")
+		humidityRaw, humidityParsed := intField(obj, "humidity_raw")
+		humidityValid := humidityParsed && humidityRaw >= 1 && humidityRaw <= 100
+		if humidityValid {
+			unit.Humidity = &humidityRaw
 		}
-		if t, ok := numberField(obj, "temp"); ok {
-			unit.Temp = &t
+		_, tempPresent := lookup(obj, "temp")
+		// Plausible AMS ambient readings are 0..100 Celsius (numberField
+		// already rejected nonfinite values); out-of-range sentinels like
+		// the observed 6503.6 retain the prior valid reading.
+		tempRaw, tempParsed := numberField(obj, "temp")
+		tempValid := tempParsed && tempRaw >= 0 && tempRaw <= 100
+		if tempValid {
+			unit.Temp = &tempRaw
+		}
+		// DEBUG sensor diagnostic at the existing report observation path:
+		// one record per unit whose report carries a sensor field, with the
+		// raw sensor value when it parsed as a finite number and the
+		// retained effective value when known. This observes the report the
+		// merge already parsed — never a fetch. Typed numbers and flags
+		// only: arbitrary report strings never enter the record, so no new
+		// settings, timers, or rate-limit state are needed; the logger
+		// level gates every emission.
+		if (humidityPresent || tempPresent) && log != nil &&
+			log.Enabled(context.Background(), slog.LevelDebug) {
+			attrs := make([]slog.Attr, 0, 10)
+			attrs = append(attrs,
+				slog.String("serial", st.Serial),
+				slog.Int("unit_id", id),
+				slog.Bool("humidity_present", humidityPresent),
+				slog.Bool("humidity_valid", humidityValid),
+				slog.Bool("temp_present", tempPresent),
+				slog.Bool("temp_valid", tempValid),
+			)
+			if humidityParsed {
+				attrs = append(attrs, slog.Int("humidity_raw", humidityRaw))
+			}
+			if tempParsed {
+				attrs = append(attrs, slog.Float64("temp_raw", tempRaw))
+			}
+			if unit.Humidity != nil {
+				attrs = append(attrs, slog.Int("humidity", *unit.Humidity))
+			}
+			if unit.Temp != nil {
+				attrs = append(attrs, slog.Float64("temp", *unit.Temp))
+			}
+			log.LogAttrs(context.Background(), slog.LevelDebug, "ams_sensor", attrs...)
 		}
 		if trays, ok := lookup(obj, "tray"); ok {
 			if list, ok := trays.([]any); ok {

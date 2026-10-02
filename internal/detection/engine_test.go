@@ -81,6 +81,10 @@ type etFrames struct {
 	released  int
 	waitCalls int
 	lastAfter uint64
+	// duringWait, when set, runs inside WaitFrame before the frame is
+	// handed out, so tests can move the world during the real camera wait
+	// instead of guessing Session call ordering.
+	duringWait func()
 }
 
 func (f *etFrames) Acquire(string) bool {
@@ -101,6 +105,9 @@ func (f *etFrames) WaitFrame(_ string, _ context.Context, after uint64, _ time.D
 	defer f.mu.Unlock()
 	f.waitCalls++
 	f.lastAfter = after
+	if f.duringWait != nil {
+		f.duringWait()
+	}
 	if !f.serve {
 		return Frame{}, false
 	}
@@ -763,6 +770,213 @@ func TestEngineLayerAlignedToFrameCaptureNotUpload(t *testing.T) {
 	}
 }
 
+// TestEngineLayerZeroOrUnknownWaitsWithoutAcquireOrUpload pins the layer
+// gate: a RUNNING print at layer 0 or with an unknown layer must not touch
+// the camera or the API, and the first positive layer must start the first
+// inspection immediately.
+func TestEngineLayerZeroOrUnknownWaitsWithoutAcquireOrUpload(t *testing.T) {
+	running := func(w *etWorld, layer *int) {
+		w.sessions.set(telemetry.SessionView{
+			Serial: "S1", Active: true, State: "RUNNING",
+			SessionGen: 1, Epoch: 1,
+			ObsAt: w.clock.Now(), Obs: 1, ObsGen: 1, StateGen: 1, LayerNum: layer,
+		}, true)
+	}
+	for _, tc := range []struct {
+		name  string
+		layer *int
+	}{{"layer_zero", intPtr(0)}, {"layer_unknown", nil}} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newEtWorld(t)
+			running(w, tc.layer)
+
+			delay := w.worker.step(context.Background())
+			if delay != w.engine.kStalePoll {
+				t.Fatalf("delay = %v, want the waiting stale poll", delay)
+			}
+			if w.frames.held != 0 || w.frames.waitCalls != 0 {
+				t.Fatalf("camera acquires/waits = %d/%d, want none while the layer is not positive",
+					w.frames.held, w.frames.waitCalls)
+			}
+			if creates, processes := w.client.counts(); creates != 0 || processes != 0 {
+				t.Fatalf("creates/processes = %d/%d, want none while the layer is not positive", creates, processes)
+			}
+			if st := w.status(); st.State != StateDegraded || st.Reason != ReasonAwaitingTelemetry {
+				t.Fatalf("state/reason = %q/%q, want the waiting degraded status", st.State, st.Reason)
+			}
+
+			// The first report with a positive layer starts the inspection
+			// immediately: the waiting gate must not insert a schedule delay.
+			running(w, intPtr(1))
+			w.client.queue(etClearResult())
+			delay = w.worker.step(context.Background())
+			creates, processes := w.client.counts()
+			if creates != 1 || processes != 1 {
+				t.Fatalf("creates/processes = %d/%d, want the first inspection on the first positive layer", creates, processes)
+			}
+			if delay != 5*time.Second {
+				t.Fatalf("delay after first inspection = %v, want the intensive Minimum 5s", delay)
+			}
+			if st := w.status(); st.State != StateMonitoring {
+				t.Fatalf("state = %q, want monitoring after the inspection", st.State)
+			}
+		})
+	}
+}
+
+// TestEngineWorldChangeDuringCaptureDiscardsFrame pins the capture-time
+// recheck: a new print boundary, a layer reset, or a reconnect while the
+// camera waited must discard the frame without spending the upload, even
+// when the new connection restates a positive layer.
+func TestEngineWorldChangeDuringCaptureDiscardsFrame(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		shake func(w *etWorld)
+	}{
+		{"new_print_unknown_layer", func(w *etWorld) {
+			v, _ := w.sessions.Session("S1")
+			v.Epoch, v.SessionGen, v.LayerNum = 2, 2, nil
+			w.sessions.set(v, true)
+		}},
+		{"layer_reset_to_zero", func(w *etWorld) {
+			v, _ := w.sessions.Session("S1")
+			v.LayerNum = intPtr(0)
+			w.sessions.set(v, true)
+		}},
+		// The printer reconnected during the camera wait and restated a
+		// positive layer on the new connection: the attempt still rides the
+		// captured generation, so the frame must not upload.
+		{"reconnect_restate_state", func(w *etWorld) {
+			w.gens.mu.Lock()
+			w.gens.gen = 2
+			w.gens.mu.Unlock()
+			v, _ := w.sessions.Session("S1")
+			v.ObsGen, v.StateGen, v.ObsAt = 2, 2, w.clock.Now()
+			w.sessions.set(v, true)
+		}},
+		// Reconnected with nothing restated yet: telemetry still looks fresh
+		// on the captured generation, and the pool generation alone must
+		// stop the upload.
+		{"reconnect_before_restatement", func(w *etWorld) {
+			w.gens.mu.Lock()
+			w.gens.gen = 2
+			w.gens.mu.Unlock()
+		}},
+		// Telemetry went stale during the camera wait: the frame may not
+		// upload against an observation past the freshness window.
+		{"telemetry_stale_during_capture", func(w *etWorld) {
+			w.clock.Advance(31 * time.Second)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newEtWorld(t)
+			w.startSession(1, 1)
+			// The world moves inside the real camera wait, so the entry
+			// snapshot authorizes the attempt and the post-frame read sees
+			// the shaken world.
+			w.frames.duringWait = func() { tc.shake(w) }
+
+			delay := w.worker.step(context.Background())
+			if delay != w.engine.kStalePoll {
+				t.Fatalf("delay = %v, want the waiting stale poll after the discard", delay)
+			}
+			if w.frames.waitCalls != 1 {
+				t.Fatalf("frame waits = %d, want exactly one capture before the discard", w.frames.waitCalls)
+			}
+			if creates, processes := w.client.counts(); creates != 0 || processes != 0 {
+				t.Fatalf("creates/processes = %d/%d, want the frame discarded without a request", creates, processes)
+			}
+			if st := w.status(); st.Reason != ReasonAwaitingTelemetry {
+				t.Fatalf("reason = %q, want the waiting status after the discard", st.Reason)
+			}
+		})
+	}
+}
+
+// TestEngineGateWaitsReleaseCameraWithoutAcquire pins the pre-acquire
+// gates: a waiting layer or authorization must not take the camera, and a
+// hold kept from an earlier inspection is released while the gate waits.
+func TestEngineGateWaitsReleaseCameraWithoutAcquire(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		shake   func(w *etWorld)
+		recover func(w *etWorld)
+	}{
+		{"layer_gone_unknown", func(w *etWorld) {
+			v, _ := w.sessions.Session("S1")
+			v.LayerNum = nil
+			w.sessions.set(v, true)
+		}, nil},
+		{"stale_telemetry", func(w *etWorld) {
+			w.clock.Advance(31 * time.Second)
+		}, nil},
+		// The printer reconnected but nothing has been reported on the new
+		// connection yet: the cached RUNNING must not authorize camera work.
+		// Recovery resumes only once a report lands on the new connection.
+		{"reconnect_before_any_report",
+			func(w *etWorld) {
+				w.gens.mu.Lock()
+				w.gens.gen = 2
+				w.gens.mu.Unlock()
+			},
+			func(w *etWorld) {
+				w.sessions.running(w.clock, 1, 1, "RUNNING")
+				v, _ := w.sessions.Session("S1")
+				v.ObsGen, v.StateGen = 2, 2
+				w.sessions.set(v, true)
+			}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newEtWorld(t)
+			// One full inspection first: the camera hold and one upload exist.
+			w.startSession(1, 1)
+			w.client.queue(etClearResult())
+			w.worker.step(context.Background())
+			if creates, processes := w.client.counts(); creates != 1 || processes != 1 {
+				t.Fatalf("creates/processes = %d/%d, want the baseline inspection", creates, processes)
+			}
+			if w.frames.held != 1 || w.frames.waitCalls != 1 {
+				t.Fatalf("acquires/waits = %d/%d, want the baseline hold and capture", w.frames.held, w.frames.waitCalls)
+			}
+
+			// The gate condition appears before any new report arrives: the
+			// next step must release the hold and neither acquire the
+			// camera again nor call the API.
+			tc.shake(w)
+			w.worker.step(context.Background())
+			if w.frames.held != 1 || w.frames.waitCalls != 1 {
+				t.Fatalf("acquires/waits = %d/%d, want the gates to add no camera work", w.frames.held, w.frames.waitCalls)
+			}
+			if w.frames.released != 1 {
+				t.Fatalf("releases = %d, want the waiting gate to release the hold", w.frames.released)
+			}
+			if _, processes := w.client.counts(); processes != 1 {
+				t.Fatalf("processes = %d, want no upload while gated", processes)
+			}
+			if st := w.status(); st.Reason != ReasonAwaitingTelemetry {
+				t.Fatalf("reason = %q, want the waiting status", st.Reason)
+			}
+
+			// The next fresh report with an eligible layer restarts the
+			// inspection promptly. The Gadget context survives: the print
+			// session never changed.
+			if tc.recover != nil {
+				tc.recover(w)
+			} else {
+				w.sessions.running(w.clock, 1, 1, "RUNNING")
+			}
+			w.client.queue(etClearResult())
+			delay := w.worker.step(context.Background())
+			if _, processes := w.client.counts(); processes != 2 {
+				t.Fatalf("processes = %d, want the inspection to resume promptly", processes)
+			}
+			if delay != 5*time.Second {
+				t.Fatalf("delay after the resumed inspection = %v, want the intensive Minimum 5s", delay)
+			}
+		})
+	}
+}
+
 func TestEngineSecondInspectionWaitsForSchedule(t *testing.T) {
 	w := newEtWorld(t)
 	w.startSession(1, 1)
@@ -1403,6 +1617,46 @@ func TestEngineTelemetryCoalescedNewPrintResets(t *testing.T) {
 	}
 	if delay < 0 {
 		t.Fatalf("delay = %v, want a live schedule after the reset", delay)
+	}
+}
+
+// TestEngineTelemetryStaleLayerDoesNotAuthorizeNewPrint merges real report
+// payloads: the previous job's last layer must not survive into the new
+// print's decisions, and the new print's first layer report must start the
+// inspection immediately.
+func TestEngineTelemetryStaleLayerDoesNotAuthorizeNewPrint(t *testing.T) {
+	w := newEtbWorld(t)
+	w.report(t, etbRunning(1, 11, "a.gcode", 4))
+	w.client.queue(etClearResult())
+	w.worker.step(context.Background())
+	if creates, processes := w.client.counts(); creates != 1 || processes != 1 {
+		t.Fatalf("creates/processes = %d/%d, want the first print inspected", creates, processes)
+	}
+
+	// The next print starts and reports before the worker wakes, but its
+	// first report omits layer_num: the previous job's layer 4 must not
+	// authorize an inspection of the new print.
+	w.report(t, etbFinish(1, 11, "a.gcode"))
+	w.report(t, `{"print":{"gcode_state":"RUNNING","project_id":1,"task_id":12,"subtask_name":"a.gcode"}}`)
+	w.worker.step(context.Background())
+	if _, processes := w.client.counts(); processes != 1 {
+		t.Fatalf("processes = %d, want the stale previous-job layer to wait", processes)
+	}
+
+	// The new print's first layer report starts the inspection immediately
+	// on a fresh context.
+	w.report(t, `{"print":{"gcode_state":"RUNNING","layer_num":1}}`)
+	w.client.queue(etClearResult())
+	delay := w.worker.step(context.Background())
+	creates, processes := w.client.counts()
+	if creates != 2 || processes != 2 {
+		t.Fatalf("creates/processes = %d/%d, want a fresh context and inspection for the new print", creates, processes)
+	}
+	if st := w.status(); st.LastInspectedLayer == nil || *st.LastInspectedLayer != 1 {
+		t.Fatalf("last_inspected_layer = %v, want the new print's first layer", st.LastInspectedLayer)
+	}
+	if delay != 5*time.Second {
+		t.Fatalf("delay after the new print's first inspection = %v, want the intensive Minimum 5s", delay)
 	}
 }
 

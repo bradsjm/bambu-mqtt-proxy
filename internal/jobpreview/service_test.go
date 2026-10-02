@@ -6,6 +6,7 @@
 package jobpreview
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -14,7 +15,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/textproto"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -665,6 +668,168 @@ func TestFinishPublishesOutcomes(t *testing.T) {
 		if res.Preview.Status != StatusUnavailable || res.PNG != nil {
 			t.Fatalf("result landed across a stale observation: %+v", res.Preview)
 		}
+	})
+}
+
+// TestFinishLogRecordShape drives finish across the outcome classes and
+// pins the one-debug-record contract through slog's JSON serializer:
+// fixed string outcome and phase fields, a published bool separating a
+// served result from a fetched-but-discarded one, a timestamp on every
+// record, and no wrapped error text — FTP reply text or credentials —
+// anywhere in the output.
+func TestFinishLogRecordShape(t *testing.T) {
+	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
+	serial := "S1"
+	const msg = "job preview attempt finished"
+
+	newFixture := func(t *testing.T) (*Service, *jobReader, *admission, *bytes.Buffer) {
+		t.Helper()
+		var buf bytes.Buffer
+		// Debug level is test-only; the production logger keeps its
+		// configured level and the record under test is a Debug event.
+		log := slog.New(slog.NewJSONHandler(&buf,
+			&slog.HandlerOptions{Level: slog.LevelDebug}))
+		clk := &testClock{now: base}
+		conn := newFakeConn(serial)
+		job := settledJob(base, 7)
+		rd := newJobReader(serial, job)
+		printers := []config.Printer{{
+			Serial: serial, Address: serial + ".invalid:8883", Username: "u", Password: "p",
+		}}
+		cache := telemetry.NewCache(slices.Clone(printers), testLogger())
+		svc := New(printers, cache, conn, log)
+		svc.readJob = rd.Job
+		svc.now = clk.Now
+		adm := &admission{
+			printer:  printers[0],
+			job:      job,
+			gen:      7,
+			rev:      1,
+			epoch:    2,
+			upstream: 4,
+		}
+		reserveSlot(svc)
+		return svc, rd, adm, &buf
+	}
+
+	// lastRecord parses the newest serialized record and checks the
+	// record shape every outcome must share.
+	lastRecord := func(t *testing.T, buf *bytes.Buffer) map[string]any {
+		t.Helper()
+		lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
+		if len(lines) == 0 || lines[len(lines)-1] == "" {
+			t.Fatal("no log record serialized")
+		}
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(lines[len(lines)-1]), &rec); err != nil {
+			t.Fatalf("record is not one JSON object: %v", err)
+		}
+		if rec["msg"] != msg {
+			t.Errorf("msg = %v, want %q", rec["msg"], msg)
+		}
+		if rec["level"] != "DEBUG" {
+			t.Errorf("level = %v, want DEBUG", rec["level"])
+		}
+		if rec["serial"] != serial {
+			t.Errorf("serial = %v, want %q", rec["serial"], serial)
+		}
+		when, ok := rec["time"].(string)
+		if !ok {
+			t.Fatalf("time = %v, want an RFC3339 string", rec["time"])
+		}
+		if _, err := time.Parse(time.RFC3339Nano, when); err != nil {
+			t.Errorf("time %q does not parse: %v", when, err)
+		}
+		return rec
+	}
+
+	expect := func(t *testing.T, rec map[string]any, outcome, phase string, published bool) {
+		t.Helper()
+		if rec["outcome"] != outcome {
+			t.Errorf("outcome = %v, want %q", rec["outcome"], outcome)
+		}
+		if rec["phase"] != phase {
+			t.Errorf("phase = %v, want %q", rec["phase"], phase)
+		}
+		got, ok := rec["published"].(bool)
+		if !ok {
+			t.Fatalf("published = %v, want a bool", rec["published"])
+		}
+		if got != published {
+			t.Errorf("published = %v, want %v", got, published)
+		}
+	}
+
+	t.Run("ready is published with no failure phase", func(t *testing.T) {
+		svc, _, adm, buf := newFixture(t)
+		svc.begin(serial, adm)
+		svc.finish(adm, Result{PNG: pngBytes(t, 2, 2),
+			Metadata: &Metadata{Source: sourcePrinter3mf, Title: strPtr("T")}}, nil)
+		expect(t, lastRecord(t, buf), catReady, phaseNone, true)
+	})
+
+	t.Run("fetched ready but discarded is not published", func(t *testing.T) {
+		svc, rd, adm, buf := newFixture(t)
+		svc.begin(serial, adm)
+		j := settledJob(base, 7)
+		j.Revision = 2
+		rd.set(serial, j)
+		svc.finish(adm, Result{PNG: pngBytes(t, 2, 2)}, nil)
+		// outcome stays ready — the fetch itself succeeded — while
+		// published separates it from a served result.
+		expect(t, lastRecord(t, buf), catReady, phaseNone, false)
+	})
+
+	t.Run("login failure keeps credential text out", func(t *testing.T) {
+		svc, _, adm, buf := newFixture(t)
+		svc.begin(serial, adm)
+		// The injected secret carries a newline: the serializer must
+		// escape it into one parseable record rather than forge a line.
+		secret := "hunter2-secret\nmarker"
+		err := classifyAttempt(context.Background(),
+			fmt.Errorf("530 login incorrect for user u pass %s", secret), phaseLogin)
+		svc.finish(adm, Result{}, err)
+		// The gate still holds, so the terminal unavailable entry is
+		// published; only the identity of the failure is confidential.
+		expect(t, lastRecord(t, buf), catTransport, phaseLogin, true)
+		for _, leak := range []string{secret, "530 login incorrect"} {
+			if strings.Contains(buf.String(), leak) {
+				t.Errorf("log leaked %q", leak)
+			}
+		}
+	})
+
+	t.Run("size failure keeps reply text out", func(t *testing.T) {
+		svc, _, adm, buf := newFixture(t)
+		svc.begin(serial, adm)
+		err := ftpsErrAt(phaseSize, catTransport,
+			&textproto.Error{Code: 550, Msg: "Permission denied secret-marker-2"})
+		svc.finish(adm, Result{}, err)
+		expect(t, lastRecord(t, buf), catTransport, phaseSize, true)
+		for _, leak := range []string{"secret-marker-2", "Permission denied", "550"} {
+			if strings.Contains(buf.String(), leak) {
+				t.Errorf("log leaked %q", leak)
+			}
+		}
+	})
+
+	t.Run("accepted partial archive stays published as archive phase", func(t *testing.T) {
+		svc, _, adm, buf := newFixture(t)
+		svc.begin(serial, adm)
+		svc.finish(adm, Result{Metadata: &Metadata{Source: sourcePrinter3mf, Title: strPtr("T")}},
+			archiveErr(catImageMissing, "plate image absent"))
+		expect(t, lastRecord(t, buf), catImageMissing, phaseArchive, true)
+	})
+
+	t.Run("cancelled after the gate broke names no phase", func(t *testing.T) {
+		svc, rd, adm, buf := newFixture(t)
+		svc.begin(serial, adm)
+		j := settledJob(base, 7)
+		j.Active = false
+		j.State = "FINISH"
+		rd.set(serial, j)
+		svc.finish(adm, Result{}, context.Canceled)
+		expect(t, lastRecord(t, buf), catCancelled, phaseNone, false)
 	})
 }
 

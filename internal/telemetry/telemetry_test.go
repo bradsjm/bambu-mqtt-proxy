@@ -150,6 +150,81 @@ func TestObserveReportDropsStragglers(t *testing.T) {
 	}
 }
 
+func TestSessionLayerRequiresCurrentSessionAndConnection(t *testing.T) {
+	c := NewCache([]config.Printer{{Serial: "S1", Name: "Shop"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	report := func(seq, gen uint64, payload string) {
+		t.Helper()
+		c.ObserveReport("S1", seq, gen, []byte(payload))
+	}
+	report(1, 4, `{"print":{"gcode_state":"RUNNING","subtask_name":"a.3mf","layer_num":7}}`)
+	v, _ := c.Session("S1")
+	if v.LayerNum == nil || *v.LayerNum != 7 {
+		t.Fatalf("layer = %v, want the current print's layer 7", v.LayerNum)
+	}
+
+	// A mid-print report that omits layer_num preserves the layer: the
+	// connection and the print session cannot have moved.
+	report(2, 4, `{"print":{"gcode_state":"RUNNING","mc_percent":42.5}}`)
+	v, _ = c.Session("S1")
+	if v.LayerNum == nil || *v.LayerNum != 7 {
+		t.Fatalf("layer = %v, want layer 7 preserved without a restamp", v.LayerNum)
+	}
+
+	// A new print on the same connection starts a new session: the previous
+	// job's layer must not leak into the detection view.
+	report(3, 4, `{"print":{"gcode_state":"FINISH"}}`)
+	report(4, 4, `{"print":{"gcode_state":"RUNNING","task_id":12,"subtask_name":"b.3mf"}}`)
+	v, _ = c.Session("S1")
+	if v.LayerNum != nil {
+		t.Fatalf("layer = %v, want nil for the new print before its own layer report", v.LayerNum)
+	}
+
+	// The new print's first layer report becomes current immediately.
+	report(5, 4, `{"print":{"gcode_state":"RUNNING","layer_num":1}}`)
+	v, _ = c.Session("S1")
+	if v.LayerNum == nil || *v.LayerNum != 1 {
+		t.Fatalf("layer = %v, want the new print's layer 1", v.LayerNum)
+	}
+
+	// A reconnected printer must re-report the layer on the new connection.
+	report(6, 5, `{"print":{"gcode_state":"RUNNING"}}`)
+	v, _ = c.Session("S1")
+	if v.LayerNum != nil {
+		t.Fatalf("layer = %v, want nil on the new connection before a fresh layer report", v.LayerNum)
+	}
+	report(7, 5, `{"print":{"gcode_state":"RUNNING","layer_num":2}}`)
+	v, _ = c.Session("S1")
+	if v.LayerNum == nil || *v.LayerNum != 2 {
+		t.Fatalf("layer = %v, want layer 2 re-reported on the new connection", v.LayerNum)
+	}
+
+	// A present but unparseable layer_num contradicts the last valid layer:
+	// the detection view must drop it instead of leaving it current, while
+	// the display keeps the sticky value.
+	report(8, 5, `{"print":{"gcode_state":"RUNNING","layer_num":"bad"}}`)
+	v, _ = c.Session("S1")
+	if v.LayerNum != nil {
+		t.Fatalf("layer = %v, want nil after an invalid layer report", v.LayerNum)
+	}
+	st, _ := c.State("S1")
+	if st.LayerNum == nil || *st.LayerNum != 2 {
+		t.Fatalf("display layer = %v, want the sticky value kept after the invalid report", st.LayerNum)
+	}
+
+	// The next valid layer report restores the current evidence.
+	report(9, 5, `{"print":{"gcode_state":"RUNNING","layer_num":3}}`)
+	v, _ = c.Session("S1")
+	if v.LayerNum == nil || *v.LayerNum != 3 {
+		t.Fatalf("layer = %v, want layer 3 after the next valid report", v.LayerNum)
+	}
+
+	// The display state keeps the sticky last reported value throughout.
+	st, _ = c.State("S1")
+	if st.LayerNum == nil || *st.LayerNum != 3 {
+		t.Fatalf("display layer = %v, want the sticky last report", st.LayerNum)
+	}
+}
+
 func TestSessionViewCarriesFreshnessEvidence(t *testing.T) {
 	c := NewCache([]config.Printer{{Serial: "S1", Name: "Shop"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	c.ObserveReport("S1", 1, 42, []byte(`{"print":{"gcode_state":"RUNNING","layer_num":12}}`))

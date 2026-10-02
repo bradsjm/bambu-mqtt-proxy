@@ -86,6 +86,8 @@ type State struct {
 	sessionGen       uint64    // bumps only when a genuinely new print session starts
 	epoch            uint64    // bumps at every state boundary or identity change
 	stateGen         uint64    // upstream generation of the last gcode_state report
+	layerSessionGen  uint64    // print session in which layer_num was last reported
+	layerGen         uint64    // upstream generation of the last layer_num report
 	speedProfile     *int      // last reported Bambu spd_lvl (1..4)
 	speedGen         uint64    // upstream generation of speedProfile
 	speedSessionGen  uint64    // print session in which speedProfile was reported
@@ -204,7 +206,7 @@ func (c *Cache) ObserveReport(serial string, seq, gen uint64, payload []byte) {
 		}
 		st.lastSeq = seq
 		before := activitySnapshot{state: st.PrintingState, sessionGen: st.sessionGen, printError: st.PrintError, hms: append([]HMSAlert(nil), st.HMS...), chamberLight: st.ChamberLight}
-		real = mergeReport(st, gen, payload, c.now())
+		real = mergeReport(st, gen, payload, c.now(), c.log)
 		if real {
 			events = collectActivityEvents(before, st)
 		} else {
@@ -434,7 +436,16 @@ func (c *Cache) Session(serial string) (SessionView, bool) {
 		v := st.RemainMin
 		view.RemainingMin = &v
 	}
-	view.LayerNum = st.LayerNum
+	// LayerNum is the current print's layer only: the display State keeps
+	// the last reported value for the camera wall, but the detection view
+	// exposes it only when it was reported in the current print session on
+	// the current connection, so a previous job's sticky layer can never
+	// authorize a new print and a reconnected printer must re-report it.
+	if st.LayerNum != nil && st.sessionGen != 0 &&
+		st.layerSessionGen == st.sessionGen && st.layerGen == st.obsGen {
+		v := *st.LayerNum
+		view.LayerNum = &v
+	}
 	view.ChamberLight = st.ChamberLight
 	view.StartedAt = st.StartedAt
 	return view, true
@@ -481,7 +492,7 @@ func (c *Cache) State(serial string) (State, bool) {
 // extraction goes through generic maps instead of a fixed struct. now is
 // the preview clock time, taken once per report for the preview-job
 // projection; detection timing is untouched.
-func mergeReport(st *State, gen uint64, payload []byte, now time.Time) bool {
+func mergeReport(st *State, gen uint64, payload []byte, now time.Time, log *slog.Logger) bool {
 	var report map[string]json.RawMessage
 	if err := json.Unmarshal(payload, &report); err != nil {
 		return false // not a JSON report (health probes, tests); ignore
@@ -498,7 +509,7 @@ func mergeReport(st *State, gen uint64, payload []byte, now time.Time) bool {
 	// deltas arrive in payloads whose print object the gate must keep
 	// rejecting for detection. Merging first changes neither the marker
 	// list nor the gate's freshness decisions.
-	mergeDisplay(st, printObj)
+	mergeDisplay(st, printObj, log)
 	real := isRealPrintReport(printObj)
 	// Preview-job tracking runs for real and metadata-only reports alike:
 	// the projection keeps its own identity and freshness evidence, and
@@ -520,8 +531,25 @@ func mergeReport(st *State, gen uint64, payload []byte, now time.Time) bool {
 		st.RemainMin = v
 		st.remainSeen = true
 	}
-	if v, ok := intField(printObj, "layer_num"); ok {
-		st.LayerNum = &v
+	if _, present := lookup(printObj, "layer_num"); present {
+		if v, ok := intField(printObj, "layer_num"); ok {
+			st.LayerNum = &v
+			// Stamp the layer's evidence so Session can tell the current
+			// print's layer from the sticky display value, following the
+			// speedGen/speedSessionGen pattern. A report that omits
+			// layer_num restamps nothing: on one connection the
+			// generations cannot move, so the last reported layer stays
+			// current until a reconnect or a new print session.
+			st.layerSessionGen = st.sessionGen
+			st.layerGen = gen
+		} else {
+			// Present but invalid: the printer contradicted the last valid
+			// layer. Keep the sticky display value, but drop the evidence
+			// (session 0 matches no real session) so an unparseable report
+			// cannot leave the previous layer authorizing indefinitely.
+			st.layerSessionGen = 0
+			st.layerGen = 0
+		}
 	}
 	if _, present := lookup(printObj, "spd_lvl"); present {
 		// A reported but unsupported value invalidates an older known

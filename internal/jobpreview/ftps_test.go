@@ -12,6 +12,12 @@
 // staging failure, the attempt deadline, and the absence of temporary
 // files on every path, with accepted partial parse results propagating
 // through the transport unchanged.
+// The studied printer family answers a missing file with a 550 and no
+// reply text; the live diagnostic recorded the replies without their
+// exact wire spacing, so both the bare and the spaced-empty form are
+// covered. The live-verified probe sequence — three empty 550s under
+// /cache and at the root, then a 213 on the root archive — must advance
+// through the bounded candidate list and download once.
 package jobpreview
 
 import (
@@ -33,8 +39,10 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"net/textproto"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -709,6 +717,51 @@ func TestTransferCandidates(t *testing.T) {
 	}
 }
 
+// TestClassifySizeEmpty550Misses pins the SIZE classification contract:
+// a truly empty or whitespace-only 550 is the printers' definite
+// file-missing answer and advances to the next candidate like the worded
+// variants. Denial wording, ambiguous text, over-bound replies, other
+// reply codes, and non-protocol errors stay terminal, carry the transport
+// category, and are stamped with the size phase.
+func TestClassifySizeEmpty550Misses(t *testing.T) {
+	overBound := "no such file " + strings.Repeat("x", 300) + " permission denied"
+	cases := []struct {
+		name     string
+		err      error
+		wantMiss bool
+	}{
+		{"bare 550 empty message", &textproto.Error{Code: 550, Msg: ""}, true},
+		{"whitespace-only message", &textproto.Error{Code: 550, Msg: " \t "}, true},
+		{"bare 550 short-response error", textproto.ProtocolError(`short response: "550"`), true},
+		{"worded missing file", &textproto.Error{Code: 550, Msg: "No such file"}, true},
+		{"could not get file size", &textproto.Error{Code: 550, Msg: "Could not get file size."}, true},
+		{"other short-response error", textproto.ProtocolError(`short response: "551"`), false},
+		{"malformed protocol error", textproto.ProtocolError(`short response: "5505"`), false},
+		{"denied wording", &textproto.Error{Code: 550, Msg: "Permission denied"}, false},
+		{"not allowed wording", &textproto.Error{Code: 550, Msg: "Not allowed here"}, false},
+		{"ambiguous wording", &textproto.Error{Code: 550, Msg: "printer state uncertain"}, false},
+		{"over-bound reply", &textproto.Error{Code: 550, Msg: overBound}, false},
+		{"other reply code", &textproto.Error{Code: 502, Msg: "SIZE not implemented"}, false},
+		{"non-protocol error", errors.New("connection reset by peer"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ferr := classifySize(tc.err)
+			if tc.wantMiss {
+				if ferr != nil {
+					t.Fatalf("classifySize = %v, want a candidate miss", ferr)
+				}
+				return
+			}
+			ftpsRequireCategory(t, ferr, catTransport)
+			var p phaser
+			if !errors.As(ferr, &p) || p.phase() != phaseSize {
+				t.Fatalf("terminal SIZE failure phase = %v, want %q", ferr, phaseSize)
+			}
+		})
+	}
+}
+
 func TestFtpsDialerRegisterAfterCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -1009,6 +1062,70 @@ func TestFetch3MFProbeOrderRootFallback(t *testing.T) {
 	}
 	srv.assertClean(t, 3)
 	ftpsNoTempFiles(t)
+}
+
+// TestFetch3MFEmpty550SequenceRootSuccess reproduces the live-verified
+// P1S probe sequence inside one authenticated session: the first three
+// SIZE probes (/cache and root, both candidate names) each answer 550
+// with no message text, and the fourth — the root archive — answers 213.
+// The live diagnostic did not record the exact wire spacing of the empty
+// replies, so both forms run the full sequence: a bare "550" line, which
+// Go's textproto rejects into the exact short-response ProtocolError,
+// and a parsed "550 " with an empty message. Both must advance through
+// the bounded candidate list to the root success, with exactly one RETR,
+// no reconnect, and one resumed data session.
+func TestFetch3MFEmpty550SequenceRootSuccess(t *testing.T) {
+	for name, reply := range map[string]string{
+		"bare 550 line":    "550",
+		"spaced empty 550": "550 ",
+	} {
+		t.Run(name, func(t *testing.T) {
+			ftpsShortenTiming(t)
+			render := ftpsTestPNG(t, 2, 2)
+			srv := newFakeFTPS(t, fakeFTPSConf{
+				user:  "bblp",
+				pass:  "12345678",
+				file:  ftpsTestPlate3MF(t, "BoxTower", render),
+				serve: map[string]bool{"/BoxTower.gcode.3mf": true},
+				sizeReplies: map[string]string{
+					"/cache/BoxTower.3mf":       reply,
+					"/cache/BoxTower.gcode.3mf": reply,
+					"/BoxTower.3mf":             reply,
+				},
+			})
+			ftpsPointControlAt(t, srv.ctrl.Addr().String())
+			res, err := fetch(ftpsFetchCtx(t), ftpsPrinter(srv.ctrl.Addr().String()),
+				ftpsJob("BoxTower", "/cache/BoxTower.3mf"))
+			if err != nil {
+				t.Fatalf("fetch: %v", err)
+			}
+			if res.Metadata == nil || res.Metadata.Title == nil || *res.Metadata.Title != "BoxTower" {
+				t.Fatalf("metadata = %+v, want the root archive's project title", res.Metadata)
+			}
+			if res.Preview.Status != StatusReady || !bytes.Equal(res.PNG, render) {
+				t.Fatalf("status = %q, png %d bytes, want ready with the archived render",
+					res.Preview.Status, len(res.PNG))
+			}
+			_, _, resumed, _, retrs, sizes := srv.snapshot()
+			wantSizes := []string{
+				"/cache/BoxTower.3mf",
+				"/cache/BoxTower.gcode.3mf",
+				"/BoxTower.3mf",
+				"/BoxTower.gcode.3mf",
+			}
+			if !slices.Equal(sizes, wantSizes) {
+				t.Fatalf("SIZE probes = %q, want %q", sizes, wantSizes)
+			}
+			if len(retrs) != 1 || retrs[0] != "/BoxTower.gcode.3mf" {
+				t.Fatalf("RETR = %q, want the root archive only", retrs)
+			}
+			if len(resumed) != 1 || !resumed[0] {
+				t.Fatalf("data sessions resumed = %v, want one resumed data session", resumed)
+			}
+			srv.assertClean(t, 4)
+			ftpsNoTempFiles(t)
+		})
+	}
 }
 
 func TestFetch3MFAllMissing(t *testing.T) {
