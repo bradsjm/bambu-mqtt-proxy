@@ -4,6 +4,7 @@
 /certs/
 .smoke/
 .env
+.orca/
 
 # Build output
 /bambu-mqtt-proxy
