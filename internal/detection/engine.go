@@ -80,15 +80,16 @@ const (
 
 // Reason codes explaining state nuances.
 const (
-	ReasonCameraDisabled    = "camera_disabled"
-	ReasonCameraUnsupported = "camera_unsupported"
-	ReasonAwaitingReports   = "awaiting_reports"
-	ReasonAwaitingTelemetry = "awaiting_fresh_telemetry"
-	ReasonCameraLost        = "camera_unavailable"
-	ReasonAPIRetrying       = "api_retrying"
-	ReasonPauseUnconfirmed  = "pause_unconfirmed"
-	ReasonPauseFailed       = "pause_command_failed"
-	ReasonRequestInvalid    = "request_invalid"
+	ReasonCameraDisabled     = "camera_disabled"
+	ReasonCameraUnsupported  = "camera_unsupported"
+	ReasonAwaitingReports    = "awaiting_reports"
+	ReasonAwaitingTelemetry  = "awaiting_fresh_telemetry"
+	ReasonAwaitingFirstLayer = "awaiting_first_layer"
+	ReasonCameraLost         = "camera_unavailable"
+	ReasonAPIRetrying        = "api_retrying"
+	ReasonPauseUnconfirmed   = "pause_unconfirmed"
+	ReasonPauseFailed        = "pause_command_failed"
+	ReasonRequestInvalid     = "request_invalid"
 )
 
 // Per-print user override values for Status.State, Status.Reason, and
@@ -430,6 +431,11 @@ type worker struct {
 	wasPaused       bool
 	blockedReason   string
 	lastFailure     string
+	// layerReady records that the current print has shown a positive
+	// layer. It survives capture failures, API failures, and reconnects,
+	// so a later missing layer reads as lost evidence rather than a normal
+	// first-layer wait, and it clears with the session.
+	layerReady bool
 
 	// Speed ownership and warning episode state are guarded by controlMu.
 	// One warning episode sends at most one slowdown and restores only a
@@ -861,6 +867,7 @@ func (w *worker) onIdle() {
 	w.clearCount = 0
 	w.clearSince = time.Time{}
 	w.lastLayer = nil
+	w.layerReady = false
 	w.wasPaused = false
 	w.lastFailure = ""
 	w.mu.Unlock()
@@ -958,32 +965,21 @@ func (w *worker) onRunning(ctx context.Context, snap telemetry.SessionView) time
 	w.noteRunningTransition()
 	w.mu.Lock()
 	w.lastLayer = copyLayer(snap.LayerNum)
+	if layerValue(snap.LayerNum) > 0 {
+		w.layerReady = true
+	}
+	layerReady := w.layerReady
 	w.mu.Unlock()
 	w.guardPauseOnRunning()
 
 	now := w.e.now()
 	freshAuthorized := w.authorized(snap, w.e.gens.Generation(w.serial))
 
-	// Layer gate: never acquire frames or upload while the current print's
-	// layer is unknown or zero. The session view exposes layer_num only when
-	// telemetry observed it on this print session and connection, so a
-	// previous job's sticky layer can never authorize a new print. While
-	// waiting, the degrade below sets a poll, and the freshness recovery
-	// under it fires immediately on the first report that carries an
-	// eligible layer. The wait releases the camera hold, so a print that
-	// cannot be inspected yet does not retain the capture.
-	if layerValue(snap.LayerNum) <= 0 {
-		if w.log.Enabled(context.Background(), slog.LevelDebug) {
-			w.log.Debug("detection inspection deferred", append(w.diagnosticAttrs(),
-				"operation", "process", "reason", "layer_unknown")...)
-		}
-		w.releaseCamera()
-		return w.degrade(ReasonAwaitingTelemetry, "waiting for the printer's current layer report", w.e.kStalePoll, false)
-	}
-
 	// Authorization gate: stale telemetry or an old transport generation is
 	// rejected here, before the camera hold or any request, so a print
-	// waiting for fresh evidence never takes the camera. inspect keeps its
+	// waiting for fresh evidence never takes the camera. It precedes the
+	// layer gate so a stale or reconnected RUNNING can never present the
+	// neutral first-layer wait, with or without a layer. inspect keeps its
 	// own recheck as the defense for the race between this gate and the
 	// capture.
 	if !freshAuthorized {
@@ -995,11 +991,49 @@ func (w *worker) onRunning(ctx context.Context, snap telemetry.SessionView) time
 		return w.degrade(ReasonAwaitingTelemetry, "waiting for fresh printer telemetry", w.e.kStalePoll, false)
 	}
 
+	// Layer gate: on a fresh, authorized observation, never acquire frames
+	// or upload while the current print's layer is unknown or zero. The
+	// session view exposes layer_num only when telemetry observed it on this
+	// print session and connection, so a previous job's sticky layer can
+	// never authorize a new print. The wait releases the camera hold, so a
+	// print that cannot be inspected yet does not retain the capture. A
+	// print that has not yet shown a layer is in its normal opening: the
+	// wait stays monitoring under awaiting_first_layer with no warning or
+	// retry claim, and it clears leftover waiting bookkeeping so the first
+	// report that carries an eligible layer starts the inspection
+	// immediately. Once a positive layer was seen, a missing layer is lost
+	// evidence and keeps the degraded waiting state.
+	if layerValue(snap.LayerNum) <= 0 {
+		if w.log.Enabled(context.Background(), slog.LevelDebug) {
+			w.log.Debug("detection inspection deferred", append(w.diagnosticAttrs(),
+				"operation", "process", "reason", "layer_unknown")...)
+		}
+		w.releaseCamera()
+		if layerReady {
+			return w.degrade(ReasonAwaitingTelemetry, "waiting for the printer's current layer report", w.e.kStalePoll, false)
+		}
+		// Fresh evidence ends any earlier waiting degradation, and no
+		// inspection has run yet, so the schedule is only waiting-poll
+		// bookkeeping: clear it so the first eligible layer fires
+		// immediately.
+		w.mu.Lock()
+		w.degraded = ""
+		w.nextDue = time.Time{}
+		w.mu.Unlock()
+		w.publish(func(s *Status) {
+			s.State = StateMonitoring
+			s.Reason = ReasonAwaitingFirstLayer
+			s.Message = "waiting for the printer's first layer report"
+		})
+		return w.e.kStalePoll
+	}
+
 	w.mu.Lock()
 	// A fresh current-generation state observation can arrive before the
 	// stale-telemetry poll expires. No upload was made while authorization was
 	// stale, so do not make the printer wait for that poll after it recovers.
-	if w.degraded == ReasonAwaitingTelemetry && freshAuthorized {
+	// The authorization gate above guarantees freshness here.
+	if w.degraded == ReasonAwaitingTelemetry {
 		w.nextDue = now
 	}
 	due := w.nextDue
@@ -1135,6 +1169,7 @@ func (w *worker) resetForNewSession(sessionGen uint64) {
 	w.clearCount = 0
 	w.clearSince = time.Time{}
 	w.lastLayer = nil
+	w.layerReady = false
 	w.wasPaused = false
 	w.lastFailure = ""
 	w.mu.Unlock()

@@ -770,11 +770,13 @@ func TestEngineLayerAlignedToFrameCaptureNotUpload(t *testing.T) {
 	}
 }
 
-// TestEngineLayerZeroOrUnknownWaitsWithoutAcquireOrUpload pins the layer
+// TestEngineFirstLayerWaitIsNeutralWithoutAcquireOrUpload pins the layer
 // gate: a RUNNING print at layer 0 or with an unknown layer must not touch
 // the camera or the API, and the first positive layer must start the first
-// inspection immediately.
-func TestEngineLayerZeroOrUnknownWaitsWithoutAcquireOrUpload(t *testing.T) {
+// inspection immediately. The wait is the print's normal opening, so it
+// must not raise the degraded state, record an ai_degraded warning, or
+// claim an API retry.
+func TestEngineFirstLayerWaitIsNeutralWithoutAcquireOrUpload(t *testing.T) {
 	running := func(w *etWorld, layer *int) {
 		w.sessions.set(telemetry.SessionView{
 			Serial: "S1", Active: true, State: "RUNNING",
@@ -788,6 +790,8 @@ func TestEngineLayerZeroOrUnknownWaitsWithoutAcquireOrUpload(t *testing.T) {
 	}{{"layer_zero", intPtr(0)}, {"layer_unknown", nil}} {
 		t.Run(tc.name, func(t *testing.T) {
 			w := newEtWorld(t)
+			activities := activity.New([]config.Printer{{Serial: "S1", Name: "Shop", Model: "P1S"}})
+			w.engine.SetActivity(activities)
 			running(w, tc.layer)
 
 			delay := w.worker.step(context.Background())
@@ -801,8 +805,19 @@ func TestEngineLayerZeroOrUnknownWaitsWithoutAcquireOrUpload(t *testing.T) {
 			if creates, processes := w.client.counts(); creates != 0 || processes != 0 {
 				t.Fatalf("creates/processes = %d/%d, want none while the layer is not positive", creates, processes)
 			}
-			if st := w.status(); st.State != StateDegraded || st.Reason != ReasonAwaitingTelemetry {
-				t.Fatalf("state/reason = %q/%q, want the waiting degraded status", st.State, st.Reason)
+			st := w.status()
+			if st.State != StateMonitoring || st.Reason != ReasonAwaitingFirstLayer {
+				t.Fatalf("state/reason = %q/%q, want the neutral first-layer wait", st.State, st.Reason)
+			}
+			if st.NextCheckSeconds != 0 {
+				t.Fatalf("next_check_seconds = %v, want none while reports alone gate the wait", st.NextCheckSeconds)
+			}
+			if w.worker.degraded != "" || !w.worker.nextDue.IsZero() {
+				t.Fatalf("degraded/nextDue = %q/%v, want no internal waiting bookkeeping in the neutral wait",
+					w.worker.degraded, w.worker.nextDue)
+			}
+			if hasActivityKind(activities.Recent("S1"), "ai_degraded") {
+				t.Fatalf("activity recorded ai_degraded for the normal first-layer wait: %+v", activities.Recent("S1"))
 			}
 
 			// The first report with a positive layer starts the inspection
@@ -819,6 +834,192 @@ func TestEngineLayerZeroOrUnknownWaitsWithoutAcquireOrUpload(t *testing.T) {
 			}
 			if st := w.status(); st.State != StateMonitoring {
 				t.Fatalf("state = %q, want monitoring after the inspection", st.State)
+			}
+		})
+	}
+}
+
+// TestEngineLayerLossAfterReadinessDegrades pins the lost-evidence split:
+// once a print has shown a positive layer, a missing layer is lost evidence
+// and must degrade again instead of repeating the neutral first-layer wait.
+// Readiness must survive a capture failure that never created the Gadget
+// context, where haveSession alone cannot tell the two waits apart.
+func TestEngineLayerLossAfterReadinessDegrades(t *testing.T) {
+	// dropLayer simulates the reconnect: the state is restated on the new
+	// connection, but the layer report has not arrived on it yet.
+	dropLayer := func(w *etWorld) {
+		w.sessions.running(w.clock, 1, 1, "RUNNING")
+		v, _ := w.sessions.Session("S1")
+		v.ObsGen, v.StateGen, v.LayerNum = 2, 2, nil
+		w.sessions.set(v, true)
+		w.gens.mu.Lock()
+		w.gens.gen = 2
+		w.gens.mu.Unlock()
+	}
+	t.Run("readiness_survives_capture_failure", func(t *testing.T) {
+		w := newEtWorld(t)
+		w.startSession(1, 1)
+		w.frames.acquireOK = false
+		if delay := w.worker.step(context.Background()); delay != w.engine.kCameraRetry {
+			t.Fatalf("delay = %v, want the camera retry poll", delay)
+		}
+		if creates, _ := w.client.counts(); creates != 0 {
+			t.Fatalf("creates = %d, want no Gadget context before the capture", creates)
+		}
+
+		dropLayer(w)
+		delay := w.worker.step(context.Background())
+		if delay != w.engine.kStalePoll {
+			t.Fatalf("delay = %v, want the stale telemetry poll after the loss", delay)
+		}
+		if st := w.status(); st.State != StateDegraded || st.Reason != ReasonAwaitingTelemetry {
+			t.Fatalf("state/reason = %q/%q, want the degraded lost-evidence wait", st.State, st.Reason)
+		}
+		if creates, processes := w.client.counts(); creates != 0 || processes != 0 {
+			t.Fatalf("creates/processes = %d/%d, want the loss to add no API work", creates, processes)
+		}
+	})
+	t.Run("clean_loss_warns", func(t *testing.T) {
+		w := newEtWorld(t)
+		activities := activity.New([]config.Printer{{Serial: "S1", Name: "Shop", Model: "P1S"}})
+		w.engine.SetActivity(activities)
+		w.startSession(1, 1)
+		w.client.queue(etClearResult())
+		w.worker.step(context.Background())
+		if hasActivityKind(activities.Recent("S1"), "ai_degraded") {
+			t.Fatalf("activity recorded ai_degraded for the clean first inspection: %+v", activities.Recent("S1"))
+		}
+
+		dropLayer(w)
+		delay := w.worker.step(context.Background())
+		if delay != w.engine.kStalePoll {
+			t.Fatalf("delay = %v, want the stale telemetry poll after the loss", delay)
+		}
+		if st := w.status(); st.State != StateDegraded || st.Reason != ReasonAwaitingTelemetry {
+			t.Fatalf("state/reason = %q/%q, want the degraded lost-evidence wait", st.State, st.Reason)
+		}
+		if !hasActivityKind(activities.Recent("S1"), "ai_degraded") {
+			t.Fatalf("activity is missing ai_degraded for the lost layer: %+v", activities.Recent("S1"))
+		}
+	})
+}
+
+// TestEngineUnauthorizedMissingLayerDegrades pins the gate order: a stale or
+// reconnected RUNNING with no layer must degrade as waiting-for-fresh-
+// telemetry, never present the neutral first-layer wait, whatever the layer
+// evidence history. The recovery phase proves a fresh report that still
+// lacks a positive layer turns the wait neutral and clears the internal
+// awaiting-telemetry degradation and its poll schedule, so no countdown
+// remains and no new warning is recorded.
+func TestEngineUnauthorizedMissingLayerDegrades(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		layer   *int
+		shake   func(w *etWorld)
+		recover func(w *etWorld)
+	}{
+		{"stale_zero_layer", intPtr(0),
+			func(w *etWorld) { w.clock.Advance(31 * time.Second) },
+			func(w *etWorld) {
+				v, _ := w.sessions.Session("S1")
+				v.ObsAt = w.clock.Now()
+				w.sessions.set(v, true)
+			}},
+		{"stale_unknown_layer", nil,
+			func(w *etWorld) { w.clock.Advance(31 * time.Second) },
+			func(w *etWorld) {
+				v, _ := w.sessions.Session("S1")
+				v.ObsAt = w.clock.Now()
+				w.sessions.set(v, true)
+			}},
+		{"reconnect_zero_layer", intPtr(0),
+			func(w *etWorld) {
+				w.gens.mu.Lock()
+				w.gens.gen = 2
+				w.gens.mu.Unlock()
+			},
+			func(w *etWorld) {
+				v, _ := w.sessions.Session("S1")
+				v.ObsGen, v.StateGen, v.ObsAt = 2, 2, w.clock.Now()
+				w.sessions.set(v, true)
+			}},
+		{"reconnect_unknown_layer", nil,
+			func(w *etWorld) {
+				w.gens.mu.Lock()
+				w.gens.gen = 2
+				w.gens.mu.Unlock()
+			},
+			func(w *etWorld) {
+				v, _ := w.sessions.Session("S1")
+				v.ObsGen, v.StateGen, v.ObsAt = 2, 2, w.clock.Now()
+				w.sessions.set(v, true)
+			}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newEtWorld(t)
+			activities := activity.New([]config.Printer{{Serial: "S1", Name: "Shop", Model: "P1S"}})
+			w.engine.SetActivity(activities)
+			w.sessions.set(telemetry.SessionView{
+				Serial: "S1", Active: true, State: "RUNNING",
+				SessionGen: 1, Epoch: 1,
+				ObsAt: w.clock.Now(), Obs: 1, ObsGen: 1, StateGen: 1, LayerNum: tc.layer,
+			}, true)
+			tc.shake(w)
+
+			// The unauthorized observation degrades through the
+			// authorization gate, whatever the layer.
+			delay := w.worker.step(context.Background())
+			if delay != w.engine.kStalePoll {
+				t.Fatalf("delay = %v, want the stale telemetry poll", delay)
+			}
+			st := w.status()
+			if st.State != StateDegraded || st.Reason != ReasonAwaitingTelemetry {
+				t.Fatalf("state/reason = %q/%q, want degraded waiting for fresh telemetry", st.State, st.Reason)
+			}
+			if st.Message != "waiting for fresh printer telemetry" {
+				t.Fatalf("message = %q, want the authorization gate message", st.Message)
+			}
+			if w.frames.held != 0 {
+				t.Fatalf("camera acquires = %d, want none while unauthorized", w.frames.held)
+			}
+			if creates, processes := w.client.counts(); creates != 0 || processes != 0 {
+				t.Fatalf("creates/processes = %d/%d, want none while unauthorized", creates, processes)
+			}
+			// Recovery may legitimately record other events (for example the
+			// chamber light auto-on); only the warning count is the contract.
+			degradedCount := func() int {
+				n := 0
+				for _, event := range activities.Recent("S1") {
+					if event.Kind == "ai_degraded" {
+						n++
+					}
+				}
+				return n
+			}
+			warnings := degradedCount()
+
+			// A fresh report that still lacks a positive layer recovers the
+			// neutral wait: the internal awaiting-telemetry degradation and
+			// its poll schedule clear, so no countdown remains and no new
+			// warning is recorded.
+			tc.recover(w)
+			delay = w.worker.step(context.Background())
+			if delay != w.engine.kStalePoll {
+				t.Fatalf("delay = %v, want the neutral waiting poll after recovery", delay)
+			}
+			st = w.status()
+			if st.State != StateMonitoring || st.Reason != ReasonAwaitingFirstLayer {
+				t.Fatalf("state/reason = %q/%q, want the neutral first-layer wait after recovery", st.State, st.Reason)
+			}
+			if st.NextCheckSeconds != 0 {
+				t.Fatalf("next_check_seconds = %v, want no countdown after recovery", st.NextCheckSeconds)
+			}
+			if w.worker.degraded != "" || !w.worker.nextDue.IsZero() {
+				t.Fatalf("degraded/nextDue = %q/%v, want the waiting bookkeeping cleared",
+					w.worker.degraded, w.worker.nextDue)
+			}
+			if n := degradedCount(); n != warnings {
+				t.Fatalf("ai_degraded entries = %d, want the pre-recovery %d unchanged", n, warnings)
 			}
 		})
 	}

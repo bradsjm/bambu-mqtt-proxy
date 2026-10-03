@@ -852,6 +852,7 @@ const detectPauseConfirmed = d => !!d && d.pauseState === "confirmed";
 const DETECT_REASONS = {
   camera_disabled: "camera disabled",
   camera_unsupported: "camera unsupported",
+  awaiting_first_layer: "waiting for first layer",
   awaiting_reports: "awaiting printer reports",
   awaiting_fresh_telemetry: "awaiting fresh telemetry",
   camera_unavailable: "camera unavailable",
@@ -894,6 +895,8 @@ function detectBadge(d, b) {
   if (detectPauseConfirmed(d)) return { tone: "warn", label: "Pause confirmed" };
   if (d.warning) return { tone: "warn", label: "AI warning" };
   if (d.suspended) return { tone: "warn", label: "AI off · account" };
+  // The neutral opening wait names itself: calm, and never attention.
+  if (d.reason === "awaiting_first_layer") return { tone: "calm", label: "AI waiting for layer 1" };
   if (d.state === "degraded") {
     return { tone: "warn", label: d.cameraLost || reasonWords(d).startsWith("camera") ? "AI view lost" : "AI retrying" };
   }
