@@ -18,7 +18,9 @@
   --printing: #34d399; --paused: #fbbf24; --preparing: #60a5fa; --finished: #22d3ee;
   --failed: #f87171; --stale: #a78bfa; --idle: #94a3b8; --waiting: #94a3b8; --offline: #64748b;
   --live: #ef4444; --attention: #f87171;
-  --heat: #fb923c; --tile-min: 340px; --gap: clamp(.5rem, 1.4vw, 1rem); --radius: 14px;
+  --heat: #fb923c; --tile-min: 340px;
+  /* Thermal stages: one color per stage wherever a temperature appears. */
+  --t-off: #6b7785; --t-heat: #fb923c; --t-hot: #ef4444; --t-cool: #60a5fa; --t-amb: #cbd5e1; --fan: #60a5fa; --gap: clamp(.5rem, 1.4vw, 1rem); --radius: 14px;
   --mono: ui-monospace, "SF Mono", "Cascadia Mono", "JetBrains Mono", Menlo, Consolas, monospace;
   --ease: cubic-bezier(.2, .7, .2, 1);
   accent-color: var(--printing);
@@ -136,10 +138,14 @@ body.kiosk .bar { display: none; }
            background: none; cursor: zoom-in; }
 .tile.spot .cam-hit { cursor: zoom-out; }
 .cam-hit:focus-visible { outline-offset: -3px; }
+/* Overlay guide: every overlay item is a glass pill of one height (1.6rem;
+   round controls 2rem) with a border in its tone. Numbers sit in reserved
+   tabular boxes with their unit, and pills carrying live values keep a
+   fixed width so the stage never reflows. */
 .pill { position: absolute; z-index: 4; top: .55rem; display: inline-flex; align-items: center; gap: .35rem;
-        padding: .2rem .55rem; border-radius: 999px; font-size: .72rem; font-weight: 650;
-        letter-spacing: .03em; pointer-events: none; background: rgb(10 12 15 / .72);
-        -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); }
+        height: 1.6rem; padding: 0 .55rem; border-radius: 999px; font-size: .72rem; font-weight: 650;
+        letter-spacing: .03em; pointer-events: none; background: rgb(10 12 15 / .72); white-space: nowrap;
+        font-variant-numeric: tabular-nums; -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); }
 .pill[hidden] { display: none; }
 .pill.state { left: .55rem; color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent); }
 .pill.state .label { color: var(--text); }
@@ -149,17 +155,34 @@ body.kiosk .bar { display: none; }
 .pill.state .label { flex: none; }
 .pill.state .stage { min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--dim); font-weight: 600; }
 .pill.state .stage::before { content: "·"; margin-right: .35rem; }
-.pill.feed { right: .55rem; color: var(--dim); font-variant-numeric: tabular-nums; }
+.pill.feed { right: .55rem; width: 5.2rem; justify-content: center; color: var(--dim);
+             border: 1px solid color-mix(in srgb, var(--dim) 35%, transparent); }
+.pill.feed .feed-label { color: var(--text); }
+.pill.feed[data-mode="live"] { border-color: transparent; }
+.pill.feed[data-mode="live"] .feed-label { color: #fff; }
 .pill.feed[data-mode="live"] { color: #fff; background: color-mix(in srgb, var(--live) 85%, transparent); }
 .pill.feed .dot, .pill.feed[data-mode="live"] .ic { display: none; }
 .pill.feed[data-mode="live"] .dot { display: block; width: .5rem; height: .5rem; border-radius: 50%; background: #fff;
                                    animation: pulse 1.6s infinite; }
-.pill.feed[data-mode="error"], .pill.feed.stale { color: var(--paused); }
+.pill.feed[data-mode="error"], .pill.feed.stale { color: var(--paused); border-color: color-mix(in srgb, var(--paused) 45%, transparent); }
+.pill.feed[data-mode="error"] .feed-label, .pill.feed.stale .feed-label { color: var(--paused); }
 /* The AI badge is a real control on camera stages: it must sit above the
    focus button and receive pointer clicks and keyboard focus itself. */
 .pill.detect { top: auto; left: .55rem; bottom: .6rem; max-width: calc(100% - 1.1rem); color: var(--tone, var(--dim));
-               border: 1px solid color-mix(in srgb, var(--tone, var(--dim)) 45%, transparent);
+               border: 1px solid color-mix(in srgb, var(--tone, var(--dim)) 45%, transparent); overflow: hidden;
                pointer-events: auto; cursor: pointer; appearance: none; text-align: left; }
+/* Value mode: a fixed-width chip with the inspection score as a percent,
+   its direction since the previous result, and a meter on the bottom edge.
+   Flag states (pause, off, lost view) show their words instead. */
+.pill.detect { min-width: 7rem; }
+.pill.detect[data-mode="value"] { width: 7rem; gap: .3rem; }
+.pill.detect[data-mode="value"] .label { color: var(--dim); }
+.pill.detect[data-mode="value"] .q { margin-left: auto; color: var(--tone, var(--dim)); }
+.pill.detect:not([data-mode="value"]) :is(.q, .tr) { display: none; }
+.pill.detect::after { content: ""; position: absolute; left: 0; bottom: 0; height: 2px; width: var(--p, 0%);
+                      background: var(--tone, var(--dim)); transition: width .6s var(--ease); }
+.pill.detect:not([data-mode="value"])::after { display: none; }
+.pill.detect .tr { font-size: .62rem; }
 .pill.detect:disabled { cursor: default; }
 .pill.detect:not(:disabled):hover { background: rgb(16 20 26 / .85); }
 .pill.detect:focus-visible { outline-offset: -3px; }
@@ -167,28 +190,29 @@ body.kiosk .bar { display: none; }
 .pill.detect[data-tone="info"], .pill.detect[data-tone="warn"] { --tone: var(--paused); }
 .pill.detect[data-tone="error"] { --tone: var(--failed); }
 .pill.detect[data-processing="true"] { animation: detect-scan 1.5s ease-in-out infinite; }
-.pill.detect .q { color: var(--text); font-variant-numeric: tabular-nums; }
-.pill.detect .q:empty { display: none; }
 .pill.detect .label { overflow: hidden; text-overflow: ellipsis; }
 .pill.detect[data-old="true"] { opacity: .72; }
 .cam-progress { position: absolute; z-index: 4; left: 0; right: 0; bottom: 0; height: 4px;
                 background: rgb(255 255 255 / .12); pointer-events: none; }
-.cam-progress > div { height: 100%; width: var(--pct, 0%); background: var(--accent);
-                      box-shadow: 0 0 10px var(--accent); transition: width .8s var(--ease); }
+.cam-progress > div { height: 100%; width: var(--pct, 0%); background: var(--bar, var(--accent));
+                      box-shadow: 0 0 10px var(--bar, var(--accent)); transition: width .8s var(--ease); }
+/* Preparing shows heat-up toward the targets; a failed print freezes dimmed at the stop. */
+.tile[data-state="preparing"] .cam-progress { --bar: var(--t-heat); }
+.tile[data-state="failed"] .cam-progress > div { opacity: .55; box-shadow: none; }
 .cam-progress[hidden] { display: none; }
 /* Printer controls sit on the camera stage at every detail level, above the
    focus button and the progress bar. */
 .ctl-bar { position: absolute; z-index: 5; right: .55rem; bottom: .6rem; display: flex; gap: .35rem; }
 .ctl-bar:not(:has(.ctl:not([hidden]))) { display: none; }
-.ctl-bar .ctl { display: grid; place-items: center; width: 32px; height: 32px; padding: 0; border-radius: 50%;
+.ctl-bar .ctl { display: grid; place-items: center; width: 2rem; height: 2rem; padding: 0; border-radius: 50%;
                 border: 1px solid color-mix(in srgb, var(--text) 18%, transparent); cursor: pointer; font-size: 1rem;
-                color: var(--text); background: color-mix(in srgb, var(--panel) 78%, transparent);
+                color: var(--text); background: rgb(10 12 15 / .72);
                 -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); }
 .ctl-bar .ctl:hover { background: var(--panel-2); }
 .ctl-bar .ctl:focus-visible { outline-offset: 1px; }
 .ctl-bar .ctl.stop { background: var(--failed); border-color: var(--failed); color: #fff; }
 .ctl-bar .ctl.stop:hover { background: color-mix(in srgb, var(--failed) 80%, #000); }
-.ctl-bar .ctl.light[aria-pressed="true"] { color: var(--paused);
+.ctl-bar .ctl.light[aria-pressed="true"] { color: var(--paused); border-color: color-mix(in srgb, var(--paused) 55%, transparent);
   box-shadow: 0 0 12px -2px color-mix(in srgb, var(--paused) 70%, transparent); }
 .ctl[aria-busy="true"] { opacity: .55; cursor: progress; }
 
@@ -232,11 +256,43 @@ body.kiosk .bar { display: none; }
                          background: var(--sw, transparent); vertical-align: -.06rem; }
 .job-materials .jm-more { color: var(--faint); }
 .job-materials.past { opacity: .7; }
-.kpi { display: flex; flex-direction: column; align-items: flex-end; text-align: right; white-space: nowrap; }
-.kpi-main { font-size: 1.3rem; font-size: clamp(1.1rem, .75rem + 3.2cqi, 1.75rem); font-weight: 700;
-            line-height: 1.1; font-variant-numeric: tabular-nums; color: var(--accent); }
-.kpi-sub { font-size: .76rem; color: var(--dim); font-variant-numeric: tabular-nums; }
-.kpi-sub > span + span::before { content: " · "; }
+/* KPI column: a fixed width so changing values never shift the name. The
+   headline, then the layer meter, then time left → end time, in reading
+   order. */
+.kpi { flex: none; width: 10rem; display: grid; grid-template-columns: minmax(0, 1fr); justify-items: end; gap: .22rem;
+       text-align: right; white-space: nowrap; }
+.kpi:not(:has(> :not([hidden]):not(:empty))) { display: none; }
+.kpi-main { display: inline-flex; align-items: center; gap: .3rem; font-size: 1.5rem; font-weight: 700; line-height: 1;
+            font-variant-numeric: tabular-nums; color: var(--kc, var(--accent)); }
+.kpi-main.word { font-size: 1.1rem; }
+.kpi-main:empty { display: none; }
+.kpi-main .ic { font-size: 1.1rem; }
+.kpi-meter { display: flex; align-items: center; gap: .4rem; width: 100%; font-size: .72rem; color: var(--dim);
+             font-variant-numeric: tabular-nums; }
+.kpi-meter .segs, .kpi-meter .mbar { flex: 1 1 0; width: 0; min-width: 2.5rem; }
+.kpi-meter b { color: var(--text); font-weight: 600; display: inline-block; text-align: right; min-width: var(--w, 3ch); }
+.tile[data-state="failed"] .kpi-meter { opacity: .6; }
+.kpi-sub { display: inline-flex; align-items: center; gap: .3rem; font-size: .74rem; color: var(--dim);
+           font-variant-numeric: tabular-nums; }
+.kpi-sub:empty { display: none; }
+.kpi-sub b { color: var(--text); font-weight: 600; }
+.kpi-sub .ic { font-size: .85rem; }
+.kpi-sub .link { color: var(--faint); }
+
+/* Values: the number in a reserved, right-aligned box; the unit always shown. */
+.val { display: inline-flex; align-items: baseline; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.val b { display: inline-block; min-width: var(--w, 3ch); text-align: right; font-weight: inherit; }
+.val small { margin-left: .14em; font-size: .72em; font-weight: 500; color: var(--dim); }
+.dur { display: inline-block; min-width: 6.2ch; text-align: right; }
+.clk { display: inline-block; min-width: 8ch; text-align: right; }
+/* Microcharts. */
+.segs { display: block; height: 6px; }
+.mbar { display: inline-block; flex: none; width: var(--bw, 3rem); height: var(--bh, 4px); border-radius: 3px;
+        background: var(--line); overflow: hidden; }
+.mbar > i { display: block; height: 100%; width: var(--p, 0%); background: var(--c, var(--dim)); border-radius: inherit;
+            transition: width .6s var(--ease); }
+.tr { display: inline-block; width: .9em; flex: none; font-size: .68em; line-height: 1; text-align: center; color: var(--tc, inherit); }
+.tr:empty, .tr.flat { visibility: hidden; }
 .alert-row { --sev: var(--dim); display: flex; align-items: center; gap: .45rem; margin-top: .45rem;
              padding: .4rem .55rem; border-radius: 8px; font-size: .8rem;
              background: color-mix(in srgb, var(--sev) 15%, transparent);
@@ -260,11 +316,20 @@ body.kiosk .bar { display: none; }
 .alert-list li > .ic { color: var(--sev); margin-top: .1rem; }
 .alert-list .alert-fix { grid-column: 2; color: var(--dim); }
 .alert-list .alert-code { grid-column: 2; justify-self: start; color: var(--dim); font: .72rem var(--mono); text-decoration: none; }
-/* Section and fact labels borrow the rating-plate lettering of /config. */
-.sec h3 { margin: 0 0 .35rem; color: var(--dim); font: 600 .66rem/1.4 var(--mono);
-          letter-spacing: .12em; text-transform: uppercase; }
-.job-full { margin: 0; font-size: .8rem; overflow-wrap: anywhere; }
-.job-meta { margin: .15rem 0 0; }
+/* Full-detail sections are inset panels: the panel edge is the one divider
+   style for every section. Labels borrow the rating-plate lettering of
+   /config, with a quiet count or model on the right. */
+.l3 .pad { gap: .45rem; }
+.sec { padding: .55rem .6rem .6rem; border-radius: 10px; border: 1px solid var(--line);
+       background: color-mix(in srgb, var(--panel-2) 70%, transparent); }
+.sec h3 { display: flex; justify-content: space-between; align-items: baseline; gap: .5rem; margin: 0 0 .45rem;
+          color: var(--dim); font: 600 .64rem/1.4 var(--mono); letter-spacing: .12em; text-transform: uppercase; }
+.sec h3 .sec-meta { font-weight: 500; color: var(--faint); letter-spacing: .04em; text-transform: none; }
+.sec h3 .sec-meta:empty { display: none; }
+/* Full detail never repeats the job name: the header line wraps instead. */
+.tile[data-level="3"] .job-line .job { white-space: normal; overflow-wrap: anywhere; }
+.job-meta { margin: 0 0 .3rem; }
+.job-archive:first-child, .job-meta[hidden] + .job-facts[hidden] + .job-archive { margin-top: 0; padding-top: 0; border-top: 0; }
 /* Full-detail archive facts from the sliced 3MF: advisory slicing-time
    values under a rule, never live state and never alert material. Past
    jobs dim the block without hiding it. */
@@ -281,37 +346,29 @@ body.kiosk .bar { display: none; }
                              letter-spacing: .12em; text-transform: uppercase; }
 .job-description p { max-height: 9rem; overflow-y: auto; white-space: pre-wrap; }
 .act-list { max-height: 14rem; overflow-y: auto; display: grid; gap: .25rem; margin: 0; padding: 0; list-style: none; }
-.act-list li { display: flex; align-items: baseline; gap: .4rem; font-size: .76rem; }
+.act-list li { display: grid; grid-template-columns: .45rem auto minmax(0, 1fr) auto; align-items: baseline;
+                gap: .45rem; font-size: .76rem; }
 .act-list li::before { content: ""; width: .45rem; height: .45rem; margin-top: .2rem; border-radius: 50%;
                        background: var(--sev, var(--dim)); flex: none; }
 .act-list time { flex: none; color: var(--dim); font-variant-numeric: tabular-nums; }
 .act-msg { min-width: 0; overflow-wrap: anywhere; }
-.act-ago { flex: none; margin-left: auto; color: var(--faint); font-size: .7rem; }
+.act-ago { min-width: 6ch; text-align: right; color: var(--faint); font-size: .7rem; font-variant-numeric: tabular-nums; }
 .act-empty { margin: 0; color: var(--dim); font-size: .78rem; }
-/* Filament overview (full detail only): one row per AMS unit with its four
-   slot cells; the external spool is a fifth column beside the first unit.
-   The active slot is marked with an outline and visible text, never color
-   alone. */
-.ams-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)) minmax(0, 1fr); gap: .25rem .3rem; }
-.ams-grid.solo { grid-template-columns: minmax(0, 10rem); }
-.ams-unit-head { display: flex; align-items: baseline; gap: .5rem; font-size: .74rem; color: var(--dim); }
-.ams-grid > .ams-unit-head:not(:first-child) { margin-top: .3rem; }
-.ams-grid:not(.solo) .ext-col { position: relative; margin-left: .35rem; }
-.ams-grid:not(.solo) .ext-col::before { content: ""; position: absolute; left: -.35rem; top: 0; bottom: 0;
-                                         border-left: 1px solid var(--line); }
-.ams-unit-name { font-weight: 650; color: var(--text); }
-.slot { display: flex; flex-wrap: wrap; align-items: center; gap: .2rem .3rem; min-width: 0;
-        padding: .3rem .4rem; border-radius: 8px; background: var(--panel-2); border: 1px solid var(--line);
-        font-size: .74rem; font-variant-numeric: tabular-nums; }
-.slot.on { border-color: var(--printing); }
-.slot .swatch { flex: none; width: .85rem; height: .85rem; border-radius: 4px;
-                border: 1px solid var(--line); background: var(--sw, transparent); }
-.slot b { font-weight: 650; }
-.slot .mat { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.slot .remain-bar { flex-basis: 100%; height: 3px; border-radius: 2px; background: var(--line); overflow: hidden; }
-.slot .remain-bar > i { display: block; height: 100%; width: var(--pct, 0%); background: var(--dim); }
-.slot .on-text { flex-basis: 100%; font-size: .68rem; font-weight: 650; color: var(--printing); }
-.slot .sensor { flex-basis: 100%; font-size: .68rem; color: var(--dim); }
+/* Filament overview (full detail only): one spool strip per AMS unit, drawn
+   in SVG — the same drawing for every AMS model. Fill height is the
+   remaining estimate; the active slot has a green outline and number. The
+   external spool joins the first strip after a dashed rule. */
+.ams-units { display: grid; gap: .5rem; }
+.ams-unit { display: grid; gap: .35rem; }
+.ams-unit-head { display: flex; align-items: center; gap: .4rem; font-size: .74rem; color: var(--dim); }
+.ams-unit-name { font-weight: 650; color: var(--text); margin-right: auto; }
+.badge { display: inline-flex; align-items: center; gap: .25rem; padding: .08rem .45rem; border-radius: 999px;
+         background: var(--bg); border: 1px solid var(--line); font-size: .7rem; color: var(--text); }
+.badge .ic { font-size: .8rem; }
+.badge.rh .ic { color: var(--preparing); }
+.badge.tc .ic { color: var(--failed); }
+svg.ams-svg { display: block; width: 100%; height: auto; }
+.ams-svg text { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; font-variant-numeric: tabular-nums; }
 .ams-note { margin: .35rem 0 0; color: var(--faint); font-size: .74rem; }
 /* The filament feeding the print, on one line at vitals level. Full detail
    marks it in the filament grid instead. */
@@ -321,10 +378,12 @@ body.kiosk .bar { display: none; }
                       border: 1px solid var(--line); background: var(--sw, transparent); }
 .active-fil b { flex: none; font-weight: 650; }
 .active-fil .af-mat { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dim); }
-.active-fil .remain-bar { flex: 0 0 3rem; height: 4px; margin-left: auto; border-radius: 2px;
+.active-fil > .ic { font-size: .95rem; color: var(--dim); }
+.active-fil .remain-bar { flex: 0 0 3.5rem; height: 4px; margin-left: auto; border-radius: 2px;
                           background: var(--line); overflow: hidden; }
-.active-fil .remain-bar > i { display: block; height: 100%; width: var(--pct, 0%); background: var(--dim); }
-.active-fil .af-pct { flex: none; color: var(--dim); }
+.active-fil .remain-bar > i { display: block; height: 100%; width: var(--pct, 0%); background: var(--af, var(--dim)); }
+.active-fil .af-pct { flex: none; color: var(--af, var(--dim)); }
+.active-fil.low { --af: var(--paused); }
 .tile[data-level="3"] .active-fil { display: none; }
 /* Detail disclosure: the chevron points down while more detail remains and
    flips up at full detail, where the next press collapses the tile. */
@@ -356,44 +415,62 @@ body.kiosk .bar { display: none; }
 .detect-l2[data-tone="info"], .detect-l2[data-tone="warn"] { --tone: var(--paused); }
 .detect-l2[data-tone="error"] { --tone: var(--failed); }
 .stat { display: inline-flex; align-items: center; gap: .3rem; white-space: nowrap; }
-.speed-wrap { --sp: var(--dim); margin-left: auto; }
-.speed-wrap .ic { color: var(--sp); }
-.speed-wrap[data-profile="silent"] { --sp: var(--preparing); }
-.speed-wrap[data-profile="sport"] { --sp: var(--paused); }
-.speed-wrap[data-profile="ludicrous"] { --sp: var(--failed); }
-select.speed { min-height: 1.9rem; padding: 0 .35rem; border-radius: 6px; border: 1px solid var(--line);
-               background: var(--panel-2); color: var(--sp); font: inherit; font-weight: 600; cursor: pointer; }
-.speed-pct { color: var(--dim); }
-.temp.fan { --t: var(--preparing); }
-.temp.fan small { color: var(--dim); }
-.f-wifi[data-bars="3"] { color: var(--printing); }
-.f-wifi[data-bars="2"] { color: var(--paused); }
-.f-wifi[data-bars="1"] { color: var(--failed); }
-/* Thermal row: content-sized chips on one wrapping line. */
-.temps { display: flex; flex-wrap: wrap; gap: .35rem; }
-.temp { --t: var(--faint); position: relative; display: inline-flex; align-items: center; gap: .35rem; overflow: hidden;
-        padding: .25rem .5rem; border-radius: 8px; background: var(--panel-2); font-size: .8rem; white-space: nowrap;
-        font-variant-numeric: tabular-nums; }
-.temp::before { content: ""; position: absolute; inset: 0; width: var(--fill, 0%);
-                background: color-mix(in srgb, var(--t) 18%, transparent); transition: width .8s var(--ease); }
-.temp > * { position: relative; }
-.temp .ic { color: var(--t); font-size: 1rem; }
-.temp b { font-weight: 650; }
-.temp small { color: var(--dim); }
-.temp.heating { --t: var(--heat); }
-.temp.hot { --t: var(--printing); }
-.temp.cooling { --t: var(--preparing); }
+.elapsed .el-text { display: inline-block; min-width: 14ch; }
+.elapsed .el-text .sep { color: var(--faint); margin: 0 .25rem; }
+/* Speed: a segmented control, the same pattern as the wall settings, with
+   every profile and its nominal speed visible. It closes the vitals. */
+.speed-seg { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border: 1px solid var(--line);
+             border-radius: 9px; overflow: hidden; }
+.speed-seg button { --c: var(--text); border: 0; background: var(--panel-2); padding: .28rem .2rem; cursor: pointer;
+                    display: grid; justify-items: center; font-size: .72rem; color: var(--dim); line-height: 1.2; }
+.speed-seg button + button { border-left: 1px solid var(--line); }
+.speed-seg button small { font-size: .64rem; color: var(--faint); font-variant-numeric: tabular-nums; }
+.speed-seg button:hover { color: var(--text); }
+.speed-seg button[aria-checked="true"] { background: color-mix(in srgb, var(--c) 18%, var(--panel-2)); color: var(--c);
+                                         font-weight: 650; box-shadow: inset 0 -2px 0 var(--c); }
+.speed-seg button[aria-checked="true"] small { color: var(--dim); }
+.speed-seg button[data-profile="silent"] { --c: var(--preparing); }
+.speed-seg button[data-profile="sport"] { --c: var(--paused); }
+.speed-seg button[data-profile="ludicrous"] { --c: var(--failed); }
+.speed-seg[aria-busy="true"] { opacity: .55; pointer-events: none; }
+.speed-seg button:focus-visible { outline-offset: -2px; }
+/* Thermal chips: fixed cells (2×2, one row of four on wide tiles), colored
+   by stage — off gray, heating orange, at target red, cooling blue, chamber
+   ambient — with an underline toward the target and a trend arrow. */
+.temps { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .3rem; }
+.tchip { --c: var(--t-off); position: relative; display: flex; align-items: center; gap: .25rem; min-width: 0;
+         padding: .32rem .4rem .4rem; border-radius: 8px; background: var(--panel-2); font-size: .8rem;
+         overflow: hidden; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.tchip > .ic { color: var(--c); font-size: .95rem; }
+.tchip .tl { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--dim); font-size: .74rem; }
+.tchip .val { color: var(--c); font-weight: 650; }
+.tchip .tg { display: inline-block; min-width: 4ch; color: var(--dim); font-size: .72em; }
+.tchip .tr { --tc: var(--c); }
+.tchip::after { content: ""; position: absolute; left: 0; bottom: 0; height: 2px; width: var(--p, 0%);
+                background: var(--c); transition: width .6s var(--ease); }
+.tchip[data-stage="heat"] { --c: var(--t-heat); }
+.tchip[data-stage="hot"] { --c: var(--t-hot); }
+.tchip[data-stage="cool"] { --c: var(--t-cool); }
+.tchip[data-stage="amb"] { --c: var(--t-amb); }
+.tchip[data-stage="fan"] { --c: var(--fan); }
+.tchip .fanbars { flex: none; }
+/* Cold heaters collapse into one full-width chip with every reading. */
+.tchip.off { grid-column: 1 / -1; gap: .35rem; }
+.tchip.off .tl { flex: 1; }
+.tchip.off .val { color: var(--dim); font-weight: 500; }
+.temps > .muted { grid-column: 1 / -1; }
+@container tile (width > 470px) {
+  .temps { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .tchip:not(.off) .tl { display: none; }
+}
 .facts { display: grid; grid-template-columns: auto 1fr; gap: .3rem .9rem; margin: 0; font-size: .8rem; align-items: baseline; }
 .facts dt { display: flex; align-items: center; gap: .4rem; color: var(--dim);
             font: 600 .66rem/1.9 var(--mono); letter-spacing: .12em; text-transform: uppercase; }
 .facts dt .ic { font-size: .9rem; }
-.facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
-/* Diagnostics close full detail: smaller, dimmer, set apart by a rule. */
-.diag { padding-top: .55rem; border-top: 1px solid var(--line); display: grid; gap: .45rem; }
-.diag .facts { font-size: .74rem; color: var(--dim); gap: .15rem .9rem; }
-.diag .facts dt { font-size: .62rem; line-height: 1.8; color: var(--faint); }
-.diag .facts dd:is(.f-serial, .f-wifi) { font-family: var(--mono); }
-.open { display: inline-flex; align-items: center; gap: .4rem; justify-self: start; padding: .35rem .7rem;
+.facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.diag .facts dd.f-serial { font-family: var(--mono); font-size: .74rem; }
+.f-wifi { display: flex; align-items: center; gap: .4rem; }
+.open { display: inline-flex; align-items: center; gap: .4rem; justify-self: start; margin-top: .45rem; padding: .35rem .7rem;
         border-radius: 8px; border: 1px solid var(--line); color: var(--text); text-decoration: none; font-size: .8rem; }
 .open:hover { background: var(--panel-2); }
 .open[hidden] { display: none; }
@@ -406,17 +483,18 @@ select.speed { min-height: 1.9rem; padding: 0 .35rem; border-radius: 6px; border
   .job-thumb { width: 32px; height: 32px; border-radius: 6px; }
   /* The detection badge is the only place this state lives, so its label survives narrow tiles. */
   .pill.detect .label { display: initial; }
-  /* Two slot columns; the external spool flows after the first unit. */
-  .ams-grid:not(.solo) { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .ams-grid > * { grid-column: auto !important; grid-row: auto !important; }
-  .ams-grid > .ams-unit-head { grid-column: 1 / -1 !important; }
-  .ams-grid:not(.solo) .ext-col { margin-left: 0; }
-  .ams-grid:not(.solo) .ext-col::before { display: none; }
 }
 /* Narrow tiles stack layer over time left so the name and job keep width. */
 @container tile (width < 380px) {
-  .kpi-sub { display: flex; flex-direction: column; align-items: flex-end; line-height: 1.25; }
-  .kpi-sub > span + span::before { content: none; }
+  .kpi { width: 8.6rem; }
+  .kpi-main { font-size: 1.3rem; }
+  /* The column keeps its fixed width; only the reserved slack inside goes. */
+  .kpi-sub .ic { display: none; }
+  .kpi-sub :is(.dur, .clk) { min-width: 0; }
+}
+@container tile (width < 300px) {
+  .kpi { width: 7.2rem; }
+  .kpi-sub .clk { min-width: 0; }
 }
 @container tile (width > 560px) {
   .pill { font-size: .8rem; }
@@ -495,6 +573,8 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
   <symbol id="i-speed" viewBox="0 0 24 24"><path d="M4 16a8 8 0 1 1 16 0M12 16l4-5"/></symbol>
   <symbol id="i-fan" viewBox="0 0 24 24"><circle cx="12" cy="12" r="2"/><path d="M12 10c0-4 1-7 4-7 2 0 2 3-2 7M14 12c4 0 7 1 7 4 0 2-3 2-7-2M12 14c0 4-1 7-4 7-2 0-2-3 2-7M10 12c-4 0-7-1-7-4 0-2 3-2 7 2"/></symbol>
   <symbol id="i-wifi" viewBox="0 0 24 24"><path d="M2 8.8a15 15 0 0 1 20 0M5 12.9a10 10 0 0 1 14 0M8.5 16.4a5 5 0 0 1 7 0M12 20h.01"/></symbol>
+  <symbol id="i-spool" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-drop" viewBox="0 0 24 24"><path d="M12 3.5s6 6.4 6 10.5a6 6 0 0 1-12 0c0-4.1 6-10.5 6-10.5z"/></symbol>
   <symbol id="i-clock-alert" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-9-9M12 7v5l3 2M19 3v4M19 10.5v.01"/></symbol>
 </svg>
 
@@ -556,7 +636,7 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
       <button class="cam-hit" type="button" aria-pressed="false"></button>
       <span class="pill state"><svg class="ic" aria-hidden="true"><use/></svg><span class="label"></span><span class="stage" hidden></span></span>
       <span class="pill feed" hidden><span class="dot" aria-hidden="true"></span><svg class="ic" aria-hidden="true"><use href="#i-camera"/></svg><span class="feed-label"></span></span>
-      <button class="pill detect" type="button" hidden><svg class="ic" aria-hidden="true"><use href="#i-ai"/></svg><span class="label"></span><span class="q"></span></button>
+      <button class="pill detect" type="button" hidden><svg class="ic" aria-hidden="true"><use href="#i-ai"/></svg><span class="label"></span><span class="val q"><b></b><small>%</small></span><span class="tr" aria-hidden="true"></span></button>
       <div class="ctl-bar">
         <button class="ctl light" type="button" hidden><svg class="ic" aria-hidden="true"><use href="#i-light"/></svg></button>
         <button class="ctl pause" type="button" hidden><svg class="ic" aria-hidden="true"><use href="#i-pause"/></svg></button>
@@ -573,19 +653,16 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
           <div class="job-line" hidden><svg class="ic" aria-hidden="true"><use href="#i-file"/></svg><span class="job"></span></div>
           <div class="job-materials" hidden></div>
         </div>
-        <div class="kpi"><span class="kpi-main"></span><span class="kpi-sub"></span></div>
+        <div class="kpi"><span class="kpi-main"></span>
+          <span class="kpi-meter" hidden><svg class="segs" aria-hidden="true"></svg><span class="kpi-layer"></span></span>
+          <span class="kpi-sub"></span></div>
         <button class="level" type="button"><svg class="ic" aria-hidden="true"><use href="#i-chevron"/></svg></button>
       </div>
       <div class="alert-row" hidden><svg class="ic" aria-hidden="true"><use href="#i-alert"/></svg><span class="alert-text"></span></div>
       <div class="alert-full" hidden><ul class="alert-list" aria-label="Alerts"></ul></div>
       <div class="more l2"><div><div class="pad">
         <div class="progress-row">
-          <span class="stat eta"><svg class="ic" aria-hidden="true"><use href="#i-flag"/></svg><b></b></span>
-          <span class="stat elapsed"><svg class="ic" aria-hidden="true"><use href="#i-clock"/></svg><b></b></span>
-          <label class="stat speed-wrap" hidden><svg class="ic" aria-hidden="true"><use href="#i-speed"/></svg><select class="ctl speed">
-            <option value="silent">Silent</option><option value="standard">Standard</option>
-            <option value="sport">Sport</option><option value="ludicrous">Ludicrous</option>
-          </select><span class="speed-pct"></span></label>
+          <span class="stat elapsed"><svg class="ic" aria-hidden="true"><use href="#i-clock"/></svg><span class="el-text"></span></span>
         </div>
         <div class="job-vitals" hidden>
           <span class="fl-stat" hidden></span>
@@ -593,13 +670,13 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
         </div>
         <div class="detect-l2" hidden><svg class="ic" aria-hidden="true"><use href="#i-ai"/></svg><b class="d-q"></b><span class="d-text"></span></div>
         <div class="temps"></div>
-        <div class="active-fil" hidden><i class="swatch"></i><b class="af-slot"></b><span class="af-mat"></span>
-          <span class="remain-bar" role="img"><i></i></span><span class="af-pct"></span></div>
+        <div class="active-fil" hidden><svg class="ic" aria-hidden="true"><use href="#i-spool"/></svg><i class="swatch"></i><b class="af-slot"></b><span class="af-mat"></span>
+          <span class="remain-bar" role="img"><i></i></span><span class="af-pct val"><b></b><small>%</small></span></div>
+        <div class="speed-seg" role="radiogroup" hidden></div>
       </div></div></div>
       <div class="more l3"><div><div class="pad">
         <section class="sec job-sec" aria-label="Job" hidden>
-          <h3>Job</h3>
-          <p class="job-full"></p>
+          <h3><span>Job</span><span class="sec-meta job-sec-meta"></span></h3>
           <p class="job-meta muted" hidden></p>
           <dl class="facts job-facts">
             <dt class="dt-detect" hidden><svg class="ic" aria-hidden="true"><use href="#i-ai"/></svg>AI</dt><dd class="f-detect" hidden></dd>
@@ -607,24 +684,19 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
           <div class="job-archive" hidden></div>
         </section>
         <section class="sec ams" aria-label="Filament" hidden>
-          <h3>Filament</h3>
-          <div class="ams-grid"></div>
+          <h3><span>Filament</span><span class="sec-meta ams-meta"></span></h3>
+          <div class="ams-units"></div>
           <p class="ams-note" hidden></p>
         </section>
-        <section class="sec printer-sec" aria-label="Printer" hidden>
-          <h3>Printer</h3>
-          <dl class="facts">
-            <dt class="dt-nozzle" hidden><svg class="ic" aria-hidden="true"><use href="#i-nozzle"/></svg>Nozzle</dt><dd class="f-nozzle" hidden></dd>
-          </dl>
-        </section>
         <section class="sec activity" aria-label="Recent activity">
-          <h3>Recent activity</h3>
+          <h3><span>Recent activity</span><span class="sec-meta act-meta"></span></h3>
           <ol class="act-list"></ol>
           <p class="act-empty">No activity since the proxy started.</p>
         </section>
-        <section class="sec diag" aria-label="Diagnostics">
-          <h3>Diagnostics</h3>
+        <section class="sec diag" aria-label="Printer">
+          <h3><span>Printer</span><span class="sec-meta diag-meta"></span></h3>
           <dl class="facts">
+            <dt class="dt-nozzle" hidden><svg class="ic" aria-hidden="true"><use href="#i-nozzle"/></svg>Nozzle</dt><dd class="f-nozzle" hidden></dd>
             <dt class="dt-camera"><svg class="ic" aria-hidden="true"><use href="#i-camera"/></svg>Camera</dt><dd class="f-camera"></dd>
             <dt class="dt-report"><svg class="ic" aria-hidden="true"><use href="#i-clock-alert"/></svg>Report</dt><dd class="f-report"></dd>
             <dt class="dt-wifi" hidden><svg class="ic" aria-hidden="true"><use href="#i-wifi"/></svg>Wi-Fi</dt><dd class="f-wifi" hidden></dd>
@@ -661,6 +733,9 @@ const STATES = {
 };
 const ATTENTION = { label: "Needs attention", icon: "i-bell" };
 const FILTER_KEYS = ["attention", ...Object.keys(STATES)];
+// Bambu speed profiles with their nominal speed.
+const SPEEDS = [{ key: "silent", label: "Silent", pct: 50 }, { key: "standard", label: "Standard", pct: 100 },
+                { key: "sport", label: "Sport", pct: 124 }, { key: "ludicrous", label: "Ludicrous", pct: 166 }];
 const SEVERITY_RANK = { fatal: 4, serious: 3, error: 3, common: 2, warning: 2, info: 1, unknown: 1 };
 const grid = document.getElementById("grid");
 const params = new URLSearchParams(location.search);
@@ -736,7 +811,8 @@ const nameOf = t => t.data.name || `${t.data.model || "Printer"} ${t.serial}`;
 // The backend adds a `detection` object to a tile only when an API key is
 // configured; without it detectOf returns null and every detection path stays
 // out of the UI, leaving the wall exactly as before. quality is 1..10 (10
-// best) and is never shown as a percentage or probability. pause_state keeps
+// best); the wall shows it as an inspection score in percent (quality × 10),
+// the same unit as every other meter, never as a failure probability. pause_state keeps
 // pending (sent, inside the confirmation window), unconfirmed (window expired,
 // publish failed, or print resumed), and confirmed (printer PAUSE report seen)
 // explicitly distinct.
@@ -784,6 +860,7 @@ const DETECT_REASONS = {
   pause_command_failed: "pause command failed",
 };
 const reasonWords = d => (d.reason ? DETECT_REASONS[d.reason] || d.reason : "");
+const qualityPct = q => (q == null ? null : Math.max(0, Math.min(100, Math.round(q * 10))));
 function qualityWord(q) {
   if (q == null) return "";
   return q <= 1 ? "failure" : q === 2 ? "probable failure" : q === 3 ? "possible failure"
@@ -853,7 +930,7 @@ function detectAlerts(d, b) {
   // While AI is off for this print, the last warning is history, not a
   // live finding; the details line carries the off state instead.
   if (d.warning && d.state !== "disabled") items.push({ severity: "common", prio: 1, sevHidden: true,
-    text: `AI warning · quality ${d.quality ?? "?"}/10${old}` });
+    text: `AI warning · score ${d.quality != null ? `${qualityPct(d.quality)} %` : "unknown"}${old}` });
   if (d.cameraLost && isActive(b)) items.push({ severity: "common", prio: 2, sevHidden: true,
     text: "AI lost camera view · inspection degraded" });
   if (d.suspended) items.push({ severity: "info", prio: 1, sevHidden: true,
@@ -917,7 +994,7 @@ function detectFact(d, b) {
   if (d.suspended) {
     bits.push("inspection unavailable");
     if (d.age != null) bits.push(`last checked ${fmtAgo(Math.round(d.age))}`);
-    if (d.quality != null) bits.push(`last result ${d.quality}/10 ${qualityWord(d.quality)}`);
+    if (d.quality != null) bits.push(`last result ${qualityPct(d.quality)} % ${qualityWord(d.quality)}`);
     bits.push("suspended · account error");
     if (d.message) bits.push(d.message);
     return bits.join(" · ");
@@ -953,6 +1030,58 @@ function icon(id) {
   svg.append(use);
   return svg;
 }
+const SVG_NS = "http://www.w3.org/2000/svg";
+function svgEl(tag, attrs = {}, text) {
+  const el = document.createElementNS(SVG_NS, tag);
+  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, String(v));
+  if (text != null) el.textContent = text;
+  return el;
+}
+// A number in a reserved, right-aligned box with its unit, so changing
+// values never resize their container.
+function valEl(n, unit, w = 3) {
+  const el = document.createElement("span");
+  el.className = "val";
+  const b = document.createElement("b");
+  b.style.setProperty("--w", `${w}ch`);
+  b.textContent = n;
+  const u = document.createElement("small");
+  u.textContent = unit;
+  el.append(b, u);
+  return el;
+}
+// Segmented layer meter: filled segments up to the current layer, a half
+// tone for the segment in progress.
+function fillSegs(svg, n, total, color, count = 24) {
+  const f = total ? Math.max(0, Math.min(1, n / total)) * count : 0, gw = 100 / count;
+  const kids = [];
+  for (let i = 0; i < count; i++) {
+    const fill = i < Math.floor(f) ? color
+      : i === Math.floor(f) && f % 1 > 0 ? `color-mix(in srgb, ${color} 40%, var(--line))` : "var(--line)";
+    const r = svgEl("rect", { x: `${(i * gw + .5).toFixed(2)}%`, y: 0, width: `${(gw - 1).toFixed(2)}%`, height: "100%", rx: 1 });
+    r.style.fill = fill;
+    kids.push(r);
+  }
+  svg.replaceChildren(...kids);
+}
+// Rising/falling arrows like a market ticker; steady keeps the slot.
+function setTrend(el, d) {
+  const k = d > .5 ? "up" : d < -.5 ? "dn" : "flat";
+  el.className = `tr ${k}`;
+  el.textContent = k === "dn" ? "▼" : "▲";
+  el.title = { up: "Rising", dn: "Falling", flat: "Steady" }[k];
+}
+// Short per-tile reading history for trend arrows: one sample at most every
+// 4 s, kept for 60 s; the trend compares with the reading ~30 s ago.
+function sampleTrend(t, key, v) {
+  if (v == null) return 0;
+  const h = (t.hist[key] ||= []), now = Date.now();
+  if (!h.length || now - h.at(-1).at >= 4000) h.push({ at: now, v });
+  while (h.length && now - h[0].at > 60000) h.shift();
+  const ref = h.find(x => now - x.at <= 30000) || h[0];
+  return v - ref.v;
+}
+
 function announce(text) {
   const el = document.getElementById("announce");
   el.textContent = "";
@@ -1004,6 +1133,8 @@ function createTile(p) {
     // request token).
     jobMetaKey: null, jobArchHead: null, jobArchBody: null, jobArchBodyShown: false, jobArchShown: false,
     jobEpKey: null, jobEpUrl: "", jobEpFailed: "", jobTok: 0,
+    // Recent readings for trend arrows, and inspection scores by result.
+    hist: {}, aiHist: [], aiAge: null,
     level: [1, 2, 3].includes(prefs.levels[p.serial]) ? prefs.levels[p.serial] : 1,
     r: {
       cam: q(".cam"), img: q(".camera-frame"), phUse: q(".ph-icon use"), phText: q(".ph-text"), hit: q(".cam-hit"),
@@ -1011,29 +1142,30 @@ function createTile(p) {
       feed: q(".pill.feed"), feedLabel: q(".feed-label"), camBar: q(".cam-progress"),
       details: q(".details"), grip: q(".grip"), model: q(".model"), serial: q(".serial"),
       kpiMain: q(".kpi-main"), kpiSub: q(".kpi-sub"), level: q(".level"),
+      kpiMeter: q(".kpi-meter"), kpiSegs: q(".kpi-meter .segs"), kpiLayer: q(".kpi-layer"),
       alertRow: q(".alert-row"), alertText: q(".alert-text"),
       alertFull: q(".alert-full"), alertList: q(".alert-full .alert-list"),
       l2: q(".l2"), l3: q(".l3"), progressRow: q(".progress-row"),
-      eta: q(".eta b"), temps: q(".temps"),
+      temps: q(".temps"),
       jobLine: q(".job-line"), job: q(".job-line .job"),
       jobThumb: q(".job-thumb"), jobMaterials: q(".job-materials"),
       jobVitals: q(".job-vitals"), flStat: q(".fl-stat"), plateFact: q(".plate-fact"),
-      jobSec: q(".job-sec"), jobFull: q(".job-full"), jobMeta: q(".job-meta"), jobFacts: q(".job-facts"),
+      jobSec: q(".job-sec"), jobMeta: q(".job-meta"), jobFacts: q(".job-facts"),
       jobArchive: q(".job-archive"),
-      printerSec: q(".printer-sec"), speedPct: q(".speed-pct"),
+      jobSecMeta: q(".job-sec-meta"), amsMeta: q(".ams-meta"), actMeta: q(".act-meta"), diagMeta: q(".diag-meta"),
       af: q(".active-fil"), afSwatch: q(".active-fil .swatch"), afSlot: q(".af-slot"), afMat: q(".af-mat"),
-      afBar: q(".active-fil .remain-bar"), afPct: q(".af-pct"),
+      afBar: q(".active-fil .remain-bar"), afPct: q(".af-pct b"),
       dtSd: q(".dt-sd"), fSd: q(".f-sd"),
       detect: q(".pill.detect"), detectUse: q(".pill.detect use"), detectLabel: q(".pill.detect .label"),
-      detectQ: q(".pill.detect .q"), d2: q(".detect-l2"), d2q: q(".detect-l2 .d-q"),
+      detectQ: q(".pill.detect .q b"), detectTr: q(".pill.detect .tr"), d2: q(".detect-l2"), d2q: q(".detect-l2 .d-q"),
       d2text: q(".detect-l2 .d-text"), fDetectDt: q(".dt-detect"), fDetect: q(".f-detect"),
       dtCamera: q(".dt-camera"), fCamera: q(".f-camera"),
       dtReport: q(".dt-report"), fReport: q(".f-report"), dtSerial: q(".dt-serial"), fSerial: q(".f-serial"), open: q(".open"),
-      stage: q(".pill.state .stage"), amsSec: q(".ams"), amsGrid: q(".ams-grid"), amsNote: q(".ams-note"),
+      stage: q(".pill.state .stage"), amsSec: q(".ams"), amsUnits: q(".ams-units"), amsNote: q(".ams-note"),
       actList: q(".act-list"), actEmpty: q(".act-empty"),
       ctlLight: q(".ctl.light"), ctlLightUse: q(".ctl.light use"), ctlPause: q(".ctl.pause"),
-      ctlPauseUse: q(".ctl.pause use"), ctlStop: q(".ctl.stop"), speedWrap: q(".speed-wrap"), speed: q("select.speed"),
-      elapsed: q(".elapsed b"), dtNozzle: q(".dt-nozzle"), fNozzle: q(".f-nozzle"),
+      ctlPauseUse: q(".ctl.pause use"), ctlStop: q(".ctl.stop"), speedSeg: q(".speed-seg"),
+      elapsed: q(".elapsed"), elText: q(".el-text"), dtNozzle: q(".dt-nozzle"), fNozzle: q(".f-nozzle"),
       dtWifi: q(".dt-wifi"), fWifi: q(".f-wifi"),
     },
   };
@@ -1063,11 +1195,35 @@ function createTile(p) {
     sendControl(t, { action: "light", on: !(t.data.chamber_light === "on") }));
   t.r.ctlPause.addEventListener("click", () => sendControl(t, { action: t.r.ctlPause.dataset.action }));
   t.r.ctlStop.addEventListener("click", () => sendControl(t, { action: "stop" }));
-  t.r.speed.addEventListener("change", () => sendControl(t, { action: "speed", profile: t.r.speed.value }));
+  for (const sp of SPEEDS) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.setAttribute("role", "radio");
+    btn.dataset.profile = sp.key;
+    const name = document.createElement("span");
+    name.textContent = sp.label;
+    const pct = document.createElement("small");
+    pct.textContent = `${sp.pct} %`;
+    btn.append(name, pct);
+    btn.addEventListener("click", () => {
+      if (t.data.speed_profile !== sp.key) sendControl(t, { action: "speed", profile: sp.key });
+    });
+    t.r.speedSeg.append(btn);
+  }
+  // Arrow keys move between profiles, as in a native radio group.
+  t.r.speedSeg.addEventListener("keydown", e => {
+    const dir = { ArrowRight: 1, ArrowDown: 1, ArrowLeft: -1, ArrowUp: -1 }[e.key];
+    if (!dir) return;
+    e.preventDefault();
+    const i = SPEEDS.findIndex(sp => sp.key === t.data.speed_profile);
+    const next = SPEEDS[Math.max(0, Math.min(SPEEDS.length - 1, (i < 0 ? 1 : i) + dir))];
+    t.r.speedSeg.querySelector(`[data-profile="${next.key}"]`)?.focus();
+    if (next.key !== t.data.speed_profile) sendControl(t, { action: "speed", profile: next.key });
+  });
   details.addEventListener("click", e => {
     // The activity and filament sections stay readable, so clicks there
     // must not cycle the detail level.
-    if (e.target.closest("a, .grip, .activity, .ams, .alert-full, .job-archive, .ctl-bar, .speed-wrap, .speed") ||
+    if (e.target.closest("a, .grip, .activity, .ams, .alert-full, .job-archive, .ctl-bar, .speed-seg") ||
         getSelection()?.toString()) return;
     t.level = t.level % 3 + 1;
     prefs.levels[t.serial] = t.level;
@@ -1086,6 +1242,7 @@ function renderActivity(t) {
   if (key === t.activityKey) return;
   t.activityKey = key;
   t.r.actEmpty.hidden = events.length > 0;
+  t.r.actMeta.textContent = events.length ? `${events.length} event${events.length > 1 ? "s" : ""}` : "";
   const rows = events.map(e => {
     const li = document.createElement("li");
     li.dataset.sev = ["info", "warning", "error"].includes(e.severity) ? e.severity : "info";
@@ -1116,13 +1273,13 @@ const stageWords = s => {
   const words = s.replaceAll("_", " ");
   return words.charAt(0).toUpperCase() + words.slice(1);
 };
-// Filament overview (full detail): one row per conventional AMS unit with
-// its four slot cells, and the external spool as a fifth column beside the
-// first unit (DOM order puts it right after that unit, so narrow tiles flow
-// it there). Occupancy labels stay honest: "Empty" only for a resolved-empty
-// slot, "Unknown" for a slot the printer never reported or loaded without
-// reported material. Offline and stale printers keep showing their last
-// known spools, so the section notes that. Pure rendering: no interaction.
+// Filament overview (full detail): one spool strip per AMS unit, the same
+// SVG drawing for every AMS model, with the external spool after a dashed
+// rule in the first strip. Occupancy labels stay honest: "Empty" only for a
+// resolved-empty slot, "Unknown" for a slot the printer never reported or
+// loaded without reported material. Offline and stale printers keep showing
+// their last known spools, so the section notes that. Every string from the
+// printer goes through textContent only. Pure rendering: no interaction.
 function renderAMS(t) {
   const p = t.data;
   const units = Array.isArray(p.ams) ? p.ams : [];
@@ -1137,39 +1294,105 @@ function renderAMS(t) {
   const key = JSON.stringify([units, ext, sensor, note]);
   if (key === t.amsKey) return;
   t.amsKey = key;
-  const place = (el, col, row) => { el.style.gridColumn = col; el.style.gridRow = String(row); return el; };
-  const extCells = () => {
-    const cell = slotCell(ext, null);
-    if (sensor != null) {
-      const s = document.createElement("span");
-      s.className = "sensor";
-      s.textContent = sensor ? "Sensor: filament" : "Sensor: empty";
-      s.title = `External spool sensor ${sensor ? "detects filament" : "detects no filament"}`;
-      cell.append(s);
-    }
-    cell.classList.add("ext-col");
-    const head = amsHead("Ext", null, null);
-    head.classList.add("ext-col");
-    head.title = "External spool";
-    return [head, cell];
-  };
-  const kids = [];
-  units.forEach((u, i) => {
-    kids.push(place(amsHead(`AMS ${typeof u.id === "number" ? u.id + 1 : ""}`, u.humidity ?? null, u.temp ?? null),
-      "1 / 5", i * 2 + 1));
-    (Array.isArray(u.slots) ? u.slots : []).forEach((s, j) =>
-      kids.push(place(slotCell(s, (s?.id ?? j) + 1), String(j + 1), i * 2 + 2)));
-    if (i === 0 && ext) {
-      const [head, cell] = extCells();
-      kids.push(place(head, "5", 1), place(cell, "5", 2));
-    }
-  });
-  if (!units.length && ext) kids.push(...extCells());
-  t.r.amsGrid.classList.toggle("solo", !units.length);
+  const extTitle = sensor == null ? "" : ` · sensor ${sensor ? "detects filament" : "detects no filament"}`;
+  const kids = units.map((u, i) => amsUnit(
+    `AMS ${typeof u.id === "number" ? u.id + 1 : i + 1}`, u.humidity ?? null, u.temp ?? null,
+    Array.isArray(u.slots) ? u.slots : [], i === 0 ? ext : null, extTitle));
+  if (!units.length && ext) kids.push(amsUnit("External spool", null, null, [], ext, extTitle));
   t.r.amsSec.hidden = !kids.length;
-  t.r.amsGrid.replaceChildren(...kids);
+  t.r.amsUnits.replaceChildren(...kids);
+  t.r.amsMeta.textContent = [units.length ? `${units.length} AMS` : "", ext ? "ext" : ""].filter(Boolean).join(" + ");
   t.r.amsNote.hidden = !note;
   t.r.amsNote.textContent = note;
+}
+const SPOOL_W = 62;
+function spoolColor(s) {
+  return typeof s.color === "string" && /^[0-9a-fA-F]{8}$/.test(s.color) ? `#${s.color.slice(0, 6)}` : "";
+}
+// One AMS unit: a heading with humidity and temperature badges over a strip
+// of spool drawings.
+function amsUnit(name, humidity, temp, slots, ext, extTitle) {
+  const box = document.createElement("div");
+  box.className = "ams-unit";
+  const head = document.createElement("div");
+  head.className = "ams-unit-head";
+  const label = document.createElement("span");
+  label.className = "ams-unit-name";
+  label.textContent = name;
+  head.append(label);
+  const badge = (cls, iconId, n, unit, w, title) => {
+    const el = document.createElement("span");
+    el.className = `badge ${cls}`;
+    el.title = title;
+    el.append(icon(iconId), valEl(n, unit, w));
+    return el;
+  };
+  if (humidity != null) head.append(badge("rh", "i-drop", humidity, "%", 2, `AMS humidity ${humidity} %`));
+  if (temp != null) head.append(badge("tc", "i-thermo", Math.round(temp), "°C", 2, `AMS temperature ${Math.round(temp)} °C`));
+  const cols = slots.length + (ext ? 1 : 0), gap = slots.length && ext ? 10 : 0;
+  const w = cols * SPOOL_W + gap;
+  const svg = svgEl("svg", { class: "ams-svg", viewBox: `0 0 ${w} 86`, role: "img" });
+  // Strips keep the same spool size whatever the slot count or tile width.
+  svg.style.maxWidth = `${(w / SPOOL_W) * 4.6}rem`;
+  const words = [];
+  slots.forEach((sl, j) => {
+    const num = ((sl && sl.id) ?? j) + 1;
+    svg.append(spoolG(31 + j * SPOOL_W, sl, String(num), ""));
+    words.push(slotWords(sl, `Slot ${num}`));
+  });
+  if (ext) {
+    if (slots.length) {
+      const x = slots.length * SPOOL_W + gap / 2;
+      svg.append(svgEl("path", { d: `M${x} 6V70`, stroke: "var(--line)", "stroke-dasharray": "3 3" }));
+    }
+    svg.append(spoolG(slots.length * SPOOL_W + gap + 31, ext, "Ext", extTitle));
+    words.push(slotWords(ext, "External spool") + extTitle);
+  }
+  svg.setAttribute("aria-label", `${name}: ${words.join("; ")}`);
+  box.append(head, svg);
+  return box;
+}
+function slotWords(s, label) {
+  s = s && typeof s === "object" ? s : {};
+  if (s.loaded === false) return `${label} empty`;
+  return [label, s.material || "unknown material", Number.isFinite(s.remain) ? `${s.remain} % left` : "",
+    s.active === true ? "active" : ""].filter(Boolean).join(", ");
+}
+// One spool: two flanges, the filament colour filled to the remaining
+// estimate, a plate with material and percent, and the slot number below.
+function spoolG(cx, s, num, extra) {
+  s = s && typeof s === "object" ? s : {};
+  const y = 4, w = 54, h = 64, x = cx - w / 2, fl = 7;
+  const g = svgEl("g");
+  g.append(svgEl("title", {}, slotWords(s, num === "Ext" ? "External spool" : `Slot ${num}`) + (extra || "")));
+  const active = s.active === true;
+  if (s.loaded === false) {
+    g.append(svgEl("rect", { x, y, width: w, height: h, rx: 6, fill: "none", stroke: "var(--faint)", "stroke-dasharray": "4 3" }),
+      svgEl("text", { x: cx, y: y + h / 2 + 4, "text-anchor": "middle", fill: "var(--faint)", "font-size": 10 }, "Empty"));
+  } else {
+    const color = spoolColor(s) || "var(--faint)";
+    const remain = Number.isFinite(s.remain) ? Math.max(0, Math.min(100, s.remain)) : null;
+    const ix = x + fl, iw = w - fl * 2, iy = y + 3, ih = h - 6, fh = ih * (remain ?? 100) / 100;
+    const back = svgEl("rect", { x: ix, y: iy, width: iw, height: ih, fill: color });
+    back.style.opacity = ".2";
+    g.append(back, svgEl("rect", { x: ix, y: (iy + ih - fh).toFixed(1), width: iw, height: fh.toFixed(1), fill: color }));
+    for (const fx of [x, x + w - fl]) {
+      g.append(svgEl("rect", { x: fx, y, width: fl, height: h, rx: 3, fill: "#2c323a", stroke: "#3b424c" }));
+    }
+    const ph = remain == null ? 18 : 32, mid = y + h / 2;
+    const plate = svgEl("rect", { x: cx - 25, y: mid - ph / 2, width: 50, height: ph, rx: 5, fill: "rgb(8 10 13 / .62)" });
+    if (active) { plate.setAttribute("stroke", "var(--printing)"); plate.setAttribute("stroke-width", "2"); }
+    const mat = String(s.material || "Unknown");
+    g.append(plate, svgEl("text", { x: cx, y: mid + (remain == null ? 4 : -3), "text-anchor": "middle",
+      fill: "#fff", "font-size": 10.5, "font-weight": 700 }, mat.length > 8 ? `${mat.slice(0, 7)}…` : mat));
+    if (remain != null) {
+      g.append(svgEl("text", { x: cx, y: mid + 10, "text-anchor": "middle", "font-size": 9.5, "font-weight": 600,
+        fill: remain < 20 ? "var(--paused)" : "rgb(230 235 240 / .75)" }, `${remain} %`));
+    }
+  }
+  g.append(svgEl("text", { x: cx, y: 82, "text-anchor": "middle", "font-size": 10, "font-weight": 600,
+    fill: active ? "var(--printing)" : "var(--dim)" }, num));
+  return g;
 }
 // Vitals level: the one slot feeding the print, when the printer reports an
 // active selection and is connected.
@@ -1185,83 +1408,19 @@ function renderActiveFilament(t, units, ext, b) {
   r.af.hidden = !hit || b === "offline";
   if (r.af.hidden) return;
   const s = hit.s;
-  const color = typeof s.color === "string" && /^[0-9a-fA-F]{8}$/.test(s.color) ? `#${s.color}` : "";
-  r.afSwatch.style.setProperty("--sw", color || "transparent");
+  r.afSwatch.style.setProperty("--sw", spoolColor(s) || "transparent");
   r.afSlot.textContent = hit.label;
   r.afMat.textContent = [s.material, s.sub_brand && s.sub_brand !== s.material ? s.sub_brand : ""]
     .filter(Boolean).join(" · ") || "Unknown";
   const remain = Number.isFinite(s.remain) ? Math.max(0, Math.min(100, s.remain)) : null;
-  r.afBar.hidden = r.afPct.hidden = remain == null;
+  r.afBar.hidden = r.afPct.parentElement.hidden = remain == null;
+  r.af.classList.toggle("low", remain != null && remain < 20);
   if (remain != null) {
     r.afBar.style.setProperty("--pct", `${remain}%`);
-    r.afBar.setAttribute("aria-label", `Estimated ${remain}% remaining`);
-    r.afPct.textContent = `${remain}%`;
+    r.afBar.setAttribute("aria-label", `Estimated ${remain} % remaining`);
+    r.afPct.textContent = remain;
   }
   r.af.title = `Active filament · ${hit.label}`;
-}
-// One filament slot cell: the color swatch, the slot number outside the
-// swatch, the material, a labelled remaining estimate, and the active
-// selection as an outline plus visible text.
-function slotCell(s, num) {
-  s = s && typeof s === "object" ? s : {};
-  const cell = document.createElement("span");
-  cell.className = "slot";
-  const swatch = document.createElement("i");
-  swatch.className = "swatch";
-  if (typeof s.color === "string" && /^[0-9a-fA-F]{8}$/.test(s.color)) {
-    swatch.style.setProperty("--sw", `#${s.color}`);
-    swatch.title = `#${s.color}`;
-  }
-  cell.append(swatch);
-  if (num != null) {
-    const n = document.createElement("b");
-    n.textContent = num;
-    cell.append(n);
-  }
-  const mat = document.createElement("span");
-  mat.className = "mat";
-  mat.textContent = s.loaded === false ? "Empty" : s.material || "Unknown";
-  cell.append(mat);
-  if (Number.isFinite(s.remain)) {
-    const bar = document.createElement("span");
-    bar.className = "remain-bar";
-    bar.style.setProperty("--pct", `${Math.max(0, Math.min(100, s.remain))}%`);
-    bar.title = `Estimated ${s.remain}% remaining`;
-    bar.setAttribute("role", "img");
-    bar.setAttribute("aria-label", bar.title);
-    bar.append(document.createElement("i"));
-    cell.append(bar);
-  }
-  if (s.active === true) {
-    cell.classList.add("on");
-    const on = document.createElement("span");
-    on.className = "on-text";
-    on.textContent = "Active";
-    cell.append(on);
-  }
-  return cell;
-}
-// One AMS heading: unit name, humidity, and temperature.
-function amsHead(name, humidity, temp) {
-  const head = document.createElement("div");
-  head.className = "ams-unit-head";
-  const label = document.createElement("span");
-  label.className = "ams-unit-name";
-  label.textContent = name;
-  head.append(label);
-  if (humidity != null) {
-    const h = document.createElement("span");
-    h.textContent = `${humidity}% RH`;
-    h.title = `AMS humidity ${humidity}%`;
-    head.append(h);
-  }
-  if (temp != null) {
-    const tc = document.createElement("span");
-    tc.textContent = `${Math.round(temp)}°`;
-    tc.title = `AMS temperature ${Math.round(temp)}°C`;
-    head.append(tc);
-  }
-  return head;
 }
 function applyLevel(t) {
   const names = ["compact", "vitals", "full details"];
@@ -1294,77 +1453,94 @@ function renderFeed(t) {
   let label = "";
   if (errored) label = "Retrying";
   else if (t.feed === "live") label = "LIVE";
-  else if (t.feed === "snap") label = t.snap.at ? `${Math.round((Date.now() - t.snap.at) / 1000)}s` : "…";
+  else if (t.feed === "snap") {
+    const age = t.snap.at ? Math.round((Date.now() - t.snap.at) / 1000) : null;
+    label = age == null ? "…" : age < 60 ? `${age} s` : `${Math.floor(age / 60)} m`;
+  }
   if (feedLabel.textContent !== label) feedLabel.textContent = label;
   const frameAge = Number(t.data.frame_age_seconds || 0);
   feed.classList.toggle("stale", t.feed === "snap" && frameAge > prefs.snapSec * 3);
 }
 
-function tempChip(iconId, name, cur, target) {
+// Thermal stage of one reading: off, heating, at target (±3 °C), cooling
+// down from a cleared target, or chamber ambient.
+function thermalStage(cur, target, chamber) {
+  if (target != null && target > 0) return Math.abs(cur - target) <= 3 ? "hot" : cur < target ? "heat" : "cool";
+  if (chamber) return "amb";
+  return cur > 45 ? "cool" : "off";
+}
+const STAGE_WORDS = { off: "off", heat: "heating", hot: "at target", cool: "cooling down", amb: "ambient" };
+// One fixed-width thermal chip: icon, label, value with unit, target, and
+// the trend since about 30 s ago. The underline fills toward the target.
+function tempChip(t, key, iconId, name, cur, target, max) {
   if (cur == null) return null;
-  const hasTarget = target != null && target > 0;
-  const state = hasTarget ? (cur < target - 3 ? "heating" : "hot") : cur > 45 ? "cooling" : "cold";
+  const v = Math.round(cur), hasTarget = target != null && target > 0;
+  const stage = thermalStage(v, target, key === "chamber");
   const el = document.createElement("span");
-  el.className = `temp ${state}`;
+  el.className = "tchip";
+  el.dataset.stage = stage;
   el.setAttribute("role", "img");
-  el.style.setProperty("--fill", hasTarget ? `${Math.min(100, (cur / target) * 100)}%` : "0%");
-  const words = { heating: "heating", hot: "at target", cooling: "cooling down", cold: "off" }[state];
-  el.title = `${name} ${Math.round(cur)}°C${hasTarget ? ` of ${Math.round(target)}°C` : ""}, ${words}`;
+  el.style.setProperty("--p", `${Math.min(100, (v / (hasTarget ? target : max)) * 100)}%`);
+  el.title = `${name} ${v} °C${hasTarget ? ` of ${Math.round(target)} °C` : ""}, ${STAGE_WORDS[stage]}`;
   el.setAttribute("aria-label", el.title);
-  const value = document.createElement("b");
-  value.textContent = `${Math.round(cur)}°`;
-  el.append(icon(iconId), value);
-  if (hasTarget) {
-    const small = document.createElement("small");
-    small.textContent = `/${Math.round(target)}`;
-    el.append(small);
-  }
+  const label = document.createElement("span");
+  label.className = "tl";
+  label.textContent = name;
+  const tg = document.createElement("span");
+  tg.className = "tg";
+  tg.textContent = hasTarget ? `/${Math.round(target)}` : "";
+  const tr = document.createElement("span");
+  tr.setAttribute("aria-hidden", "true");
+  setTrend(tr, sampleTrend(t, key, v));
+  el.append(icon(iconId), label, valEl(v, "°C", 3), tg, tr);
   return el;
 }
 
-// A vitals stat shows its value next to an icon; the title and label carry
-// the words.
-function setStat(el, value, words) {
-  el.textContent = value;
-  el.parentElement.hidden = !value;
-  el.parentElement.title = words;
-  if (words) el.parentElement.setAttribute("aria-label", words);
-  else el.parentElement.removeAttribute("aria-label");
-}
-// All fans in one chip: part · aux · chamber percentages, names in the
-// title. Hidden while every fan is off; the fill follows the fastest fan.
+// All fans in one chip: three mini bars (part · aux · chamber) and the
+// fastest fan's percent; names and values in the title.
 function fanChip(fans) {
   const list = [["Part cooling", fans?.part], ["Aux", fans?.aux], ["Chamber", fans?.chamber]]
     .filter(([, v]) => v != null);
+  if (!list.length) return null;
   const max = Math.max(0, ...list.map(([, v]) => v));
-  if (!(max > 0)) return null;
   const el = document.createElement("span");
-  el.className = "temp fan";
+  el.className = "tchip";
+  el.dataset.stage = max > 0 ? "fan" : "off";
   el.setAttribute("role", "img");
-  el.style.setProperty("--fill", `${Math.min(100, max)}%`);
-  el.title = `Fans · ${list.map(([n, v]) => `${n} ${v}%`).join(", ")}`;
-  el.setAttribute("aria-label", el.title);
-  const value = document.createElement("b");
-  value.textContent = list.map(([, v]) => v).join(" · ");
-  const unit = document.createElement("small");
-  unit.textContent = "%";
-  el.append(icon("i-fan"), value, unit);
-  return el;
-}
-// Cold heaters with no target: one chip with the warmest reading.
-function offChip(p) {
-  const readings = [["Nozzle", p.nozzle_temp], ["Bed", p.bed_temp], ["Chamber", p.chamber_temp]]
-    .filter(([, v]) => v != null);
-  const el = document.createElement("span");
-  el.className = "temp cold";
-  el.setAttribute("role", "img");
-  el.title = `Heaters off · ${readings.map(([n, v]) => `${n} ${Math.round(v)}°C`).join(", ")}`;
+  el.style.setProperty("--p", `${Math.min(100, max)}%`);
+  el.title = `Fans · ${list.map(([n, v]) => `${n} ${v} %`).join(", ")}`;
   el.setAttribute("aria-label", el.title);
   const label = document.createElement("span");
+  label.className = "tl";
+  label.textContent = "Fans";
+  const bw = 4, bars = svgEl("svg", { class: "fanbars", width: 16, height: 12, viewBox: "0 0 16 12", "aria-hidden": "true" });
+  list.forEach(([, v], i) => {
+    const bh = Math.max(1.5, (v / 100) * 12);
+    bars.append(svgEl("rect", { x: i * (bw + 2), y: (12 - bh).toFixed(1), width: bw, height: bh.toFixed(1), rx: 1,
+      fill: v > 0 ? "var(--fan)" : "var(--line)" }));
+  });
+  const tg = document.createElement("span");
+  tg.className = "tg";
+  const tr = document.createElement("span");
+  tr.className = "tr flat";
+  el.append(icon("i-fan"), label, bars, valEl(max, "%", 3), tg, tr);
+  return el;
+}
+// Cold heaters with no target: one full-width chip with every reading.
+function offChip(p) {
+  const readings = [["i-nozzle", "Nozzle", p.nozzle_temp], ["i-bed", "Bed", p.bed_temp], ["i-thermo", "Chamber", p.chamber_temp]]
+    .filter(([, , v]) => v != null);
+  const el = document.createElement("span");
+  el.className = "tchip off";
+  el.dataset.stage = "off";
+  el.setAttribute("role", "img");
+  el.title = `Heaters off · ${readings.map(([, n, v]) => `${n} ${Math.round(v)} °C`).join(", ")}`;
+  el.setAttribute("aria-label", el.title);
+  const label = document.createElement("span");
+  label.className = "tl";
   label.textContent = "Heaters off";
-  const value = document.createElement("b");
-  value.textContent = `${Math.round(Math.max(...readings.map(([, v]) => v)))}°`;
-  el.append(icon("i-thermo"), label, value);
+  el.append(icon("i-thermo"), label);
+  for (const [id, , v] of readings) el.append(icon(id), valEl(Math.round(v), "°C", 2));
   return el;
 }
 
@@ -1678,6 +1854,78 @@ function renderJobThumb(t, jp) {
   thumb.src = url;
 }
 
+// Headline column, by state: the number that matters (progress, or heat-up
+// while preparing; a word once the print is over), the layer meter, then
+// time left → end time on one line so related times read together. The
+// layer lives only here; the camera bar carries progress.
+function heatPct(p) {
+  const parts = [[p.nozzle_temp, p.nozzle_target], [p.bed_temp, p.bed_target]].filter(([v, tg]) => v != null && tg > 0);
+  return parts.length ? Math.max(0, Math.min(100, Math.round(Math.min(...parts.map(([v, tg]) => v / tg)) * 100))) : null;
+}
+function renderKpi(t, b, pct, progress, remain, reportAge) {
+  const p = t.data, r = t.r;
+  const main = r.kpiMain, sub = r.kpiSub;
+  main.replaceChildren();
+  main.classList.remove("word");
+  main.style.removeProperty("--kc");
+  const word = (iconId, text) => {
+    main.classList.add("word");
+    const span = document.createElement("span");
+    span.textContent = text;
+    main.append(icon(iconId), span);
+  };
+  const heat = b === "preparing" ? heatPct(p) : null;
+  if (heat != null) { main.append(valEl(heat, "%", 3)); main.style.setProperty("--kc", "var(--t-heat)"); }
+  else if (b === "finished") word("i-check", "Done");
+  else if (b === "failed") word("i-alert", "Failed");
+  else if (b === "idle") word("i-moon", "Ready");
+  else if (b === "offline") word("i-offline", "Offline");
+  else if (progress) main.append(valEl(pct, "%", 3));
+  main.title = heat != null ? `Heating up · ${heat} % of target temperatures` : progress ? `Progress ${pct} %` : "";
+
+  const layered = progress && b !== "finished" && p.layer_num != null && p.total_layers > 0;
+  r.kpiMeter.hidden = !layered && heat == null;
+  r.kpiLayer.replaceChildren();
+  if (layered) {
+    const color = b === "failed" ? "var(--failed)" : "var(--accent)";
+    if (r.kpiSegs.tagName.toLowerCase() !== "svg") r.kpiSegs.replaceWith(r.kpiSegs = svgEl("svg", { class: "segs", "aria-hidden": "true" }));
+    fillSegs(r.kpiSegs, p.layer_num, p.total_layers, color);
+    const n = document.createElement("b");
+    n.style.setProperty("--w", `${String(p.total_layers).length}ch`);
+    n.textContent = p.layer_num;
+    r.kpiLayer.append(icon("i-layers"), " ", n, `/${p.total_layers}`);
+    r.kpiMeter.title = `Layer ${p.layer_num} of ${p.total_layers}`;
+  } else if (heat != null) {
+    const bar = document.createElement("span");
+    bar.className = "mbar";
+    bar.style.cssText = `--p:${heat}%;--c:var(--t-heat);--bh:6px`;
+    bar.append(document.createElement("i"));
+    r.kpiSegs.replaceWith(r.kpiSegs = bar);
+    r.kpiLayer.textContent = "heat-up";
+    r.kpiMeter.title = "Heat-up toward target temperatures";
+  }
+
+  sub.replaceChildren();
+  const bold = (cls, text) => { const el = document.createElement("b"); if (cls) el.className = cls; el.textContent = text; return el; };
+  const link = text => { const el = document.createElement("span"); el.className = "link"; el.textContent = text; return el; };
+  const finish = fmtFinish(p.remaining_minutes);
+  if ((isActive(b) || b === "preparing") && remain) {
+    sub.append(icon("i-hourglass"), bold("dur", remain));
+    if (b === "paused") sub.append(" left");
+    else if (finish) sub.append(link("→"), icon("i-flag"), bold("clk", finish));
+    sub.title = `${remain} left${finish && b !== "paused" ? ` · done at ${finish}` : ""}`;
+  } else if (b === "failed" && progress) {
+    sub.append(bold("", `${pct} %`), " when stopped");
+    sub.title = "";
+  } else if (b === "stale" && reportAge != null) {
+    sub.append("no data for ", bold("", fmtAgo(reportAge).replace(" ago", "")));
+    sub.title = "";
+  } else if (b === "offline" && reportAge != null) {
+    sub.append("seen ", bold("", fmtAgo(reportAge)));
+    sub.title = "";
+  }
+}
+
 function renderTile(t) {
   const p = t.data, r = t.r, b = bucket(p), s = STATES[b];
   const pct = Math.max(0, Math.min(100, Math.round(p.progress || 0)));
@@ -1734,18 +1982,7 @@ function renderTile(t) {
   // and stale printers show how old their data is instead.
   const remain = fmtDuration(p.remaining_minutes);
   const reportAge = reportAgeOf(p) != null ? Math.round(reportAgeOf(p)) : null;
-  const layer = progress && p.layer_num != null && p.total_layers ? `L ${p.layer_num}/${p.total_layers}` : "";
-  r.kpiMain.textContent = progress && b !== "finished" ? `${pct}%` : "";
-  const parts = isActive(b) ? [layer, remain ? `${remain} left` : ""]
-    : b === "failed" && progress ? [layer, "when stopped"]
-    : b === "stale" ? [`No data for ${fmtAgo(reportAge).replace(" ago", "")}`]
-    : b === "offline" && reportAge != null ? [`Seen ${fmtAgo(reportAge)}`] : [];
-  r.kpiSub.replaceChildren(...parts.filter(Boolean).map(text => {
-    const span = document.createElement("span");
-    span.textContent = text;
-    return span;
-  }));
-  r.kpiSub.title = layer ? `Layer ${p.layer_num} of ${p.total_layers}` : "";
+  renderKpi(t, b, pct, progress, remain, reportAge);
 
   // Alerts stay visible at every detail level: they are why someone looks.
   // Compact and vitals show the top alert on one line; full detail replaces
@@ -1794,11 +2031,27 @@ function renderTile(t) {
     r.detect.dataset.old = String(!bd.off && detectOld(d));
     r.detect.dataset.processing = String(!bd.off && d.processing);
     r.detectUse.setAttribute("href", bd.off ? "#i-ai-off" : "#i-ai");
-    r.detectLabel.textContent = bd.label;
-    // Off and suspended results are history; never dress them up as
-    // current quality.
-    r.detectQ.textContent = !bd.off && !d.suspended && d.quality != null ? `${d.quality}/10` : "";
-    r.detect.setAttribute("aria-label", `AI print monitoring for ${nameOf(t)}`);
+    // Value mode: plain results and the first check show "AI", the score
+    // in percent, and its direction since the previous result. Flag states
+    // keep their words. Off and suspended results are history; never dress
+    // them up as current quality.
+    const valueMode = !bd.off && !d.suspended && (bd.label === "AI" || bd.label === "AI watching" || bd.label === "AI starting");
+    r.detect.dataset.mode = valueMode ? "value" : "label";
+    r.detectLabel.textContent = valueMode ? "AI" : bd.label;
+    const score = valueMode ? qualityPct(d.quality) : null;
+    // One history point per inspection result: a new result resets its age.
+    if (d.quality != null && (t.aiAge == null || d.age == null || d.age < t.aiAge)) {
+      t.aiHist.push(d.quality);
+      if (t.aiHist.length > 12) t.aiHist.shift();
+    }
+    t.aiAge = d.age;
+    const prev = t.aiHist.length > 1 ? t.aiHist.at(-2) : null;
+    const delta = score != null && prev != null ? d.quality - prev : 0;
+    r.detectQ.textContent = score ?? "--";
+    setTrend(r.detectTr, delta);
+    r.detect.style.setProperty("--p", `${score ?? 0}%`);
+    r.detect.setAttribute("aria-label", `AI print monitoring for ${nameOf(t)}` +
+      `${score != null ? `, score ${score} %${delta > 0 ? ", rising" : delta < 0 ? ", falling" : ""}` : ""}`);
     r.detect.setAttribute("aria-pressed", String(d.enabled !== false));
     r.detect.setAttribute("aria-busy", String(t.detPending === true));
     // The title carries the action and the override's lifetime; the
@@ -1829,47 +2082,70 @@ function renderTile(t) {
     } else {
       r.d2.dataset.tone = detectPausePending(d) || detectPauseUnconfirmed(d) ? "error"
         : detectPauseConfirmed(d) || d.warning || d.suspended ? "warn" : qualityTone(d.quality) || "";
-      r.d2q.textContent = d.quality != null ? `${d.quality}/10` : "";
+      // The score itself lives on the camera chip; vitals add its meaning.
+      r.d2q.textContent = "";
       const bits = [d.quality != null ? qualityWord(d.quality) : "no result yet"];
       if (d.layerNum != null) bits.push(`layer ${d.layerNum}`);
       if (d.age != null) bits.push(`checked ${fmtAgo(Math.round(d.age))}${detectOld(d) ? " · old" : ""}`);
       if (d.quality == null) bits.push(reasonWords(d) || d.message);
-      r.d2text.textContent = bits.join(" · ");
+      r.d2text.textContent = bits.filter(Boolean).join(" · ");
     }
   }
   const fact = d && d.state !== "idle" ? detectFact(d, b) : "";
   r.fDetectDt.hidden = r.fDetect.hidden = !fact;
   r.fDetect.textContent = fact;
   r.jobFacts.hidden = !fact;
-  // Archive-only results stay visible when the MQTT job name is absent.
-  r.jobSec.hidden = !job && !fact && !t.jobArchShown;
+  // The section shows only what the header does not: AI facts, the
+  // archive, or a failed print's start time.
+  r.jobSec.hidden = !fact && !t.jobArchShown && !(b === "failed" && p.started_at);
   const sig = detSig(d, b);
   if (t.detSig === undefined) t.detSig = sig;
   else if (sig !== t.detSig) { announceDetect(t, t.detSig, sig); t.detSig = sig; }
 
   t.el.style.setProperty("--pct", `${pct}%`);
-  r.camBar.hidden = !progress;
-  r.camBar.setAttribute("aria-valuenow", String(pct));
-  r.camBar.setAttribute("aria-label", `Print progress ${pct}%`);
-  // Progress and layer live on the camera bar and the headline; vitals add
-  // the clock time the print should end, the elapsed time, and the speed
-  // profile. Icons carry the meaning; titles carry the words.
-  const finish = isActive(b) ? fmtFinish(p.remaining_minutes) : "";
-  const started = isActive(b) && p.started_at ? new Date(p.started_at) : null;
-  const elapsed = started && !isNaN(started) ? fmtDuration((Date.now() - started.getTime()) / 60000) : "";
-  setStat(r.eta, finish, finish ? `Done at ${finish}` : "");
-  setStat(r.elapsed, elapsed, elapsed
-    ? `Elapsed ${elapsed} · Started ${started.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "");
+  // Preparing shows heat-up on the camera bar; the header names it.
+  const heat = b === "preparing" ? heatPct(p) : null;
+  const barPct = heat ?? pct;
+  r.camBar.style.setProperty("--pct", `${barPct}%`);
+  r.camBar.hidden = !progress && heat == null;
+  r.camBar.setAttribute("aria-valuenow", String(barPct));
+  r.camBar.setAttribute("aria-label", heat != null ? `Heat-up ${heat} %` : `Print progress ${pct} %`);
+  // Vitals: when the print started and how long it has run, together;
+  // time left and end time live in the headline. The speed control closes
+  // the vitals.
+  const started = (isActive(b) || b === "preparing") && p.started_at ? new Date(p.started_at) : null;
+  const startOk = !!started && !isNaN(started);
+  const elapsed = startOk ? fmtDuration((Date.now() - started.getTime()) / 60000) : "";
+  r.elText.replaceChildren();
+  if (startOk) {
+    const at = document.createElement("b");
+    at.textContent = started.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    r.elText.append("started ", at);
+    if (elapsed) {
+      const sep = document.createElement("span");
+      sep.className = "sep";
+      sep.textContent = "·";
+      const el = document.createElement("b");
+      el.textContent = elapsed;
+      r.elText.append(sep, el, b === "preparing" ? " preparing" : " elapsed");
+    }
+  }
+  r.elapsed.title = elapsed ? `Elapsed ${elapsed}` : "";
+  r.progressRow.hidden = !startOk;
   const controls = Array.isArray(p.controls) ? p.controls : [];
-  const speedOn = controls.includes("speed");
-  r.speedWrap.hidden = !speedOn;
-  r.speedWrap.dataset.profile = p.speed_profile || "";
-  if (speedOn && document.activeElement !== r.speed) r.speed.value = p.speed_profile || "";
-  r.speed.disabled = t.ctlPending;
-  r.speed.setAttribute("aria-label", `Speed profile for ${nameOf(t)}`);
-  r.speedPct.textContent = p.speed_percent != null ? `${p.speed_percent}%` : "";
-  r.speedWrap.title = `Speed ${p.speed_profile || "unknown"}${p.speed_percent != null ? ` · ${p.speed_percent}%` : ""}`;
-  r.progressRow.hidden = !finish && !elapsed && !speedOn;
+  r.speedSeg.hidden = !controls.includes("speed") || b === "offline";
+  r.speedSeg.setAttribute("aria-label", `Speed profile for ${nameOf(t)}`);
+  r.speedSeg.setAttribute("aria-busy", String(t.ctlPending === true));
+  const knownSpeed = SPEEDS.some(sp => sp.key === p.speed_profile);
+  for (const btn of r.speedSeg.children) {
+    const sp = SPEEDS.find(x => x.key === btn.dataset.profile);
+    const on = sp.key === p.speed_profile;
+    btn.setAttribute("aria-checked", String(on));
+    // Roving focus: the checked profile, or Standard when unknown.
+    btn.tabIndex = on || (!knownSpeed && sp.key === "standard") ? 0 : -1;
+    btn.lastChild.textContent = `${on && p.speed_percent != null ? p.speed_percent : sp.pct} %`;
+    btn.title = `${sp.label} speed`;
+  }
 
   // Printer controls: the server lists what the printer allows right now.
   const busy = String(t.ctlPending === true);
@@ -1891,17 +2167,24 @@ function renderTile(t) {
   r.ctlStop.title = "Emergency stop · cancels the print immediately";
   for (const btn of [r.ctlLight, r.ctlPause, r.ctlStop]) btn.setAttribute("aria-busy", busy);
 
-  // Thermal row: content-sized chips on one line. Cold heaters with no
-  // target collapse into a single "Heaters off" chip carrying the highest
-  // reading, so an idle printer spends one chip, not three.
+  // Thermal chips. Cold heaters with no target collapse into one
+  // "Heaters off" chip, so an idle printer spends one row, not two.
   const heatersOff = [p.nozzle_target, p.bed_target].every(v => !(v > 0)) &&
     [p.nozzle_temp, p.bed_temp].some(v => v != null) &&
     [p.nozzle_temp, p.bed_temp, p.chamber_temp].every(v => v == null || v <= 45);
-  const chips = (heatersOff ? [offChip(p)] : [
-    tempChip("i-nozzle", "Nozzle", p.nozzle_temp, p.nozzle_target),
-    tempChip("i-bed", "Bed", p.bed_temp, p.bed_target),
-    tempChip("i-thermo", "Chamber", p.chamber_temp, null),
-  ]).concat(fanChip(p.fans)).filter(Boolean);
+  // Trend samples keep flowing while the chips are collapsed.
+  if (heatersOff) {
+    for (const [k, v] of [["nozzle", p.nozzle_temp], ["bed", p.bed_temp], ["chamber", p.chamber_temp]]) {
+      sampleTrend(t, k, v == null ? null : Math.round(v));
+    }
+  }
+  // Offline printers report nothing live; old readings would read as current.
+  const chips = !p.connected ? [] : (heatersOff ? [offChip(p)] : [
+    tempChip(t, "nozzle", "i-nozzle", "Nozzle", p.nozzle_temp, p.nozzle_target, 300),
+    tempChip(t, "bed", "i-bed", "Bed", p.bed_temp, p.bed_target, 120),
+    tempChip(t, "chamber", "i-thermo", "Chamber", p.chamber_temp, null, 65),
+    fanChip(p.fans),
+  ]).filter(Boolean);
   if (chips.length) r.temps.replaceChildren(...chips);
   else {
     const none = document.createElement("span");
@@ -1910,28 +2193,36 @@ function renderTile(t) {
     r.temps.replaceChildren(none);
   }
 
-  // Full detail, print first: the job, then filament, printer, activity,
-  // and diagnostics last.
-  r.jobFull.textContent = job;
+  // Full detail, print first: the job, then filament, activity, and the
+  // printer's own facts last.
   const startedAll = p.started_at ? new Date(p.started_at) : null;
   const meta = [
-    startedAll && !isNaN(startedAll) && (jobLive || b === "failed")
+    // Running prints show their start in the vitals; a failed one only here.
+    startedAll && !isNaN(startedAll) && b === "failed"
       ? `Started ${startedAll.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "",
-    p.layer_num != null && p.total_layers && (jobLive || b === "failed") ? `layer ${p.layer_num} of ${p.total_layers}` : "",
-    !jobLive ? "last job" : "",
   ].filter(Boolean).join(" · ");
   r.jobMeta.textContent = meta;
+  r.jobSecMeta.textContent = jobLive ? "" : "last job";
   r.jobMeta.hidden = !meta;
   const nozzle = [p.nozzle_diameter != null ? `${p.nozzle_diameter} mm` : "",
     p.nozzle_type ? p.nozzle_type.replaceAll("_", " ") : ""].filter(Boolean).join(" · ");
   r.fNozzle.textContent = nozzle;
   r.dtNozzle.hidden = r.fNozzle.hidden = !nozzle;
-  r.printerSec.hidden = !nozzle;
+  r.diagMeta.textContent = p.name ? p.model || "" : "";
   const wifi = p.wifi_signal_dbm;
   const bars = wifi == null ? 0 : wifi >= -55 ? 3 : wifi >= -70 ? 2 : 1;
   r.dtWifi.hidden = r.fWifi.hidden = !bars;
-  r.fWifi.textContent = bars ? `${wifi} dBm` : "";
-  r.fWifi.dataset.bars = bars ? String(bars) : "";
+  r.fWifi.replaceChildren();
+  if (bars) {
+    // Signal bars: strong green, fair amber, weak red.
+    const c = ["", "var(--failed)", "var(--paused)", "var(--printing)"][bars];
+    const svg = svgEl("svg", { width: 13, height: 12, viewBox: "0 0 13 12", "aria-hidden": "true" });
+    for (let i = 0; i < 3; i++) {
+      svg.append(svgEl("rect", { x: i * 4.5, y: 12 - (i + 1) * 4, width: 3, height: (i + 1) * 4, rx: .6,
+        fill: i < bars ? c : "var(--line)" }));
+    }
+    r.fWifi.append(svg, valEl(wifi, "dBm", 3));
+  }
   r.fWifi.title = bars ? `Wi-Fi signal ${["", "weak", "fair", "strong"][bars]}` : "";
   const sd = typeof p.sd_card === "boolean" ? p.sd_card : null;
   r.dtSd.hidden = r.fSd.hidden = sd == null;
