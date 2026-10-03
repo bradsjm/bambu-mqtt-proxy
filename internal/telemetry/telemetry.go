@@ -271,7 +271,7 @@ func collectActivityEvents(before activitySnapshot, st *State) []activityRecord 
 		filename = " · " + st.Filename
 	}
 	if st.PrintingState != "" && before.state == "" {
-		add("state_initial", activity.Info, "Printer was "+strings.ToLower(st.PrintingState)+" when first observed"+filename)
+		add("state_initial", activity.Info, "Print first observedstate "+strings.ToLower(st.PrintingState)+filename)
 	} else if st.sessionGen > before.sessionGen {
 		add("print_started", activity.Info, "Print started"+filename)
 	} else if st.PrintingState != before.state {
