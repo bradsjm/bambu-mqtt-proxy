@@ -357,6 +357,12 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
             <span class="env" data-env="detection_api_key" hidden></span></div>
           <div class="control"><input id="f-ai-key" type="password" autocomplete="new-password" spellcheck="false" data-field="detection.api_key"></div>
         </div>
+        <div class="row">
+          <div><span class="label">Test API key</span>
+            <span class="hint">Asks OctoEverywhere to create one context, proving the key works. No images are uploaded; the provider may associate this key with your public IP.</span></div>
+          <div class="control"><button class="btn quiet" type="button" id="ai-test">Test API key</button>
+            <span id="ai-test-status" role="status" aria-live="polite"></span></div>
+        </div>
       </fieldset>
     </div>
   </section>
@@ -450,8 +456,10 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
       <label class="check"><input id="p-skip" type="checkbox"><span>Skip certificate check<span class="hint">Printers use self-signed certificates, so this is normally on.</span></span></label>
     </details>
     <p class="dlg-error" id="dlg-error" role="alert" hidden></p>
+    <p class="hint" id="p-test-status" role="status" aria-live="polite" hidden></p>
     <div class="dlg-foot">
       <button class="btn quiet" type="button" id="dlg-cancel">Cancel</button>
+      <button class="btn" type="button" id="p-test">Test connection</button>
       <button class="btn primary" type="submit" id="dlg-ok">Add printer</button>
     </div>
   </form>
@@ -615,6 +623,8 @@ function aiHints() {
 
 function render() {
   renderFile(); renderNotices(); renderPlates(); renderListeners(); renderFields(); refreshDirty();
+  invalidatePrinterTest();
+  invalidateAiTest();
 }
 
 /* ---- Change tracking and the save bar ---- */
@@ -730,12 +740,14 @@ function openPrinter(i) {
   const p = i >= 0 ? cfg.printers[i] : { serial: "", name: "", model: "", address: "", tls: true, insecure_skip_verify: true, username: "bblp", has_access_code: false };
   $("#dlg-title").textContent = i >= 0 ? `Edit ${p.name || p.serial}` : "Add printer";
   $("#dlg-ok").textContent = i >= 0 ? "Update printer" : "Add printer";
+  $("#p-test").hidden = i >= 0;   // the test connects to a new destination only
   $("#p-serial").value = p.serial; $("#p-name").value = p.name; $("#p-model").value = p.model;
   $("#p-address").value = p.address; $("#p-code").value = p.access_code || "";
   $("#p-user").value = p.username; $("#p-tls").checked = p.tls; $("#p-skip").checked = p.insecure_skip_verify;
   $("#p-model").placeholder = "Detected from serial";
   $("#p-more").open = false;
   $("#dlg-error").hidden = true;
+  invalidatePrinterTest();
   codeHint();
   dlg.showModal();
   $(i >= 0 ? "#p-name" : "#p-serial").focus();
@@ -799,6 +811,64 @@ $("#dlg-form").addEventListener("submit", submitPrinter);
 $("#dlg-cancel").addEventListener("click", () => dlg.close());
 $("#p-address").addEventListener("input", codeHint);
 
+/* ---- Printer connection test: one bounded connect with the draft
+   settings, no subscriptions and no commands. Any input change or dialog
+   close invalidates the run — aborting the request — so a late answer
+   never lands anywhere. ---- */
+let pTestSeq = 0, pTestAbort = null;
+function invalidatePrinterTest() {
+  pTestSeq++;
+  if (pTestAbort) { pTestAbort.abort(); pTestAbort = null; }
+  const b = $("#p-test"), out = $("#p-test-status");
+  b.disabled = false;
+  out.hidden = true;
+  out.textContent = "";
+}
+for (const id of ["p-serial", "p-address", "p-code", "p-user", "p-tls", "p-skip"]) {
+  $("#" + id).addEventListener("input", invalidatePrinterTest);
+}
+dlg.addEventListener("close", invalidatePrinterTest);
+$("#p-test").addEventListener("click", async () => {
+  const fail = (msg, el) => { $("#dlg-error").textContent = msg; $("#dlg-error").hidden = false; el.focus(); };
+  const serial = $("#p-serial").value.trim().toUpperCase();
+  const address = $("#p-address").value.trim();
+  const code = $("#p-code").value;
+  if (!serial) return fail("Enter the printer's serial number.", $("#p-serial"));
+  if (!address) return fail("Enter the printer's address, for example 192.168.1.42:8883.", $("#p-address"));
+  if (!code && codeNeeded()) return fail("Enter the printer's access code.", $("#p-code"));
+  const b = $("#p-test"), out = $("#p-test-status");
+  const seq = ++pTestSeq;
+  const abort = new AbortController();
+  pTestAbort = abort;
+  b.disabled = true;
+  out.hidden = false;
+  out.textContent = "Connecting…";
+  try {
+    const res = await fetch("/config/printers/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: abort.signal,
+      body: JSON.stringify({
+        serial, name: $("#p-name").value.trim(), model: $("#p-model").value.trim(), address,
+        tls: $("#p-tls").checked, insecure_skip_verify: $("#p-skip").checked,
+        username: $("#p-user").value.trim() || "bblp",
+        has_access_code: false, access_code: code,
+      }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (seq !== pTestSeq || !dlg.open) return;   // superseded inputs or a closed dialog
+    out.textContent = res.ok
+      ? "Connected. The printer accepted the username and access code."
+      : body.error || `The test failed with status ${res.status}.`;
+  } catch {
+    if (seq !== pTestSeq || !dlg.open) return;
+    out.textContent = "The proxy could not be reached.";
+  } finally {
+    if (pTestAbort === abort) pTestAbort = null;
+    if (seq === pTestSeq) b.disabled = false;
+  }
+});
+
 $("#main").addEventListener("input", e => {
   const el = e.target;
   if (el.dataset.field) {
@@ -833,6 +903,45 @@ $("#notify-test").addEventListener("click", async () => {
     out.textContent = "The proxy could not be reached.";
   } finally {
     b.disabled = false;
+  }
+});
+
+/* ---- Gadget API key test: one free CreateContext call, no images. The
+   button works with detection off; changing the key field, reloading, or
+   discarding invalidates the result and aborts a request in flight. ---- */
+let aiTestSeq = 0, aiTestAbort = null;
+function invalidateAiTest() {
+  aiTestSeq++;
+  if (aiTestAbort) { aiTestAbort.abort(); aiTestAbort = null; }
+  $("#ai-test").disabled = false;
+  $("#ai-test-status").textContent = "";
+}
+$("#f-ai-key").addEventListener("input", invalidateAiTest);
+$("#ai-test").addEventListener("click", async () => {
+  const b = $("#ai-test"), out = $("#ai-test-status");
+  const seq = ++aiTestSeq;
+  const abort = new AbortController();
+  aiTestAbort = abort;
+  b.disabled = true;
+  out.textContent = "Checking…";
+  try {
+    const res = await fetch("/config/detection/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: abort.signal,
+      body: JSON.stringify(cfg.detection),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (seq !== aiTestSeq) return;   // the key changed while checking
+    out.textContent = res.ok
+      ? "Key verified. OctoEverywhere accepted it and created a context; no images were uploaded."
+      : body.error || `The test failed with status ${res.status}.`;
+  } catch {
+    if (seq !== aiTestSeq) return;
+    out.textContent = "The proxy could not be reached.";
+  } finally {
+    if (aiTestAbort === abort) aiTestAbort = null;
+    if (seq === aiTestSeq) b.disabled = false;
   }
 });
 $("#listeners").addEventListener("click", e => {

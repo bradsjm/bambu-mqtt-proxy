@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -22,6 +23,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"bambu-mqtt-proxy/internal/config"
+	"bambu-mqtt-proxy/internal/detection"
 	"bambu-mqtt-proxy/internal/notification"
 )
 
@@ -48,6 +50,12 @@ type Store struct {
 	rename  func(string, string) error
 	// sendTest delivers the /config test notification; replaced by tests.
 	sendTest func(context.Context, config.Notifications, string, string, []byte) error
+	// probePrinter performs the /config printer connection test; replaced
+	// by tests.
+	probePrinter func(context.Context, config.Printer) error
+	// probeDetection performs the /config Gadget API key test; replaced by
+	// tests.
+	probeDetection func(context.Context, string) error
 
 	mu         sync.Mutex
 	generation uint64
@@ -59,10 +67,16 @@ type Store struct {
 // NewStore returns a store for the YAML file at path.
 func NewStore(path string) *Store {
 	return &Store{
-		path:     path,
-		rename:   os.Rename,
-		reloads:  make(chan Reload, 1),
-		sendTest: notification.Send,
+		path:         path,
+		rename:       os.Rename,
+		reloads:      make(chan Reload, 1),
+		sendTest:     notification.Send,
+		probePrinter: probePrinterConn,
+		probeDetection: func(ctx context.Context, key string) error {
+			// The session is discarded: the test never processes frames.
+			_, err := detection.NewGadgetClient(key).CreateContext(ctx)
+			return err
+		},
 	}
 }
 
@@ -98,9 +112,10 @@ func (s *Store) Restore(r Reload) error {
 }
 
 // Register adds GET /config (page), GET /config/api (settings),
-// PUT /config/api (save and apply), and POST /config/notifications/test
-// (one test notification). Writes are protected against cross-origin
-// browser requests.
+// PUT /config/api (save and apply), POST /config/notifications/test
+// (one test notification), POST /config/printers/test (one draft printer
+// connection test), and POST /config/detection/test (one Gadget API key
+// check). Writes are protected against cross-origin browser requests.
 func (s *Store) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /config", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -111,6 +126,8 @@ func (s *Store) Register(mux *http.ServeMux) {
 	protection := http.NewCrossOriginProtection()
 	mux.Handle("PUT /config/api", protection.Handler(http.HandlerFunc(s.handlePut)))
 	mux.Handle("POST /config/notifications/test", protection.Handler(http.HandlerFunc(s.handleNotificationTest)))
+	mux.Handle("POST /config/printers/test", protection.Handler(http.HandlerFunc(s.handlePrinterTest)))
+	mux.Handle("POST /config/detection/test", protection.Handler(http.HandlerFunc(s.handleDetectionTest)))
 }
 
 // View is the editable configuration exchanged with the page.
@@ -325,6 +342,174 @@ func (s *Store) handleNotificationTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"sent": true})
+}
+
+// handlePrinterTest performs one bounded MQTT connect with the submitted
+// draft printer settings and reports connectivity or authentication — it
+// never verifies the serial, never subscribes, never publishes, and never
+// saves. The application flow: decode the draft, reject settings that
+// cannot run, reject destinations that a configured printer already owns
+// (the test must not disturb a configured printer), then make exactly one
+// connect attempt with a unique client id under a fixed timeout. Passing
+// the test stays optional: saving and adding work exactly as before.
+func (s *Store) handlePrinterTest(w http.ResponseWriter, r *http.Request) {
+	var in PrinterView
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, "The settings could not be read: "+err.Error())
+		return
+	}
+	p := config.Printer{
+		Serial:             strings.TrimSpace(in.Serial),
+		Address:            strings.TrimSpace(in.Address),
+		TLS:                in.TLS,
+		InsecureSkipVerify: in.InsecureSkipVerify,
+		Username:           strings.TrimSpace(in.Username),
+		Password:           in.AccessCode,
+	}
+	if p.Username == "" {
+		p.Username = "bblp"
+	}
+	if p.Serial == "" {
+		writeError(w, http.StatusUnprocessableEntity, "Enter the printer's serial number.")
+		return
+	}
+	if p.Address == "" {
+		writeError(w, http.StatusUnprocessableEntity, "Enter the printer's address, for example 192.168.1.42:8883.")
+		return
+	}
+	if strings.Contains(p.Address, "://") {
+		writeError(w, http.StatusUnprocessableEntity, "Enter the address without a scheme, for example 192.168.1.42:8883.")
+		return
+	}
+	// URL delimiters never belong in a host:port. Without this check a
+	// userinfo or path fragment would reach the dialer or a URL parser and
+	// send the test somewhere the user did not type.
+	if strings.ContainsAny(p.Address, "/?#@") {
+		writeError(w, http.StatusUnprocessableEntity, "Enter the address as host:port, for example 192.168.1.42:8883.")
+		return
+	}
+	// The port must be explicit and numeric: paho would otherwise dial the
+	// plain-MQTT default port 1883, which no Bambu printer serves.
+	host, port, err := net.SplitHostPort(p.Address)
+	if n, perr := strconv.Atoi(port); err != nil || host == "" || perr != nil || n < 1 || n > 65535 {
+		writeError(w, http.StatusUnprocessableEntity, "Enter the address as host:port, for example 192.168.1.42:8883.")
+		return
+	}
+	if p.Password == "" {
+		writeError(w, http.StatusUnprocessableEntity, "Enter the printer's access code.")
+		return
+	}
+	// A simple rejection, no alias resolution: a test connect may never
+	// touch a destination a configured printer already owns, so both the
+	// serial and the address are refused when they match the effective
+	// configuration (stored file printers with the BMBPX_* environment
+	// applied, exactly as startup resolves them).
+	configured, err := s.effectivePrinters()
+	if err != nil {
+		// Fail closed: without the configured list the proxy cannot tell
+		// whether the destination belongs to a configured printer, and the
+		// test must never disturb one.
+		writeError(w, http.StatusInternalServerError, "The configured printers could not be read, so the proxy cannot tell whether this destination is already configured. "+err.Error())
+		return
+	}
+	for _, c := range configured {
+		if strings.EqualFold(c.Serial, p.Serial) {
+			writeError(w, http.StatusConflict, fmt.Sprintf("Printer %s is already configured. Test is only available for new printers.", c.Serial))
+			return
+		}
+		if c.Address == p.Address {
+			writeError(w, http.StatusConflict, fmt.Sprintf("Address %s is already used by printer %s.", p.Address, c.Serial))
+			return
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), testConnectTimeout)
+	defer cancel()
+	if err := s.probePrinter(ctx, p); err != nil {
+		writeError(w, http.StatusBadGateway, classifyProbeError(err, p.Address))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleDetectionTest verifies one Gadget API key with a single
+// CreateContext request — the same free call the detection engine makes
+// before any print exists — and nothing else: no Process call, no image,
+// no engine. The application flow: the submitted key wins, a blank
+// submission falls back to the stored file key, and an existing
+// BMBPX_OCTOEVERYWHERE_API_KEY overrides both, even when set-but-empty,
+// exactly like startup. Nothing is saved.
+func (s *Store) handleDetectionTest(w http.ResponseWriter, r *http.Request) {
+	var in DetectionView
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, "The settings could not be read: "+err.Error())
+		return
+	}
+
+	key := strings.TrimSpace(in.APIKey)
+	if key == "" {
+		raw, existed, err := readFile(s.path)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if existed {
+			// An unreadable file has no stored key to fall back on.
+			if cur, perr := config.Parse(raw); perr == nil {
+				key = cur.Detection.APIKey
+			}
+		}
+	}
+	// Presence, not value: an empty environment variable clears the stored
+	// key, so an existing variable always decides, like ApplyEnv.
+	if v, ok := os.LookupEnv(config.EnvOctoEverywhereAPIKey); ok {
+		key = strings.TrimSpace(v)
+	}
+	if key == "" {
+		if _, ok := os.LookupEnv(config.EnvOctoEverywhereAPIKey); ok {
+			writeError(w, http.StatusUnprocessableEntity, config.EnvOctoEverywhereAPIKey+" is set but empty, so there is no key to test. Set the variable to a valid key.")
+			return
+		}
+		writeError(w, http.StatusUnprocessableEntity, "No Gadget API key is configured. Enter a key or set "+config.EnvOctoEverywhereAPIKey+".")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), detectionTestTimeout)
+	defer cancel()
+	if err := s.probeDetection(ctx, key); err != nil {
+		writeError(w, http.StatusBadGateway, classifyDetectionError(err))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// effectivePrinters returns the printers a test connect must stay away
+// from: the stored file list when the file parses, with the BMBPX_*
+// environment applied as startup would — BMBPX_PRINTERS replaces the list
+// entirely when set. Read, parse, and environment failures are errors, so
+// the caller can fail closed instead of testing against an empty list.
+func (s *Store) effectivePrinters() ([]config.Printer, error) {
+	var ps []config.Printer
+	raw, existed, err := readFile(s.path)
+	if err != nil {
+		return nil, err
+	}
+	if existed {
+		c, perr := config.Parse(raw)
+		if perr != nil {
+			return nil, perr
+		}
+		ps = c.Printers
+	}
+	c := &config.Config{Printers: ps}
+	if _, aerr := c.ApplyEnv(); aerr != nil {
+		return nil, aerr
+	}
+	return c.Printers, nil
 }
 
 // check validates the file as written, both on its own and with the
