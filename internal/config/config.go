@@ -4,6 +4,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -92,6 +93,12 @@ type Printer struct {
 	InsecureSkipVerify bool   `yaml:"insecure_skip_verify"`
 	Username           string `yaml:"username"`
 	Password           string `yaml:"password"`
+	// PandaBreath is the optional WebSocket address of a Panda Breath
+	// accessory chamber sensor, for example ws://panda-breath-blue.iot/ws.
+	// It supplies the chamber temperature display for models without a
+	// physical chamber sensor (see ChamberTemperatureSupported); it never
+	// affects MQTT routing. Empty disables the observer for the printer.
+	PandaBreath string `yaml:"panda_breath,omitempty"`
 }
 
 // Behavior holds routing and upstream connection tuning knobs.
@@ -449,7 +456,8 @@ func (c *Config) ApplyEnv() (bool, error) {
 
 // parsePrintersEnv parses the BMBPX_PRINTERS format: printer entries
 // separated by ';', each a comma-separated key=value list with keys serial,
-// address, name, model, password, username, tls, insecure_skip_verify.
+// address, name, model, panda_breath, password, username, tls,
+// insecure_skip_verify.
 func parsePrintersEnv(v string) ([]Printer, error) {
 	var out []Printer
 	for _, entry := range strings.Split(v, ";") {
@@ -487,6 +495,8 @@ func parsePrinterEntry(entry string) (Printer, error) {
 			p.Name = strings.TrimSpace(val)
 		case "model":
 			p.Model = val
+		case "panda_breath":
+			p.PandaBreath = strings.TrimSpace(val)
 		case "password":
 			p.Password = val
 		case "username":
@@ -583,6 +593,12 @@ func (c *Config) Validate() error {
 		}
 		if p.Password == "" {
 			return fmt.Errorf("printers[%d] (%s): password (LAN access code) is required", i, p.Serial)
+		}
+		if breath := strings.TrimSpace(p.PandaBreath); breath != "" {
+			u, err := url.Parse(breath)
+			if err != nil || (u.Scheme != "ws" && u.Scheme != "wss") || u.Host == "" || u.User != nil || u.Fragment != "" {
+				return fmt.Errorf("printers[%d] (%s): panda_breath %q must be a ws:// or wss:// URL with a host and no credentials or fragment", i, p.Serial, breath)
+			}
 		}
 	}
 	if c.Behavior.UpstreamKeepaliveSeconds <= 0 ||

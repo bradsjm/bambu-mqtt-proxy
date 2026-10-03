@@ -74,6 +74,15 @@ type State struct {
 	Timelapse            *bool
 	FirstLayerInspection *bool
 	SpaghettiDetection   *bool
+	// BreathChamberTemp and BreathChamberAt are the accessory chamber
+	// reading (Panda Breath) stamped onto State copies at read time by the
+	// optional chamber source. They are display-only: mergeReport never
+	// writes them, and they never refresh the report sequence, freshness,
+	// activity, or detection state, nor the native ChamberTemp. Nil means
+	// nothing was observed; consumers decide freshness from
+	// BreathChamberAt against their own clock.
+	BreathChamberTemp *float64
+	BreathChamberAt   time.Time
 
 	// Detection session bookkeeping. Not display state: these fields track
 	// the current print session for the optional OctoEverywhere detection
@@ -142,13 +151,14 @@ func (a HMSAlert) Severity() string {
 
 // Cache stores merged state for every configured printer.
 type Cache struct {
-	mu         sync.Mutex
-	activityMu sync.Mutex // keeps activity events in report-merge order
-	states     map[string]*State
-	watch      map[string]chan struct{}
-	seq        atomic.Uint64
-	log        *slog.Logger
-	activity   *activity.Log // optional recent-event log
+	mu          sync.Mutex
+	activityMu  sync.Mutex // keeps activity events in report-merge order
+	states      map[string]*State
+	watch       map[string]chan struct{}
+	seq         atomic.Uint64
+	log         *slog.Logger
+	activity    *activity.Log                                             // optional recent-event log
+	chamberRead func(serial string) (temp float64, at time.Time, ok bool) // optional accessory chamber reader (pandabreath.Store.ChamberReading)
 	// now is the preview-job timing clock. Production uses time.Now;
 	// package-local preview-job tests replace it to drive gap and settling
 	// boundaries deterministically. Detection timing stays on time.Now.
@@ -169,6 +179,29 @@ func NewCache(printers []config.Printer, log *slog.Logger) *Cache {
 // reports.
 func (c *Cache) SetActivity(log *activity.Log) {
 	c.activity = log
+}
+
+// SetChamberReader attaches the optional accessory chamber reader, observed
+// outside the MQTT report stream (the Panda Breath observer's
+// ChamberReading). It returns the latest reading and its observation time;
+// ok is false before the first accepted reading, and consumers decide
+// freshness from the observation time. Call during wiring, before the
+// first Snapshot or State read. The reader must never call back into the
+// Cache: the accessors hold the cache mutex while stamping.
+func (c *Cache) SetChamberReader(read func(serial string) (temp float64, at time.Time, ok bool)) {
+	c.chamberRead = read
+}
+
+// stampBreath copies the accessory chamber reading from the optional source
+// onto a State copy. The caller holds c.mu; the source keeps its own
+// synchronization and never calls back into the Cache.
+func (c *Cache) stampBreath(s *State) {
+	if c.chamberRead == nil {
+		return
+	}
+	if temp, at, ok := c.chamberRead(s.Serial); ok {
+		s.BreathChamberTemp, s.BreathChamberAt = &temp, at
+	}
 }
 
 // obsSeqBase starts the cache-assigned sequence space far above the pool's
@@ -469,7 +502,9 @@ func (c *Cache) Snapshot() []State {
 	defer c.mu.Unlock()
 	out := make([]State, 0, len(c.states))
 	for _, st := range c.states {
-		out = append(out, *st)
+		s := *st
+		c.stampBreath(&s)
+		out = append(out, s)
 	}
 	return out
 }
@@ -483,7 +518,9 @@ func (c *Cache) State(serial string) (State, bool) {
 	if !ok {
 		return State{}, false
 	}
-	return *st, true
+	s := *st
+	c.stampBreath(&s)
+	return s, true
 }
 
 // mergeReport applies one report payload onto st and reports whether the

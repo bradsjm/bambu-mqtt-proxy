@@ -28,6 +28,7 @@ import (
 	"bambu-mqtt-proxy/internal/jobpreview"
 	"bambu-mqtt-proxy/internal/mcpserver"
 	"bambu-mqtt-proxy/internal/notification"
+	"bambu-mqtt-proxy/internal/pandabreath"
 	"bambu-mqtt-proxy/internal/routing"
 	"bambu-mqtt-proxy/internal/telemetry"
 	"bambu-mqtt-proxy/internal/upstream"
@@ -120,6 +121,17 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	// detection can never treat a pre-reconnect observation as current.
 	state := telemetry.NewCache(cfg.Printers, logger)
 	state.SetActivity(activities)
+	// Panda Breath accessory chamber readings: one read-only WebSocket per
+	// printer configured with a panda_breath address, for models whose
+	// reports carry no usable chamber sensor. The wall and MCP project the
+	// reading through the telemetry cache, so the observer runs
+	// independently of the camera feature; with the shared HTTP listener
+	// off nothing can serve a projection and no device connection opens.
+	var breath *pandabreath.Store
+	if cfg.HTTP.Port > 0 {
+		breath = pandabreath.New(cfg.Printers, logger)
+		state.SetChamberReader(breath.ChamberReading)
+	}
 	// Printer controls: the only allow-listed path from the camera wall and
 	// MCP to printer commands. No heater or temperature command exists.
 	controls := control.New(pool, state, activities)
@@ -262,6 +274,9 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		if previews != nil {
 			previews.Close()
 		}
+		if breath != nil {
+			breath.Stop()
+		}
 		if raw != nil {
 			raw.Close()
 		}
@@ -280,6 +295,14 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	// closes it on the single shutdown path.
 	if previews != nil {
 		previews.Start()
+	}
+
+	// The Panda Breath observers connect to the accessory devices, not to
+	// the broker or the printers, so they start on the same post-teardown
+	// path as the preview scheduler and stop on the single shutdown path
+	// above.
+	if breath != nil {
+		breath.Start()
 	}
 
 	// Raw camera endpoint: the camera feature keeps its printer-compatible

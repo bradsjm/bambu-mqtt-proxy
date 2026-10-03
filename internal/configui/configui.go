@@ -158,9 +158,13 @@ type DetectionView struct {
 // PrinterView is one printer. AccessCode is accepted on save and never
 // returned; PreviousSerial names the stored printer an edit started from.
 type PrinterView struct {
-	Serial             string `json:"serial"`
-	Name               string `json:"name"`
-	Model              string `json:"model"`
+	Serial string `json:"serial"`
+	Name   string `json:"name"`
+	Model  string `json:"model"`
+	// PandaBreath is the optional Panda Breath sensor WebSocket address.
+	// Plain data, unlike the access code: the API returns it and a blank
+	// submitted value clears it.
+	PandaBreath        string `json:"panda_breath"`
 	Address            string `json:"address"`
 	TLS                bool   `json:"tls"`
 	InsecureSkipVerify bool   `json:"insecure_skip_verify"`
@@ -586,6 +590,7 @@ func toView(c *config.Config) View {
 			Serial:             p.Serial,
 			Name:               p.Name,
 			Model:              p.Model,
+			PandaBreath:        p.PandaBreath,
 			Address:            p.Address,
 			TLS:                p.TLS,
 			InsecureSkipVerify: p.InsecureSkipVerify,
@@ -662,6 +667,7 @@ func (v View) toConfig(stored *config.Config) (*config.Config, error) {
 			Serial:             strings.TrimSpace(p.Serial),
 			Name:               strings.TrimSpace(p.Name),
 			Model:              strings.TrimSpace(p.Model),
+			PandaBreath:        strings.TrimSpace(p.PandaBreath),
 			Address:            strings.TrimSpace(p.Address),
 			TLS:                p.TLS,
 			InsecureSkipVerify: p.InsecureSkipVerify,

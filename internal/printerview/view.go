@@ -152,8 +152,16 @@ func Build(st telemetry.State, sv telemetry.SessionView, connected bool, current
 		name := speedProfiles[*p-1]
 		v.SpeedProfile = &name
 	}
-	if config.ChamberTemperatureSupported(st.Model, st.Serial) {
+	// Native chamber temperature: only models with a physical sensor
+	// project the report value, resolved through DisplayModel so the same
+	// model inference that names the printer also decides the sensor (a
+	// model-less RTSPS-prefix serial is an X1-class printer with a real
+	// sensor). Without a native sensor, a fresh Panda Breath accessory
+	// reading fills the same field; the native sensor always wins.
+	if config.ChamberTemperatureSupported(config.DisplayModel(st.Model, st.Serial), st.Serial) {
 		v.ChamberTemp = st.ChamberTemp
+	} else if st.BreathChamberTemp != nil && now.Sub(st.BreathChamberAt) <= FreshnessWindow {
+		v.ChamberTemp = st.BreathChamberTemp
 	}
 	if st.PrintError != 0 {
 		code := uint32(st.PrintError)
