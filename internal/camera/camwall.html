@@ -354,19 +354,14 @@ body.kiosk .bar { display: none; }
 .act-msg { min-width: 0; overflow-wrap: anywhere; }
 .act-ago { min-width: 6ch; text-align: right; color: var(--faint); font-size: .7rem; font-variant-numeric: tabular-nums; }
 .act-empty { margin: 0; color: var(--dim); font-size: .78rem; }
-/* Filament overview (full detail only): one spool strip per AMS unit, drawn
-   in SVG — the same drawing for every AMS model. Fill height is the
-   remaining estimate; the active slot has a green outline and number. The
-   external spool joins the first strip after a dashed rule. */
+/* Filament overview (full detail only): one illustrated unit per AMS row —
+   dome, spools, feeders, humidity and temperature badges — drawn in SVG, the
+   same drawing for every AMS model. Fill height is the remaining estimate;
+   a green plate outline and feeder LED mark the active slot. The external
+   spool hangs beside the first unit with the same spool drawing. */
 .ams-units { display: grid; gap: .5rem; }
-.ams-unit { display: grid; gap: .35rem; }
-.ams-unit-head { display: flex; align-items: center; gap: .4rem; font-size: .74rem; color: var(--dim); }
-.ams-unit-name { font-weight: 650; color: var(--text); margin-right: auto; }
-.badge { display: inline-flex; align-items: center; gap: .25rem; padding: .08rem .45rem; border-radius: 999px;
-         background: var(--bg); border: 1px solid var(--line); font-size: .7rem; color: var(--text); }
-.badge .ic { font-size: .8rem; }
-.badge.rh .ic { color: var(--preparing); }
-.badge.tc .ic { color: var(--failed); }
+.ams-row { display: flex; gap: 6px; align-items: flex-start; }
+.ams-row > div { min-width: 0; }
 svg.ams-svg { display: block; width: 100%; height: auto; }
 .ams-svg text { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; font-variant-numeric: tabular-nums; }
 .ams-note { margin: .35rem 0 0; color: var(--faint); font-size: .74rem; }
@@ -1276,9 +1271,11 @@ const stageWords = s => {
   const words = s.replaceAll("_", " ");
   return words.charAt(0).toUpperCase() + words.slice(1);
 };
-// Filament overview (full detail): one spool strip per AMS unit, the same
-// SVG drawing for every AMS model, with the external spool after a dashed
-// rule in the first strip. Occupancy labels stay honest: "Empty" only for a
+// Filament overview (full detail): one illustrated unit per AMS — dome,
+// spools, feeders, humidity and temperature badges — the same SVG drawing for
+// every AMS model, with the external spool drawn beside the first unit.
+// Every row shares one scale, so spools keep one size whatever the slot
+// count. Occupancy labels stay honest: "Empty" only for a
 // resolved-empty slot, "Unknown" for a slot the printer never reported or
 // loaded without reported material. Offline and stale printers keep showing
 // their last known spools, so the section notes that. Every string from the
@@ -1298,62 +1295,98 @@ function renderAMS(t) {
   if (key === t.amsKey) return;
   t.amsKey = key;
   const extTitle = sensor == null ? "" : ` · sensor ${sensor ? "detects filament" : "detects no filament"}`;
-  const kids = units.map((u, i) => amsUnit(
-    `AMS ${typeof u.id === "number" ? u.id + 1 : i + 1}`, u.humidity ?? null, u.temp ?? null,
-    Array.isArray(u.slots) ? u.slots : [], i === 0 ? ext : null, extTitle));
-  if (!units.length && ext) kids.push(amsUnit("External spool", null, null, [], ext, extTitle));
+  const kids = units.map((u, i) => {
+    const unit = amsUnitSvg(`AMS ${typeof u.id === "number" ? u.id + 1 : i + 1}`, u.humidity ?? null, u.temp ?? null,
+      Array.isArray(u.slots) ? u.slots : []);
+    return amsRow(i === 0 && ext ? [unit, extSvg(ext, extTitle)] : [unit]);
+  });
+  if (!units.length && ext) kids.push(amsRow([extSvg(ext, extTitle)]));
   t.r.amsSec.hidden = !kids.length;
   t.r.amsUnits.replaceChildren(...kids);
   t.r.amsMeta.textContent = [units.length ? `${units.length} AMS` : "", ext ? "ext" : ""].filter(Boolean).join(" + ");
   t.r.amsNote.hidden = !note;
   t.r.amsNote.textContent = note;
 }
-const SPOOL_W = 62;
+// Slot pitch inside a unit, and the reference row width (a four-slot unit
+// plus the external spool) that fixes one scale for every row.
+const AMS_PITCH = 72, AMS_ROW_W = 404, EXT_W = 84;
 function spoolColor(s) {
   return typeof s.color === "string" && /^[0-9a-fA-F]{8}$/.test(s.color) ? `#${s.color.slice(0, 6)}` : "";
 }
-// One AMS unit: a heading with humidity and temperature badges over a strip
-// of spool drawings.
-function amsUnit(name, humidity, temp, slots, ext, extTitle) {
-  const box = document.createElement("div");
-  box.className = "ams-unit";
-  const head = document.createElement("div");
-  head.className = "ams-unit-head";
-  const label = document.createElement("span");
-  label.className = "ams-unit-name";
-  label.textContent = name;
-  head.append(label);
-  const badge = (cls, iconId, n, unit, w, title) => {
-    const el = document.createElement("span");
-    el.className = `badge ${cls}`;
-    el.title = title;
-    el.append(icon(iconId), valEl(n, unit, w));
-    return el;
-  };
-  if (humidity != null) head.append(badge("rh", "i-drop", humidity, "%", 2, `AMS humidity ${humidity} %`));
-  if (temp != null) head.append(badge("tc", "i-thermo", Math.round(temp), "°C", 2, `AMS temperature ${Math.round(temp)} °C`));
-  const cols = slots.length + (ext ? 1 : 0), gap = slots.length && ext ? 10 : 0;
-  const w = cols * SPOOL_W + gap;
-  const svg = svgEl("svg", { class: "ams-svg", viewBox: `0 0 ${w} 86`, role: "img" });
-  // Strips keep the same spool size whatever the slot count or tile width.
-  svg.style.maxWidth = `${(w / SPOOL_W) * 4.6}rem`;
-  const words = [];
-  slots.forEach((sl, j) => {
-    const num = ((sl && sl.id) ?? j) + 1;
-    svg.append(spoolG(31 + j * SPOOL_W, sl, String(num), ""));
-    words.push(slotWords(sl, `Slot ${num}`));
-  });
-  if (ext) {
-    if (slots.length) {
-      const x = slots.length * SPOOL_W + gap / 2;
-      svg.append(svgEl("path", { d: `M${x} 6V70`, stroke: "var(--line)", "stroke-dasharray": "3 3" }));
-    }
-    svg.append(spoolG(slots.length * SPOOL_W + gap + 31, ext, "Ext", extTitle));
-    words.push(slotWords(ext, "External spool") + extTitle);
+// One row of drawings, each [viewBox width, svg]; widths map onto the shared
+// reference row so every drawing renders at the same scale.
+function amsRow(parts) {
+  const row = document.createElement("div");
+  row.className = "ams-row";
+  for (const [w, svg] of parts) {
+    const cell = document.createElement("div");
+    cell.style.flex = `0 1 ${(w / AMS_ROW_W * 100).toFixed(2)}%`;
+    cell.append(svg);
+    row.append(cell);
   }
-  svg.setAttribute("aria-label", `${name}: ${words.join("; ")}`);
-  box.append(head, svg);
-  return box;
+  return row;
+}
+// A pill badge drawn inside the unit SVG: drop or thermometer icon plus value.
+function amsBadge(x, w, kind, text, title) {
+  const g = svgEl("g");
+  const y = 150;
+  const glyph = kind === "drop"
+    ? svgEl("path", { d: `M${x + 13} ${y + 6}c0 0 4.5 4.6 4.5 7.4a4.5 4.5 0 0 1-9 0c0-2.8 4.5-7.4 4.5-7.4z`, fill: "var(--preparing)" })
+    : svgEl("path", { d: `M${x + 14.5} ${y + 13.5}V${y + 7.5}a1.5 1.5 0 0 0-3 0v6a3 3 0 1 0 3 0z`, fill: "var(--failed)" });
+  g.append(svgEl("title", {}, title),
+    svgEl("rect", { x, y, width: w, height: 24, rx: 12, fill: "var(--bg)", stroke: "#2f363f" }), glyph,
+    svgEl("text", { x: x + 22, y: y + 16, fill: "var(--text)", "font-size": 10.5, "font-weight": 600 }, text));
+  return g;
+}
+// One AMS unit: dome with name, one spool per slot, a feeder per slot with
+// its number and an LED lit for the active slot, and humidity and
+// temperature badges below. Narrow units (AMS HT) keep room for both badges.
+function amsUnitSvg(name, humidity, temp, slots) {
+  const n = Math.max(1, slots.length);
+  const w = Math.max(32 + n * AMS_PITCH, 176);
+  const x0 = (w - (n - 1) * AMS_PITCH) / 2;
+  const svg = svgEl("svg", { class: "ams-svg", viewBox: `0 0 ${w} 178`, role: "img" });
+  svg.append(
+    svgEl("rect", { x: 6, y: 4, width: w - 12, height: 120, rx: 28, fill: "rgb(255 255 255 / .045)", stroke: "rgb(255 255 255 / .16)" }),
+    svgEl("path", { d: `M34 9H${w - 34}`, stroke: "rgb(255 255 255 / .13)", "stroke-width": 2, "stroke-linecap": "round" }),
+    svgEl("text", { x: 24, y: 22, fill: "var(--dim)", "font-size": 9.5, "font-weight": 700, "letter-spacing": ".08em" }, name.toUpperCase()));
+  const words = [];
+  const feeders = [];
+  slots.forEach((sl, j) => {
+    const num = String(((sl && sl.id) ?? j) + 1), cx = x0 + j * AMS_PITCH;
+    svg.append(spoolG(cx, sl, `Slot ${num}`, ""));
+    words.push(slotWords(sl, `Slot ${num}`));
+    feeders.push(
+      svgEl("rect", { x: cx - 14, y: 124, width: 28, height: 22, rx: 4, fill: "#363d46" }),
+      svgEl("text", { x: cx, y: 139, "text-anchor": "middle", fill: "var(--dim)", "font-size": 10, "font-weight": 600 }, num),
+      svgEl("circle", { cx: cx + 9, cy: 128.5, r: 2, fill: sl?.active === true ? "var(--printing)" : "#4b535e" }));
+  });
+  svg.append(svgEl("rect", { x: 0, y: 118, width: w, height: 38, rx: 8, fill: "#20252c", stroke: "#2f363f" }), ...feeders);
+  const parts = [];
+  if (humidity != null) {
+    svg.append(amsBadge(4, 56, "drop", `${humidity} %`, `AMS humidity ${humidity} %`));
+    parts.push(`humidity ${humidity} %`);
+  }
+  if (temp != null) {
+    const c = Math.round(temp);
+    svg.append(amsBadge(w - 76, 72, "thermo", `${c} °C`, `AMS temperature ${c} °C`));
+    parts.push(`${c} °C`);
+  }
+  svg.setAttribute("aria-label", `${[name, ...parts].join(", ")}: ${words.join("; ") || "no slots reported"}`);
+  return [w, svg];
+}
+// The external spool: a holder above the same spool drawing, on a base
+// labelled EXT (green while it feeds the print).
+function extSvg(ext, extTitle) {
+  const svg = svgEl("svg", { class: "ams-svg", viewBox: `0 0 ${EXT_W} 178`, role: "img" });
+  svg.append(
+    svgEl("rect", { x: 38, y: 4, width: 8, height: 24, rx: 2, fill: "#2f363f" }),
+    spoolG(42, ext, "External spool", extTitle),
+    svgEl("rect", { x: 4, y: 118, width: 76, height: 38, rx: 8, fill: "#20252c", stroke: "#2f363f" }),
+    svgEl("text", { x: 42, y: 141, "text-anchor": "middle", "font-size": 10, "font-weight": 700, "letter-spacing": ".08em",
+      fill: ext.active === true ? "var(--printing)" : "var(--dim)" }, "EXT"));
+  svg.setAttribute("aria-label", slotWords(ext, "External spool") + extTitle);
+  return [EXT_W, svg];
 }
 function slotWords(s, label) {
   s = s && typeof s === "object" ? s : {};
@@ -1362,12 +1395,12 @@ function slotWords(s, label) {
     s.active === true ? "active" : ""].filter(Boolean).join(", ");
 }
 // One spool: two flanges, the filament colour filled to the remaining
-// estimate, a plate with material and percent, and the slot number below.
-function spoolG(cx, s, num, extra) {
+// estimate, and a plate with material and percent, outlined green when active.
+function spoolG(cx, s, label, extra) {
   s = s && typeof s === "object" ? s : {};
-  const y = 4, w = 54, h = 64, x = cx - w / 2, fl = 7;
+  const y = 28, w = 62, h = 86, x = cx - w / 2, fl = 7;
   const g = svgEl("g");
-  g.append(svgEl("title", {}, slotWords(s, num === "Ext" ? "External spool" : `Slot ${num}`) + (extra || "")));
+  g.append(svgEl("title", {}, slotWords(s, label) + (extra || "")));
   const active = s.active === true;
   if (s.loaded === false) {
     g.append(svgEl("rect", { x, y, width: w, height: h, rx: 6, fill: "none", stroke: "var(--faint)", "stroke-dasharray": "4 3" }),
@@ -1382,19 +1415,17 @@ function spoolG(cx, s, num, extra) {
     for (const fx of [x, x + w - fl]) {
       g.append(svgEl("rect", { x: fx, y, width: fl, height: h, rx: 3, fill: "#2c323a", stroke: "#3b424c" }));
     }
-    const ph = remain == null ? 18 : 32, mid = y + h / 2;
-    const plate = svgEl("rect", { x: cx - 25, y: mid - ph / 2, width: 50, height: ph, rx: 5, fill: "rgb(8 10 13 / .62)" });
+    const ph = remain == null ? 18 : 30, mid = y + h / 2;
+    const plate = svgEl("rect", { x: cx - 27, y: mid - ph / 2 - 2, width: 54, height: ph, rx: 5, fill: "rgb(8 10 13 / .62)" });
     if (active) { plate.setAttribute("stroke", "var(--printing)"); plate.setAttribute("stroke-width", "2"); }
     const mat = String(s.material || "Unknown");
-    g.append(plate, svgEl("text", { x: cx, y: mid + (remain == null ? 4 : -3), "text-anchor": "middle",
-      fill: "#fff", "font-size": 10.5, "font-weight": 700 }, mat.length > 8 ? `${mat.slice(0, 7)}…` : mat));
+    g.append(plate, svgEl("text", { x: cx, y: mid + (remain == null ? 2 : -1), "text-anchor": "middle",
+      fill: "#fff", "font-size": 11, "font-weight": 700 }, mat.length > 8 ? `${mat.slice(0, 7)}…` : mat));
     if (remain != null) {
-      g.append(svgEl("text", { x: cx, y: mid + 10, "text-anchor": "middle", "font-size": 9.5, "font-weight": 600,
+      g.append(svgEl("text", { x: cx, y: mid + 11, "text-anchor": "middle", "font-size": 10, "font-weight": 600,
         fill: remain < 20 ? "var(--paused)" : "rgb(230 235 240 / .75)" }, `${remain} %`));
     }
   }
-  g.append(svgEl("text", { x: cx, y: 82, "text-anchor": "middle", "font-size": 10, "font-weight": 600,
-    fill: active ? "var(--printing)" : "var(--dim)" }, num));
   return g;
 }
 // Vitals level: the one slot feeding the print, when the printer reports an
