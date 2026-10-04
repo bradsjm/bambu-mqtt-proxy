@@ -355,9 +355,11 @@ body.kiosk .bar { display: none; }
 .act-ago { min-width: 6ch; text-align: right; color: var(--faint); font-size: .7rem; font-variant-numeric: tabular-nums; }
 .act-empty { margin: 0; color: var(--dim); font-size: .78rem; }
 /* Filament overview (full detail only): one spool strip per AMS unit, drawn
-   in SVG — the same drawing for every AMS model. Fill height is the
-   remaining estimate; the active slot has a green outline and number. The
-   external spool joins the first strip after a dashed rule. */
+   in SVG — the same drawing for every AMS model. Spools are edge-on: the
+   filament band around the hub is the remaining estimate. Each spool has a
+   numbered feeder tag whose LED is green (pulsing) when active and red when
+   an HMS alert names that slot. The external spool joins the first strip
+   after a dashed rule. */
 .ams-units { display: grid; gap: .5rem; }
 .ams-unit { display: grid; gap: .35rem; }
 .ams-unit-head { display: flex; align-items: center; gap: .4rem; font-size: .74rem; color: var(--dim); }
@@ -369,6 +371,9 @@ body.kiosk .bar { display: none; }
 .badge.tc .ic { color: var(--failed); }
 svg.ams-svg { display: block; width: 100%; height: auto; }
 .ams-svg text { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; font-variant-numeric: tabular-nums; }
+.ams-svg .lbl { paint-order: stroke; stroke: rgb(6 8 10 / .78); stroke-width: 2.6px; stroke-linejoin: round; text-anchor: middle; }
+.ams-svg .led-pulse { transform-box: fill-box; transform-origin: center; animation: led-pulse 2s ease-in-out infinite; }
+@keyframes led-pulse { 0%, 100% { opacity: .15; transform: scale(.7); } 50% { opacity: .55; transform: scale(1); } }
 .ams-note { margin: .35rem 0 0; color: var(--faint); font-size: .74rem; }
 /* The filament feeding the print, on one line at vitals level. Full detail
    marks it in the filament grid instead. */
@@ -1294,27 +1299,68 @@ function renderAMS(t) {
       : b === "stale" ? "Last known · no recent data" : ""
     : "";
   renderActiveFilament(t, units, ext, b);
-  const key = JSON.stringify([units, ext, sensor, note]);
+  const faults = slotFaults(p);
+  const key = JSON.stringify([units, ext, sensor, note, [...faults]]);
   if (key === t.amsKey) return;
   t.amsKey = key;
   const extTitle = sensor == null ? "" : ` · sensor ${sensor ? "detects filament" : "detects no filament"}`;
-  const kids = units.map((u, i) => amsUnit(
-    `AMS ${typeof u.id === "number" ? u.id + 1 : i + 1}`, u.humidity ?? null, u.temp ?? null,
-    Array.isArray(u.slots) ? u.slots : [], i === 0 ? ext : null, extTitle));
-  if (!units.length && ext) kids.push(amsUnit("External spool", null, null, [], ext, extTitle));
+  const kids = units.map((u, i) => {
+    const id = typeof u.id === "number" ? u.id : i;
+    return amsUnit(`AMS ${id + 1}`, u.humidity ?? null, u.temp ?? null,
+      Array.isArray(u.slots) ? u.slots : [], i === 0 ? ext : null, extTitle, j => faults.has(`${id}:${j}`));
+  });
+  if (!units.length && ext) kids.push(amsUnit("External spool", null, null, [], ext, extTitle, () => false));
   t.r.amsSec.hidden = !kids.length;
   t.r.amsUnits.replaceChildren(...kids);
   t.r.amsMeta.textContent = [units.length ? `${units.length} AMS` : "", ext ? "ext" : ""].filter(Boolean).join(" + ");
   t.r.amsNote.hidden = !note;
   t.r.amsNote.textContent = note;
 }
+// AMS slot faults from HMS alerts. AMS codes name their slot in the attribute:
+// HMS_07UU_2S00_… is unit UU, slot S (e.g. HMS_0700_2300_0002_0001, AMS 1
+// slot 4 ran out). Other modules and unit-wide codes mark no slot.
+function slotFaults(p) {
+  const out = new Set();
+  for (const h of Array.isArray(p.hms) ? p.hms : []) {
+    const m = /^HMS_07([0-9A-F]{2})_2([0-3])00_/.exec(h?.id || "");
+    if (m) out.add(`${parseInt(m[1], 16)}:${m[2]}`);
+  }
+  return out;
+}
 const SPOOL_W = 62;
 function spoolColor(s) {
   return typeof s.color === "string" && /^[0-9a-fA-F]{8}$/.test(s.color) ? `#${s.color.slice(0, 6)}` : "";
 }
+// Active outline tint: dark filament colours lift toward white (same hue) so
+// the border stays visible on the dark tile.
+function outlineColor(hex) {
+  if (!hex) return "var(--printing)";
+  const [r, g, b] = [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16) / 255)
+    .map(v => v <= .04045 ? v / 12.92 : ((v + .055) / 1.055) ** 2.4);
+  const lift = Math.round(Math.max(0, (.3 - (.2126 * r + .7152 * g + .0722 * b)) / .3 * 65));
+  return lift ? `color-mix(in oklab, ${hex}, #fff ${lift}%)` : hex;
+}
+// Shared paint for one strip: cylinder shading, flange plastic, and the
+// winding texture. Ids are unique per strip so several strips coexist.
+let amsUid = 0;
+function amsDefs(p) {
+  const defs = svgEl("defs");
+  const grad = (id, x2, y2, stops) => {
+    const g = svgEl("linearGradient", { id: `${p}-${id}`, x1: 0, y1: 0, x2, y2 });
+    for (const [o, c, a] of stops) g.append(svgEl("stop", { offset: o, "stop-color": c, "stop-opacity": a }));
+    return g;
+  };
+  const wind = svgEl("pattern", { id: `${p}-wind`, width: 2.4, height: 6, patternUnits: "userSpaceOnUse", patternTransform: "skewX(-8)" });
+  wind.append(svgEl("path", { d: "M.6 0V6", stroke: "#000", "stroke-opacity": .2, "stroke-width": .7 }));
+  defs.append(
+    grad("cyl", 0, 1, [[0, "#000", .5], [.22, "#fff", .22], [.4, "#fff", 0], [.78, "#000", .12], [1, "#000", .55]]),
+    grad("fl", 1, 0, [[0, "#464e59", 1], [.45, "#2f353d", 1], [1, "#1f242a", 1]]),
+    wind);
+  return defs;
+}
 // One AMS unit: a heading with humidity and temperature badges over a strip
-// of spool drawings.
-function amsUnit(name, humidity, temp, slots, ext, extTitle) {
+// of spool drawings with their feeder tags.
+function amsUnit(name, humidity, temp, slots, ext, extTitle, faulted) {
   const box = document.createElement("div");
   box.className = "ams-unit";
   const head = document.createElement("div");
@@ -1337,64 +1383,84 @@ function amsUnit(name, humidity, temp, slots, ext, extTitle) {
   const svg = svgEl("svg", { class: "ams-svg", viewBox: `0 0 ${w} 86`, role: "img" });
   // Strips keep the same spool size whatever the slot count or tile width.
   svg.style.maxWidth = `${(w / SPOOL_W) * 4.6}rem`;
+  const p = `ams${++amsUid}`;
+  svg.append(amsDefs(p));
   const words = [];
   slots.forEach((sl, j) => {
-    const num = ((sl && sl.id) ?? j) + 1;
-    svg.append(spoolG(31 + j * SPOOL_W, sl, String(num), ""));
-    words.push(slotWords(sl, `Slot ${num}`));
+    const id = (sl && sl.id) ?? j, fault = faulted(id);
+    svg.append(spoolG(p, 31 + j * SPOOL_W, sl, String(id + 1), "", fault));
+    words.push(slotWords(sl, `Slot ${id + 1}`, fault));
   });
   if (ext) {
     if (slots.length) {
       const x = slots.length * SPOOL_W + gap / 2;
-      svg.append(svgEl("path", { d: `M${x} 6V70`, stroke: "var(--line)", "stroke-dasharray": "3 3" }));
+      svg.append(svgEl("path", { d: `M${x} 6V82`, stroke: "var(--line)", "stroke-dasharray": "3 3" }));
     }
-    svg.append(spoolG(slots.length * SPOOL_W + gap + 31, ext, "Ext", extTitle));
+    svg.append(spoolG(p, slots.length * SPOOL_W + gap + 31, ext, "Ext", extTitle, false));
     words.push(slotWords(ext, "External spool") + extTitle);
   }
   svg.setAttribute("aria-label", `${name}: ${words.join("; ")}`);
   box.append(head, svg);
   return box;
 }
-function slotWords(s, label) {
+function slotWords(s, label, fault) {
   s = s && typeof s === "object" ? s : {};
-  if (s.loaded === false) return `${label} empty`;
+  if (s.loaded === false) return `${label} empty${fault ? ", error" : ""}`;
   return [label, s.material || "unknown material", Number.isFinite(s.remain) ? `${s.remain} % left` : "",
-    s.active === true ? "active" : ""].filter(Boolean).join(", ");
+    s.active === true ? "active" : "", fault ? "error" : ""].filter(Boolean).join(", ");
 }
-// One spool: two flanges, the filament colour filled to the remaining
-// estimate, a plate with material and percent, and the slot number below.
-function spoolG(cx, s, num, extra) {
+// One edge-on spool: shaded flanges, the hub, and the filament wound around
+// it with band thickness following the remaining estimate (full when
+// unknown); haloed material and percent labels; and the feeder tag below.
+// A fault outlines it red, otherwise the active spool takes its own colour.
+function spoolG(p, cx, s, num, extra, fault) {
   s = s && typeof s === "object" ? s : {};
-  const y = 4, w = 54, h = 64, x = cx - w / 2, fl = 7;
+  const y = 3, w = 54, h = 60, x = cx - w / 2, fl = 6, mid = y + h / 2;
   const g = svgEl("g");
-  g.append(svgEl("title", {}, slotWords(s, num === "Ext" ? "External spool" : `Slot ${num}`) + (extra || "")));
+  g.append(svgEl("title", {}, slotWords(s, num === "Ext" ? "External spool" : `Slot ${num}`, fault) + (extra || "")));
   const active = s.active === true;
+  const st = fault ? "error" : active ? "active" : "";
   if (s.loaded === false) {
-    g.append(svgEl("rect", { x, y, width: w, height: h, rx: 6, fill: "none", stroke: "var(--faint)", "stroke-dasharray": "4 3" }),
-      svgEl("text", { x: cx, y: y + h / 2 + 4, "text-anchor": "middle", fill: "var(--faint)", "font-size": 10 }, "Empty"));
+    g.append(svgEl("rect", { x, y, width: w, height: h, rx: 5, fill: "none", stroke: fault ? "var(--failed)" : "var(--faint)", "stroke-dasharray": "4 3" }),
+      svgEl("text", { x: cx, y: mid + 4, "text-anchor": "middle", fill: "var(--faint)", "font-size": 10 }, "Empty"));
   } else {
-    const color = spoolColor(s) || "var(--faint)";
+    const hex = spoolColor(s), color = hex || "var(--faint)";
     const remain = Number.isFinite(s.remain) ? Math.max(0, Math.min(100, s.remain)) : null;
-    const ix = x + fl, iw = w - fl * 2, iy = y + 3, ih = h - 6, fh = ih * (remain ?? 100) / 100;
-    const back = svgEl("rect", { x: ix, y: iy, width: iw, height: ih, fill: color });
-    back.style.opacity = ".2";
-    g.append(back, svgEl("rect", { x: ix, y: (iy + ih - fh).toFixed(1), width: iw, height: fh.toFixed(1), fill: color }));
-    for (const fx of [x, x + w - fl]) {
-      g.append(svgEl("rect", { x: fx, y, width: fl, height: h, rx: 3, fill: "#2c323a", stroke: "#3b424c" }));
+    const ix = x + fl, iw = w - fl * 2, rim = h - 6, hub = rim * .22, band = hub + (rim - hub) * (remain ?? 100) / 100;
+    const ring = st === "error" ? "var(--failed)" : st === "active" ? outlineColor(hex) : "";
+    if (ring) {
+      const o = svgEl("rect", { x: x - 2.5, y: y - 2.5, width: w + 5, height: h + 5, rx: 5, stroke: ring, "stroke-width": 1.2 });
+      o.style.fill = `color-mix(in srgb, ${ring} 10%, transparent)`;
+      g.append(o);
     }
-    const ph = remain == null ? 18 : 32, mid = y + h / 2;
-    const plate = svgEl("rect", { x: cx - 25, y: mid - ph / 2, width: 50, height: ph, rx: 5, fill: "rgb(8 10 13 / .62)" });
-    if (active) { plate.setAttribute("stroke", "var(--printing)"); plate.setAttribute("stroke-width", "2"); }
+    const wrap = (hgt, fill) => svgEl("rect", { x: ix, y: (mid - hgt / 2).toFixed(1), width: iw, height: hgt.toFixed(1), fill });
+    g.append(svgEl("rect", { x: ix, y: y + 3, width: iw, height: rim, fill: "#0d1014" }),
+      wrap(hub, "#5a5148"), wrap(hub, `url(#${p}-cyl)`));
+    if (band > hub) g.append(wrap(band, color), wrap(band, `url(#${p}-wind)`), wrap(band, `url(#${p}-cyl)`));
+    for (const fx of [x, x + w - fl]) {
+      g.append(svgEl("rect", { x: fx, y, width: fl, height: h, rx: 2.5, fill: `url(#${p}-fl)`, stroke: "#3b424c", "stroke-width": .75 }));
+    }
+    g.append(svgEl("path", { d: `M${x + 1.6} ${y + 4}V${y + h - 4}M${x + w - fl + 1.6} ${y + 4}V${y + h - 4}`,
+      stroke: "rgb(255 255 255 / .14)", "stroke-linecap": "round" }));
     const mat = String(s.material || "Unknown");
-    g.append(plate, svgEl("text", { x: cx, y: mid + (remain == null ? 4 : -3), "text-anchor": "middle",
-      fill: "#fff", "font-size": 10.5, "font-weight": 700 }, mat.length > 8 ? `${mat.slice(0, 7)}…` : mat));
+    g.append(svgEl("text", { class: "lbl", x: cx, y: mid + (remain == null ? 3.5 : -2), fill: "#fff",
+      "font-size": mat.length > 4 ? 8.5 : 10, "font-weight": 700 }, mat.length > 8 ? `${mat.slice(0, 7)}…` : mat));
     if (remain != null) {
-      g.append(svgEl("text", { x: cx, y: mid + 10, "text-anchor": "middle", "font-size": 9.5, "font-weight": 600,
-        fill: remain < 20 ? "var(--paused)" : "rgb(230 235 240 / .75)" }, `${remain} %`));
+      g.append(svgEl("text", { class: "lbl", x: cx, y: mid + 9, "font-size": 9, "font-weight": 650,
+        fill: fault ? "#ff8a8a" : remain < 20 ? "var(--paused)" : "#fff" }, `${remain} %`));
     }
   }
-  g.append(svgEl("text", { x: cx, y: 82, "text-anchor": "middle", "font-size": 10, "font-weight": 600,
-    fill: active ? "var(--printing)" : "var(--dim)" }, num));
+  // Feeder tag: number box with a status LED; the active LED's glow pulses.
+  const ty = 70, led = st === "error" ? "var(--failed)" : st === "active" ? "var(--printing)" : "#4b535e", wide = num.length > 1;
+  g.append(svgEl("rect", { x: cx - 16, y: ty, width: 32, height: 14, rx: 3.5, fill: "#262c34", stroke: "#363e48" }),
+    svgEl("text", { x: wide ? cx - 5.5 : cx - 4, y: ty + 10.5, "text-anchor": "middle", "font-size": wide ? 8.5 : 9.5,
+      "font-weight": 650, fill: st ? "var(--text)" : "var(--dim)" }, num));
+  if (st) {
+    const glow = svgEl("circle", { cx: cx + 8.5, cy: ty + 7, r: 4.6, fill: led, opacity: .3 });
+    if (st === "active") glow.setAttribute("class", "led-pulse");
+    g.append(glow);
+  }
+  g.append(svgEl("circle", { cx: cx + 8.5, cy: ty + 7, r: 2.4, fill: led }));
   return g;
 }
 // Vitals level: the one slot feeding the print, when the printer reports an
