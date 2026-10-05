@@ -69,8 +69,10 @@ type Store struct {
 	log     *slog.Logger // process logger; frames never reach it
 	targets []target     // printers configured with a Panda Breath address
 
-	mu       sync.Mutex         // guards readings
-	readings map[string]reading // latest accepted reading per serial
+	mu        sync.Mutex           // guards readings, history, and connected
+	readings  map[string]reading   // latest accepted reading per serial
+	history   map[string][]reading // spaced recent readings per serial, oldest first, for the trend
+	connected map[string]bool      // whether the device WebSocket is open, per serial
 
 	cancel context.CancelFunc // set by Start; nil before it and after Stop
 	done   chan struct{}      // closed when the observers have returned
@@ -80,7 +82,8 @@ type Store struct {
 // address. Printers without an address get no connection; a store with no
 // configured device starts nothing.
 func New(printers []config.Printer, log *slog.Logger) *Store {
-	s := &Store{log: log, readings: make(map[string]reading)}
+	s := &Store{log: log, readings: make(map[string]reading),
+		history: make(map[string][]reading), connected: make(map[string]bool)}
 	for _, p := range printers {
 		if addr := strings.TrimSpace(p.PandaBreath); addr != "" {
 			s.targets = append(s.targets, target{serial: p.Serial, addr: addr})
@@ -229,6 +232,8 @@ func (s *Store) connect(ctx context.Context, t target) (bool, string) {
 	}()
 	// Discard the response: its headers belong to the device, not the log.
 	s.log.Info("panda breath connected", "serial", t.serial)
+	s.setConnected(t.serial, true)
+	defer s.setConnected(t.serial, false)
 	conn.SetReadLimit(maxFrameBytes)
 	gotReading := false
 	for {
@@ -241,8 +246,10 @@ func (s *Store) connect(ctx context.Context, t target) (bool, string) {
 		}
 		if temp, ok := warehouseTemper(data); ok {
 			gotReading = true
+			r := reading{temp: temp, at: time.Now()}
 			s.mu.Lock()
-			s.readings[t.serial] = reading{temp: temp, at: time.Now()}
+			s.readings[t.serial] = r
+			s.history[t.serial] = keepSample(s.history[t.serial], r)
 			s.mu.Unlock()
 		}
 	}
