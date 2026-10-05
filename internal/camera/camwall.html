@@ -200,6 +200,22 @@ body.kiosk .bar { display: none; }
 .tile[data-state="preparing"] .cam-progress { --bar: var(--t-heat); }
 .tile[data-state="failed"] .cam-progress > div { opacity: .55; box-shadow: none; }
 .cam-progress[hidden] { display: none; }
+/* Module overlay: display-only glass pills right-aligned under the feed
+   pill, clear of the state, feed, and AI pills, the controls, and the
+   progress bar. Pills wrap to at most two rows; a pill that would start a
+   third row is clipped, and a long reading truncates on its own row. A
+   short camera-less stage grows just enough to keep both rows apart from
+   the bottom pills. */
+.mod-overlay { position: absolute; z-index: 4; top: 2.5rem; left: .55rem; right: .55rem; display: flex;
+               flex-wrap: wrap; justify-content: flex-end; gap: .35rem; max-height: 3.55rem; overflow: hidden;
+               pointer-events: none; }
+.cam:has(> .mod-overlay:not([hidden])) { min-height: 9rem; }
+.pill.mod { position: static; flex: 0 1 auto; max-width: min(16rem, 100%); color: var(--tone, var(--dim));
+            border: 1px solid color-mix(in srgb, var(--tone, var(--dim)) 45%, transparent); }
+.pill.mod .mod-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+:is(.pill.mod, .mod-sec dd)[data-tone="calm"] { --tone: var(--printing); }
+:is(.pill.mod, .mod-sec dd)[data-tone="info"], :is(.pill.mod, .mod-sec dd)[data-tone="warn"] { --tone: var(--paused); }
+:is(.pill.mod, .mod-sec dd)[data-tone="error"] { --tone: var(--failed); }
 /* Printer controls sit on the camera stage at every detail level, above the
    focus button and the progress bar. */
 .ctl-bar { position: absolute; z-index: 5; right: .55rem; bottom: .6rem; display: flex; gap: .35rem; }
@@ -397,6 +413,13 @@ svg.ams-svg { display: block; width: 100%; height: auto; }
 .level:hover { background: var(--panel-2); color: var(--text); }
 .level .ic { transition: rotate .3s var(--ease); }
 .tile[data-level="3"] .level .ic { rotate: 180deg; }
+/* Module panels: details sections shown from their own level up. Labels
+   take at most 45% of the row so long untrusted text keeps its value. */
+.mod-host { display: grid; gap: .45rem; }
+.mod-l1 { margin-top: .45rem; }
+.mod-sec .facts { grid-template-columns: fit-content(45%) minmax(0, 1fr); }
+.mod-sec h3 span, .mod-sec .facts dt { min-width: 0; overflow-wrap: anywhere; }
+.mod-sec .facts dd[data-tone] { color: var(--tone, var(--text)); }
 
 /* Smooth expand: rows animate between 0fr and 1fr. */
 .more { display: grid; grid-template-rows: 0fr; opacity: 0;
@@ -642,6 +665,7 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
       <span class="pill state"><svg class="ic" aria-hidden="true"><use/></svg><span class="label"></span><span class="stage" hidden></span></span>
       <span class="pill feed" hidden><span class="dot" aria-hidden="true"></span><svg class="ic" aria-hidden="true"><use href="#i-camera"/></svg><span class="feed-label"></span></span>
       <button class="pill detect" type="button" hidden><svg class="ic" aria-hidden="true"><use href="#i-ai"/></svg><span class="label"></span><span class="val q"><b></b><small>%</small></span><span class="tr" aria-hidden="true"></span></button>
+      <div class="mod-overlay" role="list" aria-label="Module readings" hidden></div>
       <div class="ctl-bar">
         <button class="ctl light" type="button" hidden><svg class="ic" aria-hidden="true"><use href="#i-light"/></svg></button>
         <button class="ctl pause" type="button" hidden><svg class="ic" aria-hidden="true"><use href="#i-pause"/></svg></button>
@@ -665,6 +689,7 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
       </div>
       <div class="alert-row" hidden><svg class="ic" aria-hidden="true"><use href="#i-alert"/></svg><span class="alert-text"></span></div>
       <div class="alert-full" hidden><ul class="alert-list" aria-label="Alerts"></ul></div>
+      <div class="mod-host mod-l1" hidden></div>
       <div class="more l2"><div><div class="pad">
         <div class="progress-row">
           <span class="stat elapsed"><svg class="ic" aria-hidden="true"><use href="#i-clock"/></svg><span class="el-text"></span></span>
@@ -677,6 +702,7 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
         <div class="temps"></div>
         <div class="active-fil" hidden><svg class="ic" aria-hidden="true"><use href="#i-spool"/></svg><i class="swatch"></i><b class="af-slot"></b><span class="af-mat"></span>
           <span class="remain-bar" role="img"><i></i></span><span class="af-pct val"><b></b><small>%</small></span></div>
+        <div class="mod-host mod-l2" hidden></div>
         <div class="speed-seg" role="radiogroup" hidden></div>
       </div></div></div>
       <div class="more l3"><div><div class="pad">
@@ -698,6 +724,7 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
           <ol class="act-list"></ol>
           <p class="act-empty">No activity since the proxy started.</p>
         </section>
+        <div class="mod-host mod-l3" hidden></div>
         <section class="sec diag" aria-label="Printer">
           <h3><span>Printer</span><span class="sec-meta diag-meta"></span></h3>
           <dl class="facts">
@@ -1174,7 +1201,8 @@ function createTile(p) {
       ctlLight: q(".ctl.light"), ctlLightUse: q(".ctl.light use"), ctlPause: q(".ctl.pause"),
       ctlPauseUse: q(".ctl.pause use"), ctlStop: q(".ctl.stop"), speedSeg: q(".speed-seg"),
       elapsed: q(".elapsed"), elText: q(".el-text"), dtNozzle: q(".dt-nozzle"), fNozzle: q(".f-nozzle"),
-      dtWifi: q(".dt-wifi"), fWifi: q(".f-wifi"),
+      dtWifi: q(".dt-wifi"), fWifi: q(".f-wifi"), modOverlay: q(".mod-overlay"),
+      modHosts: [q(".mod-l1"), q(".mod-l2"), q(".mod-l3")],
     },
   };
   const { img, details, grip, hit, open } = t.r;
@@ -1231,7 +1259,7 @@ function createTile(p) {
   details.addEventListener("click", e => {
     // The activity and filament sections stay readable, so clicks there
     // must not cycle the detail level.
-    if (e.target.closest("a, .grip, .activity, .ams, .alert-full, .job-archive, .ctl-bar, .speed-seg") ||
+    if (e.target.closest("a, .grip, .activity, .ams, .alert-full, .job-archive, .mod-sec, .ctl-bar, .speed-seg") ||
         getSelection()?.toString()) return;
     t.level = t.level % 3 + 1;
     prefs.levels[t.serial] = t.level;
@@ -1271,6 +1299,70 @@ function renderActivity(t) {
     return li;
   });
   t.r.actList.replaceChildren(...rows);
+}
+// Optional proxy modules: display data keyed by module name, all untrusted
+// text. Overlay badges ride on the camera stage; each panel joins the
+// details from its level up (1 compact, 2 vitals, 3 full; absent or 0 is 3).
+// Without module data every module element stays hidden.
+const MOD_TONES = ["calm", "info", "warn", "error"];
+function renderModules(t) {
+  const raw = t.data.modules;
+  const key = JSON.stringify(raw ?? null);
+  if (key === t.modKey) return;
+  t.modKey = key;
+  const mods = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  const str = v => (typeof v === "string" ? v.trim() : "");
+  const tone = v => (MOD_TONES.includes(v) ? v : "");
+  const badges = [], panels = [[], [], []];
+  for (const name of Object.keys(mods).sort()) {
+    const m = mods[name];
+    if (!m || typeof m !== "object") continue;
+    for (const o of Array.isArray(m.overlay) ? m.overlay : []) {
+      const text = str(o?.text), title = str(o?.title);
+      if (!text) continue;
+      const pill = document.createElement("span");
+      pill.className = "pill mod";
+      pill.setAttribute("role", "listitem");
+      pill.setAttribute("aria-label", title ? `${text}, ${title}` : text);
+      pill.dataset.tone = tone(o.tone);
+      if (title) pill.title = title;
+      const label = document.createElement("span");
+      label.className = "mod-text";
+      label.textContent = text;
+      pill.append(label);
+      badges.push(pill);
+    }
+    const pn = m.panel && typeof m.panel === "object" ? m.panel : null;
+    const facts = document.createElement("dl");
+    facts.className = "facts";
+    for (const row of Array.isArray(pn?.rows) ? pn.rows : []) {
+      const label = str(row?.label), value = str(row?.value);
+      if (!label && !value) continue;
+      const dt = document.createElement("dt");
+      dt.textContent = label;
+      const dd = document.createElement("dd");
+      dd.textContent = value;
+      if (tone(row.tone)) dd.dataset.tone = row.tone;
+      facts.append(dt, dd);
+    }
+    if (!facts.childElementCount) continue;
+    const title = str(pn.title) || name;
+    const sec = document.createElement("section");
+    sec.className = "sec mod-sec";
+    sec.setAttribute("aria-label", title);
+    const head = document.createElement("h3");
+    const headText = document.createElement("span");
+    headText.textContent = title;
+    head.append(headText);
+    sec.append(head, facts);
+    panels[[1, 2, 3].includes(pn.level) ? pn.level - 1 : 2].push(sec);
+  }
+  t.r.modOverlay.replaceChildren(...badges);
+  t.r.modOverlay.hidden = !badges.length;
+  t.r.modHosts.forEach((host, i) => {
+    host.replaceChildren(...panels[i]);
+    host.hidden = !panels[i].length;
+  });
 }
 // Stage slugs arrive as protocol names ("changing_filament"); the wall
 // shows them as words next to the identity. Stage is secondary information:
@@ -2323,6 +2415,7 @@ function renderTile(t) {
     return li;
   }));
   renderActivity(t);
+  renderModules(t);
   renderAMS(t);
   r.fReport.textContent = reportAge == null ? "No report yet" : reportAge < 2 ? "Just now" : fmtAgo(reportAge);
   r.fSerial.textContent = p.serial;

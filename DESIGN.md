@@ -100,6 +100,8 @@ A custom mochi hook is the only coupling between the broker and the pool. The ho
 
 An optional notifier (§9) observes recorded activity and delivers Pushover messages off the forwarding path; delivery is best-effort and never blocks the broker.
 
+Optional capabilities are modules (`internal/module`): AI failure detection, Panda Breath chamber readings, notifications, and job previews. Each module package declares its hooks with one `module.Module` value; the service wiring constructs the enabled modules with the core services they need (telemetry, camera frames, guarded printer commands, activity log) and hands the declarations to one generic path. That path owns start and stop order, the shared per-printer report interest, activity fan-out, the accessory chamber reading, and camera wall display. A module shows information on the wall through `Display`: badges over the camera image or a titled panel in the tile details, under the tile's `modules` key, with no wall code change. Detection keeps its dedicated wall, MCP, and `/status` surfaces.
+
 ## 4. Downstream endpoint (printer-compatible)
 
 - Listener: TCP + TLS on `:8883` (default) — the port every Bambu app already targets. Certificate: self-signed, ECDSA P-256, 10-year validity, generated on first start and persisted to `cert_file`/`key_file` paths. Apps skip certificate verification exactly as they do against the printer; the file paths also let an operator load a specific cert for tools that pin.

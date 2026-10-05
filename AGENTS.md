@@ -12,6 +12,7 @@
 - `internal/broker` adapts the mochi MQTT server and its hooks. `internal/routing` resolves topic filters against configured serials.
 - `internal/upstream` owns lazy per-printer connections, merged subscriptions, reconnects, and warmup commands.
 - `internal/telemetry` observes reports without changing forwarding. `internal/camera` owns camera capture and endpoints. `internal/health` and `internal/httpsrv` provide the shared HTTP service.
+- `internal/module` defines the module contract for optional capabilities (detection, Panda Breath, notifications, job previews). Add a new capability as its own package: construct it in `serveOnce` with the narrow core services it needs, return its hooks from a `Module() module.Module` method, and append it to the module list. Show its wall information through `Display` (camera overlay badges or a details panel); do not add capability-specific fields to core packages.
 
 Keep dependencies explicit at constructors and preserve package ownership. The broker injector is attached after construction to break its callback cycle with the upstream pool.
 

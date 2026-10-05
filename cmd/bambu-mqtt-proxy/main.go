@@ -27,6 +27,7 @@ import (
 	"bambu-mqtt-proxy/internal/httpsrv"
 	"bambu-mqtt-proxy/internal/jobpreview"
 	"bambu-mqtt-proxy/internal/mcpserver"
+	"bambu-mqtt-proxy/internal/module"
 	"bambu-mqtt-proxy/internal/notification"
 	"bambu-mqtt-proxy/internal/pandabreath"
 	"bambu-mqtt-proxy/internal/routing"
@@ -130,7 +131,6 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	var breath *pandabreath.Store
 	if cfg.HTTP.Port > 0 {
 		breath = pandabreath.New(cfg.Printers, logger)
-		state.SetChamberReader(breath.ChamberReading)
 	}
 	// Printer controls: the only allow-listed path from the camera wall and
 	// MCP to printer commands. No heater or temperature command exists.
@@ -195,7 +195,43 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	var notifier *notification.Service
 	if cfg.Notifications.Enabled {
 		notifier = notification.New(cfg.Notifications, state, cameras, logger)
-		activities.SetObserver(notifier.Observe)
+	}
+
+	// Optional modules, in start order. Their shared hooks are wired once,
+	// before the broker can record activity or deliver reports.
+	var mods []module.Module
+	if notifier != nil {
+		mods = append(mods, notifier.Module())
+	}
+	if previews != nil {
+		mods = append(mods, previews.Module())
+	}
+	if breath != nil {
+		mods = append(mods, breath.Module())
+	}
+	if detector != nil {
+		mods = append(mods, detector.Module())
+	}
+	var chamberSet bool
+	var observers []func(string, activity.Entry)
+	for _, mod := range mods {
+		if mod.ChamberReading != nil && !chamberSet {
+			state.SetChamberReader(mod.ChamberReading)
+			chamberSet = true
+		}
+		if mod.ObserveActivity != nil {
+			observers = append(observers, mod.ObserveActivity)
+		}
+	}
+	if len(observers) > 0 {
+		activities.SetObserver(func(serial string, e activity.Entry) {
+			for _, observe := range observers {
+				observe(serial, e)
+			}
+		})
+	}
+	if renderer != nil {
+		renderer.SetModules(mods)
 	}
 	// MCP endpoint on the shared HTTP listener, on by default and disabled
 	// with mcp.enabled: false / BMBPX_MCP_ENABLED=false. Its sampler reads
@@ -239,31 +275,22 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		_ = srv.Close()
 		return nil, fmt.Errorf("broker: %w", err)
 	}
-	if notifier != nil {
-		notifier.Start()
-	}
 
-	// The broker is up. Defer every teardown from here so both the signal
-	// path and later startup errors (a raw camera or HTTP bind failure) stop
-	// the detector, MCP, HTTP server, preview scheduler, raw camera
-	// listener, camera captures, upstream pool, and broker — in that order.
-	// HTTP stops first among the shared services so its streaming handlers
-	// end before the captures and connections they read, and the preview
-	// scheduler closes after both of its consumers (MCP and the HTTP
-	// handlers) stop but before the cameras and pool it reads. The raw
-	// listener closes before the capture manager so its camera sockets never
-	// outlive the captures they read. Each stop is idempotent, so the single
-	// deferred call never double-stops a service.
+	// The broker is up. Install the single teardown before starting the raw
+	// camera listener or modules, so later bind failures use the same path.
+	// MCP and HTTP stop first, then started modules stop in reverse order:
+	// detection, Panda Breath, job preview, notifications. Their consumers
+	// end before the modules and the cameras and pool they read. The raw
+	// listener stops next, before camera captures, the pool, and the broker.
+	// Modules whose Start never ran must not receive Stop.
 	var httpSrv *httpsrv.Server
 	var raw *camera.RawServer
+	var started []module.Module
 	defer func() {
 		if sigCtx.Err() != nil {
 			logger.Info("shutting down")
 		} else {
 			logger.Info("restarting with the saved configuration")
-		}
-		if detector != nil {
-			detector.Close()
 		}
 		if mcpsrv != nil {
 			mcpsrv.Close()
@@ -271,17 +298,13 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		if httpSrv != nil {
 			httpSrv.Stop()
 		}
-		if previews != nil {
-			previews.Close()
-		}
-		if breath != nil {
-			breath.Stop()
+		for i := len(started) - 1; i >= 0; i-- {
+			if started[i].Stop != nil {
+				started[i].Stop()
+			}
 		}
 		if raw != nil {
 			raw.Close()
-		}
-		if notifier != nil {
-			notifier.Close()
 		}
 		if cameras != nil {
 			cameras.Close()
@@ -289,21 +312,6 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		pool.Stop()
 		_ = srv.Close()
 	}()
-
-	// The preview scheduler starts only after the broker is serving and the
-	// deferred teardown is installed, so any later startup failure still
-	// closes it on the single shutdown path.
-	if previews != nil {
-		previews.Start()
-	}
-
-	// The Panda Breath observers connect to the accessory devices, not to
-	// the broker or the printers, so they start on the same post-teardown
-	// path as the preview scheduler and stop on the single shutdown path
-	// above.
-	if breath != nil {
-		breath.Start()
-	}
 
 	// Raw camera endpoint: the camera feature keeps its printer-compatible
 	// listener even when the HTTP port is off. Starting it after the
@@ -318,20 +326,21 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		logger.Info("raw camera endpoint serving", "port", camera.Port)
 	}
 
-	// Start detection workers only after the broker accepted its
-	// listeners.
-	if detector != nil {
-		detector.Start()
+	// Start modules in declaration order only after the broker serves, the
+	// teardown is installed, and the raw camera listener is ready.
+	needsReports := (cfg.CameraEnabled() && cfg.HTTP.Port > 0) || cfg.MCPEnabled()
+	for _, mod := range mods {
+		if mod.Start != nil {
+			mod.Start()
+			started = append(started, mod)
+			needsReports = needsReports || mod.NeedsReports
+		}
 	}
 
-	// Hold one report interest per printer when anything consumes live
-	// state: the camera wall (HTTP on) or detection. Async on purpose: the
-	// interest is recorded while printers may still be offline, and
-	// the connection supervisor restores the recorded interests on each
-	// (re)connect. MCP counts as a live-state consumer even with cameras
-	// disabled, and notifications need the reports that produce activity
-	// events even with no dashboard or MQTT client attached.
-	if (cfg.CameraEnabled() && (cfg.HTTP.Port > 0 || detector != nil)) || cfg.MCPEnabled() || cfg.Notifications.Enabled {
+	// Hold one report interest per printer when the camera wall, MCP, or a
+	// started module consumes live state. Async interest survives offline
+	// printers and is restored by the supervisor on each reconnect.
+	if needsReports {
 		for _, p := range cfg.Printers {
 			pool.SubscribeAsync(p.Serial, fmt.Sprintf("device/%s/report", p.Serial))
 		}

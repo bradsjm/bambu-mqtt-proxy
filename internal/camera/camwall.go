@@ -18,6 +18,7 @@ import (
 	"bambu-mqtt-proxy/internal/control"
 	"bambu-mqtt-proxy/internal/detection"
 	"bambu-mqtt-proxy/internal/jobpreview"
+	"bambu-mqtt-proxy/internal/module"
 	"bambu-mqtt-proxy/internal/printerview"
 	"bambu-mqtt-proxy/internal/telemetry"
 )
@@ -71,6 +72,8 @@ type Tile struct {
 	// become alerts.
 	JobPreview  jobpreview.View      `json:"job_preview"`
 	JobMetadata *jobpreview.Metadata `json:"job_metadata"`
+	// Modules contains optional display contributions keyed by module name.
+	Modules map[string]module.Display `json:"modules,omitempty"`
 }
 
 // statusPayload is the shared /camera/status and /camera/events body.
@@ -92,6 +95,7 @@ type StatusRenderer struct {
 	printer   controlService      // optional printer controls
 	activity  *activity.Log       // optional recent-event source
 	previews  *jobpreview.Service // optional archived print preview
+	modules   []module.Module     // optional module display hooks
 }
 
 // NewStatusRenderer builds the /camera/status payload renderer.
@@ -147,6 +151,11 @@ func (r *StatusRenderer) SetJobPreview(s *jobpreview.Service) {
 	r.previews = s
 }
 
+// SetModules attaches optional module display hooks before serving requests.
+func (r *StatusRenderer) SetModules(mods []module.Module) {
+	r.modules = mods
+}
+
 // connectivitySource reports upstream MQTT connectivity per serial, so the
 // camera wall can distinguish an idle printer from a disconnected one.
 type connectivitySource interface {
@@ -190,6 +199,17 @@ func (r *StatusRenderer) Tiles() []Tile {
 		t.JobPreview = preview.Preview
 		t.JobMetadata = preview.Metadata
 		t.Activity = r.activity.Recent(st.Serial)
+		for _, mod := range r.modules {
+			if mod.Display == nil {
+				continue
+			}
+			if display := mod.Display(st.Serial); display != nil {
+				if t.Modules == nil {
+					t.Modules = make(map[string]module.Display)
+				}
+				t.Modules[mod.Name] = *display
+			}
+		}
 		tiles = append(tiles, t)
 	}
 	sort.Slice(tiles, func(i, j int) bool { return tiles[i].Serial < tiles[j].Serial })
