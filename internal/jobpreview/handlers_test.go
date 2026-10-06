@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"bambu-mqtt-proxy/internal/config"
+	"bambu-mqtt-proxy/internal/module"
 	"bambu-mqtt-proxy/internal/telemetry"
 )
 
@@ -41,6 +42,14 @@ func servePreview(t *testing.T, mux *http.ServeMux, method, target string) *http
 	return rec
 }
 
+func mountRoute(t *testing.T, mux *http.ServeMux, svc *Service) {
+	t.Helper()
+	if err := module.Check([]module.Module{svc.Module()}); err != nil {
+		t.Fatalf("module Check: %v", err)
+	}
+	module.Mount(mux, []module.Module{svc.Module()})
+}
+
 func TestPreviewRouteServesVersionedPNG(t *testing.T) {
 	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
 	clk := &testClock{now: base}
@@ -61,7 +70,7 @@ func TestPreviewRouteServesVersionedPNG(t *testing.T) {
 	v := hex.EncodeToString(sum[:])
 
 	mux := http.NewServeMux()
-	svc.Register(mux)
+	mountRoute(t, mux, svc)
 
 	// The published image URL matches the route exactly.
 	res, ok := svc.Lookup("S1", false)
@@ -138,7 +147,7 @@ func TestPreviewRouteStaleVersionAfterJobSwitch(t *testing.T) {
 	vB := hex.EncodeToString(sumB[:])
 
 	mux := http.NewServeMux()
-	svc.Register(mux)
+	mountRoute(t, mux, svc)
 	if rec := servePreview(t, mux, http.MethodGet, "/camera/S1/preview?v="+vA); rec.Code != http.StatusNotFound {
 		t.Fatalf("old version code = %d, want 404 after job switch", rec.Code)
 	}
@@ -170,7 +179,7 @@ func TestPreviewRouteMetadataOnlyHasNoImage(t *testing.T) {
 		archiveErr(catImageMissing, "plate image missing"))
 
 	mux := http.NewServeMux()
-	svc.Register(mux)
+	mountRoute(t, mux, svc)
 	rec := servePreview(t, mux, http.MethodGet, "/camera/S1/preview?v=anything")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("metadata-only code = %d, want 404", rec.Code)

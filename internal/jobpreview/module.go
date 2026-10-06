@@ -1,6 +1,8 @@
 package jobpreview
 
 import (
+	"net/http"
+
 	"bambu-mqtt-proxy/internal/module"
 )
 
@@ -27,13 +29,18 @@ func (s *Service) moduleState(serial string) any {
 }
 
 // Module declares the job preview service's module hooks: the per-printer
-// state for the camera wall and MCP, and the get_job_preview tool.
+// state for the camera wall and MCP, the versioned preview image route, and
+// the get_job_preview tool.
 func (s *Service) Module() module.Module {
 	return module.Module{
 		Name:  "jobpreview",
 		Start: s.Start,
 		Stop:  s.Close,
 		State: s.moduleState,
-		MCP:   s.registerMCP,
+		Routes: []module.Route{{
+			Pattern: previewRoute,
+			Handler: http.HandlerFunc(s.handlePreview),
+		}},
+		MCP: s.registerMCP,
 	}
 }

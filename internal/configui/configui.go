@@ -19,13 +19,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"gopkg.in/yaml.v3"
 
 	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/jsonobj"
-	"bambu-mqtt-proxy/internal/notification"
 )
 
 //go:embed config.html
@@ -49,8 +47,6 @@ type Store struct {
 	path    string
 	reloads chan Reload
 	rename  func(string, string) error
-	// sendTest delivers the /config test notification; replaced by tests.
-	sendTest func(context.Context, config.Notifications, string, string, []byte) error
 	// probePrinter performs the /config printer connection test; replaced
 	// by tests.
 	probePrinter func(context.Context, config.Printer) error
@@ -68,7 +64,6 @@ func NewStore(path string) *Store {
 		path:         path,
 		rename:       os.Rename,
 		reloads:      make(chan Reload, 1),
-		sendTest:     notification.Send,
 		probePrinter: probePrinterConn,
 	}
 }
@@ -115,7 +110,6 @@ func (s *Store) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /config/api", s.handleGet)
 	protection := http.NewCrossOriginProtection()
 	mux.Handle("PUT /config/api", protection.Handler(http.HandlerFunc(s.handlePut)))
-	mux.Handle("POST /config/notifications/test", protection.Handler(http.HandlerFunc(s.handleNotificationTest)))
 	mux.Handle("POST /config/printers/test", protection.Handler(http.HandlerFunc(s.handlePrinterTest)))
 	for _, section := range config.Sections() {
 		if section.Test != nil {
@@ -137,7 +131,6 @@ type View struct {
 	MCPEnabled      bool                 `json:"mcp_enabled"`
 	LogLevel        string               `json:"log_level"`
 	Behavior        BehaviorView         `json:"behavior"`
-	Notifications   NotificationsView    `json:"notifications"`
 	sections        map[string]any
 }
 
@@ -192,23 +185,6 @@ type BehaviorView struct {
 	ConnectTimeoutSeconds int      `json:"connect_timeout_seconds"`
 	BackoffInitialSeconds int      `json:"backoff_initial_seconds"`
 	BackoffMaxSeconds     int      `json:"backoff_max_seconds"`
-}
-
-// NotificationsView is the notification section of the page. AppToken and
-// UserKey are accepted on save and never returned.
-type NotificationsView struct {
-	Enabled  bool         `json:"enabled"`
-	Provider string       `json:"provider"`
-	Pushover PushoverView `json:"pushover"`
-}
-
-// PushoverView holds Pushover credentials. The has_* flags report stored
-// credentials to the page; incoming flags are ignored on save.
-type PushoverView struct {
-	HasAppToken bool   `json:"has_app_token"`
-	HasUserKey  bool   `json:"has_user_key"`
-	AppToken    string `json:"app_token,omitempty"`
-	UserKey     string `json:"user_key,omitempty"`
 }
 
 type meta struct {
@@ -331,47 +307,6 @@ func (s *Store) handlePut(w http.ResponseWriter, r *http.Request) {
 		"path":      s.path,
 		"http_port": effective.HTTP.Port,
 	})
-}
-
-// handleNotificationTest sends one test notification with the submitted
-// notification settings on top of the stored credentials. It reads the
-// file without the save mutex and never saves, reloads, or returns either
-// credential.
-func (s *Store) handleNotificationTest(w http.ResponseWriter, r *http.Request) {
-	var in NotificationsView
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&in); err != nil {
-		writeError(w, http.StatusBadRequest, "The settings could not be read: "+err.Error())
-		return
-	}
-
-	raw, existed, err := readFile(s.path)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	var stored config.Notifications
-	if existed {
-		// An unreadable file has no stored credentials to keep.
-		if cur, err := config.Parse(raw); err == nil {
-			stored = cur.Notifications
-		}
-	}
-	cfg := in.toConfig(stored)
-	cfg.Enabled = true
-	if err := cfg.Validate(); err != nil {
-		writeError(w, http.StatusUnprocessableEntity, err.Error())
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
-	defer cancel()
-	if err := s.sendTest(ctx, cfg, "bambu-mqtt-proxy test", "Pushover notifications are working.", nil); err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"sent": true})
 }
 
 // handlePrinterTest performs one bounded MQTT connect with the submitted
@@ -565,14 +500,6 @@ func toView(c *config.Config) View {
 			BackoffInitialSeconds: c.Behavior.UpstreamBackoffInitialSeconds,
 			BackoffMaxSeconds:     c.Behavior.UpstreamBackoffMaxSeconds,
 		},
-		Notifications: NotificationsView{
-			Enabled:  c.Notifications.Enabled,
-			Provider: c.Notifications.Provider,
-			Pushover: PushoverView{
-				HasAppToken: c.Notifications.Pushover.AppToken != "",
-				HasUserKey:  c.Notifications.Pushover.UserKey != "",
-			},
-		},
 	}
 	v.sections = make(map[string]any)
 	for _, section := range config.Sections() {
@@ -613,9 +540,9 @@ func toView(c *config.Config) View {
 
 // toConfig builds the file configuration. A blank access code keeps the
 // stored code of the printer the edit started from, but only while its
-// address is unchanged: a stored code is never sent to a new host. Blank
-// notification credentials keep their stored values. A nil stored config
-// (missing or unreadable file) keeps submitted values as written.
+// address is unchanged: a stored code is never sent to a new host.
+// A nil stored config (missing or unreadable file) keeps submitted values
+// as written.
 func (v View) toConfig(stored *config.Config) (*config.Config, error) {
 	var prevPrinters []config.Printer
 	if stored != nil {
@@ -640,11 +567,6 @@ func (v View) toConfig(stored *config.Config) (*config.Config, error) {
 			UpstreamBackoffMaxSeconds:     v.Behavior.BackoffMaxSeconds,
 		},
 	}
-	storedNotifications := config.Notifications{}
-	if stored != nil {
-		storedNotifications = stored.Notifications
-	}
-	c.Notifications = v.Notifications.toConfig(storedNotifications)
 	for _, cmd := range v.Behavior.WarmupCommands {
 		if cmd = strings.TrimSpace(cmd); cmd != "" {
 			c.Behavior.WarmupCommands = append(c.Behavior.WarmupCommands, cmd)
@@ -696,35 +618,6 @@ func (v View) toConfig(stored *config.Config) (*config.Config, error) {
 		c.Printers = append(c.Printers, out)
 	}
 	return c, nil
-}
-
-// toConfig builds notification settings from the submitted view. Submitted
-// values are trimmed, and a blank submitted credential keeps the stored
-// one. An empty submitted or stored provider means pushover, and incoming
-// has_* flags are ignored.
-func (v NotificationsView) toConfig(stored config.Notifications) config.Notifications {
-	provider := strings.TrimSpace(v.Provider)
-	if provider == "" {
-		provider = strings.TrimSpace(stored.Provider)
-	}
-	if provider == "" {
-		provider = "pushover"
-	}
-	out := config.Notifications{
-		Enabled:  v.Enabled,
-		Provider: provider,
-		Pushover: config.Pushover{
-			AppToken: strings.TrimSpace(v.Pushover.AppToken),
-			UserKey:  strings.TrimSpace(v.Pushover.UserKey),
-		},
-	}
-	if out.Pushover.AppToken == "" {
-		out.Pushover.AppToken = strings.TrimSpace(stored.Pushover.AppToken)
-	}
-	if out.Pushover.UserKey == "" {
-		out.Pushover.UserKey = strings.TrimSpace(stored.Pushover.UserKey)
-	}
-	return out
 }
 
 // envOverrides maps page field names to the BMBPX_* variable that

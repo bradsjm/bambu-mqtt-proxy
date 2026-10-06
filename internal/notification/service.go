@@ -11,7 +11,6 @@ import (
 
 	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/camera"
-	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/hmscodes"
 	"bambu-mqtt-proxy/internal/telemetry"
 )
@@ -33,7 +32,7 @@ type event struct {
 // queues and failed deliveries are logged, never fatal. One Service runs
 // one delivery goroutine.
 type Service struct {
-	cfg       config.Notifications
+	cfg       Settings
 	state     *telemetry.Cache
 	logger    *slog.Logger
 	events    chan event
@@ -43,13 +42,13 @@ type Service struct {
 
 	// send and snapshot are seams for package tests. send defaults to
 	// Send; snapshot is nil without a camera manager.
-	send func(context.Context, config.Notifications, string, string, []byte) error
+	send func(context.Context, Settings, string, string, []byte) error
 	// snapshot fetches a web-camera frame; nil when cameras are disabled.
 	snapshot func(ctx context.Context, serial string) (*camera.Frame, camera.Status)
 }
 
 // New builds a service for one notification configuration.
-func New(cfg config.Notifications, state *telemetry.Cache, cameras *camera.Manager, logger *slog.Logger) *Service {
+func New(cfg Settings, state *telemetry.Cache, cameras *camera.Manager, logger *slog.Logger) *Service {
 	s := &Service{
 		cfg:    cfg,
 		state:  state,

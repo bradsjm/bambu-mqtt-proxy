@@ -41,15 +41,7 @@ const (
 	// EnvMCPEnable controls the Model Context Protocol endpoint on the
 	// shared HTTP port. MCP is enabled by default; an explicit false
 	// disables it.
-	EnvMCPEnable = "BMBPX_MCP_ENABLED"
-	// EnvJobPreview controls the printer job preview feature: the
-	// best-effort retrieval of the current print's sliced 3MF plate image
-	// and metadata from the printer. Job preview is enabled by default;
-	// an explicit false disables it. The switch is environment-only:
-	// there is no YAML field and no configuration-page control, and
-	// resolveConfig re-applies the environment after every
-	// configuration-page save.
-	EnvJobPreview   = "BMBPX_JOB_PREVIEW"
+	EnvMCPEnable    = "BMBPX_MCP_ENABLED"
 	defaultFileName = "bambu-mqtt-proxy.yaml"
 )
 
@@ -163,56 +155,17 @@ type MCP struct {
 	Enabled *bool `yaml:"enabled"`
 }
 
-// Notifications configures optional print alerts sent to one recipient.
-type Notifications struct {
-	Enabled  bool     `yaml:"enabled"`
-	Provider string   `yaml:"provider"`
-	Pushover Pushover `yaml:"pushover"`
-}
-
-// Pushover holds the Pushover application token and user key.
-type Pushover struct {
-	AppToken string `yaml:"app_token"`
-	UserKey  string `yaml:"user_key"`
-}
-
-// Validate rejects notification settings that cannot run. An empty provider
-// means pushover; any other provider is unsupported. Disabled notifications
-// may keep blank or stale credentials; enabled notifications require both.
-func (n Notifications) Validate() error {
-	switch n.Provider {
-	case "", "pushover":
-	default:
-		return fmt.Errorf("notifications: unsupported provider %q", n.Provider)
-	}
-	if !n.Enabled {
-		return nil
-	}
-	if strings.TrimSpace(n.Pushover.AppToken) == "" {
-		return fmt.Errorf("notifications: pushover app token is required")
-	}
-	if strings.TrimSpace(n.Pushover.UserKey) == "" {
-		return fmt.Errorf("notifications: pushover user key is required")
-	}
-	return nil
-}
-
 // Config is the top-level proxy configuration.
 type Config struct {
 	Listen []Listener `yaml:"listen"`
 	Auth   Auth       `yaml:"auth"`
 	// Printers is the upstream printer list.
-	Printers      []Printer     `yaml:"printers"`
-	Behavior      Behavior      `yaml:"behavior"`
-	Log           Log           `yaml:"log"`
-	HTTP          HTTP          `yaml:"http"`
-	Camera        Camera        `yaml:"camera"`
-	MCP           MCP           `yaml:"mcp"`
-	Notifications Notifications `yaml:"notifications"`
-	// JobPreview is the printer job preview switch applied from
-	// BMBPX_JOB_PREVIEW only; yaml:"-" keeps it out of files. Nil means
-	// enabled.
-	JobPreview *bool `yaml:"-"`
+	Printers []Printer `yaml:"printers"`
+	Behavior Behavior  `yaml:"behavior"`
+	Log      Log       `yaml:"log"`
+	HTTP     HTTP      `yaml:"http"`
+	Camera   Camera    `yaml:"camera"`
+	MCP      MCP       `yaml:"mcp"`
 	// Sections holds module-owned top-level YAML sections and unknown keys.
 	Sections map[string]yaml.Node `yaml:",inline"`
 }
@@ -314,14 +267,6 @@ func (c *Config) MCPEnabled() bool {
 	return c.MCP.Enabled == nil || *c.MCP.Enabled
 }
 
-// JobPreviewEnabled reports whether the printer job preview feature should
-// run: the scheduler that retrieves the current print's sliced 3MF, the
-// cached plate image route, and the MCP preview tool. It defaults to on;
-// an explicit false (from BMBPX_JOB_PREVIEW only) disables it.
-func (c *Config) JobPreviewEnabled() bool {
-	return c.JobPreview == nil || *c.JobPreview
-}
-
 // Load reads and parses the YAML configuration at path. Defaults and
 // validation are applied by the caller after environment overrides.
 func Load(path string) (*Config, error) {
@@ -409,18 +354,6 @@ func (c *Config) ApplyEnv() (bool, error) {
 			return false, fmt.Errorf("%s: invalid bool %q", EnvMCPEnable, v)
 		}
 		c.MCP.Enabled = &b
-	}
-	// The job preview switch is environment-only: clear any previous
-	// application first so a re-apply after a configuration-page save
-	// follows a removed variable back to the default, then apply a
-	// nonempty value. Unset or empty keeps the enabled default.
-	c.JobPreview = nil
-	if v, ok := os.LookupEnv(EnvJobPreview); ok && v != "" {
-		b, err := strconv.ParseBool(v)
-		if err != nil {
-			return false, fmt.Errorf("%s: invalid bool %q", EnvJobPreview, v)
-		}
-		c.JobPreview = &b
 	}
 	for _, s := range sections {
 		if s.ApplyEnv != nil {
@@ -542,9 +475,6 @@ func (c *Config) ApplyDefaults() {
 			c.Printers[i].Username = "bblp"
 		}
 	}
-	if c.Notifications.Provider == "" {
-		c.Notifications.Provider = "pushover"
-	}
 }
 
 // Validate rejects configurations that cannot run. An empty printer list is
@@ -617,7 +547,7 @@ func (c *Config) Validate() error {
 	if (c.HTTP.Port < 0 && c.HTTP.Port != PortUnset) || c.HTTP.Port > 65535 {
 		return fmt.Errorf("http: port %d out of range (0 disables)", c.HTTP.Port)
 	}
-	return c.Notifications.Validate()
+	return nil
 }
 
 // DisplayModel names a printer model: explicit model configuration first,

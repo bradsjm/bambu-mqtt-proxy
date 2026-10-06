@@ -146,7 +146,7 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	// dependencies, a disabled feature must leave the consumer side truly
 	// nil.
 	var previews *jobpreview.Service
-	if cfg.JobPreviewEnabled() && cfg.HTTP.Port > 0 && (cfg.CameraEnabled() || cfg.MCPEnabled()) {
+	if jobpreview.Enabled(cfg) && cfg.HTTP.Port > 0 && (cfg.CameraEnabled() || cfg.MCPEnabled()) {
 		previews = jobpreview.New(cfg.Printers, state, pool, logger)
 	}
 
@@ -193,8 +193,12 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	// activity observer before the broker serves, so entries recorded
 	// during startup reach it; upstream connections are lazy.
 	var notifier *notification.Service
-	if cfg.Notifications.Enabled {
-		notifier = notification.New(cfg.Notifications, state, cameras, logger)
+	notificationSettings, err := notification.SettingsOf(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("notification settings: %w", err)
+	}
+	if notificationSettings.Enabled {
+		notifier = notification.New(notificationSettings, state, cameras, logger)
 	}
 
 	// Optional modules start in order: notifications, job preview, Panda
@@ -363,10 +367,6 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 			mcpsrv.Register(httpSrv.Mux())
 			mcpsrv.Start()
 			logger.Info("mcp endpoint serving", "path", "/mcp")
-		}
-		if previews != nil {
-			previews.Register(httpSrv.Mux())
-			logger.Info("job preview image route serving", "port", cfg.HTTP.Port)
 		}
 		if cfg.CameraEnabled() {
 			camera.Register(httpSrv.Mux(), cameras)

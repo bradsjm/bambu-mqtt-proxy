@@ -16,8 +16,8 @@ import (
 	"testing"
 	"time"
 
-	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/configui"
+	"bambu-mqtt-proxy/internal/jobpreview"
 )
 
 const detectionContractSerial = "01S00CDETECT001"
@@ -215,11 +215,11 @@ func TestDetectionConfigProbePreflight(t *testing.T) {
 	}
 }
 
-// TestDetectionUnchangedConfigBytes pins byte-identical page saves of pre-migration settings with a stored secret.
+// TestDetectionUnchangedConfigBytes pins byte-identical page saves with sorted module sections and a stored secret.
 func TestDetectionUnchangedConfigBytes(t *testing.T) {
 	detectionContractCleanEnv(t)
-	// Captured from today's page save, before the migration. Keep the fixture
-	// independent of the serializer so a changed YAML layout fails this test.
+	// Keep the page-save fixture independent of the serializer. Module-owned
+	// sections are sorted, so detection precedes notifications.
 	const fixture = `# bambu-mqtt-proxy configuration, written by the /config page.
 # Comments are not preserved when the page saves this file.
 listen:
@@ -243,15 +243,15 @@ camera:
     enabled: true
 mcp:
     enabled: true
+detection:
+    enabled: true
+    api_key: contract-stored-secret
 notifications:
     enabled: false
     provider: pushover
     pushover:
         app_token: ""
         user_key: ""
-detection:
-    enabled: true
-    api_key: contract-stored-secret
 `
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(path, []byte(fixture), 0o600); err != nil {
@@ -309,7 +309,7 @@ func detectionContractServe(t *testing.T, enabled, cameras bool, previews ...boo
 	}
 	t.Setenv("BMBPX_CAMERA_ENABLED", fmt.Sprint(cameras))
 	if len(previews) > 0 {
-		t.Setenv(config.EnvJobPreview, fmt.Sprint(previews[0]))
+		t.Setenv(jobpreview.EnvSwitch, fmt.Sprint(previews[0]))
 	}
 	port := freePort(t)
 	path := filepath.Join(t.TempDir(), "config.yaml")

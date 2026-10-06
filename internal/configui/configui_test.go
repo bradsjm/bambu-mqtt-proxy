@@ -15,10 +15,14 @@ import (
 
 	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/detection"
+	"bambu-mqtt-proxy/internal/jobpreview"
+	"bambu-mqtt-proxy/internal/notification"
 )
 
 func TestMain(m *testing.M) {
 	config.RegisterSection(detection.ConfigSection)
+	config.RegisterSection(notification.ConfigSection)
+	config.RegisterSection(jobpreview.ConfigSection)
 	os.Exit(m.Run())
 }
 
@@ -46,7 +50,7 @@ func serve(t *testing.T, path string) (*Store, *httptest.Server) {
 	t.Helper()
 	for _, env := range []string{config.EnvPrinters, config.EnvListenPort, config.EnvListenTLS, config.EnvCertFile,
 		config.EnvKeyFile, config.EnvAuthMode, config.EnvLogLevel, config.EnvHTTPPort, config.EnvCameraEnable,
-		config.EnvMCPEnable, config.EnvJobPreview, detection.EnvAPIKey} {
+		config.EnvMCPEnable, jobpreview.EnvSwitch, detection.EnvAPIKey} {
 		t.Setenv(env, "") // restores the original value after the test
 		_ = os.Unsetenv(env)
 	}
@@ -84,7 +88,11 @@ func get(t *testing.T, srv *httptest.Server) getResponse {
 	if err := json.Unmarshal(members["detection"], &d); err != nil {
 		t.Fatal(err)
 	}
-	out.Config.sections = map[string]any{"detection": &d}
+	var n notificationsPage
+	if err := json.Unmarshal(members["notifications"], &n); err != nil {
+		t.Fatal(err)
+	}
+	out.Config.sections = map[string]any{"detection": &d, "notifications": &n}
 	return out
 }
 
@@ -397,7 +405,7 @@ func writeConfig(t *testing.T, path string) {
 func TestJobPreviewStaysEnvOnlyAcrossConfigPageSave(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "bambu-mqtt-proxy.yaml")
 	store, srv := serve(t, path)
-	t.Setenv(config.EnvJobPreview, "false")
+	t.Setenv(jobpreview.EnvSwitch, "false")
 
 	v := get(t, srv).Config
 	v.Printers = []PrinterView{{Serial: "01P00A123456789", Address: "192.168.1.42:8883", TLS: true,
@@ -427,11 +435,8 @@ func TestJobPreviewStaysEnvOnlyAcrossConfigPageSave(t *testing.T) {
 	if _, err := cfg.ApplyEnv(); err != nil {
 		t.Fatalf("ApplyEnv: %v", err)
 	}
-	if cfg.JobPreviewEnabled() {
+	if jobpreview.Enabled(cfg) {
 		t.Fatal("BMBPX_JOB_PREVIEW=false must survive the configuration-page save and reload")
-	}
-	if cfg.JobPreview == nil || *cfg.JobPreview {
-		t.Fatal("the explicit false must be retained after the re-apply")
 	}
 }
 

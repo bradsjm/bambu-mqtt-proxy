@@ -69,15 +69,11 @@ The core is the MQTT proxy path (config, broker, routing, upstream), telemetry, 
 - Do not add capability-specific fields, imports, or branches to core packages. If the contract cannot express a need, extend the contract generically for all modules.
 - Add module markup to `camwall.html` or `config.html` only when `Display` or `config.PrinterSetting` cannot express it. The detection AI controls and the config section forms are such cases.
 
-### Known exceptions
+### Accepted cross-module knowledge
 
-Do not copy these exceptions. Move each one into its module when you next change that code.
+The `notification` module maps activity kinds that other modules record (`ai_*`, `first_layer_complete`). This module-to-module knowledge is accepted. Core packages hold no capability code. Keep it that way.
 
-- Notifications config: `config.Notifications`, its validation, and the `notification.Send` import in `internal/configui`. Target: a `config.Section` in `internal/notification`.
-- Job preview switch: `Config.JobPreview`, `EnvJobPreview`, and `JobPreviewEnabled` in `internal/config`.
-- Job preview image route: `serveOnce` mounts it with `previews.Register`. Target: the `Routes` hook.
-
-The `notification` module maps activity kinds that other modules record (`ai_*`, `first_layer_complete`). This module-to-module knowledge is accepted.
+An environment-only module switch is a `config.Section` with only `ApplyEnv`. `ApplyEnv` always replaces the section from the environment. See `jobpreview.ConfigSection`.
 
 ### Module tests
 

@@ -21,6 +21,7 @@ import (
 	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/detection"
 	"bambu-mqtt-proxy/internal/health"
+	"bambu-mqtt-proxy/internal/jobpreview"
 	"bambu-mqtt-proxy/internal/upstream"
 )
 
@@ -446,29 +447,29 @@ func TestResolveConfigJobPreviewEnvSwitch(t *testing.T) {
 	}
 
 	t.Run("unset defaults to enabled", func(t *testing.T) {
-		unsetEnv(t, config.EnvJobPreview)
+		unsetEnv(t, jobpreview.EnvSwitch)
 		cfg, _, err := resolveConfig(path)
 		if err != nil {
 			t.Fatalf("resolveConfig: %v", err)
 		}
-		if cfg.JobPreview != nil || !cfg.JobPreviewEnabled() {
-			t.Fatalf("switch = %v, want the nil enabled default", cfg.JobPreview)
+		if !jobpreview.Enabled(cfg) {
+			t.Fatal("job preview must default to enabled")
 		}
 	})
 
 	t.Run("empty defaults to enabled", func(t *testing.T) {
-		t.Setenv(config.EnvJobPreview, "")
+		t.Setenv(jobpreview.EnvSwitch, "")
 		cfg, _, err := resolveConfig(path)
 		if err != nil {
 			t.Fatalf("resolveConfig: %v", err)
 		}
-		if cfg.JobPreview != nil || !cfg.JobPreviewEnabled() {
-			t.Fatalf("switch = %v, want the enabled default", cfg.JobPreview)
+		if !jobpreview.Enabled(cfg) {
+			t.Fatal("an empty switch must keep the enabled default")
 		}
 	})
 
 	t.Run("false disables across a reload", func(t *testing.T) {
-		t.Setenv(config.EnvJobPreview, "false")
+		t.Setenv(jobpreview.EnvSwitch, "false")
 		cfg, found, err := resolveConfig(path)
 		if err != nil {
 			t.Fatalf("resolveConfig: %v", err)
@@ -476,8 +477,8 @@ func TestResolveConfigJobPreviewEnvSwitch(t *testing.T) {
 		if !found {
 			t.Fatal("config file not found")
 		}
-		if cfg.JobPreview == nil || *cfg.JobPreview || cfg.JobPreviewEnabled() {
-			t.Fatalf("switch = %v, want an explicit false", cfg.JobPreview)
+		if jobpreview.Enabled(cfg) {
+			t.Fatal("an explicit false must disable job preview")
 		}
 
 		// Re-running the startup path mirrors the post-save reload: the
@@ -486,13 +487,13 @@ func TestResolveConfigJobPreviewEnvSwitch(t *testing.T) {
 		if err != nil {
 			t.Fatalf("resolveConfig reload: %v", err)
 		}
-		if cfg.JobPreviewEnabled() {
+		if jobpreview.Enabled(cfg) {
 			t.Fatal("the switch must survive a resolveConfig reload")
 		}
 	})
 
 	t.Run("invalid fails startup", func(t *testing.T) {
-		t.Setenv(config.EnvJobPreview, "bogus")
+		t.Setenv(jobpreview.EnvSwitch, "bogus")
 		_, _, err := resolveConfig(path)
 		if err == nil || err.Error() != `BMBPX_JOB_PREVIEW: invalid bool "bogus"` {
 			t.Fatalf("error = %v, want BMBPX_JOB_PREVIEW: invalid bool \"bogus\"", err)

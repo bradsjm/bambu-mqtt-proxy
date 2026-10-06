@@ -14,8 +14,6 @@ import (
 	"net/textproto"
 	"strings"
 	"time"
-
-	"bambu-mqtt-proxy/internal/config"
 )
 
 // Pushover message limits, https://pushover.net/api#limits.
@@ -38,7 +36,7 @@ var pushoverClient = &http.Client{Timeout: 15 * time.Second}
 // An empty provider means pushover. A nonempty jpeg attaches one camera
 // snapshot. Errors are safe: they never contain credentials or the
 // response body.
-func Send(ctx context.Context, cfg config.Notifications, title, body string, jpeg []byte) error {
+func Send(ctx context.Context, cfg Settings, title, body string, jpeg []byte) error {
 	switch cfg.Provider {
 	case "", "pushover":
 	default:

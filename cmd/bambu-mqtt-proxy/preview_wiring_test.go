@@ -22,6 +22,7 @@ import (
 
 	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/detection"
+	"bambu-mqtt-proxy/internal/jobpreview"
 )
 
 // startProxyChild starts the real run() in a subprocess with one
@@ -52,7 +53,7 @@ func startProxyChild(t *testing.T, previewEnv, cameraEnv, mcpEnv string) (url st
 		detection.EnvAPIKey+"=",
 	)
 	switches := []struct{ name, value string }{
-		{config.EnvJobPreview, previewEnv},
+		{jobpreview.EnvSwitch, previewEnv},
 		{config.EnvCameraEnable, cameraEnv},
 		{config.EnvMCPEnable, mcpEnv},
 	}

@@ -8,8 +8,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-
-	"bambu-mqtt-proxy/internal/config"
 )
 
 // pointPushoverURL aims pushoverURL at srv for the test and restores it.
@@ -52,10 +50,10 @@ func TestSendPostsMultipartMessage(t *testing.T) {
 	defer srv.Close()
 	pointPushoverURL(t, srv)
 
-	cfg := config.Notifications{
+	cfg := Settings{
 		Enabled:  true,
 		Provider: "pushover",
-		Pushover: config.Pushover{AppToken: " app-token ", UserKey: " user-key "},
+		Pushover: Pushover{AppToken: " app-token ", UserKey: " user-key "},
 	}
 	longTitle := strings.Repeat("t", 300)
 	longBody := strings.Repeat("m", 2000)
@@ -89,8 +87,8 @@ func TestSendStatusZeroReturnsErrorWithoutCredentials(t *testing.T) {
 	defer srv.Close()
 	pointPushoverURL(t, srv)
 
-	cfg := config.Notifications{Provider: "pushover",
-		Pushover: config.Pushover{AppToken: "secret-token", UserKey: "secret-user"}}
+	cfg := Settings{Provider: "pushover",
+		Pushover: Pushover{AppToken: "secret-token", UserKey: "secret-user"}}
 	err := Send(context.Background(), cfg, "title", "body", nil)
 	if err == nil {
 		t.Fatal("status 0 accepted")
@@ -111,8 +109,8 @@ func TestSendHTTPErrorReturnsSafeError(t *testing.T) {
 	defer srv.Close()
 	pointPushoverURL(t, srv)
 
-	cfg := config.Notifications{Provider: "pushover",
-		Pushover: config.Pushover{AppToken: "secret-token", UserKey: "secret-user"}}
+	cfg := Settings{Provider: "pushover",
+		Pushover: Pushover{AppToken: "secret-token", UserKey: "secret-user"}}
 	err := Send(context.Background(), cfg, "title", "body", []byte{1})
 	if err == nil || err.Error() != "pushover rejected the notification (HTTP 502)" {
 		t.Fatalf("Send error = %v", err)

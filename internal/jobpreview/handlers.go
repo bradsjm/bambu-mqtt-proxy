@@ -13,13 +13,6 @@ import (
 // GET /camera/{serial}/preview?v=<sha256-hex of the PNG bytes>.
 const previewRoute = "GET /camera/{serial}/preview"
 
-// Register mounts the preview image route on the shared mux. Main registers
-// only when a service exists, even when cameras are off and MCP is the only
-// consumer.
-func (s *Service) Register(mux *http.ServeMux) {
-	mux.HandleFunc(previewRoute, s.handlePreview)
-}
-
 // handlePreview serves the cached PNG for one serial and version. The
 // version must equal the SHA-256 of the currently cached image: unknown
 // serials, unavailable images, and stale versions all return 404 with no

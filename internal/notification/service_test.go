@@ -33,13 +33,13 @@ func newTestService(t *testing.T) (*Service, chan sentMsg) {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	state := telemetry.NewCache(testPrinters(), log)
-	s := New(config.Notifications{
+	s := New(Settings{
 		Enabled:  true,
 		Provider: "pushover",
-		Pushover: config.Pushover{AppToken: "app-token", UserKey: "user-key"},
+		Pushover: Pushover{AppToken: "app-token", UserKey: "user-key"},
 	}, state, nil, log)
 	sent := make(chan sentMsg, 8)
-	s.send = func(_ context.Context, _ config.Notifications, title, body string, jpeg []byte) error {
+	s.send = func(_ context.Context, _ Settings, title, body string, jpeg []byte) error {
 		sent <- sentMsg{title, body, jpeg}
 		return nil
 	}

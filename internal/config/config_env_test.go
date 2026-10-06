@@ -122,7 +122,7 @@ func unsetEnvForTest(t *testing.T, keys ...string) {
 	}
 }
 
-// allEnvKeys is the full BMBPX_* surface. Focused fixtures unset every one
+// allEnvKeys is the core BMBPX_* surface. Focused fixtures unset every one
 // so ambient values cannot alter the input a test means to establish.
 var allEnvKeys = []string{
 	EnvPrinters,
@@ -135,7 +135,6 @@ var allEnvKeys = []string{
 	EnvHTTPPort,
 	EnvCameraEnable,
 	EnvMCPEnable,
-	EnvJobPreview,
 }
 
 // TestApplyEnvDefaultListener pins the env-only startup path used when the
@@ -237,77 +236,5 @@ printers:
 				t.Fatalf("http.port = %d, want %d", cfg.HTTP.Port, tc.wantHTTP)
 			}
 		})
-	}
-}
-
-// TestApplyEnvJobPreview covers the environment-only job preview switch:
-// unset or empty keeps the enabled default, a parseable value wins, an
-// invalid value is the existing-style startup error, and re-applying
-// follows a removed variable back to the default.
-func TestApplyEnvJobPreview(t *testing.T) {
-	unsetEnvForTest(t, EnvJobPreview)
-	cfg := &Config{}
-	if !cfg.JobPreviewEnabled() || cfg.JobPreview != nil {
-		t.Fatal("job preview must default to enabled with a nil switch")
-	}
-
-	// An empty value means unset.
-	t.Setenv(EnvJobPreview, "")
-	if _, err := cfg.ApplyEnv(); err != nil {
-		t.Fatalf("ApplyEnv: %v", err)
-	}
-	if cfg.JobPreview != nil || !cfg.JobPreviewEnabled() {
-		t.Fatal("an empty variable must keep the default")
-	}
-
-	// An explicit false survives as a typed value.
-	t.Setenv(EnvJobPreview, "false")
-	if _, err := cfg.ApplyEnv(); err != nil {
-		t.Fatalf("ApplyEnv: %v", err)
-	}
-	if cfg.JobPreview == nil || *cfg.JobPreview || cfg.JobPreviewEnabled() {
-		t.Fatal("BMBPX_JOB_PREVIEW=false must disable job preview")
-	}
-
-	// Numeric and word spellings parse like the other bool switches.
-	t.Setenv(EnvJobPreview, "1")
-	if _, err := cfg.ApplyEnv(); err != nil {
-		t.Fatalf("ApplyEnv: %v", err)
-	}
-	if cfg.JobPreview == nil || !*cfg.JobPreview || !cfg.JobPreviewEnabled() {
-		t.Fatal("BMBPX_JOB_PREVIEW=1 must enable job preview")
-	}
-
-	// Invalid input is the existing-style startup error.
-	t.Setenv(EnvJobPreview, "bogus")
-	_, err := cfg.ApplyEnv()
-	if err == nil || err.Error() != `BMBPX_JOB_PREVIEW: invalid bool "bogus"` {
-		t.Fatalf("invalid value error = %v, want BMBPX_JOB_PREVIEW: invalid bool \"bogus\"", err)
-	}
-
-	// Re-applying after the variable disappears resets the switch, so the
-	// post-save re-apply never keeps a stale value.
-	unsetEnvForTest(t, EnvJobPreview)
-	disabled := false
-	cfg.JobPreview = &disabled
-	if _, err := cfg.ApplyEnv(); err != nil {
-		t.Fatalf("ApplyEnv: %v", err)
-	}
-	if cfg.JobPreview != nil || !cfg.JobPreviewEnabled() {
-		t.Fatal("re-apply without the variable must reset the switch")
-	}
-
-	// The field is environment-only: yaml:"-" keeps it out of files, and
-	// a file cannot set it.
-	typ := reflect.TypeOf(Config{})
-	if f, ok := typ.FieldByName("JobPreview"); !ok || f.Tag.Get("yaml") != "-" {
-		t.Fatal("JobPreview must be tagged yaml:\"-\"")
-	}
-	parsed, err := Parse([]byte("printers: []\njob_preview: false\n"))
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
-	if parsed.JobPreview != nil {
-		t.Fatal("a YAML job_preview field must not set the switch")
 	}
 }
