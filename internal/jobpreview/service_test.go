@@ -687,8 +687,17 @@ func TestFinishLogRecordShape(t *testing.T) {
 		var buf bytes.Buffer
 		// Debug level is test-only; the production logger keeps its
 		// configured level and the record under test is a Debug event.
-		log := slog.New(slog.NewJSONHandler(&buf,
-			&slog.HandlerOptions{Level: slog.LevelDebug}))
+		// The wall-clock time is pinned to a fixed value: its random digits
+		// could contain a leak marker such as "550" and fail by chance.
+		log := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{
+			Level: slog.LevelDebug,
+			ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+				if len(groups) == 0 && a.Key == slog.TimeKey {
+					return slog.Time(slog.TimeKey, time.Date(2026, 1, 2, 3, 4, 6, 0, time.UTC))
+				}
+				return a
+			},
+		}))
 		clk := &testClock{now: base}
 		conn := newFakeConn(serial)
 		job := settledJob(base, 7)
