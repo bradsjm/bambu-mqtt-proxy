@@ -50,6 +50,23 @@ type Module struct {
 	// Display returns the module's contribution to one printer's camera
 	// wall tile, or nil for nothing. It must be cheap and non-blocking.
 	Display func(serial string) *Display
+	// TileValue returns the module's own value for one printer's camera wall
+	// tile. The core serves it as the tile member named Name and omits the
+	// member for nil. A value with a StableKey() any method is compared
+	// through that method when the core decides whether to send an events
+	// update, so continuously aging fields may stay in the value. It must be
+	// safe for concurrent use and must not block.
+	TileValue func(serial string) any
+	// FleetValues returns top-level members of the /camera/status and
+	// /camera/events body. Every key equals Name or starts with Name+"_".
+	// nil or empty adds nothing.
+	FleetValues func() map[string]any
+	// StatusValue returns the module's /status member, served under Name.
+	StatusValue func() any
+	// Routes are HTTP handlers on the shared listener, mounted only when the
+	// listener runs. Mount protects every non-GET/HEAD route against
+	// cross-origin browser writes.
+	Routes []Route
 }
 
 // Display is one module's contribution to one printer tile. Values must be

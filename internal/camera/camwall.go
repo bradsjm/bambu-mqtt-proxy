@@ -11,13 +11,15 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"reflect"
 	"sort"
+	"strings"
 	"time"
 
 	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/control"
-	"bambu-mqtt-proxy/internal/detection"
 	"bambu-mqtt-proxy/internal/jobpreview"
+	"bambu-mqtt-proxy/internal/jsonobj"
 	"bambu-mqtt-proxy/internal/module"
 	"bambu-mqtt-proxy/internal/printerview"
 	"bambu-mqtt-proxy/internal/telemetry"
@@ -45,21 +47,17 @@ const (
 	eventsKeepalive = 10 * time.Second
 )
 
-// detectionPutMaxBody bounds the toggle and control request bodies: a few
-// small fields.
-const detectionPutMaxBody = 4 << 10
+// controlMaxBody bounds printer control request bodies.
+const controlMaxBody = 4 << 10
 
 // Tile is one printer's entry in /camera/status: the shared printer view
 // plus camera-wall-only state. It carries only display state: never
 // serial-derived credentials or raw configuration.
 type Tile struct {
 	printerview.View
-	CameraOK     bool   `json:"camera_supported"`
-	CameraReason string `json:"camera_reason,omitempty"`
-	// Detection is the optional OctoEverywhere detection status object,
-	// omitted when the feature is not configured.
-	Detection any              `json:"detection,omitempty"`
-	Activity  []activity.Entry `json:"activity,omitempty"` // recent events, newest first
+	CameraOK     bool             `json:"camera_supported"`
+	CameraReason string           `json:"camera_reason,omitempty"`
+	Activity     []activity.Entry `json:"activity,omitempty"` // recent events, newest first
 	// Controls lists the printer controls currently available.
 	Controls []string `json:"controls"`
 	FrameAge float64  `json:"frame_age_seconds,omitempty"`
@@ -74,48 +72,78 @@ type Tile struct {
 	JobMetadata *jobpreview.Metadata `json:"job_metadata"`
 	// Modules contains optional display contributions keyed by module name.
 	Modules map[string]module.Display `json:"modules,omitempty"`
+	extra   map[string]any
 }
 
 // statusPayload is the shared /camera/status and /camera/events body.
 type statusPayload struct {
 	Printers []Tile `json:"printers"`
-	// DetectionSuspended and DetectionMessage appear only while the
-	// OctoEverywhere account-level suspension is active.
-	DetectionSuspended bool   `json:"detection_suspended,omitempty"`
-	DetectionMessage   string `json:"detection_message,omitempty"`
+	extra    map[string]any
+}
+
+// MarshalJSON adds module-owned tile values to the core tile object.
+func (t Tile) MarshalJSON() ([]byte, error) {
+	type coreTile Tile
+	obj, err := json.Marshal(coreTile(t))
+	if err != nil {
+		return nil, err
+	}
+	return jsonobj.Append(obj, t.extra)
+}
+
+// MarshalJSON adds module-owned fleet members to the core payload.
+func (p statusPayload) MarshalJSON() ([]byte, error) {
+	type corePayload statusPayload
+	obj, err := json.Marshal(corePayload(p))
+	if err != nil {
+		return nil, err
+	}
+	return jsonobj.Append(obj, p.extra)
+}
+
+// tileCoreKeys includes core tile members even when their zero values are omitted.
+var tileCoreKeys = coreJSONKeys(reflect.TypeFor[Tile]())
+
+// coreJSONKeys collects JSON field names, including promoted embedded fields.
+func coreJSONKeys(t reflect.Type) map[string]bool {
+	keys := make(map[string]bool)
+	for i := range t.NumField() {
+		field := t.Field(i)
+		if !field.IsExported() {
+			continue
+		}
+		name := strings.Split(field.Tag.Get("json"), ",")[0]
+		if field.Anonymous && name == "" {
+			for key := range coreJSONKeys(field.Type) {
+				keys[key] = true
+			}
+			continue
+		}
+		if name == "-" {
+			continue
+		}
+		if name == "" {
+			name = field.Name
+		}
+		keys[name] = true
+	}
+	return keys
 }
 
 // NewStatusRenderer pairs the camera manager with the telemetry cache.
 type StatusRenderer struct {
-	cameras   *Manager
-	state     *telemetry.Cache
-	status    connectivitySource
-	detection detectionSource
-	control   detectionControl
-	printer   controlService      // optional printer controls
-	activity  *activity.Log       // optional recent-event source
-	previews  *jobpreview.Service // optional archived print preview
-	modules   []module.Module     // optional module display hooks
+	cameras  *Manager
+	state    *telemetry.Cache
+	status   connectivitySource
+	printer  controlService      // optional printer controls
+	activity *activity.Log       // optional recent-event source
+	previews *jobpreview.Service // optional archived print preview
+	modules  []module.Module     // optional module display hooks
 }
 
 // NewStatusRenderer builds the /camera/status payload renderer.
 func NewStatusRenderer(cameras *Manager, state *telemetry.Cache, status connectivitySource) *StatusRenderer {
 	return &StatusRenderer{cameras: cameras, state: state, status: status}
-}
-
-// detectionSource is the narrow, optional detection contract the renderer
-// consumes: one status object per serial plus the account suspension state.
-type detectionSource interface {
-	DetectionStatus(serial string) any
-	AccountSuspended() (suspended bool, message string)
-}
-
-// detectionControl is the optional write contract behind PUT /detection/
-// {serial}: apply the per-print override and return the authoritative
-// state. It is satisfied by *detection.Engine and stays nil when detection
-// is not configured, which keeps the write endpoint absent.
-type detectionControl interface {
-	SetDetectionEnabled(serial string, enabled bool, sessionID string) (any, error)
 }
 
 // controlService is the allow-listed printer control backend behind POST
@@ -130,16 +158,6 @@ func (r *StatusRenderer) SetControl(c controlService) {
 	r.printer = c
 }
 
-// SetDetection attaches the optional detection engine after construction.
-func (r *StatusRenderer) SetDetection(d detectionSource) {
-	r.detection = d
-}
-
-// SetDetectionControl attaches the optional per-print AI toggle backend.
-func (r *StatusRenderer) SetDetectionControl(c detectionControl) {
-	r.control = c
-}
-
 // SetActivity attaches the recent activity log shown in printer tiles.
 func (r *StatusRenderer) SetActivity(log *activity.Log) {
 	r.activity = log
@@ -151,9 +169,17 @@ func (r *StatusRenderer) SetJobPreview(s *jobpreview.Service) {
 	r.previews = s
 }
 
-// SetModules attaches optional module display hooks before serving requests.
-func (r *StatusRenderer) SetModules(mods []module.Module) {
+// SetModules attaches module hooks and rejects names that collide with core tile keys.
+func (r *StatusRenderer) SetModules(mods []module.Module) error {
+	for _, mod := range mods {
+		if mod.TileValue != nil {
+			if tileCoreKeys[mod.Name] {
+				return fmt.Errorf("module %q collides with a core tile member", mod.Name)
+			}
+		}
+	}
 	r.modules = mods
+	return nil
 }
 
 // connectivitySource reports upstream MQTT connectivity per serial, so the
@@ -185,9 +211,6 @@ func (r *StatusRenderer) Tiles() []Tile {
 			t.FrameAge = time.Since(f.Captured).Seconds()
 			t.FrameSeq = f.Seq
 		}
-		if r.detection != nil {
-			t.Detection = r.detection.DetectionStatus(st.Serial)
-		}
 		preview := jobpreview.Disabled()
 		if r.previews != nil {
 			// Cache-only read: Lookup never performs network work and the
@@ -200,6 +223,14 @@ func (r *StatusRenderer) Tiles() []Tile {
 		t.JobMetadata = preview.Metadata
 		t.Activity = r.activity.Recent(st.Serial)
 		for _, mod := range r.modules {
+			if mod.TileValue != nil {
+				if value := mod.TileValue(st.Serial); value != nil {
+					if t.extra == nil {
+						t.extra = make(map[string]any)
+					}
+					t.extra[mod.Name] = value
+				}
+			}
 			if mod.Display == nil {
 				continue
 			}
@@ -216,12 +247,25 @@ func (r *StatusRenderer) Tiles() []Tile {
 	return tiles
 }
 
-// payload assembles the shared status body, including the account-level
-// detection suspension when active.
+// payload assembles the shared status body with module fleet values.
 func (r *StatusRenderer) payload(tiles []Tile) statusPayload {
 	p := statusPayload{Printers: tiles}
-	if r.detection != nil {
-		p.DetectionSuspended, p.DetectionMessage = r.detection.AccountSuspended()
+	for _, mod := range r.modules {
+		if mod.FleetValues == nil {
+			continue
+		}
+		for key, value := range mod.FleetValues() {
+			if key != mod.Name && !strings.HasPrefix(key, mod.Name+"_") {
+				continue
+			}
+			if key == "printers" {
+				continue
+			}
+			if p.extra == nil {
+				p.extra = make(map[string]any)
+			}
+			p.extra[key] = value
+		}
 	}
 	return p
 }
@@ -236,10 +280,12 @@ func changeKey(tiles []Tile) ([]byte, error) {
 		for j := range t.Activity {
 			t.Activity[j].AgeSeconds = 0
 		}
-		// Detection ages (age_seconds, next_check_seconds) are continuously
-		// changing; the detection object carries a stable projection.
-		if d, ok := t.Detection.(interface{ StableKey() any }); ok {
-			t.Detection = d.StableKey()
+		t.extra = make(map[string]any, len(t.extra))
+		for key, value := range tiles[i].extra {
+			if stable, ok := value.(interface{ StableKey() any }); ok {
+				value = stable.StableKey()
+			}
+			t.extra[key] = value
 		}
 		stable[i] = t
 	}
@@ -301,11 +347,8 @@ func (r *StatusRenderer) RegisterStatus(mux *http.ServeMux) {
 		_ = json.NewEncoder(w).Encode(r.payload(r.Tiles()))
 	})
 	mux.HandleFunc("GET /camera/events", r.handleEvents)
-	// The per-print AI toggle and the printer controls are the wall's write
-	// endpoints; they are protected against cross-origin browser writes like
-	// /config/api.
+	// Printer controls are protected against cross-origin browser writes.
 	protection := http.NewCrossOriginProtection()
-	mux.Handle("PUT /detection/{serial}", protection.Handler(http.HandlerFunc(r.handleDetectionPut)))
 	mux.Handle("POST /control/{serial}", protection.Handler(http.HandlerFunc(r.handleControl)))
 	mux.HandleFunc("GET /camwall", func(w http.ResponseWriter, _ *http.Request) {
 		noStore(w)
@@ -325,46 +368,6 @@ func staticAsset(contentType string, body []byte) http.HandlerFunc {
 	}
 }
 
-// handleDetectionPut applies the per-print AI detection toggle: PUT JSON
-// {"enabled":bool,"session_id":string}. Disabling requires the opaque
-// token of the current print; a stale token or no active print answers
-// 409. Every success returns the authoritative detection state.
-func (r *StatusRenderer) handleDetectionPut(w http.ResponseWriter, req *http.Request) {
-	noStore(w)
-	if r.control == nil {
-		writeJSONError(w, http.StatusNotFound, "detection is not configured")
-		return
-	}
-	var in struct {
-		Enabled   *bool  `json:"enabled"`
-		SessionID string `json:"session_id"`
-	}
-	dec := json.NewDecoder(http.MaxBytesReader(w, req.Body, detectionPutMaxBody))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&in); err != nil || in.Enabled == nil {
-		writeJSONError(w, http.StatusBadRequest, "body must be a JSON object with an enabled boolean")
-		return
-	}
-	st, err := r.control.SetDetectionEnabled(req.PathValue("serial"), *in.Enabled, in.SessionID)
-	if err != nil {
-		var code int
-		switch {
-		case errors.Is(err, detection.ErrUnknownPrinter):
-			code = http.StatusNotFound
-		case errors.Is(err, detection.ErrNoPrintSession),
-			errors.Is(err, detection.ErrStaleSession),
-			errors.Is(err, detection.ErrDetectionUnavailable):
-			code = http.StatusConflict
-		default:
-			code = http.StatusInternalServerError
-		}
-		writeJSONError(w, code, err.Error())
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(st)
-}
-
 // handleControl sends one allow-listed printer control: POST JSON
 // {"action":"light|pause|resume|speed|stop","on":bool,"profile":string}.
 // There is no confirmation step; the result reports that the command was
@@ -376,7 +379,7 @@ func (r *StatusRenderer) handleControl(w http.ResponseWriter, req *http.Request)
 		return
 	}
 	var in control.Request
-	dec := json.NewDecoder(http.MaxBytesReader(w, req.Body, detectionPutMaxBody))
+	dec := json.NewDecoder(http.MaxBytesReader(w, req.Body, controlMaxBody))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&in); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "body must be a JSON object with an action")

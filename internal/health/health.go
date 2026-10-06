@@ -15,20 +15,18 @@ type StatusSource interface {
 	Status() map[string]bool
 }
 
-// DetectionSource provides the optional per-serial OctoEverywhere detection
-// status map served on /status. nil disables the field.
-type DetectionSource interface {
-	// DetectionMap returns serial -> detection status object.
-	DetectionMap() map[string]any
-}
-
-// Routes registers /livez, /readyz and /status on the shared mux. The
-// detection source may be nil when the feature is not configured; the
-// /status payload then stays byte-compatible with the previous shape.
-func Routes(mux *http.ServeMux, source StatusSource, detection DetectionSource) {
+// Routes registers /livez, /readyz and /status on the shared mux.
+// Each sections entry adds a top-level /status member; nil keeps the core payload.
+// A section name that collides with a core member is rejected before mounting.
+func Routes(mux *http.ServeMux, source StatusSource, sections map[string]func() any) {
+	for name := range sections {
+		if name == "status" || name == "upstreams" {
+			panic("health section collides with core member: " + name)
+		}
+	}
 	mux.HandleFunc("GET /livez", ok)
 	mux.HandleFunc("GET /readyz", ok)
-	mux.HandleFunc("GET /status", status(source, detection))
+	mux.HandleFunc("GET /status", status(source, sections))
 }
 
 // ok answers 200 for liveness and readiness probes.
@@ -39,15 +37,17 @@ func ok(w http.ResponseWriter, _ *http.Request) {
 }
 
 // status answers with upstream connectivity JSON.
-func status(source StatusSource, detection DetectionSource) http.HandlerFunc {
+func status(source StatusSource, sections map[string]func() any) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		out := map[string]any{
 			"status":    "ok",
 			"upstreams": source.Status(),
 		}
-		if detection != nil {
-			out["detection"] = detection.DetectionMap()
+		for name, value := range sections {
+			if value != nil {
+				out[name] = value()
+			}
 		}
 		_ = json.NewEncoder(w).Encode(out)
 	}

@@ -35,28 +35,19 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// TestDetectionSourceNoKeyWiring exercises the actual no-key wiring run()
-// performs: the disabled detector is a typed-nil *detection.Engine, and
-// detectionSource must convert it to a true nil interface so the served
-// /status payload omits detection instead of panicking inside
-// health.Routes.
-func TestDetectionSourceNoKeyWiring(t *testing.T) {
-	if got := detectionSource(nil); got != nil {
-		t.Fatalf("detectionSource(nil) = %#v, want a true nil interface", got)
-	}
-
-	// Enabled branch: the helper forwards the live engine, which answers
-	// for every configured serial even before Start.
+// TestDetectionModuleNoKeyWiring checks that disabled modules add no status member.
+func TestDetectionModuleNoKeyWiring(t *testing.T) {
+	// An enabled module supplies status for every serial before Start.
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	engine := detection.New(
 		[]config.Printer{{Serial: "01P1TESTENABLED", Model: "P1S"}},
 		detection.NewGadgetClient("test-key"),
 		idleFrames{}, nil, nil, nil, logger,
 	)
-	if got := detectionSource(engine); got == nil {
-		t.Fatal("detectionSource(engine) = nil, want the engine")
-	} else if m := got.DetectionMap(); m["01P1TESTENABLED"] == nil {
-		t.Fatalf("DetectionMap missing serial: %v", m)
+	value := engine.Module().StatusValue()
+	statuses, ok := value.(map[string]any)
+	if !ok || statuses["01P1TESTENABLED"] == nil {
+		t.Fatalf("StatusValue missing serial: %v", value)
 	}
 
 	// The exact run() call shape for a no-key configuration.
@@ -69,9 +60,8 @@ func TestDetectionSourceNoKeyWiring(t *testing.T) {
 	pool := upstream.NewPool(cfg.Printers, nil, cfg.Behavior, logger)
 	t.Cleanup(pool.Stop)
 
-	var detector *detection.Engine // no key configured: stays nil
 	mux := http.NewServeMux()
-	health.Routes(mux, pool, detectionSource(detector))
+	health.Routes(mux, pool, nil)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 

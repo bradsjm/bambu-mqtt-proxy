@@ -186,10 +186,6 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	// First-layer completion observes telemetry that is already live; it
 	// neither holds report interest nor opens a camera connection.
 	firstLayers := firstlayer.New(cfg.Printers, state, activities)
-	if renderer != nil && detector != nil {
-		renderer.SetDetection(detector)
-		renderer.SetDetectionControl(detector)
-	}
 	if renderer != nil && previews != nil {
 		renderer.SetJobPreview(previews)
 	}
@@ -218,6 +214,9 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		mods = append(mods, detector.Module())
 	}
 	mods = append(mods, firstLayers.Module())
+	if err := module.Check(mods); err != nil {
+		return nil, fmt.Errorf("modules: %w", err)
+	}
 	var chamberSet bool
 	var observers []func(string, activity.Entry)
 	for _, mod := range mods {
@@ -237,7 +236,9 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		})
 	}
 	if renderer != nil {
-		renderer.SetModules(mods)
+		if err := renderer.SetModules(mods); err != nil {
+			return nil, fmt.Errorf("camera modules: %w", err)
+		}
 	}
 	// MCP endpoint on the shared HTTP listener, on by default and disabled
 	// with mcp.enabled: false / BMBPX_MCP_ENABLED=false. Its sampler reads
@@ -356,7 +357,13 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	if cfg.HTTP.Port > 0 {
 		httpSrv = httpsrv.New(cfg.HTTP.Port, logger)
 		activities.Register(httpSrv.Mux())
-		health.Routes(httpSrv.Mux(), pool, detectionSource(detector))
+		sections := make(map[string]func() any)
+		for _, mod := range mods {
+			if mod.StatusValue != nil {
+				sections[mod.Name] = mod.StatusValue
+			}
+		}
+		health.Routes(httpSrv.Mux(), pool, sections)
 		store.Register(httpSrv.Mux())
 		if mcpsrv != nil {
 			mcpsrv.Register(httpSrv.Mux())
@@ -372,6 +379,7 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 			renderer.RegisterStatus(httpSrv.Mux())
 			logger.Info("camera endpoints and camera wall serving", "port", cfg.HTTP.Port)
 		}
+		module.Mount(httpSrv.Mux(), mods)
 		// Root: setup mode sends visitors to the configuration page; with
 		// printers configured the camera wall is the main page. Without
 		// cameras the wall does not exist, so / stays a plain 404.
@@ -418,18 +426,6 @@ func waitReload(sigCtx context.Context, store *configui.Store) *configui.Reload 
 	case r := <-store.Reloads():
 		return &r
 	}
-}
-
-// detectionSource adapts the optional detection engine to the health
-// endpoint contract. A disabled feature must become a true nil interface:
-// the nil *detection.Engine converted directly is a typed nil that the
-// /status handler cannot tell apart from a live engine, and calling
-// DetectionMap on it panics.
-func detectionSource(e *detection.Engine) health.DetectionSource {
-	if e == nil {
-		return nil
-	}
-	return e
 }
 
 // resolveConfig builds the configuration from an optional YAML file with

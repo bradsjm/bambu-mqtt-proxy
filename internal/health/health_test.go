@@ -10,8 +10,6 @@ import (
 	"strconv"
 	"testing"
 	"time"
-
-	"bambu-mqtt-proxy/internal/detection"
 )
 
 type fakeSource struct {
@@ -81,23 +79,10 @@ func liveURL(port int, path string) string {
 	return "http://127.0.0.1:" + strconv.Itoa(port) + path
 }
 
-type fakeDetection struct {
-	suspended bool
-}
-
-func (f fakeDetection) DetectionMap() map[string]any {
-	// Serve a real detection.Status so the JSON keys asserted below come
-	// from the production struct tags, not from hardcoded literals here.
-	return map[string]any{"S1": &detection.Status{
-		State:      detection.StateMonitoring,
-		PauseState: detection.PauseNone,
-	}}
-}
-
 func TestStatusDetectionContract(t *testing.T) {
-	mk := func(detection DetectionSource) *httptest.Server {
+	mk := func(sections map[string]func() any) *httptest.Server {
 		mux := http.NewServeMux()
-		Routes(mux, fakeSource{status: map[string]bool{"S1": true}}, detection)
+		Routes(mux, fakeSource{status: map[string]bool{"S1": true}}, sections)
 		return httptest.NewServer(mux)
 	}
 
@@ -119,7 +104,13 @@ func TestStatusDetectionContract(t *testing.T) {
 	}
 
 	// With detection configured, every serial's status object is served.
-	with := mk(fakeDetection{})
+	with := mk(map[string]func() any{
+		"detection": func() any {
+			return map[string]any{"S1": map[string]string{
+				"state": "monitoring", "pause_state": "none",
+			}}
+		},
+	})
 	defer with.Close()
 	resp, err = http.Get(with.URL + "/status")
 	if err != nil {
