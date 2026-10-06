@@ -12,9 +12,77 @@
 - `internal/broker` adapts the mochi MQTT server and its hooks. `internal/routing` resolves topic filters against configured serials.
 - `internal/upstream` owns lazy per-printer connections, merged subscriptions, reconnects, and warmup commands.
 - `internal/telemetry` observes reports without changing forwarding. `internal/camera` owns camera capture and endpoints. `internal/health` and `internal/httpsrv` provide the shared HTTP service.
-- `internal/module` defines the module contract for optional capabilities (detection, Panda Breath, notifications, job previews, first-layer completion). Add a new capability as its own package: construct it in `serveOnce` with the narrow core services it needs, return its hooks from a `Module() module.Module` method, and append it to the module list. Show its wall information through `Display` (camera overlay badges or a details panel). When a module must keep its own wire contract, serve it under the module's name with `State` (per-printer module state served as the camera wall tile member and as MCP `state.modules.<name>`), `FleetValues`, `StatusValue`, and `Routes`; `module.Mount` protects write routes. Register module MCP tools through the `MCP` hook, calling `mcp.AddTool` with the helpers in `internal/module/mcp.go` (`ReadOnly`, `Command`, `SerialInput`, and `ToolError` with `CodeUnknownSerial` and `CodeCommandFailed`). A per-printer option belongs to its module: define a `config.PrinterSetting` (key, label, hint, validation) in the module package and register it in `cmd/bambu-mqtt-proxy/settings.go`; core config, `BMBPX_PRINTERS`, and the `/config` page handle it generically. A whole top-level config section belongs to its module as a `config.Section`, registered in the same file. Do not add capability-specific fields to core packages.
+- `internal/module` defines the module contract. Every optional capability is a module; follow the Module Pattern section below.
 
 Keep dependencies explicit at constructors and preserve package ownership. The broker injector is attached after construction to break its callback cycle with the upstream pool.
+
+## Module Pattern
+
+The core is the MQTT proxy path (config, broker, routing, upstream), telemetry, cameras, the activity log, and the control service. The core also includes the shared HTTP listener, health, and the MCP endpoint with its core tools. The camera wall and `/config` page shells are core too. Every other capability is a module. The current modules are `notification`, `jobpreview`, `pandabreath`, `detection`, and `firstlayer`.
+
+### Add a capability
+
+1. Create one package `internal/<name>`. Use `<name>` as the module `Name`.
+2. Give its constructor only the narrow core services that it needs:
+   - telemetry and camera frames
+   - `control.Service` for user commands
+   - the generation-guarded `upstream.Pool` commands for autonomous actions
+   - the activity log
+3. Construct it in `serveOnce` only when the capability is enabled.
+4. Return its hooks from a `Module() module.Module` method. Set only the hooks that it uses.
+5. Append it to the module list in `serveOnce`. The core starts modules in list order and stops them in reverse order.
+
+| Hook | Use it for |
+| --- | --- |
+| `Start`, `Stop` | Background work. `Stop` waits until the work ends. |
+| `NeedsReports` | Live telemetry without MQTT clients. |
+| `ObserveActivity` | Reactions to recorded activity entries. |
+| `ChamberReading` | An accessory chamber temperature. |
+| `Display` | Camera wall badges over the image, or a titled details panel. |
+| `State` | Per-printer state. The core serves it as the wall tile member `<name>` and as MCP `state.modules.<name>`. |
+| `FleetValues` | Top-level `/camera/status` members named `<name>` or `<name>_*`. |
+| `StatusValue` | The `/status` member `<name>`. |
+| `Routes` | HTTP handlers. `module.Mount` protects the write routes. |
+| `MCP` | MCP tools, registered with `mcp.AddTool`. |
+
+### Configuration
+
+- Put a per-printer option in a `config.PrinterSetting` in the module package.
+- Put a top-level config section in a `config.Section` in the module package.
+- Register both in `cmd/bambu-mqtt-proxy/settings.go`. Core config, `BMBPX_PRINTERS`, and the `/config` page then handle them generically.
+
+### MCP
+
+- Put per-printer data in `State`. Do not add module fields to `internal/mcpserver` types.
+- Register tools in the `MCP` hook. Use the helpers in `internal/module/mcp.go`: `ReadOnly`, `Command`, `SerialInput`, and `ToolError` with `CodeUnknownSerial` and `CodeCommandFailed`.
+- Register a tool only when the module can serve it. For example, blocked detection registers no `set_ai_monitoring`.
+- Check the serial first. Return `unknown_serial` for a printer that is not configured.
+- Return an expected failure as typed output with `error` set and `IsError: true`. Return a nil Go error.
+- Give every tool a unique name. The SDK silently replaces a tool that has the same name.
+
+### Rules
+
+- Modules MUST NOT publish raw MQTT or change forwarded payloads. Send user commands through `control.Service`. Send autonomous commands through the generation-guarded pool methods.
+- Keep `State`, `Display`, and tool handlers safe for concurrent use, non-blocking, and free of network work. Keep them safe after `Stop`.
+- Keep `State` and `Display` values stable between real changes. Round or omit aging fields, or implement `StableKey() any` on the `State` value. Otherwise every sample updates the wall and wakes `watch_printer`.
+- Start every route pattern with an HTTP method.
+- Do not add capability-specific fields, imports, or branches to core packages. If the contract cannot express a need, extend the contract generically for all modules.
+- Add module markup to `camwall.html` or `config.html` only when `Display` or `config.PrinterSetting` cannot express it. The detection AI controls and the config section forms are such cases.
+
+### Known exceptions
+
+Do not copy these exceptions. Move each one into its module when you next change that code.
+
+- Notifications config: `config.Notifications`, its validation, and the `notification.Send` import in `internal/configui`. Target: a `config.Section` in `internal/notification`.
+- Job preview switch: `Config.JobPreview`, `EnvJobPreview`, and `JobPreviewEnabled` in `internal/config`.
+- Job preview image route: `serveOnce` mounts it with `previews.Register`. Target: the `Routes` hook.
+
+The `notification` module maps activity kinds that other modules record (`ai_*`, `first_layer_complete`). This module-to-module knowledge is accepted.
+
+### Module tests
+
+- Test module MCP tools through a real `mcp.Server` with in-memory transports, so the SDK validates every output. See `internal/detection/mcp_test.go`.
+- When a module adds or removes a tool, update `TestModuleMCPWiring` in `cmd/bambu-mqtt-proxy/preview_wiring_test.go`.
 
 ## Printer MQTT Contract
 
@@ -34,7 +102,7 @@ The upstream device is a printer with a bare-bones ESP32 MQTT broker, not a gene
 | Path | Purpose |
 | --- | --- |
 | `cmd/bambu-mqtt-proxy/` | Application entry point and service wiring |
-| `internal/` | Config, broker, routing, upstream, telemetry, camera, HTTP, health, and TLS packages |
+| `internal/` | Core packages (config, broker, routing, upstream, telemetry, camera, HTTP, health, MCP, TLS) and one package per module (`detection`, `jobpreview`, `pandabreath`, `notification`, `firstlayer`) |
 | `internal/integration/` | End-to-end tests with fake printers and MQTT clients |
 | `.github/workflows/` | CI checks and multi-architecture image publishing |
 

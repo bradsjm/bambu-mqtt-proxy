@@ -98,15 +98,47 @@ Four parts, one process:
 
 A custom mochi hook is the only coupling between the broker and the pool. The hook rewrites where packets go; it does not rewrite packets. The telemetry cache observes reports through the pool without changing forwarding.
 
-An optional notifier (§9) observes recorded activity and delivers Pushover messages off the forwarding path; delivery is best-effort and never blocks the broker.
+### 3.1 Modules
 
-Optional capabilities are modules (`internal/module`): AI failure detection, Panda Breath chamber readings, notifications, and job previews. Each module package declares its hooks with one `module.Module` value; the service wiring constructs the enabled modules with the core services they need (telemetry, camera frames, guarded printer commands, activity log) and hands the declarations to one generic path. That path owns start and stop order, the shared per-printer report interest, activity fan-out, the accessory chamber reading, and camera wall display. A module shows information on the wall through `Display`: badges over the camera image or a titled panel in the tile details, under the tile's `modules` key, with no wall code change. Modules can also serve members under their own name: per-printer module state (`State`, served as the camera wall tile member named after the module and as `state.modules.<name>` in MCP printer state), top-level camera status members (`FleetValues`), a `/status` member (`StatusValue`), HTTP routes (`Routes`; `module.Mount` adds cross-origin protection to every write route), and MCP tools (`MCP`; the module registers its tools with `mcp.AddTool` and the core calls the hook for every module in the running configuration). Detection uses `State` with a `StableKey` value to keep its wall tile `detection` and MCP `state.modules.detection` contract, plus fleet `detection_suspended` and `detection_message`, `/status` `detection`, and `PUT /detection/{serial}` with its MCP tool `set_ai_monitoring` registered by its `MCP` hook, while the camera wall renderer, `/status`, and `internal/mcpserver` hold no detection code.
+The core is the MQTT proxy path (§4–§8), telemetry, cameras, the activity log, the allow-listed control service, the shared HTTP listener and health, the camera wall and `/config` page shells, and the MCP endpoint with its core tools. Every other capability is a module: one package that owns the capability and declares its hooks with one `module.Module` value (`internal/module`). Apart from the exceptions listed below, the core holds no capability-specific fields, imports, or branches; a module serves everything under its own name.
 
-Panda Breath is the first module with a wall display. Its panel (full detail level) shows the device link (connected, connected with no readings, or offline), the device's own chamber reading while fresh, and a trend over up to three minutes of spaced samples; a "Chamber warming" badge appears on the camera image only while the chamber rises by at least 2 °C over at least two minutes. Everything derives from the live `warehouse_temper` stream: the device sends its settings only once per connection, so the module shows no settings and opens no extra connections. The same snapshot is the module's `State` value, served to MCP as `state.modules.pandabreath` (`link`, `chamber_c` while fresh, `trend`, and the signed `rate_c_per_min`); its `StableKey` keeps only the link and trend, so temperature steps do not wake `watch_printer`.
+`serveOnce` constructs each enabled module with only the narrow core services it needs: telemetry and print sessions, camera frames, `control.Service` for user-style commands, generation-guarded pool commands for autonomous actions, and the activity log. It collects the declarations into one explicit list, and `module.Check` rejects empty or duplicate names and route patterns without an HTTP method. Modules are compile-time: no plugin loading, no registry of constructed modules.
 
-A per-printer module option is a `config.PrinterSetting` that the module package defines (key, page label, hint, validation) and `cmd/bambu-mqtt-proxy/settings.go` registers at program initialization. The setting stays at the printer level in YAML (for example `panda_breath:`), as a `BMBPX_PRINTERS` key, and as a field in the `/config` printer dialog, with no core code per module. Unknown printer keys still load and are ignored, whatever their YAML shape.
+| Hook | What the core does with it |
+|---|---|
+| `Start`, `Stop` | Starts modules in list order after the broker and the raw camera listener serve; stops the started modules in reverse order after MCP and HTTP stop |
+| `NeedsReports` | Holds one report interest per printer, so telemetry stays live without MQTT clients |
+| `ObserveActivity` | Fans out every recorded activity entry |
+| `ChamberReading` | Uses the first module's accessory chamber reading for models without a usable sensor, with the shared freshness window |
+| `Display` | Draws badges over the camera image or a titled panel in the tile details, under the tile's `modules` key, with no wall code change |
+| `State` | Serves one per-printer value as the wall tile member `<name>` and as MCP `state.modules.<name>`; a change, compared through `StableKey()` when the value has it and through its JSON otherwise, sends a wall update and a `watch_printer` `module_changed` event |
+| `FleetValues` | Adds top-level `/camera/status` and `/camera/events` members named `<name>` or `<name>_*` |
+| `StatusValue` | Adds the `/status` member `<name>` |
+| `Routes` | Mounts HTTP handlers on the shared listener; `module.Mount` adds cross-origin protection to every write route |
+| `MCP` | Calls the hook once while building the MCP server; the module registers its tools with `mcp.AddTool` and the helpers in `internal/module/mcp.go` |
 
-A module-owned top-level config section is a `config.Section` that the module package defines and `cmd/bambu-mqtt-proxy/settings.go` registers: it owns the section's YAML shape, environment overrides, effective validation, its `/config` API member and secret handling, and an optional `POST /config/{key}/test` action. Detection's `detection:` section, the `BMBPX_OCTOEVERYWHERE_API_KEY` override, the enable-requires-key rule, and the key test live in `internal/detection`; the page markup stays in `config.html`.
+Read hooks and tool handlers run on HTTP, sampler, and report goroutines at once. They can also run after `Stop`: MCP close cancels requests without joining the sampler, and the HTTP server force-closes after a bounded grace period. They must be safe for concurrent use, non-blocking, free of network work, and safe after `Stop`. Modules never publish raw MQTT and never change forwarded payloads.
+
+Module configuration has two generic forms, both defined in the module package and registered in `cmd/bambu-mqtt-proxy/settings.go` at program initialization, because the `/config` store outlives `serveOnce` and setup mode runs with no modules:
+
+- A per-printer option is a `config.PrinterSetting` (key, page label, hint, validation). It stays at the printer level in YAML (for example `panda_breath:`), as a `BMBPX_PRINTERS` key, and as a field in the `/config` printer dialog. Unknown printer keys still load and are ignored, whatever their YAML shape.
+- A top-level section is a `config.Section`. It owns the section's YAML shape, environment overrides, effective validation, its `/config` API member and secret handling, and an optional `POST /config/{key}/test` action. `Config.Sections` keeps each section's YAML node, so scalar text survives a save unchanged.
+
+MCP follows the same ownership. A module's per-printer data reaches agents only through `State`; `internal/mcpserver` has no module types. A module registers a tool only when it can serve it, so tool presence follows the running configuration and `ListChanged` stays false: a configuration save rebuilds the server. Module tools check the serial first, return expected failures as typed output with an `error` member and `IsError`, and use unique names, because the SDK replaces a tool with the same name silently.
+
+| Module | Runs when | Hooks | Surfaces |
+|---|---|---|---|
+| `notification` | `notifications.enabled` | `Start`/`Stop`, `NeedsReports`, `ObserveActivity` | Pushover messages (§9) |
+| `jobpreview` | Job preview switch on, HTTP on, and the wall or MCP on | `Start`/`Stop`, `State`, `MCP` | Tile and `state.modules.jobpreview`, `get_job_preview`, the cached image route |
+| `pandabreath` | HTTP on; one device connection per printer with `panda_breath` set | `Start`/`Stop`, `ChamberReading`, `Display`, `State` | Wall panel and badge, accessory chamber reading, `state.modules.pandabreath` |
+| `detection` | A Gadget key (or explicit enable) is configured (§6.1) | `Start`/`Stop`, `NeedsReports`, `State`, `FleetValues`, `StatusValue`, `Routes`, `MCP` | Tile `detection`, fleet `detection_suspended`/`detection_message`, `/status` `detection`, `PUT /detection/{serial}`, `state.modules.detection`, `set_ai_monitoring` |
+| `firstlayer` | Always | `Start`/`Stop` | The `first_layer_complete` activity entry |
+
+Two kinds of module-specific markup remain in the embedded pages, because the generic hooks cannot express them: the interactive detection controls in `camwall.html` and the section forms in `config.html`. Three core exceptions predate the pattern and move into their modules when that code next changes: the notifications config (`config.Notifications` and the `notification.Send` import in `internal/configui`), the job preview switch (`Config.JobPreview` and `BMBPX_JOB_PREVIEW` in `internal/config`), and the job preview image route, which `serveOnce` mounts directly instead of through `Routes`. The notification module's summaries for other modules' activity kinds (`ai_*`, `first_layer_complete`) are accepted module-to-module knowledge.
+
+Panda Breath shows a wall panel (full detail level) with the device link (connected, connected with no readings, or offline), the device's own chamber reading while fresh, and a trend over up to three minutes of spaced samples; a "Chamber warming" badge appears on the camera image only while the chamber rises by at least 2 °C over at least two minutes. Everything derives from the live `warehouse_temper` stream: the device sends its settings only once per connection, so the module shows no settings and opens no extra connections. One locked snapshot backs both the panel and the `State` value (`link`, `chamber_c` while fresh, `trend`, and the signed `rate_c_per_min`); its `StableKey` keeps only the link and trend, so temperature steps do not wake `watch_printer`.
+
+Detection keeps its own `detection:` section, the `BMBPX_OCTOEVERYWHERE_API_KEY` override, the enable-requires-key rule, and the key test in `internal/detection` as a `config.Section`. While blocked (cameras off) it serves its blocked state but registers neither `PUT /detection/{serial}` nor `set_ai_monitoring`.
 
 First-layer completion is an activity-only module: when a print session observed at layer 1 reaches layer 2, it records one `first_layer_complete` entry ("First layer complete"). With notifications enabled, that entry sends a push with a live camera frame, so someone away from the wall can check the first layer. It opens no camera connection itself, adds no report interest, and records nothing for a print first seen past layer 1.
 
@@ -588,8 +620,13 @@ internal/upstream/conn.go      paho client wrapper (connect, publish, merged sub
 internal/routing/topic.go      serial extraction, wildcard expansion, filter↔serial sets
 internal/telemetry/            delta-merging display-state cache fed by upstream reports
 internal/camera/               P1/A1 chamber-image capture, X1/P2S/H2-series RTSPS capture via FFmpeg, raw TLS camera endpoint, snapshot/stream/camera wall handlers
-internal/mcpserver/            MCP endpoint (tools, state resource, subscriptions, shared sampler)
-internal/notification/         Pushover sender + batched best-effort notifier over recorded activity
+internal/mcpserver/            MCP endpoint (core tools, state resource, subscriptions, shared sampler)
+internal/module/               module contract, route mounting, shared MCP tool helpers
+internal/notification/         module: Pushover sender + batched best-effort notifier over recorded activity
+internal/jobpreview/           module: cached 3MF plate render and metadata, get_job_preview
+internal/pandabreath/          module: Panda Breath accessory link, chamber reading, and trend
+internal/detection/            module: Gadget AI failure detection, its config section, set_ai_monitoring
+internal/firstlayer/           module: first-layer completion activity entry
 internal/httpsrv/              shared health + camera HTTP listener
 internal/tlsutil/              self-signed certificate generation and persistence
 ```
