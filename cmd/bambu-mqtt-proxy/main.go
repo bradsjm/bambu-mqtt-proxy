@@ -14,7 +14,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/broker"
@@ -173,12 +172,12 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	if cfg.DetectionEnabled() {
 		client := detection.NewGadgetClient(cfg.DetectionKey())
 		if !cfg.CameraEnabled() {
-			detector = detection.New(cfg.Printers, client, idleFrames{}, state, pool, pool, logger)
+			detector = detection.New(cfg.Printers, client, detection.IdleFrames{}, state, pool, pool, logger)
 			detector.SetBlocked(detection.ReasonCameraDisabled)
 			logger.Warn("detection blocked: the camera feature is disabled",
 				"env", config.EnvCameraEnable)
 		} else {
-			detector = detection.New(cfg.Printers, client, cameraFrames{m: cameras}, state, pool, pool, logger)
+			detector = detection.New(cfg.Printers, client, detection.CameraFrames(cameras), state, pool, pool, logger)
 			logger.Info("octoeverywhere detection enabled")
 		}
 		detector.SetActivity(activities)
@@ -473,45 +472,4 @@ func newLogger(level string) (*slog.Logger, error) {
 		return nil, fmt.Errorf("log level %q: %w", level, err)
 	}
 	return slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: lv})), nil
-}
-
-// cameraFrames adapts the camera manager to the detection engine's frame
-// source. The engine receives plain values, so it never imports the camera
-// package and the camera package never imports detection.
-type cameraFrames struct {
-	m *camera.Manager
-}
-
-// Acquire starts (or joins) the shared capture for serial; false means the
-// serial is unknown or its model cannot serve camera frames.
-func (f cameraFrames) Acquire(serial string) bool {
-	_, st := f.m.Acquire(serial)
-	return st == camera.StatusOK
-}
-
-// Release drops one camera consumer interest taken with Acquire.
-func (f cameraFrames) Release(serial string) {
-	f.m.Release(serial)
-}
-
-// WaitFrame waits up to timeout for a frame newer than after.
-func (f cameraFrames) WaitFrame(serial string, ctx context.Context, after uint64,
-	timeout time.Duration) (detection.Frame, bool) {
-	frame := f.m.Wait(serial, ctx, after, timeout)
-	if frame == nil {
-		return detection.Frame{}, false
-	}
-	return detection.Frame{JPEG: frame.JPEG, Seq: frame.Seq, Captured: frame.Captured}, true
-}
-
-// idleFrames is the frame source for blocked detection: the engine parks its
-// workers before touching it, but the dependency stays non-nil.
-type idleFrames struct{}
-
-func (idleFrames) Acquire(string) bool { return false }
-
-func (idleFrames) Release(string) {}
-
-func (idleFrames) WaitFrame(string, context.Context, uint64, time.Duration) (detection.Frame, bool) {
-	return detection.Frame{}, false
 }

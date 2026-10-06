@@ -42,7 +42,7 @@ func TestDetectionModuleNoKeyWiring(t *testing.T) {
 	engine := detection.New(
 		[]config.Printer{{Serial: "01P1TESTENABLED", Model: "P1S"}},
 		detection.NewGadgetClient("test-key"),
-		idleFrames{}, nil, nil, nil, logger,
+		detection.IdleFrames{}, nil, nil, nil, logger,
 	)
 	value := engine.Module().StatusValue()
 	statuses, ok := value.(map[string]any)
