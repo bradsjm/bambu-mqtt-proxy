@@ -18,7 +18,6 @@ import (
 
 	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/control"
-	"bambu-mqtt-proxy/internal/jobpreview"
 	"bambu-mqtt-proxy/internal/jsonobj"
 	"bambu-mqtt-proxy/internal/module"
 	"bambu-mqtt-proxy/internal/printerview"
@@ -62,14 +61,6 @@ type Tile struct {
 	Controls []string `json:"controls"`
 	FrameAge float64  `json:"frame_age_seconds,omitempty"`
 	FrameSeq uint64   `json:"frame_seq,omitempty"`
-	// JobPreview is the shared archived preview of the current print and
-	// JobMetadata carries its accepted archive facts; both come from the
-	// job preview service and are present whenever the feature runs, with
-	// status disabled when it does not. These are display-only archived
-	// values: they never feed printerview's live projection and never
-	// become alerts.
-	JobPreview  jobpreview.View      `json:"job_preview"`
-	JobMetadata *jobpreview.Metadata `json:"job_metadata"`
 	// Modules contains optional display contributions keyed by module name.
 	Modules map[string]module.Display `json:"modules,omitempty"`
 	extra   map[string]any
@@ -135,10 +126,9 @@ type StatusRenderer struct {
 	cameras  *Manager
 	state    *telemetry.Cache
 	status   connectivitySource
-	printer  controlService      // optional printer controls
-	activity *activity.Log       // optional recent-event source
-	previews *jobpreview.Service // optional archived print preview
-	modules  []module.Module     // optional module display hooks
+	printer  controlService  // optional printer controls
+	activity *activity.Log   // optional recent-event source
+	modules  []module.Module // optional module display hooks
 }
 
 // NewStatusRenderer builds the /camera/status payload renderer.
@@ -163,16 +153,10 @@ func (r *StatusRenderer) SetActivity(log *activity.Log) {
 	r.activity = log
 }
 
-// SetJobPreview attaches the shared job preview service; nil keeps the
-// disabled projection in every tile.
-func (r *StatusRenderer) SetJobPreview(s *jobpreview.Service) {
-	r.previews = s
-}
-
 // SetModules attaches module hooks and rejects names that collide with core tile keys.
 func (r *StatusRenderer) SetModules(mods []module.Module) error {
 	for _, mod := range mods {
-		if mod.TileValue != nil {
+		if mod.State != nil {
 			if tileCoreKeys[mod.Name] {
 				return fmt.Errorf("module %q collides with a core tile member", mod.Name)
 			}
@@ -211,20 +195,10 @@ func (r *StatusRenderer) Tiles() []Tile {
 			t.FrameAge = time.Since(f.Captured).Seconds()
 			t.FrameSeq = f.Seq
 		}
-		preview := jobpreview.Disabled()
-		if r.previews != nil {
-			// Cache-only read: Lookup never performs network work and the
-			// false flag keeps the PNG bytes out of the status payload.
-			if res, ok := r.previews.Lookup(st.Serial, false); ok {
-				preview = res
-			}
-		}
-		t.JobPreview = preview.Preview
-		t.JobMetadata = preview.Metadata
 		t.Activity = r.activity.Recent(st.Serial)
 		for _, mod := range r.modules {
-			if mod.TileValue != nil {
-				if value := mod.TileValue(st.Serial); value != nil {
+			if mod.State != nil {
+				if value := mod.State(st.Serial); value != nil {
 					if t.extra == nil {
 						t.extra = make(map[string]any)
 					}

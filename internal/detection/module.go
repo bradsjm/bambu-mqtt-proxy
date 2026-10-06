@@ -14,11 +14,12 @@ func (e *Engine) Module() module.Module {
 		Start:        e.Start,
 		Stop:         e.Close,
 		NeedsReports: e.blocked == "",
-		TileValue:    e.DetectionStatus,
+		State:        e.DetectionStatus,
 		FleetValues:  e.fleetValues,
 		StatusValue:  func() any { return e.DetectionMap() },
 	}
 	if e.blocked == "" {
+		m.MCP = e.registerMCP
 		m.Routes = []module.Route{{
 			Pattern: "PUT /detection/{serial}",
 			Handler: http.HandlerFunc(e.handlePut),

@@ -309,11 +309,20 @@ contains `chamber_temper`.
 On by default; disable with `BMBPX_MCP_ENABLED=false`. MCP protocol
 2026-07-28 over Streamable HTTP:
 
-- **Read-only tools** — `list_printers`, `get_printer_state`,
+- **Core read-only tools** — `list_printers`, `get_printer_state`,
   `get_camera_snapshot`, and `watch_printer`.
-- **Control tools** — `pause_print`, `resume_print`, `stop_print` (a
+- **Core control tools** — `pause_print`, `resume_print`, `stop_print` (a
   destructive emergency stop with no confirmation), `set_chamber_light`,
-  `set_speed_profile`, and `set_ai_monitoring`.
+  and `set_speed_profile`.
+- **Module tools**, served by their modules when those modules run:
+  `set_ai_monitoring` with the Gadget AI detection (which also needs the
+  camera feature), and `get_job_preview` with the job preview feature.
+- **Printer state** — `get_printer_state` returns
+  `state.modules.<name>` per running module (for example
+  `state.modules.jobpreview` with the archived job preview), so one tool
+  stays current whatever capabilities are enabled.
+- `watch_printer` emits one event when any module state changes: kind
+  `module_changed` with a `module` field naming the module.
 - **Resource** — `bambu://printers/{serial}/state`, a typed live state
   projection that clients can subscribe to.
 - The endpoint never learns printer credentials; control commands go through

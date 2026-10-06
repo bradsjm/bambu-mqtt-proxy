@@ -1730,10 +1730,10 @@ const bedLabel = v => BED_LABELS[v] || String(v).replaceAll("_", " ");
 const objectWord = n => n.replace(/\.(stl|obj|3mf)$/i, "");
 
 function renderJobPreview(t, b) {
-  const p = t.data, r = t.r;
-  const jp = p.job_preview && typeof p.job_preview === "object"
-    ? p.job_preview : { status: "disabled", job_name: "", current: false, retrieved_at: null, image_url: null };
-  const md = p.job_metadata && typeof p.job_metadata === "object" ? p.job_metadata : null;
+  const p = t.data, m = p.jobpreview || {}, r = t.r;
+  const jp = m.job_preview && typeof m.job_preview === "object"
+    ? m.job_preview : { status: "disabled", job_name: "", current: false, retrieved_at: null, image_url: null };
+  const md = m.job_metadata && typeof m.job_metadata === "object" ? m.job_metadata : null;
   // Past jobs dim the archived fields; live state keeps its own colors.
   const past = jp.current !== true;
   const metaKey = md ? JSON.stringify(md) : "";

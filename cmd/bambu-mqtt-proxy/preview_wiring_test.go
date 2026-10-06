@@ -6,7 +6,10 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"os"
@@ -147,5 +150,110 @@ func TestJobPreviewRouteFollowsFeatureSwitch(t *testing.T) {
 				t.Fatalf("GET %s with wrong version = %d, want %d", previewPath, got, tc.wantGETCode)
 			}
 		})
+	}
+}
+
+// TestModuleMCPWiring checks the real serveOnce module list in both
+// configurations. Cameras are on with detection, because a blocked
+// detection engine registers no tool.
+func TestModuleMCPWiring(t *testing.T) {
+	for _, on := range []bool{true, false} {
+		t.Run(strconv.FormatBool(on), func(t *testing.T) {
+			base := detectionContractServe(t, on, on, on)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			body := `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"wiring","version":"0"},"io.modelcontextprotocol/clientCapabilities":{}}}}`
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/mcp", strings.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Accept", "application/json, text/event-stream")
+			req.Header.Set("MCP-Protocol-Version", "2026-07-28")
+			req.Header.Set("Mcp-Method", "tools/list")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("tools/list status = %d", resp.StatusCode)
+			}
+			var result struct {
+				Result struct {
+					Tools []struct {
+						Name string `json:"name"`
+					} `json:"tools"`
+				} `json:"result"`
+				Error json.RawMessage `json:"error"`
+			}
+			found := false
+			sc := bufio.NewScanner(resp.Body)
+			for sc.Scan() {
+				if data, ok := strings.CutPrefix(sc.Text(), "data:"); ok {
+					if err := json.Unmarshal([]byte(strings.TrimSpace(data)), &result); err != nil {
+						t.Fatal(err)
+					}
+					found = true
+					break
+				}
+			}
+			if err := sc.Err(); err != nil {
+				t.Fatal(err)
+			}
+			if !found || len(result.Error) > 0 {
+				t.Fatalf("tools/list response = %+v", result)
+			}
+			counts := map[string]int{}
+			for _, tool := range result.Result.Tools {
+				counts[tool.Name]++
+			}
+			want := 0
+			if on {
+				want = 1
+			}
+			for _, name := range []string{"set_ai_monitoring", "get_job_preview"} {
+				if counts[name] != want {
+					t.Fatalf("%s count = %d, want %d", name, counts[name], want)
+				}
+			}
+		})
+	}
+}
+
+// TestJobPreviewTileModulePath checks the jobpreview.job_preview tile member.
+func TestJobPreviewTileModulePath(t *testing.T) {
+	base, _, _, stop := startProxyChild(t, "", "", "false")
+	defer stop()
+	resp, err := http.Get(base + "/camera/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var payload struct {
+		Printers []map[string]json.RawMessage `json:"printers"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Printers) != 1 {
+		t.Fatalf("tiles = %d", len(payload.Printers))
+	}
+	tile := payload.Printers[0]
+	var state struct {
+		JobPreview struct {
+			Status string `json:"status"`
+		} `json:"job_preview"`
+	}
+	if err := json.Unmarshal(tile["jobpreview"], &state); err != nil {
+		t.Fatal(err)
+	}
+	if state.JobPreview.Status == "" {
+		t.Fatalf("jobpreview.job_preview absent: %s", tile["jobpreview"])
+	}
+	for _, name := range []string{"job_preview", "job_metadata"} {
+		if _, exists := tile[name]; exists {
+			t.Fatalf("old tile member %q remains", name)
+		}
 	}
 }

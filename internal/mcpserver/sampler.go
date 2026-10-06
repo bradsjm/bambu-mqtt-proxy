@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -67,7 +68,8 @@ type sample struct {
 	active     bool
 	connected  bool
 	fresh      bool
-	detKey     string
+	// moduleKeys is a fresh ordered slice for every sample.
+	moduleKeys []moduleSample
 	// hmsKey is the sorted active HMS alert IDs joined by ","; printError
 	// is the raw print_error code.
 	hmsKey     string
@@ -75,6 +77,25 @@ type sample struct {
 	// milestone is the current 5-percentage-point bucket while printing,
 	// or -1 when not printing or progress is unknown.
 	milestone int
+}
+
+// moduleSample records one module's name and change-sensitive state key.
+type moduleSample struct {
+	name string
+	key  string
+}
+
+// moduleKey compares stable state when supplied, or the entire JSON value.
+// A nil value has no key.
+func moduleKey(value any) string {
+	if value == nil {
+		return ""
+	}
+	if stable, ok := value.(interface{ StableKey() any }); ok {
+		value = stable.StableKey()
+	}
+	raw, _ := json.Marshal(value)
+	return string(raw)
 }
 
 // newSampler builds the sampler with one primed entry per configured
@@ -297,8 +318,11 @@ func (s *Server) sampleNow(serial string, now time.Time) sample {
 		sm.printError = st.PrintError
 	}
 	sm.connected = s.connStatus(serial)
-	if s.det != nil {
-		sm.detKey = detectionKey(s.det.DetectionStatus(serial))
+	sm.moduleKeys = make([]moduleSample, 0, len(s.modules))
+	for _, m := range s.modules {
+		if m.State != nil {
+			sm.moduleKeys = append(sm.moduleKeys, moduleSample{name: m.Name, key: moduleKey(m.State(serial))})
+		}
 	}
 	return sm
 }
@@ -306,8 +330,7 @@ func (s *Server) sampleNow(serial string, now time.Time) sample {
 // attentionEvents diffs two samples into the stable attention event list.
 // The transitions follow the printed contract: pause, fail, finish, job
 // changes, stops, new HMS alerts and printer errors, connectivity,
-// freshness, and detection health. Ordinary resume and pure value churn
-// stay silent.
+// freshness, and module state. Ordinary resume and pure value churn stay silent.
 func attentionEvents(prev, cur sample) []WatchEvent {
 	var events []WatchEvent
 	add := func(kind, detail string) {
@@ -367,8 +390,12 @@ func attentionEvents(prev, cur sample) []WatchEvent {
 	if cur.fresh && !prev.fresh {
 		add(kindReportsFresh, "real reports are current again")
 	}
-	if cur.detKey != prev.detKey {
-		add(kindDetectionChange, "detection health changed")
+	for i, m := range cur.moduleKeys {
+		if m.key != prev.moduleKeys[i].key {
+			events = append(events, WatchEvent{
+				Kind: kindModuleChanged, Module: m.name, Detail: m.name + " state changed",
+			})
+		}
 	}
 	return events
 }

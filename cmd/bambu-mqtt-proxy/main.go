@@ -189,9 +189,6 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	// First-layer completion observes telemetry that is already live; it
 	// neither holds report interest nor opens a camera connection.
 	firstLayers := firstlayer.New(cfg.Printers, state, activities)
-	if renderer != nil && previews != nil {
-		renderer.SetJobPreview(previews)
-	}
 	// Optional Pushover print notifications. The notifier registers as an
 	// activity observer before the broker serves, so entries recorded
 	// during startup reach it; upstream connections are lazy.
@@ -258,17 +255,11 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 			Generations:  pool,
 			Activity:     activities,
 			Control:      controls,
+			Modules:      mods,
 			Log:          logger,
 		}
 		if cameras != nil {
 			deps.Cameras = cameras
-		}
-		if detector != nil {
-			deps.Detector = detector
-			deps.DetectorControl = detector
-		}
-		if previews != nil {
-			deps.JobPreviews = previews
 		}
 		mcpsrv = mcpserver.New(deps)
 	}

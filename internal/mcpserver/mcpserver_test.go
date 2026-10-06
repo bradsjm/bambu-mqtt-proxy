@@ -22,8 +22,7 @@ import (
 	"bambu-mqtt-proxy/internal/camera"
 	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/control"
-	"bambu-mqtt-proxy/internal/detection"
-	"bambu-mqtt-proxy/internal/jobpreview"
+	"bambu-mqtt-proxy/internal/module"
 	"bambu-mqtt-proxy/internal/telemetry"
 )
 
@@ -196,67 +195,6 @@ func (f *fakeCams) balanced(t *testing.T) {
 	}
 }
 
-// fakeDet is a DetectionSource with a mutable status pointer.
-type fakeDet struct {
-	mu   sync.Mutex
-	st   *detection.Status
-	susp bool
-	why  string
-}
-
-func (f *fakeDet) DetectionStatus(string) any {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.st
-}
-
-func (f *fakeDet) AccountSuspended() (bool, string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.susp, f.why
-}
-
-// fakePreviews is a JobPreviewSource over a mutable map with call
-// accounting, so tests can assert which lookups run and with which
-// includeImage flag.
-type fakePreviews struct {
-	mu       sync.Mutex
-	bySerial map[string]jobpreview.Result
-	lookups  int
-	withImg  int
-}
-
-func newFakePreviews() *fakePreviews {
-	return &fakePreviews{bySerial: make(map[string]jobpreview.Result)}
-}
-
-func (f *fakePreviews) Lookup(serial string, includeImage bool) (jobpreview.Result, bool) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.lookups++
-	if includeImage {
-		f.withImg++
-	}
-	res, ok := f.bySerial[serial]
-	if !ok {
-		return jobpreview.Result{}, false
-	}
-	return res, true
-}
-
-func (f *fakePreviews) set(serial string, res jobpreview.Result) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.bySerial[serial] = res
-}
-
-// counts reports the lookup totals.
-func (f *fakePreviews) counts() (lookups, withImg int) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.lookups, f.withImg
-}
-
 // fakeCommander records control commands over the fixture's connectivity
 // and generation fakes.
 type fakeCommander struct {
@@ -289,21 +227,19 @@ func (f *fakeCommander) SetChamberLight(string, uint64, bool) error {
 
 // fixture bundles one server with mutable fakes and a fixed clock.
 type fixture struct {
-	srv     *Server
-	cmd     *fakeCommander
-	state   *fakeState
-	conn    *fakeConn
-	gens    *fakeGens
-	cams    *fakeCams
-	det     *fakeDet
-	preview *fakePreviews
-	now     time.Time
+	srv   *Server
+	cmd   *fakeCommander
+	state *fakeState
+	conn  *fakeConn
+	gens  *fakeGens
+	cams  *fakeCams
+	now   time.Time
 }
 
 // newFixture builds a server over three printers: P001/P002 camera-capable
 // (model P1S), P003 not (model X1C, refused by the camera source). The
 // sampler is NOT started; tests call step explicitly.
-func newFixture(t *testing.T) *fixture {
+func newFixture(t *testing.T, mods ...module.Module) *fixture {
 	t.Helper()
 	now := time.Now()
 	st := newFakeState("P001", "P002", "P003")
@@ -314,11 +250,9 @@ func newFixture(t *testing.T) *fixture {
 		conn:  &fakeConn{st: map[string]bool{}},
 		gens:  &fakeGens{g: map[string]uint64{}},
 		cams:  cams,
-		det:   &fakeDet{},
 		now:   now,
 	}
 	f.cmd = &fakeCommander{fakeConn: f.conn, fakeGens: f.gens}
-	f.preview = newFakePreviews()
 	f.srv = New(Deps{
 		Printers: []config.Printer{
 			{Serial: "P001", Name: "Alpha", Model: "P1S", Address: "secret-a", Password: "pw-a"},
@@ -329,8 +263,7 @@ func newFixture(t *testing.T) *fixture {
 		Connectivity: f.conn,
 		Generations:  f.gens,
 		Cameras:      cams,
-		Detector:     f.det,
-		JobPreviews:  f.preview,
+		Modules:      mods,
 		Control:      control.New(f.cmd, st, nil),
 	})
 	f.srv.now = func() time.Time { return now }
@@ -449,7 +382,7 @@ func TestAttentionEventTransitions(t *testing.T) {
 		{"reports stale", nil, set(func(c *sample) { c.fresh = false }), []string{kindReportsStale}, false},
 		{"reports fresh again", func(p *sample) { p.fresh = false },
 			set(func(c *sample) { c.fresh = true }), []string{kindReportsFresh}, false},
-		{"detection health", nil, set(func(c *sample) { c.detKey = "changed" }), []string{kindDetectionChange}, false},
+		{"module state", func(p *sample) { p.moduleKeys = []moduleSample{{name: "example"}} }, set(func(c *sample) { c.moduleKeys = []moduleSample{{name: "example", key: "changed"}} }), []string{kindModuleChanged}, false},
 		{"state churn without a notable state", nil, set(func(c *sample) { c.state = "SLICING" }), nil, true},
 		{"stopped", nil, set(func(c *sample) { c.state = "IDLE" }), []string{kindPrintStopped}, false},
 		{"idle from finish", func(p *sample) { p.state = "FINISH" }, set(func(c *sample) { c.state = "IDLE" }), nil, true},
@@ -845,7 +778,7 @@ func TestWatchPrinterUnknownSerial(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handler error: %v", err)
 	}
-	if res.Error == nil || res.Error.Code != errUnknownSerial {
+	if res.Error == nil || res.Error.Code != module.CodeUnknownSerial {
 		t.Fatalf("unknown serial: %+v", res.Error)
 	}
 }
@@ -975,7 +908,7 @@ func TestCameraSnapshotLifecycle(t *testing.T) {
 	// Unknown serial and disabled feature stay explicit.
 	_, out, _ = f.srv.toolGetCameraSnapshot(context.Background(), nil,
 		GetCameraSnapshotIn{Serial: "NOPE"})
-	if out.Error == nil || out.Error.Code != errUnknownSerial {
+	if out.Error == nil || out.Error.Code != module.CodeUnknownSerial {
 		t.Fatalf("unknown serial: %+v", out.Error)
 	}
 	f.cams.balanced(t)
@@ -1081,197 +1014,6 @@ func TestCameraStateProjection(t *testing.T) {
 	}
 }
 
-// previewPNG is a stand-in for the validated plate render bytes; the
-// preview service guarantees the bytes are a PNG, and the tool must
-// forward them untouched.
-var previewPNG = []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x01, 0x02}
-
-// readyPreview builds a ready cached result with accepted metadata.
-func readyPreview() jobpreview.Result {
-	title := "Bracket"
-	retrieved := "2026-10-02T10:00:00Z"
-	url := "/camera/P001/preview?v=abc"
-	ty := "PLA"
-	color := "#FF8800"
-	usedG := 12.5
-	count := 3
-	return jobpreview.Result{
-		Preview: jobpreview.View{
-			Status:      jobpreview.StatusReady,
-			JobName:     "Bracket.3mf",
-			Current:     true,
-			RetrievedAt: &retrieved,
-			ImageURL:    &url,
-		},
-		Metadata: &jobpreview.Metadata{
-			Source:      "printer_3mf",
-			Title:       &title,
-			Materials:   []jobpreview.Material{{ID: "1", Type: &ty, Color: &color, UsedG: &usedG}},
-			Objects:     []jobpreview.Object{{Name: "bracket.stl", Count: 2}},
-			ObjectCount: &count,
-			Warnings:    []jobpreview.SlicerWarning{},
-		},
-		PNG: previewPNG,
-	}
-}
-
-func TestJobPreviewProjection(t *testing.T) {
-	f := newFixture(t)
-
-	// The fixture wires a preview service with no cached data: the state
-	// projection reads pending/unavailable per the service, here a miss is
-	// read as feature-off, and it never asks for image bytes.
-	state, known := f.srv.buildPrinterState("P001", f.now)
-	if !known {
-		t.Fatal("P001 unknown")
-	}
-	if state.JobPreview.Status != jobpreview.StatusDisabled {
-		t.Fatalf("empty source projection = %q", state.JobPreview.Status)
-	}
-	if state.JobMetadata != nil {
-		t.Fatalf("empty source projection carries metadata: %+v", state.JobMetadata)
-	}
-	lookups, withImg := f.preview.counts()
-	if lookups != 1 || withImg != 0 {
-		t.Fatalf("projection lookups = (%d, %d)", lookups, withImg)
-	}
-
-	// A nil source is the explicit disabled projection too.
-	f.preview.set("P001", readyPreview())
-	f.srv.previews = nil
-	state, _ = f.srv.buildPrinterState("P001", f.now)
-	if state.JobPreview.Status != jobpreview.StatusDisabled || state.JobMetadata != nil {
-		t.Fatalf("nil source projection = %+v", state.JobPreview)
-	}
-
-	// A ready cached result flows through with its metadata.
-	f.srv.previews = f.preview
-	state, _ = f.srv.buildPrinterState("P001", f.now)
-	if state.JobPreview.Status != jobpreview.StatusReady || state.JobPreview.JobName != "Bracket.3mf" {
-		t.Fatalf("ready projection = %+v", state.JobPreview)
-	}
-	if state.JobMetadata == nil || state.JobMetadata.Source != "printer_3mf" ||
-		len(state.JobMetadata.Materials) != 1 {
-		t.Fatalf("ready metadata = %+v", state.JobMetadata)
-	}
-	if _, withImg = f.preview.counts(); withImg != 0 {
-		t.Fatalf("projection requested image bytes: withImg=%d", withImg)
-	}
-}
-
-func TestGetJobPreviewTool(t *testing.T) {
-	f := newFixture(t)
-	f.preview.set("P001", readyPreview())
-
-	res, out, err := f.srv.toolGetJobPreview(context.Background(), nil, GetJobPreviewIn{Serial: "P001"})
-	if err != nil {
-		t.Fatalf("ready call: %v", err)
-	}
-	if res.IsError {
-		t.Fatalf("ready result flagged as error: %+v", res)
-	}
-	if out.Serial != "P001" || out.JobPreview.Status != jobpreview.StatusReady ||
-		out.JobMetadata == nil || out.JobMetadata.Title == nil || *out.JobMetadata.Title != "Bracket" {
-		t.Fatalf("ready output = %+v", out)
-	}
-	var image *mcp.ImageContent
-	for _, c := range res.Content {
-		if img, ok := c.(*mcp.ImageContent); ok {
-			image = img
-			break
-		}
-	}
-	if image == nil {
-		t.Fatalf("ready result has no image content: %+v", res.Content)
-	}
-	if string(image.Data) != string(previewPNG) || image.MIMEType != "image/png" {
-		t.Fatalf("image content = %d bytes %s", len(image.Data), image.MIMEType)
-	}
-	if _, withImg := f.preview.counts(); withImg != 1 {
-		t.Fatalf("tool lookups with image = %d", withImg)
-	}
-	// No camera path is consulted: the preview tool never acquires.
-	f.cams.balanced(t)
-	if f.cams.acquires != 0 {
-		t.Fatalf("preview tool acquired the camera %d times", f.cams.acquires)
-	}
-
-	// Repeated calls are pure cache reads with identical payloads.
-	first := out
-	_, out2, err := f.srv.toolGetJobPreview(context.Background(), nil, GetJobPreviewIn{Serial: "P001"})
-	if err != nil {
-		t.Fatalf("repeat call: %v", err)
-	}
-	if out2.JobPreview != first.JobPreview || out2.JobMetadata == nil || first.JobMetadata == nil ||
-		*out2.JobMetadata.Title != *first.JobMetadata.Title {
-		t.Fatalf("repeat call output changed: %+v vs %+v", out2, first)
-	}
-	lookups, _ := f.preview.counts()
-	if lookups != 2 { // two pure cache reads
-		t.Fatalf("lookup count = %d", lookups)
-	}
-}
-
-func TestGetJobPreviewNonReadyOutcomes(t *testing.T) {
-	f := newFixture(t)
-	cases := []struct {
-		name string
-		res  jobpreview.Result
-	}{
-		{"pending", jobpreview.Result{Preview: jobpreview.View{Status: jobpreview.StatusPending, JobName: "Bracket.3mf", Current: true}}},
-		{"unavailable", jobpreview.Result{Preview: jobpreview.View{Status: jobpreview.StatusUnavailable}}},
-		{"disabled", jobpreview.Disabled()},
-	}
-	for _, tc := range cases {
-		f.preview.set("P001", tc.res)
-		res, out, err := f.srv.toolGetJobPreview(context.Background(), nil, GetJobPreviewIn{Serial: "P001"})
-		if err != nil {
-			t.Fatalf("%s call: %v", tc.name, err)
-		}
-		if res.IsError {
-			t.Fatalf("%s result flagged as error", tc.name)
-		}
-		if out.JobPreview.Status != tc.res.Preview.Status {
-			t.Fatalf("%s output status = %q", tc.name, out.JobPreview.Status)
-		}
-		for _, c := range res.Content {
-			if _, ok := c.(*mcp.ImageContent); ok {
-				t.Fatalf("%s result carried image content", tc.name)
-			}
-		}
-	}
-
-	// A source that does not carry the serial reads as feature-off, not as
-	// an error, because the serial is known to the server.
-	delete(f.preview.bySerial, "P001")
-	res, out, err := f.srv.toolGetJobPreview(context.Background(), nil, GetJobPreviewIn{Serial: "P001"})
-	if err != nil || res.IsError || out.JobPreview.Status != jobpreview.StatusDisabled {
-		t.Fatalf("missing serial read = (%v, %v, %+v)", err, res.IsError, out.JobPreview)
-	}
-
-	// A nil source reads disabled as well.
-	f.srv.previews = nil
-	res, out, err = f.srv.toolGetJobPreview(context.Background(), nil, GetJobPreviewIn{Serial: "P001"})
-	if err != nil || res.IsError || out.JobPreview.Status != jobpreview.StatusDisabled || out.JobMetadata != nil {
-		t.Fatalf("nil source read = (%v, %v, %+v)", err, res.IsError, out)
-	}
-}
-
-func TestGetJobPreviewUnknownSerial(t *testing.T) {
-	f := newFixture(t)
-	f.preview.set("NOPE", readyPreview())
-	res, out, err := f.srv.toolGetJobPreview(context.Background(), nil, GetJobPreviewIn{Serial: "NOPE"})
-	if err != nil {
-		t.Fatalf("unknown serial: %v", err)
-	}
-	if !res.IsError || out.Error == nil || out.Error.Code != errUnknownSerial {
-		t.Fatalf("unknown serial = (%v, %+v)", res.IsError, out.Error)
-	}
-	if lookups, _ := f.preview.counts(); lookups != 0 {
-		t.Fatalf("unknown serial reached the preview source %d times", lookups)
-	}
-}
-
 func TestListPrintersPaging(t *testing.T) {
 	f := newFixture(t)
 	_, page1, err := f.srv.toolListPrinters(context.Background(), nil, ListPrintersIn{Limit: 2})
@@ -1304,7 +1046,7 @@ func TestPrinterStateUnknownSerial(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handler error: %v", err)
 	}
-	if !res.IsError || out.Error == nil || out.Error.Code != errUnknownSerial {
+	if !res.IsError || out.Error == nil || out.Error.Code != module.CodeUnknownSerial {
 		t.Fatalf("unknown serial: isError=%v err=%+v", res.IsError, out.Error)
 	}
 }
@@ -1329,15 +1071,6 @@ func TestCredentialStripping(t *testing.T) {
 	raw := fmt.Sprintf("%+v", f.srv)
 	if strings.Contains(raw, "secret-a") || strings.Contains(raw, "pw-a") {
 		t.Fatal("server state carries credentials")
-	}
-}
-
-func TestDetectionDisabledProjection(t *testing.T) {
-	f := newFixture(t)
-	f.srv.det = nil
-	view := f.srv.detectionView("P001")
-	if view.State != "disabled" {
-		t.Fatalf("disabled detection = %+v", view)
 	}
 }
 
@@ -1448,4 +1181,36 @@ func TestRevisionTokenCannotConsumeMidReadChange(t *testing.T) {
 		}
 		resync(t, f, payload.Revision)
 	})
+}
+
+func TestModuleSampleJSONKeysAndIsolation(t *testing.T) {
+	value := any(map[string]any{"health": "ready", "count": 1})
+	f := newFixture(t,
+		module.Module{Name: "example", State: func(string) any { return value }},
+		module.Module{Name: "no-state"},
+		module.Module{Name: "empty", State: func(string) any { return nil }},
+	)
+	first := f.srv.sampleNow("P001", f.now)
+	if len(first.moduleKeys) != 2 || first.moduleKeys[0].key != `{"count":1,"health":"ready"}` || first.moduleKeys[1].key != "" {
+		t.Fatalf("JSON keys = %+v", first.moduleKeys)
+	}
+	value = map[string]any{"health": "ready", "count": 2}
+	second := f.srv.sampleNow("P002", f.now)
+	if first.moduleKeys[0].key != `{"count":1,"health":"ready"}` {
+		t.Fatalf("sample keys share backing storage: %+v", first.moduleKeys)
+	}
+	second.connected = true
+	events := attentionEvents(first, second)
+	if len(events) != 2 || events[0].Kind != kindConnectRestored || events[1].Kind != kindModuleChanged || events[1].Module != "example" {
+		t.Fatalf("core/module event order = %+v", events)
+	}
+	value = nil
+	third := f.srv.sampleNow("P001", f.now)
+	events = attentionEvents(first, third)
+	if len(events) != 1 || events[0].Kind != kindModuleChanged || events[0].Module != "example" {
+		t.Fatalf("nil transition = %+v", events)
+	}
+	if got := moduleKey(stableModuleState{Health: "ready", Age: 99}); got != `"ready"` {
+		t.Fatalf("StableKey is not JSON encoded: %q", got)
+	}
 }

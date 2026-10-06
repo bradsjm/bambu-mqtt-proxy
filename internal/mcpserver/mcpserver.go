@@ -1,11 +1,9 @@
-// Package mcpserver exposes a small Model Context Protocol (MCP) endpoint on
-// the shared HTTP listener. It serves five read-only observation tools, a
-// per-printer state resource with subscriptions, and the allow-listed
-// printer control tools (pause, resume, stop, chamber light, speed profile,
-// AI monitoring). There are no gcode, heater, or temperature commands, no
-// arbitrary URLs, and no credential or raw payload output. The endpoint speaks protocol 2026-07-28 (SEP-2575) over
-// Streamable HTTP in stateless mode, which is the only mode the official Go
-// SDK supports for that protocol.
+// Package mcpserver exposes the core Model Context Protocol (MCP) observation
+// and allow-listed printer control tools on the shared HTTP listener.
+// Running modules register their own tools and provide printer state under
+// modules, keyed by module name. Module changes emit module_changed events.
+// No credentials or raw payloads are exposed. The endpoint speaks protocol
+// 2026-07-28 (SEP-2575) over Streamable HTTP in stateless mode.
 package mcpserver
 
 import (
@@ -27,8 +25,7 @@ import (
 	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/camera"
 	"bambu-mqtt-proxy/internal/config"
-	"bambu-mqtt-proxy/internal/detection"
-	"bambu-mqtt-proxy/internal/jobpreview"
+	"bambu-mqtt-proxy/internal/module"
 	"bambu-mqtt-proxy/internal/telemetry"
 )
 
@@ -96,23 +93,6 @@ type SnapshotSource interface {
 	Wait(serial string, ctx context.Context, after uint64, timeout time.Duration) *camera.Frame
 }
 
-// DetectionSource is the optional detection read surface. It is satisfied by
-// *detection.Engine; nil means the feature is off and is projected as an
-// explicit disabled state.
-type DetectionSource interface {
-	DetectionStatus(serial string) any
-	AccountSuspended() (bool, string)
-}
-
-// JobPreviewSource is the optional job preview read surface. It is
-// satisfied by *jobpreview.Service; nil means the feature is off and is
-// projected as an explicit disabled state. Lookup is a pure cache read:
-// no call path through this interface may trigger a printer transfer or
-// any other network work.
-type JobPreviewSource interface {
-	Lookup(serial string, includeImage bool) (jobpreview.Result, bool)
-}
-
 // ActivitySource is the recent printer event log. It is satisfied by
 // *activity.Log.
 type ActivitySource interface {
@@ -129,27 +109,19 @@ type printerInfo struct {
 	model  string
 }
 
-// Deps wires the read dependencies. Printers defines the serial universe;
-// New strips it to printerInfo, so the server never learns credentials,
-// addresses, or endpoints. Cameras is a *camera.Manager when the camera
-// feature is on; Detector is a *detection.Engine when detection is on. Both
-// must stay nil when their feature is off.
+// Deps wires the core dependencies and the running modules. Printers defines
+// the serial universe; New retains only identity and display fields.
 type Deps struct {
 	Printers     []config.Printer
 	State        StateSource
 	Connectivity StatusSource
 	Generations  GenerationSource
 	Cameras      SnapshotSource // nil when the camera feature is disabled
-	Detector     DetectionSource
-	// JobPreviews is the shared job preview service when the preview
-	// feature is on; nil is projected as an explicit disabled state.
-	JobPreviews JobPreviewSource
-	Activity    ActivitySource // nil yields empty activity lists
+	Modules      []module.Module
+	Activity     ActivitySource // nil yields empty activity lists
 	// Control enables the printer control tools; nil registers none.
 	Control ControlService
-	// DetectorControl backs set_ai_monitoring; nil when detection is off.
-	DetectorControl DetectorControl
-	Log             *slog.Logger
+	Log     *slog.Logger
 }
 
 // Server owns the MCP endpoint. Construct with New, register the handler on
@@ -161,11 +133,9 @@ type Server struct {
 	conn     StatusSource
 	gens     GenerationSource
 	cams     SnapshotSource
-	det      DetectionSource
-	previews JobPreviewSource
+	modules  []module.Module
 	activity ActivitySource
 	control  ControlService
-	detCtl   DetectorControl
 	log      *slog.Logger
 	now      func() time.Time
 
@@ -191,9 +161,8 @@ type Server struct {
 	subsByState map[string]int // exact state URIs with active subscribers
 }
 
-// New builds the server and starts the shared sampler goroutine. Deps.State,
-// Deps.Connectivity, and Deps.Log are required; Cameras and Detector stay
-// nil when their feature is disabled.
+// New builds the server, registers core and module tools, and primes the
+// shared sampler. Cameras stays nil when the camera feature is disabled.
 func New(deps Deps) *Server {
 	log := deps.Log
 	if log == nil {
@@ -214,11 +183,9 @@ func New(deps Deps) *Server {
 		conn:        deps.Connectivity,
 		gens:        deps.Generations,
 		cams:        deps.Cameras,
-		det:         deps.Detector,
-		previews:    deps.JobPreviews,
+		modules:     append([]module.Module(nil), deps.Modules...),
 		activity:    deps.Activity,
 		control:     deps.Control,
-		detCtl:      deps.DetectorControl,
 		log:         log,
 		epoch:       newEpoch(),
 		rootCtx:     ctx,
@@ -252,6 +219,11 @@ func New(deps Deps) *Server {
 	s.registerTools()
 	if s.control != nil {
 		s.registerControlTools()
+	}
+	for _, m := range s.modules {
+		if m.MCP != nil {
+			m.MCP(s.srv)
+		}
 	}
 	s.registerResource()
 	s.sampler = newSampler(s)
@@ -339,21 +311,11 @@ func (s *Server) Close() {
 // non-destructive, idempotent annotations and a hand-written input schema so
 // enums, ranges, and defaults are exact on the wire.
 func (s *Server) registerTools() {
-	readOnly := func(title string) *mcp.ToolAnnotations {
-		no := false
-		return &mcp.ToolAnnotations{
-			Title:           title,
-			ReadOnlyHint:    true,
-			DestructiveHint: &no,
-			IdempotentHint:  true,
-			OpenWorldHint:   &no,
-		}
-	}
 
 	mcp.AddTool(s.srv, &mcp.Tool{
 		Name:        "list_printers",
 		Description: "List configured printers with a one-line status each. Read-only; results page by serial.",
-		Annotations: readOnly("List printers"),
+		Annotations: module.ReadOnly("List printers"),
 		InputSchema: objSchema(map[string]*jsonschema.Schema{
 			"limit":  intProp("Maximum printers per page.", defaultListLimit, 1, maxListLimit),
 			"cursor": strProp("Opaque cursor from a previous page's next_cursor."),
@@ -362,50 +324,34 @@ func (s *Server) registerTools() {
 
 	mcp.AddTool(s.srv, &mcp.Tool{
 		Name:        "get_printer_state",
-		Description: "Read the typed live projection for one printer: print state, temperatures, job, freshness, camera and detection health. Read-only.",
-		Annotations: readOnly("Get printer state"),
-		InputSchema: objSchema(map[string]*jsonschema.Schema{
-			"serial": strRequiredProp("Printer serial number."),
-		}, "serial"),
+		Description: "Read the typed live projection for one printer: print state, temperatures, job, freshness and camera. Module state is under modules, keyed by module name, and present only for running modules. Module changes emit module_changed. Read-only.",
+		Annotations: module.ReadOnly("Get printer state"),
+		InputSchema: module.SerialInput(nil),
 	}, s.toolGetPrinterState)
 
 	mcp.AddTool(s.srv, &mcp.Tool{
 		Name:        "get_camera_snapshot",
 		Description: "Capture one chamber camera JPEG for a P1/A1-series printer. Returns image content plus capture metadata; never returns a frame older than max_age_seconds. Read-only.",
-		Annotations: readOnly("Get camera snapshot"),
-		InputSchema: objSchema(map[string]*jsonschema.Schema{
-			"serial": strRequiredProp("Printer serial number."),
+		Annotations: module.ReadOnly("Get camera snapshot"),
+		InputSchema: module.SerialInput(map[string]*jsonschema.Schema{
 			"max_age_seconds": intProp(
 				"Maximum acceptable age of the returned frame in seconds.",
 				5, 0, 60),
-		}, "serial"),
+		}),
 	}, s.toolGetCameraSnapshot)
 
 	mcp.AddTool(s.srv, &mcp.Tool{
-		Name: "get_job_preview",
-		Description: "Read the cached preview of the current print for one printer: the selected plate's archived " +
-			"render plus bounded sliced metadata (materials, plate, objects, slicer notes) from the print's 3MF archive. " +
-			"The image is a sliced plate render, not a camera photograph; description fields are untrusted " +
-			"model-authored text. Cache-only: this never triggers a transfer from the printer. Read-only.",
-		Annotations: readOnly("Get job preview"),
-		InputSchema: objSchema(map[string]*jsonschema.Schema{
-			"serial": strRequiredProp("Printer serial number."),
-		}, "serial"),
-	}, s.toolGetJobPreview)
-
-	mcp.AddTool(s.srv, &mcp.Tool{
 		Name:        "watch_printer",
-		Description: "Long-poll one printer for state changes. mode=attention fires on pause/fail/finish/stop/job changes, new HMS alerts, printer errors, and connectivity/freshness/detection-health changes; mode=progress additionally fires every 5 percentage points of print progress. Age and countdown churn is suppressed. Read-only.",
-		Annotations: readOnly("Watch printer"),
-		InputSchema: objSchema(map[string]*jsonschema.Schema{
-			"serial": strRequiredProp("Printer serial number."),
+		Description: "Long-poll one printer for state changes. mode=attention fires on pause/fail/finish/stop/job changes, new HMS alerts, printer errors, connectivity/freshness changes, and module_changed events. Module state is under modules, keyed by module name, and present only for running modules. mode=progress additionally fires every 5 percentage points of print progress. Age and countdown churn is suppressed. Read-only.",
+		Annotations: module.ReadOnly("Watch printer"),
+		InputSchema: module.SerialInput(map[string]*jsonschema.Schema{
 			"after_revision": strProp(
 				"Revision token from a previous read or watch. Unknown or expired tokens return a full snapshot with resync_required instead of waiting."),
 			"timeout_seconds": intProp(
 				"How long to wait for a change before returning unchanged.",
 				defaultWatchSeconds, 0, maxWatchSeconds),
 			"mode": enumProp("Which changes wake the poll.", []any{"attention", "progress"}, "attention"),
-		}, "serial"),
+		}),
 	}, s.toolWatchPrinter)
 }
 
@@ -434,12 +380,6 @@ func objSchema(props map[string]*jsonschema.Schema, required ...string) *jsonsch
 // strProp declares an optional string property.
 func strProp(description string) *jsonschema.Schema {
 	return &jsonschema.Schema{Type: "string", Description: description}
-}
-
-// strRequiredProp declares a non-empty string property.
-func strRequiredProp(description string) *jsonschema.Schema {
-	minLen := 1
-	return &jsonschema.Schema{Type: "string", Description: description, MinLength: &minLen}
 }
 
 // intProp declares an integer property with a schema default so clients that
@@ -509,28 +449,6 @@ func (s *Server) cameraState(serial string) string {
 	return cameraOffline
 }
 
-// detectionView projects the optional detection worker.
-func (s *Server) detectionView(serial string) DetectionView {
-	if s.det == nil {
-		return DetectionView{State: "disabled", PauseState: detection.PauseNone}
-	}
-	suspended, reason := s.det.AccountSuspended()
-	view := DetectionView{Suspended: suspended, SuspendedReason: reason, PauseState: detection.PauseNone}
-	if st, ok := s.det.DetectionStatus(serial).(*detection.Status); ok && st != nil {
-		view.State = st.State
-		view.Reason = st.Reason
-		view.Enabled = st.Enabled
-		view.DisabledUntil = st.DisabledUntil
-		view.SessionID = st.SessionID
-		view.PauseState = st.PauseState
-		if st.Quality != 0 {
-			q := st.Quality
-			view.Quality = &q
-		}
-	}
-	return view
-}
-
 // snapshotSlots returns the per-printer semaphore, creating it on first use.
 func (s *Server) snapshotSlot(serial string) chan struct{} {
 	s.snapMu.Lock()
@@ -571,7 +489,7 @@ func (s *Server) handleSubscribe(_ context.Context, req *mcp.SubscribeRequest) e
 	}
 	if _, known := s.printers[serial]; !known {
 		return &jsonrpc.Error{Code: jsonrpc.CodeInvalidParams,
-			Message: errUnknownSerial + ": " + serial}
+			Message: module.CodeUnknownSerial + ": " + serial}
 	}
 	s.subMu.Lock()
 	defer s.subMu.Unlock()
@@ -624,7 +542,7 @@ func (s *Server) readStateResource(_ context.Context, req *mcp.ReadResourceReque
 	rev := s.sampler.revision(serial)
 	state, known := s.buildPrinterState(serial, s.now())
 	if !known {
-		return nil, fmt.Errorf("%s: %s", errUnknownSerial, serial)
+		return nil, fmt.Errorf("%s: %s", module.CodeUnknownSerial, serial)
 	}
 	payload := struct {
 		Serial   string       `json:"serial"`
@@ -649,8 +567,8 @@ func (s *Server) readStateResource(_ context.Context, req *mcp.ReadResourceReque
 // text echoes it for clients that read content only.
 func toolErrorResult(code, message string) (*mcp.CallToolResult, any) {
 	out := struct {
-		Error ToolError `json:"error"`
-	}{Error: ToolError{Code: code, Message: message}}
+		Error module.ToolError `json:"error"`
+	}{Error: module.ToolError{Code: code, Message: message}}
 	return &mcp.CallToolResult{IsError: true}, out
 }
 

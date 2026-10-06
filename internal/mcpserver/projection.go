@@ -2,14 +2,11 @@ package mcpserver
 
 import (
 	"encoding/base64"
-	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
 	"bambu-mqtt-proxy/internal/activity"
-	"bambu-mqtt-proxy/internal/detection"
-	"bambu-mqtt-proxy/internal/jobpreview"
 	"bambu-mqtt-proxy/internal/printerview"
 )
 
@@ -18,18 +15,10 @@ import (
 // is declared here. Nulls mean "the printer has not reported this", never a
 // guessed 0.
 
-// ToolError is a stable, machine-readable operational outcome. Codes are a
-// closed set; message text is human context and may change.
-type ToolError struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
-}
-
 // Stable operational error codes. Input validation failures (bad enum,
 // out-of-range numbers) are rejected by the input schema before a handler
 // runs and never surface as these codes.
 const (
-	errUnknownSerial      = "unknown_serial"
 	errCameraDisabled     = "camera_disabled"
 	errCameraUnsupported  = "camera_unsupported"
 	errCameraUnavailable  = "camera_unavailable"
@@ -39,52 +28,14 @@ const (
 	errSubscriptionsLimit = "subscriptions_limit"
 )
 
-// DetectionView is the projection of the optional OctoEverywhere detection
-// worker. The disabled state is explicit, never omitted, and the per-print
-// user override surfaces as its own permission state.
-type DetectionView struct {
-	// State mirrors the detection display state, or "disabled" when the
-	// feature is not configured.
-	State string `json:"state"`
-	// Reason explains blocked, starting, or user-disabled states; empty
-	// otherwise.
-	Reason string `json:"reason,omitempty"`
-	// Quality is the reported detection quality 0-100, when reported.
-	Quality *int `json:"quality,omitempty"`
-	// Enabled reports permission, not activity: false while the user's
-	// per-print override is in force, and also when the feature is not
-	// configured at all.
-	Enabled bool `json:"enabled"`
-	// DisabledUntil explains the override's lifetime and is set only while
-	// Enabled is false because of a user override.
-	DisabledUntil string `json:"disabled_until,omitempty"`
-	// SessionID is the opaque token of the active print session;
-	// set_ai_monitoring uses it to scope the override to this print.
-	SessionID string `json:"session_id,omitempty"`
-	// PauseState mirrors the pause lifecycle: none, pending, confirmed, or
-	// unconfirmed. It is preserved while a user override is active.
-	PauseState string `json:"pause_state"`
-	// Suspended reports a Gadget account-level suspension.
-	Suspended bool `json:"suspended,omitempty"`
-	// SuspendedReason carries the suspension message when suspended.
-	SuspendedReason string `json:"suspended_reason,omitempty"`
-}
-
 // PrinterState is the typed projection of one printer: the shared printer
 // view (the same fields /camera/status serves) plus MCP feature states.
 type PrinterState struct {
 	printerview.View
-	// Camera and Detection are explicit feature states; they never disappear
-	// when a feature is switched off.
-	Camera    string        `json:"camera"`
-	Detection DetectionView `json:"detection"`
-	// JobPreview is the job preview feature state: the selected plate's
-	// archived render projection. It reads disabled when the feature is
-	// switched off and pending before the settled job attempt completes.
-	JobPreview jobpreview.View `json:"job_preview"`
-	// JobMetadata carries the accepted archive facts for the selected
-	// plate; nil when no archive field has been accepted.
-	JobMetadata *jobpreview.Metadata `json:"job_metadata"`
+	// Camera reports the core camera feature state.
+	Camera string `json:"camera"`
+	// Modules contains non-nil state from running modules, keyed by name.
+	Modules map[string]any `json:"modules,omitempty"`
 	// Activity lists recent printer events, newest first.
 	Activity []activity.Entry `json:"activity"`
 	// Controls lists the control actions currently available.
@@ -104,6 +55,8 @@ const (
 // keeps no per-client history.
 type WatchEvent struct {
 	Kind string `json:"kind"`
+	// Module names the module for module_changed events.
+	Module string `json:"module,omitempty"`
 	// Percent is set only for progress_milestone events.
 	Percent *float64 `json:"percent,omitempty"`
 	// Detail is a short human-readable note; not a stable field.
@@ -121,7 +74,7 @@ const (
 	kindConnectRestored = "connectivity_restored"
 	kindReportsStale    = "reports_stale"
 	kindReportsFresh    = "reports_fresh"
-	kindDetectionChange = "detection_health_changed"
+	kindModuleChanged   = "module_changed"
 	kindProgressStep    = "progress_milestone"
 	kindHMSAlert        = "hms_alert"
 	kindPrintError      = "print_error"
@@ -195,19 +148,8 @@ func decodeCursor(cursor string) (string, bool) {
 	return strings.TrimPrefix(string(raw), "s:"), true
 }
 
-// detectionKey renders the change-sensitive fingerprint of a detection
-// status: continuously aging fields are stripped via StableKey, so the key
-// only moves on real health changes. An absent status collapses to "".
-func detectionKey(v any) string {
-	st, ok := v.(*detection.Status)
-	if !ok || st == nil {
-		return ""
-	}
-	return fmt.Sprint(st.StableKey())
-}
-
-// buildPrinterState merges telemetry, connectivity, camera, and detection
-// views into the wire projection. now is injected so tests can freeze time.
+// buildPrinterState merges core and module views into the wire projection.
+// now is injected so tests can freeze time.
 func (s *Server) buildPrinterState(serial string, now time.Time) (PrinterState, bool) {
 	info, known := s.printers[serial]
 	if !known {
@@ -216,15 +158,22 @@ func (s *Server) buildPrinterState(serial string, now time.Time) (PrinterState, 
 	st, _ := s.state.State(serial)
 	st.Serial, st.Name, st.Model = info.serial, info.name, info.model
 	sv, _ := s.state.Session(serial)
-	preview, jobMeta := s.jobPreview(serial)
 	out := PrinterState{
-		View:        printerview.Build(st, sv, s.connStatus(serial), s.generation(serial), now),
-		Camera:      s.cameraState(serial),
-		Detection:   s.detectionView(serial),
-		JobPreview:  preview,
-		JobMetadata: jobMeta,
-		Activity:    []activity.Entry{},
-		Controls:    []string{},
+		View:     printerview.Build(st, sv, s.connStatus(serial), s.generation(serial), now),
+		Camera:   s.cameraState(serial),
+		Activity: []activity.Entry{},
+		Controls: []string{},
+	}
+	for _, m := range s.modules {
+		if m.State == nil {
+			continue
+		}
+		if value := m.State(serial); value != nil {
+			if out.Modules == nil {
+				out.Modules = make(map[string]any)
+			}
+			out.Modules[m.Name] = value
+		}
 	}
 	if s.control != nil {
 		out.Controls = s.control.Available(serial)
@@ -235,21 +184,4 @@ func (s *Server) buildPrinterState(serial string, now time.Time) (PrinterState, 
 		}
 	}
 	return out, true
-}
-
-// jobPreview projects the optional preview service. A nil service, like a
-// serial the service does not carry, reads as the explicit disabled state.
-// The projection never carries image bytes, so Lookup runs with
-// includeImage=false.
-func (s *Server) jobPreview(serial string) (jobpreview.View, *jobpreview.Metadata) {
-	if s.previews == nil {
-		v := jobpreview.Disabled()
-		return v.Preview, v.Metadata
-	}
-	res, ok := s.previews.Lookup(serial, false)
-	if !ok {
-		v := jobpreview.Disabled()
-		return v.Preview, v.Metadata
-	}
-	return res.Preview, res.Metadata
 }

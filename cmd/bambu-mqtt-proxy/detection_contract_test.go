@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/configui"
 )
 
@@ -300,13 +301,16 @@ func detectionContractStore(t *testing.T, path string) string {
 	return srv.URL
 }
 
-func detectionContractServe(t *testing.T, enabled, cameras bool) string {
+func detectionContractServe(t *testing.T, enabled, cameras bool, previews ...bool) string {
 	t.Helper()
 	detectionContractCleanEnv(t)
 	if enabled {
 		t.Setenv(detectionContractEnv, "contract-dummy-key")
 	}
 	t.Setenv("BMBPX_CAMERA_ENABLED", fmt.Sprint(cameras))
+	if len(previews) > 0 {
+		t.Setenv(config.EnvJobPreview, fmt.Sprint(previews[0]))
+	}
 	port := freePort(t)
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	fixture := fmt.Sprintf(`listen:

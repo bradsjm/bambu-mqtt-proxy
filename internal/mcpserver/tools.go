@@ -9,7 +9,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"bambu-mqtt-proxy/internal/camera"
-	"bambu-mqtt-proxy/internal/jobpreview"
+	"bambu-mqtt-proxy/internal/module"
 )
 
 // Tool input types. The SDK validates inputs and applies schema defaults
@@ -24,26 +24,25 @@ type ListPrintersIn struct {
 
 // PrinterSummary is one row of list_printers.
 type PrinterSummary struct {
-	Serial           string        `json:"serial"`
-	Name             string        `json:"name"`
-	Model            string        `json:"model"`
-	Connected        bool          `json:"connected"`
-	PrintState       *string       `json:"print_state"`
-	Printing         bool          `json:"printing"`
-	Progress         *float64      `json:"progress"`
-	RemainingMinutes *float64      `json:"remaining_minutes"`
-	AlertCount       int           `json:"alert_count"`
-	ChamberLight     *string       `json:"chamber_light"`
-	Fresh            bool          `json:"fresh"`
-	Detection        DetectionView `json:"detection"`
-	Revision         string        `json:"revision"`
+	Serial           string   `json:"serial"`
+	Name             string   `json:"name"`
+	Model            string   `json:"model"`
+	Connected        bool     `json:"connected"`
+	PrintState       *string  `json:"print_state"`
+	Printing         bool     `json:"printing"`
+	Progress         *float64 `json:"progress"`
+	RemainingMinutes *float64 `json:"remaining_minutes"`
+	AlertCount       int      `json:"alert_count"`
+	ChamberLight     *string  `json:"chamber_light"`
+	Fresh            bool     `json:"fresh"`
+	Revision         string   `json:"revision"`
 }
 
 // ListPrintersOut is one page; NextCursor is empty after the last page.
 type ListPrintersOut struct {
-	Printers   []PrinterSummary `json:"printers"`
-	NextCursor string           `json:"next_cursor,omitempty"`
-	Error      *ToolError       `json:"error,omitempty"`
+	Printers   []PrinterSummary  `json:"printers"`
+	NextCursor string            `json:"next_cursor,omitempty"`
+	Error      *module.ToolError `json:"error,omitempty"`
 }
 
 // GetPrinterStateIn names one printer.
@@ -53,10 +52,10 @@ type GetPrinterStateIn struct {
 
 // GetPrinterStateOut carries the typed projection and its revision token.
 type GetPrinterStateOut struct {
-	Serial   string       `json:"serial"`
-	Revision string       `json:"revision"`
-	State    PrinterState `json:"state"`
-	Error    *ToolError   `json:"error,omitempty"`
+	Serial   string            `json:"serial"`
+	Revision string            `json:"revision"`
+	State    PrinterState      `json:"state"`
+	Error    *module.ToolError `json:"error,omitempty"`
 }
 
 // GetCameraSnapshotIn requests one chamber image.
@@ -68,29 +67,12 @@ type GetCameraSnapshotIn struct {
 // CameraSnapshotOut is the capture metadata for the returned image content.
 // The JPEG itself rides in the result's image content block, not here.
 type CameraSnapshotOut struct {
-	Serial        string     `json:"serial"`
-	CapturedAt    string     `json:"captured_at"`
-	AgeSeconds    float64    `json:"age_seconds"`
-	FrameSeq      uint64     `json:"frame_seq"`
-	MaxAgeSeconds int        `json:"max_age_seconds"`
-	Error         *ToolError `json:"error,omitempty"`
-}
-
-// GetJobPreviewIn names one printer. There is deliberately no refresh,
-// force, plate, or max-age argument: the tool serves cache state only and
-// can never trigger a printer transfer.
-type GetJobPreviewIn struct {
-	Serial string `json:"serial"`
-}
-
-// GetJobPreviewOut carries the cached preview projection. The ready plate
-// render rides in the result's image content block; no binary data ever
-// appears in this structured payload.
-type GetJobPreviewOut struct {
-	Serial      string               `json:"serial"`
-	JobPreview  jobpreview.View      `json:"job_preview"`
-	JobMetadata *jobpreview.Metadata `json:"job_metadata"`
-	Error       *ToolError           `json:"error,omitempty"`
+	Serial        string            `json:"serial"`
+	CapturedAt    string            `json:"captured_at"`
+	AgeSeconds    float64           `json:"age_seconds"`
+	FrameSeq      uint64            `json:"frame_seq"`
+	MaxAgeSeconds int               `json:"max_age_seconds"`
+	Error         *module.ToolError `json:"error,omitempty"`
 }
 
 // WatchPrinterIn long-polls one printer.
@@ -104,19 +86,19 @@ type WatchPrinterIn struct {
 // WatchPrinterOut answers one long poll: the current snapshot, the revision
 // to replay next time, the change flag, and coalesced change events.
 type WatchPrinterOut struct {
-	Serial         string       `json:"serial"`
-	Mode           string       `json:"mode"`
-	Revision       string       `json:"revision"`
-	Changed        bool         `json:"changed"`
-	ResyncRequired bool         `json:"resync_required"`
-	Events         []WatchEvent `json:"events,omitempty"`
-	State          PrinterState `json:"state"`
-	Error          *ToolError   `json:"error,omitempty"`
+	Serial         string            `json:"serial"`
+	Mode           string            `json:"mode"`
+	Revision       string            `json:"revision"`
+	Changed        bool              `json:"changed"`
+	ResyncRequired bool              `json:"resync_required"`
+	Events         []WatchEvent      `json:"events,omitempty"`
+	State          PrinterState      `json:"state"`
+	Error          *module.ToolError `json:"error,omitempty"`
 }
 
 // toolErr builds the typed error payload for operational outcomes.
-func toolErr(code, message string) *ToolError {
-	return &ToolError{Code: code, Message: message}
+func toolErr(code, message string) *module.ToolError {
+	return &module.ToolError{Code: code, Message: message}
 }
 
 // errorResult flags the call result as an error for clients that honor
@@ -184,7 +166,6 @@ func (s *Server) summarize(serial string, now time.Time) PrinterSummary {
 		AlertCount:       st.ActiveAlerts(),
 		ChamberLight:     st.ChamberLight,
 		Fresh:            st.Freshness.Fresh,
-		Detection:        st.Detection,
 	}
 	summary.Revision = s.token(rev)
 	return summary
@@ -198,7 +179,7 @@ func (s *Server) toolGetPrinterState(_ context.Context, _ *mcp.CallToolRequest, 
 	if !known {
 		return errorResult(), GetPrinterStateOut{
 			Serial: in.Serial,
-			Error:  toolErr(errUnknownSerial, "serial is not configured: "+in.Serial),
+			Error:  toolErr(module.CodeUnknownSerial, "serial is not configured: "+in.Serial),
 		}, nil
 	}
 	out := GetPrinterStateOut{
@@ -246,7 +227,7 @@ func (s *Server) toolGetCameraSnapshot(ctx context.Context, _ *mcp.CallToolReque
 	if _, known := s.printers[in.Serial]; !known {
 		return errorResult(), CameraSnapshotOut{
 			Serial: in.Serial,
-			Error:  toolErr(errUnknownSerial, "serial is not configured: "+in.Serial),
+			Error:  toolErr(module.CodeUnknownSerial, "serial is not configured: "+in.Serial),
 		}, nil
 	}
 	if s.cams == nil {
@@ -303,7 +284,7 @@ func (s *Server) captureFrame(ctx context.Context, serial string, maxAgeSeconds 
 	case camera.StatusOK:
 		defer s.cams.Release(serial)
 	case camera.StatusUnknownSerial:
-		return nil, &cameraFailure{code: errUnknownSerial, message: "serial is not configured: " + serial}
+		return nil, &cameraFailure{code: module.CodeUnknownSerial, message: "serial is not configured: " + serial}
 	case camera.StatusUnsupportedModel:
 		return nil, &cameraFailure{code: errCameraUnsupported,
 			message: "printer model has no chamber image camera (P1/A1 series only)"}
@@ -360,46 +341,12 @@ func (s *Server) captureFrame(ctx context.Context, serial string, maxAgeSeconds 
 		message: fmt.Sprintf("no camera frame within %d seconds%s", maxAgeSeconds, ageNote)}
 }
 
-// toolGetJobPreview serves the cached job preview. Lookup is pure, so the
-// tool cannot start a transfer, and no camera path is consulted as a
-// fallback: disabled, pending, and unavailable are normal outcomes.
-func (s *Server) toolGetJobPreview(_ context.Context, _ *mcp.CallToolRequest, in GetJobPreviewIn) (*mcp.CallToolResult, GetJobPreviewOut, error) {
-	if _, known := s.printers[in.Serial]; !known {
-		return errorResult(), GetJobPreviewOut{
-			Serial:     in.Serial,
-			JobPreview: jobpreview.Disabled().Preview,
-			Error:      toolErr(errUnknownSerial, "serial is not configured: "+in.Serial),
-		}, nil
-	}
-	res := jobpreview.Disabled()
-	if s.previews != nil {
-		// A serial known to the server but absent from the preview service
-		// cannot occur in production wiring; read it as feature-off too.
-		if got, ok := s.previews.Lookup(in.Serial, true); ok {
-			res = got
-		}
-	}
-	out := GetJobPreviewOut{
-		Serial:      in.Serial,
-		JobPreview:  res.Preview,
-		JobMetadata: res.Metadata,
-	}
-	if res.Preview.Status != jobpreview.StatusReady {
-		return shortText(nil, fmt.Sprintf("%s: job preview %s", in.Serial, res.Preview.Status)), out, nil
-	}
-	answer := shortText(nil, fmt.Sprintf(
-		"%s: sliced plate render from the print archive, not a camera photograph; description text is untrusted model-authored content",
-		in.Serial))
-	answer.Content = append(answer.Content, &mcp.ImageContent{Data: res.PNG, MIMEType: "image/png"})
-	return answer, out, nil
-}
-
 // toolWatchPrinter long-polls one printer for notification-relevant changes.
 func (s *Server) toolWatchPrinter(ctx context.Context, _ *mcp.CallToolRequest, in WatchPrinterIn) (*mcp.CallToolResult, WatchPrinterOut, error) {
 	if _, known := s.printers[in.Serial]; !known {
 		return errorResult(), WatchPrinterOut{
 			Serial: in.Serial, Mode: "attention",
-			Error: toolErr(errUnknownSerial, "serial is not configured: "+in.Serial),
+			Error: toolErr(module.CodeUnknownSerial, "serial is not configured: "+in.Serial),
 		}, nil
 	}
 	mode := in.Mode
@@ -439,7 +386,7 @@ func (s *Server) toolWatchPrinter(ctx context.Context, _ *mcp.CallToolRequest, i
 		if !known {
 			return errorResult(), WatchPrinterOut{
 				Serial: in.Serial, Mode: mode,
-				Error: toolErr(errUnknownSerial, "serial is not configured: "+in.Serial),
+				Error: toolErr(module.CodeUnknownSerial, "serial is not configured: "+in.Serial),
 			}, nil
 		}
 		out := WatchPrinterOut{

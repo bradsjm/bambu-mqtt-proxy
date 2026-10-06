@@ -18,11 +18,14 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
 	"bambu-mqtt-proxy/internal/camera"
-	"bambu-mqtt-proxy/internal/jobpreview"
+	"bambu-mqtt-proxy/internal/module"
 )
 
 const (
@@ -55,9 +58,9 @@ type wireFixture struct {
 	ts *httptest.Server
 }
 
-func newWireFixture(t *testing.T) *wireFixture {
+func newWireFixture(t *testing.T, mods ...module.Module) *wireFixture {
 	t.Helper()
-	f := newFixture(t)
+	f := newFixture(t, mods...)
 	mux := http.NewServeMux()
 	f.srv.Register(mux)
 	ts := httptest.NewServer(mux)
@@ -430,9 +433,9 @@ func TestMCPDiscovery(t *testing.T) {
 	if err := json.Unmarshal(tl.Result, &tools); err != nil {
 		t.Fatalf("bad tools/list result: %v", err)
 	}
-	readOnly := []string{"list_printers", "get_printer_state", "get_camera_snapshot", "watch_printer", "get_job_preview"}
+	readOnly := []string{"list_printers", "get_printer_state", "get_camera_snapshot", "watch_printer"}
 	want := append(slices.Clone(readOnly), "pause_print", "resume_print", "stop_print",
-		"set_chamber_light", "set_speed_profile", "set_ai_monitoring")
+		"set_chamber_light", "set_speed_profile")
 	if len(tools.Tools) != len(want) {
 		t.Fatalf("tools/list returned %d tools, want exactly %d", len(tools.Tools), len(want))
 	}
@@ -456,17 +459,6 @@ func TestMCPDiscovery(t *testing.T) {
 	for _, name := range want {
 		if !seen[name] {
 			t.Fatalf("tool %q missing from discovery", name)
-		}
-	}
-	for _, tool := range tools.Tools {
-		if tool.Name != "get_job_preview" {
-			continue
-		}
-		if tool.InputSchema.Properties["serial"].Type != "string" {
-			t.Fatalf("get_job_preview serial property = %+v", tool.InputSchema.Properties["serial"])
-		}
-		if !slices.Contains(tool.InputSchema.Required, "serial") {
-			t.Fatalf("get_job_preview required = %v", tool.InputSchema.Required)
 		}
 	}
 
@@ -574,7 +566,7 @@ func TestMCPToolCalls(t *testing.T) {
 	}
 
 	// Unknown serial is a typed tool error, not a transport failure.
-	assertToolError(t, call(12, "get_printer_state", map[string]any{"serial": "NOPE"}, nil), errUnknownSerial)
+	assertToolError(t, call(12, "get_printer_state", map[string]any{"serial": "NOPE"}, nil), module.CodeUnknownSerial)
 
 	// Unknown tool and unknown method are refused with JSON-RPC errors: the
 	// surface has no write path at all.
@@ -1077,230 +1069,6 @@ func TestMCPCameraSnapshotWire(t *testing.T) {
 	w.cams.balanced(t)
 }
 
-func TestMCPGetJobPreviewWire(t *testing.T) {
-	w := newWireFixture(t)
-	call := func(id int, args map[string]any) sseMessage {
-		return w.post(t, id, "tools/call", map[string]any{"name": "get_job_preview", "arguments": args})
-	}
-
-	// The default fixture wires a preview source with no cached data, so
-	// the state projection and the tool both read the explicit disabled
-	// state with no image bytes and no tool error.
-	res := call(50, map[string]any{"serial": "P001"})
-	if res.Error != nil {
-		t.Fatalf("disabled call error: %+v", res.Error)
-	}
-	var out struct {
-		IsError bool `json:"isError"`
-		Content []struct {
-			Type string `json:"type"`
-			Data string `json:"data"`
-		} `json:"content"`
-		StructuredContent struct {
-			Serial     string `json:"serial"`
-			JobPreview struct {
-				Status  string `json:"status"`
-				JobName string `json:"job_name"`
-				Current bool   `json:"current"`
-			} `json:"job_preview"`
-			JobMetadata *struct {
-				Source string `json:"source"`
-				Plate  *struct {
-					Index int `json:"index"`
-				} `json:"plate"`
-			} `json:"job_metadata"`
-			Error *struct {
-				Code string `json:"code"`
-			} `json:"error"`
-		} `json:"structuredContent"`
-	}
-	if err := json.Unmarshal(res.Result, &out); err != nil {
-		t.Fatalf("bad disabled result: %v", err)
-	}
-	if out.IsError || out.StructuredContent.Error != nil ||
-		out.StructuredContent.JobPreview.Status != jobpreview.StatusDisabled ||
-		out.StructuredContent.JobMetadata != nil {
-		t.Fatalf("disabled result = %s", res.Result)
-	}
-	for _, c := range out.Content {
-		if c.Type == "image" {
-			t.Fatalf("disabled result carried image content")
-		}
-	}
-
-	// A ready cached result flows to the tool as one atomic read: typed
-	// view plus metadata in the structured output and the plate render as
-	// image content from the same lookup. The state projection carries the
-	// same cache state without image bytes.
-	w.preview.set("P001", readyPreview())
-	res = call(51, map[string]any{"serial": "P001"})
-	if res.Error != nil {
-		t.Fatalf("ready call error: %+v", res.Error)
-	}
-	if err := json.Unmarshal(res.Result, &out); err != nil {
-		t.Fatalf("bad ready result: %v", err)
-	}
-	sc := out.StructuredContent
-	if out.IsError || sc.Error != nil || sc.JobPreview.Status != jobpreview.StatusReady ||
-		sc.JobPreview.JobName != "Bracket.3mf" || !sc.JobPreview.Current {
-		t.Fatalf("ready structured = %s", res.Result)
-	}
-	if sc.JobMetadata == nil || sc.JobMetadata.Source != "printer_3mf" {
-		t.Fatalf("ready metadata = %s", res.Result)
-	}
-	sawPNG := false
-	for _, c := range out.Content {
-		if c.Type != "image" {
-			continue
-		}
-		raw, err := base64.StdEncoding.DecodeString(c.Data)
-		if err != nil || !bytes.Equal(raw, previewPNG) {
-			t.Fatalf("image payload mismatch: %v", err)
-		}
-		sawPNG = true
-	}
-	if !sawPNG {
-		t.Fatalf("no png block: %+v", out.Content)
-	}
-	// The ready text names the archive render, its difference from a
-	// camera photograph, and the untrusted description text.
-	var textOut struct {
-		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"content"`
-	}
-	if err := json.Unmarshal(res.Result, &textOut); err != nil {
-		t.Fatalf("bad ready content: %v", err)
-	}
-	text := ""
-	for _, c := range textOut.Content {
-		if c.Type == "text" {
-			text = c.Text
-		}
-	}
-	for _, want := range []string{"sliced plate render", "not a camera photograph", "untrusted"} {
-		if !strings.Contains(text, want) {
-			t.Fatalf("ready text %q lacks %q", text, want)
-		}
-	}
-
-	// The state projection mirrors the cache additively: job_preview ready,
-	// job_metadata present, and no image bytes anywhere in state.
-	st := w.post(t, 52, "tools/call", map[string]any{
-		"name": "get_printer_state", "arguments": map[string]any{"serial": "P001"},
-	})
-	var stateOut struct {
-		StructuredContent struct {
-			State struct {
-				JobPreview struct {
-					Status string `json:"status"`
-				} `json:"job_preview"`
-				JobMetadata *struct {
-					Source string `json:"source"`
-				} `json:"job_metadata"`
-			} `json:"state"`
-		} `json:"structuredContent"`
-	}
-	if err := json.Unmarshal(st.Result, &stateOut); err != nil {
-		t.Fatalf("bad state result: %v", err)
-	}
-	if stateOut.StructuredContent.State.JobPreview.Status != jobpreview.StatusReady ||
-		stateOut.StructuredContent.State.JobMetadata == nil {
-		t.Fatalf("state projection = %s", st.Result)
-	}
-	rd := w.post(t, 53, "resources/read", map[string]any{"uri": stateURI("P001")})
-	var read struct {
-		Contents []struct {
-			Text string `json:"text"`
-		} `json:"contents"`
-	}
-	if err := json.Unmarshal(rd.Result, &read); err != nil {
-		t.Fatalf("bad resource read: %v", err)
-	}
-	if len(read.Contents) != 1 ||
-		!strings.Contains(read.Contents[0].Text, `"job_preview"`) ||
-		!strings.Contains(read.Contents[0].Text, `"job_metadata"`) {
-		t.Fatalf("resource read lacks preview projection: %s", rd.Result)
-	}
-
-	// Repeated calls are pure cache reads: identical payload, and the
-	// camera source is never consulted as a fallback.
-	again := call(54, map[string]any{"serial": "P001"})
-	if !bytes.Equal([]byte(again.Result), []byte(res.Result)) {
-		t.Fatalf("repeat call differed:\n%s\n%s", res.Result, again.Result)
-	}
-	w.cams.balanced(t)
-	if w.cams.acquires != 0 {
-		t.Fatalf("preview path acquired the camera %d times", w.cams.acquires)
-	}
-
-	// Pending and unavailable are normal outcomes without image content.
-	w.preview.set("P001", jobpreview.Result{Preview: jobpreview.View{
-		Status: jobpreview.StatusPending, JobName: "Bracket.3mf", Current: true}})
-	res = call(55, map[string]any{"serial": "P001"})
-	var pend struct {
-		IsError           bool `json:"isError"`
-		StructuredContent struct {
-			JobPreview struct {
-				Status string `json:"status"`
-			} `json:"job_preview"`
-			JobMetadata *struct{} `json:"job_metadata"`
-		} `json:"structuredContent"`
-	}
-	if err := json.Unmarshal(res.Result, &pend); err != nil {
-		t.Fatalf("bad pending result: %v", err)
-	}
-	if pend.IsError || pend.StructuredContent.JobPreview.Status != jobpreview.StatusPending ||
-		pend.StructuredContent.JobMetadata != nil {
-		t.Fatalf("pending result = %s", res.Result)
-	}
-	w.preview.set("P001", jobpreview.Result{Preview: jobpreview.View{Status: jobpreview.StatusUnavailable}})
-	res = call(56, map[string]any{"serial": "P001"})
-	var unav struct {
-		IsError           bool `json:"isError"`
-		StructuredContent struct {
-			JobPreview struct {
-				Status string `json:"status"`
-			} `json:"job_preview"`
-		} `json:"structuredContent"`
-	}
-	if err := json.Unmarshal(res.Result, &unav); err != nil {
-		t.Fatalf("bad unavailable result: %v", err)
-	}
-	if unav.IsError || unav.StructuredContent.JobPreview.Status != jobpreview.StatusUnavailable {
-		t.Fatalf("unavailable result = %s", res.Result)
-	}
-
-	// Unknown serial is the typed tool error, and the preview source is
-	// never consulted for it.
-	assertToolError(t, call(57, map[string]any{"serial": "NOPE"}), errUnknownSerial)
-	before, _ := w.preview.counts()
-	assertToolError(t, call(58, map[string]any{"serial": "NOPE"}), errUnknownSerial)
-	if after, _ := w.preview.counts(); after != before {
-		t.Fatalf("unknown serial reached the preview source")
-	}
-
-	// The input schema admits serial only: a refresh-style argument is
-	// rejected before the handler runs (the SDK reports it as a flagged
-	// tool result, not one of the typed operational codes), so no client
-	// can request a fetch.
-	before, _ = w.preview.counts()
-	res = call(59, map[string]any{"serial": "P001", "force": true})
-	var forced struct {
-		IsError bool `json:"isError"`
-	}
-	if err := json.Unmarshal(res.Result, &forced); err != nil {
-		t.Fatalf("bad forced result: %v", err)
-	}
-	if !forced.IsError {
-		t.Fatalf("forced argument accepted: %s", res.Result)
-	}
-	if after, _ := w.preview.counts(); after != before {
-		t.Fatalf("rejected call reached the preview source")
-	}
-}
-
 func TestMCPTransportHardening(t *testing.T) {
 	w := newWireFixture(t)
 
@@ -1502,7 +1270,7 @@ func TestMCPStateSchemaFlattensView(t *testing.T) {
 		}
 		props := tool.OutputSchema.Properties["state"].Properties
 		for _, key := range []string{"print_state", "chamber_light", "freshness", "controls", "activity",
-			"camera", "job_preview", "job_metadata"} {
+			"camera", "modules"} {
 			if _, ok := props[key]; !ok {
 				t.Fatalf("state schema lacks %q: %v", key, props)
 			}
@@ -1543,8 +1311,7 @@ func TestMCPControlTools(t *testing.T) {
 	}
 	assertToolError(t, call(2, "set_chamber_light", map[string]any{"serial": "P002", "on": true}), errUpstreamUnavailable)
 	assertToolError(t, call(3, "pause_print", map[string]any{"serial": "P001"}), errInvalidState)
-	assertToolError(t, call(4, "stop_print", map[string]any{"serial": "NOPE"}), errUnknownSerial)
-	assertToolError(t, call(5, "set_ai_monitoring", map[string]any{"serial": "P001", "enabled": false}), errDetectionDisabled)
+	assertToolError(t, call(4, "stop_print", map[string]any{"serial": "NOPE"}), module.CodeUnknownSerial)
 	if bad := call(6, "set_speed_profile", map[string]any{"serial": "P001", "profile": "turbo"}); bad.Error == nil {
 		var r struct {
 			IsError bool `json:"isError"`
@@ -1575,4 +1342,222 @@ func waitWatchParked() bool {
 		time.Sleep(time.Millisecond)
 	}
 	return false
+}
+
+// stableModuleState keeps elapsed time on the wire but out of its change key.
+type stableModuleState struct {
+	Health string `json:"health"`
+	Age    int    `json:"age"`
+}
+
+func (s stableModuleState) StableKey() any { return s.Health }
+
+// fakeModuleState returns immutable copies under a lock for sampler tests.
+type fakeModuleState struct {
+	mu    sync.Mutex
+	value stableModuleState
+}
+
+func (f *fakeModuleState) state(string) any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.value
+}
+
+func (f *fakeModuleState) set(value stableModuleState) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.value = value
+}
+
+func TestMCPModuleStateWire(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		mods    []module.Module
+		present bool
+	}{
+		{"value", []module.Module{{Name: "example", State: func(string) any { return map[string]any{"health": "ready"} }}}, true},
+		{"no modules", nil, false},
+		{"nil value", []module.Module{{Name: "example", State: func(string) any { return nil }}}, false},
+		{"no state hook", []module.Module{{Name: "example"}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newWireFixture(t, tc.mods...)
+			msg := w.post(t, 1, "tools/call", map[string]any{
+				"name": "get_printer_state", "arguments": map[string]any{"serial": "P001"},
+			})
+			if msg.Error != nil {
+				t.Fatalf("SDK rejected state: %+v", msg.Error)
+			}
+			var out struct {
+				IsError           bool `json:"isError"`
+				StructuredContent struct {
+					State map[string]json.RawMessage `json:"state"`
+				} `json:"structuredContent"`
+			}
+			if err := json.Unmarshal(msg.Result, &out); err != nil {
+				t.Fatal(err)
+			}
+			value, present := out.StructuredContent.State["modules"]
+			if out.IsError || present != tc.present {
+				t.Fatalf("state = %s", msg.Result)
+			}
+			if tc.present && string(value) != `{"example":{"health":"ready"}}` {
+				t.Fatalf("modules = %s", value)
+			}
+			for _, removed := range []string{"detection", "job_preview", "job_metadata"} {
+				if _, exists := out.StructuredContent.State[removed]; exists {
+					t.Fatalf("old state member %q remains", removed)
+				}
+			}
+		})
+	}
+}
+
+func TestMCPModuleStableKeyWatchWire(t *testing.T) {
+	first := &fakeModuleState{value: stableModuleState{Health: "ready"}}
+	second := &fakeModuleState{value: stableModuleState{Health: "ready"}}
+	w := newWireFixture(t,
+		module.Module{Name: "first", State: first.state},
+		module.Module{Name: "second", State: second.state},
+	)
+	initial := w.post(t, 1, "tools/call", map[string]any{
+		"name": "watch_printer", "arguments": map[string]any{"serial": "P001", "timeout_seconds": 0},
+	})
+	var baseline struct {
+		StructuredContent WatchPrinterOut `json:"structuredContent"`
+	}
+	if initial.Error != nil {
+		t.Fatalf("initial watch: %+v", initial.Error)
+	}
+	if err := json.Unmarshal(initial.Result, &baseline); err != nil {
+		t.Fatal(err)
+	}
+	token := baseline.StructuredContent.Revision
+	first.set(stableModuleState{Health: "ready", Age: 10})
+	second.set(stableModuleState{Health: "ready", Age: 20})
+	w.step()
+	unchanged := w.post(t, 2, "tools/call", map[string]any{
+		"name": "watch_printer", "arguments": map[string]any{"serial": "P001", "after_revision": token, "timeout_seconds": 0},
+	})
+	var quiet struct {
+		StructuredContent WatchPrinterOut `json:"structuredContent"`
+	}
+	if unchanged.Error != nil {
+		t.Fatalf("aging watch: %+v", unchanged.Error)
+	}
+	if err := json.Unmarshal(unchanged.Result, &quiet); err != nil {
+		t.Fatal(err)
+	}
+	if quiet.StructuredContent.Revision != token || quiet.StructuredContent.Changed || quiet.StructuredContent.ResyncRequired || len(quiet.StructuredContent.Events) != 0 {
+		t.Fatalf("aging woke watch: %s", unchanged.Result)
+	}
+	done := make(chan sseMessage, 1)
+	go func() {
+		done <- w.post(t, 3, "tools/call", map[string]any{
+			"name": "watch_printer", "arguments": map[string]any{"serial": "P001", "after_revision": token, "timeout_seconds": 5},
+		})
+	}()
+	if !waitWatchParked() {
+		t.Fatal("module watch did not park")
+	}
+	first.set(stableModuleState{Health: "warning", Age: 11})
+	second.set(stableModuleState{Health: "blocked", Age: 21})
+	w.step()
+	select {
+	case msg := <-done:
+		if msg.Error != nil {
+			t.Fatalf("changed watch: %+v", msg.Error)
+		}
+		var out struct {
+			StructuredContent WatchPrinterOut `json:"structuredContent"`
+		}
+		if err := json.Unmarshal(msg.Result, &out); err != nil {
+			t.Fatal(err)
+		}
+		if !out.StructuredContent.Changed || out.StructuredContent.ResyncRequired || out.StructuredContent.Revision == token {
+			t.Fatalf("changed watch = %s", msg.Result)
+		}
+		events := out.StructuredContent.Events
+		if len(events) != 2 {
+			t.Fatalf("module events = %+v", events)
+		}
+		for i, name := range []string{"first", "second"} {
+			if events[i].Kind != kindModuleChanged || events[i].Module != name || events[i].Detail != name+" state changed" {
+				t.Fatalf("module event %d = %+v", i, events[i])
+			}
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("module change did not wake watch")
+	}
+}
+
+func TestMCPModuleToolHookWire(t *testing.T) {
+	hooks := 0
+	type input struct {
+		Serial string `json:"serial"`
+	}
+	type output struct {
+		Serial string `json:"serial"`
+	}
+	w := newWireFixture(t, module.Module{Name: "example", MCP: func(srv *mcp.Server) {
+		hooks++
+		mcp.AddTool(srv, &mcp.Tool{Name: "module_echo", Annotations: module.ReadOnly("Echo"), InputSchema: module.SerialInput(nil)},
+			func(_ context.Context, _ *mcp.CallToolRequest, in input) (*mcp.CallToolResult, output, error) {
+				return nil, output{Serial: in.Serial}, nil
+			})
+	}})
+	list := w.post(t, 1, "tools/list", map[string]any{})
+	if list.Error != nil {
+		t.Fatalf("tools/list: %+v", list.Error)
+	}
+	var tools struct {
+		Tools []struct {
+			Name string `json:"name"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(list.Result, &tools); err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, tool := range tools.Tools {
+		if tool.Name == "module_echo" {
+			count++
+		}
+	}
+	if hooks != 1 || count != 1 {
+		t.Fatalf("hooks = %d, module tools = %d", hooks, count)
+	}
+	call := w.post(t, 2, "tools/call", map[string]any{"name": "module_echo", "arguments": map[string]any{"serial": "P001"}})
+	if call.Error != nil {
+		t.Fatalf("module call: %+v", call.Error)
+	}
+	var out struct {
+		IsError           bool   `json:"isError"`
+		StructuredContent output `json:"structuredContent"`
+	}
+	if err := json.Unmarshal(call.Result, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.IsError || out.StructuredContent.Serial != "P001" {
+		t.Fatalf("module call = %s", call.Result)
+	}
+}
+
+func TestMCPErrorOutputValidationWire(t *testing.T) {
+	w := newWireFixture(t, module.Module{Name: "example", State: func(string) any { return map[string]any{"ready": true} }})
+	for id, name := range []string{"get_printer_state", "watch_printer", "get_camera_snapshot", "stop_print"} {
+		assertToolError(t, w.post(t, id+1, "tools/call", map[string]any{"name": name, "arguments": map[string]any{"serial": "NOPE"}}), module.CodeUnknownSerial)
+	}
+	for range maxWaits {
+		w.srv.waits <- struct{}{}
+	}
+	defer func() {
+		for range maxWaits {
+			<-w.srv.waits
+		}
+	}()
+	assertToolError(t, w.post(t, 10, "tools/call", map[string]any{
+		"name": "watch_printer", "arguments": map[string]any{"serial": "P001", "timeout_seconds": 0},
+	}), errTooManyWaits)
 }

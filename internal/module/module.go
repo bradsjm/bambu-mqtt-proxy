@@ -4,8 +4,8 @@
 // its hooks with one Module value. The service wiring constructs each
 // enabled module with the core services it needs, then hands the
 // declarations to the core, which owns lifecycle order, the shared report
-// interest, activity fan-out, display placement, and the members and
-// routes a module serves under its own name.
+// interest, activity fan-out, display placement, and the members, routes,
+// and MCP tools a module serves under its own name.
 //
 // Core services a module may take at construction, by narrow interface:
 //   - merged printer state and print sessions (*telemetry.Cache),
@@ -20,6 +20,8 @@ package module
 
 import (
 	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"bambu-mqtt-proxy/internal/activity"
 )
@@ -51,13 +53,15 @@ type Module struct {
 	// Display returns the module's contribution to one printer's camera
 	// wall tile, or nil for nothing. It must be cheap and non-blocking.
 	Display func(serial string) *Display
-	// TileValue returns the module's own value for one printer's camera wall
-	// tile. The core serves it as the tile member named Name and omits the
-	// member for nil. A value with a StableKey() any method is compared
-	// through that method when the core decides whether to send an events
-	// update, so continuously aging fields may stay in the value. It must be
-	// safe for concurrent use and must not block.
-	TileValue func(serial string) any
+	// State returns the module's state for one printer, or nil for nothing.
+	// The core serves the same value as the camera wall tile member named
+	// Name and as state.modules.<Name> in MCP printer state. A value with a
+	// StableKey() any method is compared through that method; any other
+	// value is compared by its JSON. A change sends a camera wall events
+	// update and wakes MCP watch_printer attention watchers, so
+	// continuously aging fields must be rounded, omitted, or excluded by
+	// StableKey. It must be safe for concurrent use and must not block.
+	State func(serial string) any
 	// FleetValues returns top-level members of the /camera/status and
 	// /camera/events body. Every key equals Name or starts with Name+"_".
 	// nil or empty adds nothing.
@@ -68,6 +72,13 @@ type Module struct {
 	// listener runs. Mount protects every non-GET/HEAD route against
 	// cross-origin browser writes.
 	Routes []Route
+	// MCP registers the module's MCP tools on the server with mcp.AddTool.
+	// The core calls it once while it builds the server, and only for
+	// modules in the running configuration. Tool names must be unique
+	// across the core and every module: the SDK silently replaces a tool
+	// with the same name. Handlers follow the same concurrency and
+	// after-Stop rules as the read hooks.
+	MCP func(s *mcp.Server)
 }
 
 // Display is one module's contribution to one printer tile. Values must be
