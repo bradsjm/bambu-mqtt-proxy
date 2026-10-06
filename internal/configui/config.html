@@ -446,11 +446,7 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
       <input id="p-code" type="password" autocomplete="new-password" spellcheck="false">
       <p class="hint" id="p-code-hint">Shown on the printer's screen with LAN mode.</p>
     </div>
-    <div class="field">
-      <label for="p-breath">Panda Breath address <span class="hint" style="display:inline">(optional)</span></label>
-      <input id="p-breath" type="text" autocomplete="off" spellcheck="false" placeholder="ws://panda-breath-blue.iot/ws">
-      <p class="hint">WebSocket address of a Panda Breath sensor. It supplies the chamber temperature for printers without a chamber sensor, such as the P1 and A1 series.</p>
-    </div>
+    <div id="p-settings" style="display:contents"></div>
     <details id="p-more">
       <summary>Connection options</summary>
       <div class="field">
@@ -740,15 +736,42 @@ function guard(e) { if (snapshot() !== baseline) e.preventDefault(); }
 
 /* ---- Printer dialog ---- */
 const dlg = $("#dlg");
+const printerSettingInputs = new Map();
 function openPrinter(i) {
   editing = i;
-  const p = i >= 0 ? cfg.printers[i] : { serial: "", name: "", model: "", panda_breath: "", address: "", tls: true, insecure_skip_verify: true, username: "bblp", has_access_code: false };
+  const p = i >= 0 ? cfg.printers[i] : { serial: "", name: "", model: "", settings: {}, address: "", tls: true, insecure_skip_verify: true, username: "bblp", has_access_code: false };
   $("#dlg-title").textContent = i >= 0 ? `Edit ${p.name || p.serial}` : "Add printer";
   $("#dlg-ok").textContent = i >= 0 ? "Update printer" : "Add printer";
   $("#p-test").hidden = i >= 0;   // the test connects to a new destination only
   $("#p-serial").value = p.serial; $("#p-name").value = p.name; $("#p-model").value = p.model;
   $("#p-address").value = p.address; $("#p-code").value = p.access_code || "";
-  $("#p-breath").value = p.panda_breath || "";
+  $("#p-settings").replaceChildren();
+  printerSettingInputs.clear();
+  for (const s of cfg.printer_settings) {
+    const field = document.createElement("div");
+    field.className = "field";
+    const label = document.createElement("label");
+    label.htmlFor = `p-setting-${s.key}`;
+    label.textContent = s.label + " ";
+    const optional = document.createElement("span");
+    optional.className = "hint";
+    optional.style.display = "inline";
+    optional.textContent = "(optional)";
+    label.append(optional);
+    const input = document.createElement("input");
+    input.id = label.htmlFor;
+    input.type = "text";
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    input.placeholder = s.placeholder;
+    input.value = p.settings?.[s.key] || "";
+    const hint = document.createElement("p");
+    hint.className = "hint";
+    hint.textContent = s.hint;
+    field.append(label, input, hint);
+    $("#p-settings").append(field);
+    printerSettingInputs.set(s.key, input);
+  }
   $("#p-user").value = p.username; $("#p-tls").checked = p.tls; $("#p-skip").checked = p.insecure_skip_verify;
   $("#p-model").placeholder = "Detected from serial";
   $("#p-more").open = false;
@@ -790,11 +813,15 @@ function submitPrinter(e) {
   const prev = editing >= 0 ? cfg.printers[editing] : {};
   const p = {
     serial, name: $("#p-name").value.trim(), model: $("#p-model").value.trim(), address,
-    panda_breath: $("#p-breath").value.trim(),
+    settings: {},
     tls: $("#p-tls").checked, insecure_skip_verify: $("#p-skip").checked,
     username: $("#p-user").value.trim() || "bblp",
     has_access_code: !!prev.has_access_code,
   };
+  for (const [key, input] of printerSettingInputs) {
+    const value = input.value.trim();
+    if (value) p.settings[key] = value;
+  }
   if (prev.previous_serial) p.previous_serial = prev.previous_serial;
   if (code) p.access_code = code;
   if (editing >= 0) cfg.printers[editing] = p; else cfg.printers.push(p);

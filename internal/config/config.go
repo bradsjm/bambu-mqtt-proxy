@@ -4,7 +4,6 @@ package config
 
 import (
 	"fmt"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -78,6 +77,26 @@ type Auth struct {
 	Mode string `yaml:"mode"`
 }
 
+// PrinterSetting describes one optional per-printer string option owned by a module.
+type PrinterSetting struct {
+	Key, Label, Placeholder, Hint string
+	Validate                      func(value string) error
+}
+
+// printerSettings holds module settings registered during program initialization.
+var printerSettings []PrinterSetting
+
+// RegisterPrinterSetting registers a module's optional printer setting.
+// Registration happens only during program initialization, before any config is loaded.
+func RegisterPrinterSetting(s PrinterSetting) {
+	printerSettings = append(printerSettings, s)
+}
+
+// PrinterSettings returns a copy of the registered module printer settings.
+func PrinterSettings() []PrinterSetting {
+	return append([]PrinterSetting(nil), printerSettings...)
+}
+
 // Printer describes one upstream Bambu printer MQTT endpoint.
 type Printer struct {
 	Serial  string `yaml:"serial"`
@@ -93,12 +112,18 @@ type Printer struct {
 	InsecureSkipVerify bool   `yaml:"insecure_skip_verify"`
 	Username           string `yaml:"username"`
 	Password           string `yaml:"password"`
-	// PandaBreath is the optional WebSocket address of a Panda Breath
-	// accessory chamber sensor, for example ws://panda-breath-blue.iot/ws.
-	// It supplies the chamber temperature display for models without a
-	// physical chamber sensor (see ChamberTemperatureSupported); it never
-	// affects MQTT routing. Empty disables the observer for the printer.
-	PandaBreath string `yaml:"panda_breath,omitempty"`
+	// Settings holds optional per-printer settings owned by modules, inline
+	// at the printer level in YAML. Values keep any YAML shape, so unknown
+	// printer keys load as they did before modules owned settings; read a
+	// module's string value with Setting.
+	Settings map[string]any `yaml:",inline"`
+}
+
+// Setting returns the trimmed string value of one module setting, or empty
+// when the key is unset or its value is not a string.
+func (p Printer) Setting(key string) string {
+	v, _ := p.Settings[key].(string)
+	return strings.TrimSpace(v)
 }
 
 // Behavior holds routing and upstream connection tuning knobs.
@@ -456,8 +481,8 @@ func (c *Config) ApplyEnv() (bool, error) {
 
 // parsePrintersEnv parses the BMBPX_PRINTERS format: printer entries
 // separated by ';', each a comma-separated key=value list with keys serial,
-// address, name, model, panda_breath, password, username, tls,
-// insecure_skip_verify.
+// address, name, model, password, username, tls, insecure_skip_verify,
+// and registered module printer setting keys.
 func parsePrintersEnv(v string) ([]Printer, error) {
 	var out []Printer
 	for _, entry := range strings.Split(v, ";") {
@@ -495,8 +520,6 @@ func parsePrinterEntry(entry string) (Printer, error) {
 			p.Name = strings.TrimSpace(val)
 		case "model":
 			p.Model = val
-		case "panda_breath":
-			p.PandaBreath = strings.TrimSpace(val)
 		case "password":
 			p.Password = val
 		case "username":
@@ -506,7 +529,20 @@ func parsePrinterEntry(entry string) (Printer, error) {
 		case "insecure_skip_verify":
 			p.InsecureSkipVerify, err = strconv.ParseBool(val)
 		default:
-			return Printer{}, fmt.Errorf("unknown key %q", k)
+			registered := false
+			for _, s := range printerSettings {
+				if s.Key == strings.ToLower(k) {
+					if p.Settings == nil {
+						p.Settings = make(map[string]any)
+					}
+					p.Settings[s.Key] = strings.TrimSpace(val)
+					registered = true
+					break
+				}
+			}
+			if !registered {
+				return Printer{}, fmt.Errorf("unknown key %q", k)
+			}
 		}
 		if err != nil {
 			return Printer{}, fmt.Errorf("key %q: %w", k, err)
@@ -594,10 +630,20 @@ func (c *Config) Validate() error {
 		if p.Password == "" {
 			return fmt.Errorf("printers[%d] (%s): password (LAN access code) is required", i, p.Serial)
 		}
-		if breath := strings.TrimSpace(p.PandaBreath); breath != "" {
-			u, err := url.Parse(breath)
-			if err != nil || (u.Scheme != "ws" && u.Scheme != "wss") || u.Host == "" || u.User != nil || u.Fragment != "" {
-				return fmt.Errorf("printers[%d] (%s): panda_breath %q must be a ws:// or wss:// URL with a host and no credentials or fragment", i, p.Serial, breath)
+		for _, s := range printerSettings {
+			raw, ok := p.Settings[s.Key]
+			if !ok || raw == nil {
+				continue
+			}
+			// A registered setting must be a string: a number or list
+			// would otherwise read as unset and silently disable it.
+			if _, isString := raw.(string); !isString {
+				return fmt.Errorf("printers[%d] (%s): %s must be a string", i, p.Serial, s.Key)
+			}
+			if value := p.Setting(s.Key); value != "" && s.Validate != nil {
+				if err := s.Validate(value); err != nil {
+					return fmt.Errorf("printers[%d] (%s): %s %q %w", i, p.Serial, s.Key, value, err)
+				}
 			}
 		}
 	}

@@ -132,16 +132,17 @@ func (s *Store) Register(mux *http.ServeMux) {
 
 // View is the editable configuration exchanged with the page.
 type View struct {
-	Printers      []PrinterView     `json:"printers"`
-	Listen        []ListenerView    `json:"listen"`
-	AuthMode      string            `json:"auth_mode"`
-	HTTPPort      int               `json:"http_port"`
-	CameraEnabled bool              `json:"camera_enabled"`
-	MCPEnabled    bool              `json:"mcp_enabled"`
-	Detection     DetectionView     `json:"detection"`
-	LogLevel      string            `json:"log_level"`
-	Behavior      BehaviorView      `json:"behavior"`
-	Notifications NotificationsView `json:"notifications"`
+	Printers        []PrinterView        `json:"printers"`
+	PrinterSettings []PrinterSettingView `json:"printer_settings"`
+	Listen          []ListenerView       `json:"listen"`
+	AuthMode        string               `json:"auth_mode"`
+	HTTPPort        int                  `json:"http_port"`
+	CameraEnabled   bool                 `json:"camera_enabled"`
+	MCPEnabled      bool                 `json:"mcp_enabled"`
+	Detection       DetectionView        `json:"detection"`
+	LogLevel        string               `json:"log_level"`
+	Behavior        BehaviorView         `json:"behavior"`
+	Notifications   NotificationsView    `json:"notifications"`
 }
 
 // DetectionView is the Gadget AI detection section. APIKey is accepted on
@@ -155,23 +156,30 @@ type DetectionView struct {
 	APIKey    string `json:"api_key,omitempty"`
 }
 
+// PrinterSettingView describes a module's optional printer field on the page.
+type PrinterSettingView struct {
+	Key         string `json:"key"`
+	Label       string `json:"label"`
+	Placeholder string `json:"placeholder"`
+	Hint        string `json:"hint"`
+}
+
 // PrinterView is one printer. AccessCode is accepted on save and never
 // returned; PreviousSerial names the stored printer an edit started from.
 type PrinterView struct {
 	Serial string `json:"serial"`
 	Name   string `json:"name"`
 	Model  string `json:"model"`
-	// PandaBreath is the optional Panda Breath sensor WebSocket address.
-	// Plain data, unlike the access code: the API returns it and a blank
-	// submitted value clears it.
-	PandaBreath        string `json:"panda_breath"`
-	Address            string `json:"address"`
-	TLS                bool   `json:"tls"`
-	InsecureSkipVerify bool   `json:"insecure_skip_verify"`
-	Username           string `json:"username"`
-	HasAccessCode      bool   `json:"has_access_code"`
-	AccessCode         string `json:"access_code,omitempty"`
-	PreviousSerial     string `json:"previous_serial,omitempty"`
+	// Settings holds optional module values returned by the API.
+	// A blank submitted value clears a setting.
+	Settings           map[string]string `json:"settings"`
+	Address            string            `json:"address"`
+	TLS                bool              `json:"tls"`
+	InsecureSkipVerify bool              `json:"insecure_skip_verify"`
+	Username           string            `json:"username"`
+	HasAccessCode      bool              `json:"has_access_code"`
+	AccessCode         string            `json:"access_code,omitempty"`
+	PreviousSerial     string            `json:"previous_serial,omitempty"`
 }
 
 // ListenerView is one downstream MQTT listener.
@@ -585,12 +593,24 @@ func toView(c *config.Config) View {
 			},
 		},
 	}
+	v.PrinterSettings = []PrinterSettingView{}
+	for _, s := range config.PrinterSettings() {
+		v.PrinterSettings = append(v.PrinterSettings, PrinterSettingView{
+			Key: s.Key, Label: s.Label, Placeholder: s.Placeholder, Hint: s.Hint,
+		})
+	}
 	for _, p := range c.Printers {
+		settings := map[string]string{}
+		for _, s := range config.PrinterSettings() {
+			if value := p.Setting(s.Key); value != "" {
+				settings[s.Key] = value
+			}
+		}
 		v.Printers = append(v.Printers, PrinterView{
 			Serial:             p.Serial,
 			Name:               p.Name,
 			Model:              p.Model,
-			PandaBreath:        p.PandaBreath,
+			Settings:           settings,
 			Address:            p.Address,
 			TLS:                p.TLS,
 			InsecureSkipVerify: p.InsecureSkipVerify,
@@ -667,12 +687,19 @@ func (v View) toConfig(stored *config.Config) (*config.Config, error) {
 			Serial:             strings.TrimSpace(p.Serial),
 			Name:               strings.TrimSpace(p.Name),
 			Model:              strings.TrimSpace(p.Model),
-			PandaBreath:        strings.TrimSpace(p.PandaBreath),
 			Address:            strings.TrimSpace(p.Address),
 			TLS:                p.TLS,
 			InsecureSkipVerify: p.InsecureSkipVerify,
 			Username:           strings.TrimSpace(p.Username),
 			Password:           p.AccessCode,
+		}
+		for _, s := range config.PrinterSettings() {
+			if value := strings.TrimSpace(p.Settings[s.Key]); value != "" {
+				if out.Settings == nil {
+					out.Settings = make(map[string]any)
+				}
+				out.Settings[s.Key] = value
+			}
 		}
 		if out.Username == "" {
 			out.Username = "bblp"

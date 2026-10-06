@@ -162,7 +162,7 @@ log:
 
 | Environment variable | Default | Meaning |
 |---|---|---|
-| `BMBPX_PRINTERS` | — | Semicolon-separated printers: `serial=…,address=…,password=…[,name=…][,model=…][,username=…][,tls=…][,insecure_skip_verify=…]` |
+| `BMBPX_PRINTERS` | — | Semicolon-separated printers: `serial=…,address=…,password=…[,name=…][,model=…][,username=…][,tls=…][,insecure_skip_verify=…][,panda_breath=ws://…]` |
 | `BMBPX_LISTEN_PORT` | `8883` | Downstream MQTT port |
 | `BMBPX_LISTEN_TLS` | `true` | TLS on the downstream listener |
 | `BMBPX_CERT_FILE` / `BMBPX_KEY_FILE` | *(empty)* | Empty = ephemeral in-memory self-signed certificate |

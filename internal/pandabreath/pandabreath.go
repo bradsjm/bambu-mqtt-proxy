@@ -1,6 +1,6 @@
 // Package pandabreath observes Panda Breath accessory chamber sensors over
-// a read-only WebSocket connection. A printer configured with a PandaBreath
-// address (config.Printer.PandaBreath) gains a chamber temperature display
+// a read-only WebSocket connection. A printer configured with an AddressKey
+// setting (config.Printer.Settings) gains a chamber temperature display
 // through the shared projection even when its model has no physical chamber
 // sensor.
 //
@@ -21,7 +21,6 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net"
-	"strings"
 	"sync"
 	"time"
 
@@ -85,7 +84,7 @@ func New(printers []config.Printer, log *slog.Logger) *Store {
 	s := &Store{log: log, readings: make(map[string]reading),
 		history: make(map[string][]reading), connected: make(map[string]bool)}
 	for _, p := range printers {
-		if addr := strings.TrimSpace(p.PandaBreath); addr != "" {
+		if addr := p.Setting(AddressKey); addr != "" {
 			s.targets = append(s.targets, target{serial: p.Serial, addr: addr})
 		}
 	}

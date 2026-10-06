@@ -104,6 +104,8 @@ Optional capabilities are modules (`internal/module`): AI failure detection, Pan
 
 Panda Breath is the first module with a wall display. Its panel (full detail level) shows the device link (connected, connected with no readings, or offline), the device's own chamber reading while fresh, and a trend over up to three minutes of spaced samples; a "Chamber warming" badge appears on the camera image only while the chamber rises by at least 2 °C over at least two minutes. Everything derives from the live `warehouse_temper` stream: the device sends its settings only once per connection, so the module shows no settings and opens no extra connections.
 
+A per-printer module option is a `config.PrinterSetting` that the module package defines (key, page label, hint, validation) and `cmd/bambu-mqtt-proxy/settings.go` registers at program initialization. The setting stays at the printer level in YAML (for example `panda_breath:`), as a `BMBPX_PRINTERS` key, and as a field in the `/config` printer dialog, with no core code per module. Unknown printer keys still load and are ignored, whatever their YAML shape.
+
 ## 4. Downstream endpoint (printer-compatible)
 
 - Listener: TCP + TLS on `:8883` (default) — the port every Bambu app already targets. Certificate: self-signed, ECDSA P-256, 10-year validity, generated on first start and persisted to `cert_file`/`key_file` paths. Apps skip certificate verification exactly as they do against the printer; the file paths also let an operator load a specific cert for tools that pin.
