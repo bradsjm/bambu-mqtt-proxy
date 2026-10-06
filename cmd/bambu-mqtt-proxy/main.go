@@ -30,6 +30,7 @@ import (
 	"bambu-mqtt-proxy/internal/module"
 	"bambu-mqtt-proxy/internal/notification"
 	"bambu-mqtt-proxy/internal/pandabreath"
+	"bambu-mqtt-proxy/internal/pandapwr"
 	"bambu-mqtt-proxy/internal/platecheck"
 	"bambu-mqtt-proxy/internal/routing"
 	"bambu-mqtt-proxy/internal/telemetry"
@@ -133,6 +134,14 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	if cfg.HTTP.Port > 0 {
 		breath = pandabreath.New(cfg.Printers, logger)
 	}
+	// Panda PWR smart plug power: one HTTP poll loop per printer
+	// configured with a panda_pwr address, feeding the wall panel and
+	// MCP state.modules.pandapwr. Like breath, nothing opens unless the
+	// shared HTTP listener can serve the projection.
+	var pwr *pandapwr.Store
+	if cfg.HTTP.Port > 0 {
+		pwr = pandapwr.New(cfg.Printers, logger)
+	}
 	// Printer controls: the only allow-listed path from the camera wall and
 	// MCP to printer commands. No heater or temperature command exists.
 	controls := control.New(pool, state, activities)
@@ -232,8 +241,9 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	}
 
 	// Optional modules start in order: notifications, job preview, Panda
-	// Breath, detection, plate check, first-layer completion. Wire their
-	// shared hooks before the broker can record activity or deliver reports.
+	// Breath, Panda PWR, detection, plate check, first-layer completion.
+	// Wire their shared hooks before the broker can record activity or
+	// deliver reports.
 	var mods []module.Module
 	if notifier != nil {
 		mods = append(mods, notifier.Module())
@@ -243,6 +253,9 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	}
 	if breath != nil {
 		mods = append(mods, breath.Module())
+	}
+	if pwr != nil {
+		mods = append(mods, pwr.Module())
 	}
 	if detector != nil {
 		mods = append(mods, detector.Module())

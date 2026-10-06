@@ -18,7 +18,7 @@ Keep dependencies explicit at constructors and preserve package ownership. The b
 
 ## Module Pattern
 
-The core is the MQTT proxy path (config, broker, routing, upstream), telemetry, cameras, the activity log, and the control service. The core also includes the shared HTTP listener, health, and the MCP endpoint with its core tools. The camera wall and `/config` page shells are core too. Every other capability is a module. The current modules are `notification`, `jobpreview`, `pandabreath`, `detection`, `platecheck`, and `firstlayer`.
+The core is the MQTT proxy path (config, broker, routing, upstream), telemetry, cameras, the activity log, and the control service. The core also includes the shared HTTP listener, health, and the MCP endpoint with its core tools. The camera wall and `/config` page shells are core too. Every other capability is a module. The current modules are `notification`, `jobpreview`, `pandabreath`, `pandapwr`, `detection`, `platecheck`, and `firstlayer`.
 
 ### Add a capability
 
@@ -98,7 +98,7 @@ The upstream device is a printer with a bare-bones ESP32 MQTT broker, not a gene
 | Path | Purpose |
 | --- | --- |
 | `cmd/bambu-mqtt-proxy/` | Application entry point and service wiring |
-| `internal/` | Core packages (config, broker, routing, upstream, telemetry, camera, HTTP, health, MCP, TLS) and one package per module (`detection`, `platecheck`, `jobpreview`, `pandabreath`, `notification`, `firstlayer`) |
+| `internal/` | Core packages (config, broker, routing, upstream, telemetry, camera, HTTP, health, MCP, TLS) and one package per module (`detection`, `platecheck`, `jobpreview`, `pandabreath`, `pandapwr`, `notification`, `firstlayer`) |
 | `internal/integration/` | End-to-end tests with fake printers and MQTT clients |
 | `.github/workflows/` | CI checks and multi-architecture image publishing |
 

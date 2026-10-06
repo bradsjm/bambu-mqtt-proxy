@@ -32,6 +32,9 @@ printers:
     insecure_skip_verify: true
     username: "bblp"
     password: "12345678"
+    # Optional accessory modules, each addressed on the local network:
+    # panda_breath: "ws://panda-breath-blue.iot/ws" # Panda Breath sensor; chamber temperature
+    # panda_pwr: http://192.168.4.1 # Panda PWR smart plug; printer power draw over HTTP
   # Non-standard endpoint (custom firmware or fronting relay):
   # - serial: "01P00A987654321"
   #   address: "192.168.1.43:1883"

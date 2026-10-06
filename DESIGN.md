@@ -131,6 +131,7 @@ MCP follows the same ownership. A module's per-printer data reaches agents only 
 | `notification` | `notifications.enabled` (a `config.Section` owned by the module) | `Start`/`Stop`, `NeedsReports`, `ObserveActivity` | Pushover messages (§9), `POST /config/notifications/test` |
 | `jobpreview` | `BMBPX_JOB_PREVIEW` not false (an environment-only `config.Section`), HTTP on, and the wall or MCP on | `Start`/`Stop`, `State`, `Routes`, `MCP` | Tile and `state.modules.jobpreview`, `get_job_preview`, `GET /camera/{serial}/preview` |
 | `pandabreath` | HTTP on; one device connection per printer with `panda_breath` set | `Start`/`Stop`, `ChamberReading`, `Display`, `State` | Wall panel and badge, accessory chamber reading, `state.modules.pandabreath` |
+| `pandapwr` | HTTP on; one HTTP poller per printer with `panda_pwr` set, every 25–35 s with jitter, one quick retry, because the device serves one request at a time | `Start`/`Stop`, `Display`, `State` | Wall panel with power draw in watts; `state.modules.pandapwr` (`link`, fresh `power_w`); no MCP tool |
 | `detection` | A Gadget key (or explicit enable) is configured (§6.1) | `Start`/`Stop`, `NeedsReports`, `State`, `FleetValues`, `StatusValue`, `Routes`, `MCP` | Tile `detection`, fleet `detection_suspended`/`detection_message`, `/status` `detection`, `PUT /detection/{serial}`, `state.modules.detection`, `set_ai_monitoring` |
 | `platecheck` | Cameras on and HTTP on (diagnostics), or endpoint and key set (§6.2) | `Start`/`Stop`, `NeedsReports`, `ObserveActivity`, `State`, `Display`, `StatusValue`, `Routes` | Tile `platecheck` and panel, `/status` `platecheck`, `POST /platecheck/snapshots`, `state.modules.platecheck` |
 | `firstlayer` | Always | `Start`/`Stop` | The `first_layer_complete` activity entry |
@@ -138,6 +139,8 @@ MCP follows the same ownership. A module's per-printer data reaches agents only 
 Two kinds of module-specific markup remain in the embedded pages, because the generic hooks cannot express them: the interactive detection controls in `camwall.html` and the section forms in `config.html`. The notification module's summaries for other modules' activity kinds (`ai_*`, `first_layer_complete`) are accepted module-to-module knowledge. An environment-only module switch is a `config.Section` with only `ApplyEnv`, which always replaces the section from the environment: `job_preview` is never read from the file and never shown on `/config`.
 
 Panda Breath shows a wall panel (full detail level) with the device link (connected, connected with no readings, or offline), the device's own chamber reading while fresh, and a trend over up to three minutes of spaced samples; a "Chamber warming" badge appears on the camera image only while the chamber rises by at least 2 °C over at least two minutes. Everything derives from the live `warehouse_temper` stream: the device sends its settings only once per connection, so the module shows no settings and opens no extra connections. One locked snapshot backs both the panel and the `State` value (`link`, `chamber_c` while fresh, `trend`, and the signed `rate_c_per_min`); its `StableKey` keeps only the link and trend, so temperature steps do not wake `watch_printer`.
+
+Panda PWR polls a BigTreeTech smart plug over HTTP for the printer's power draw: a wall panel shows the device link (connected while a reading is fresh, otherwise offline) and, while fresh, the power in whole watts; `State` serves `link` and, while fresh, `power_w`, and its `StableKey` is the link alone, so a power change is value churn that does not wake `watch_printer`. The device serves one request at a time, so each printer with `panda_pwr` set runs a single poller on a jittered 25–35 s cadence with one quick retry after a failure, and a reading stays fresh for 90 s.
 
 Detection keeps its own `detection:` section, the `BMBPX_OCTOEVERYWHERE_API_KEY` override, the enable-requires-key rule, and the key test in `internal/detection` as a `config.Section`. While blocked (cameras off) it serves its blocked state but registers neither `PUT /detection/{serial}` nor `set_ai_monitoring`.
 
@@ -638,6 +641,7 @@ internal/module/               module contract, route mounting, shared MCP tool 
 internal/notification/         module: Pushover sender + batched best-effort notifier over recorded activity
 internal/jobpreview/           module: cached 3MF plate render and metadata, get_job_preview
 internal/pandabreath/          module: Panda Breath accessory link, chamber reading, and trend
+internal/pandapwr/             module: Panda PWR smart plug power draw over HTTP
 internal/detection/            module: Gadget AI failure detection, its config section, set_ai_monitoring
 internal/firstlayer/           module: first-layer completion activity entry
 internal/httpsrv/              shared health + camera HTTP listener

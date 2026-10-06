@@ -163,7 +163,7 @@ log:
 
 | Environment variable | Default | Meaning |
 |---|---|---|
-| `BMBPX_PRINTERS` | — | Semicolon-separated printers: `serial=…,address=…,password=…[,name=…][,model=…][,username=…][,tls=…][,insecure_skip_verify=…][,panda_breath=ws://…]` |
+| `BMBPX_PRINTERS` | — | Semicolon-separated printers: `serial=…,address=…,password=…[,name=…][,model=…][,username=…][,tls=…][,insecure_skip_verify=…][,panda_breath=ws://…][,panda_pwr=http://…]` |
 | `BMBPX_LISTEN_PORT` | `8883` | Downstream MQTT port |
 | `BMBPX_LISTEN_TLS` | `true` | TLS on the downstream listener |
 | `BMBPX_CERT_FILE` / `BMBPX_KEY_FILE` | *(empty)* | Empty = ephemeral in-memory self-signed certificate |
@@ -323,13 +323,17 @@ On by default; disable with `BMBPX_MCP_ENABLED=false`. MCP protocol
   camera feature), and `get_job_preview` with the job preview feature.
 - **Printer state** — `get_printer_state` returns
   `state.modules.<name>` per running module (for example
-  `state.modules.jobpreview` with the archived job preview, or
+  `state.modules.jobpreview` with the archived job preview,
   `state.modules.pandabreath` with the device `link`, its fresh
-  `chamber_c` reading, and the `trend` and signed `rate_c_per_min`), so
+  `chamber_c` reading, and the `trend` and signed `rate_c_per_min`, or
+  `state.modules.pandapwr` with the device `link` and its fresh
+  `power_w` in watts; Panda PWR has no MCP tool), so
   one tool stays current whatever capabilities are enabled.
 - `watch_printer` emits one event when a module's state changes: kind
-  `module_changed` with a `module` field naming the module. Value churn
-  such as a Panda Breath temperature step does not count as a change.
+  `module_changed` with a `module` field naming the module. A Panda PWR
+  `link` change emits the event; value churn such as a Panda Breath
+  temperature step or a Panda PWR power change does not count as a
+  change.
 - **Resource** — `bambu://printers/{serial}/state`, a typed live state
   projection that clients can subscribe to.
 - The endpoint never learns printer credentials; control commands go through
