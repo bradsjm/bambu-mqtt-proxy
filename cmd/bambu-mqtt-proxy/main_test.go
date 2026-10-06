@@ -103,7 +103,7 @@ func TestNoKeyStartupStatus(t *testing.T) {
 		config.EnvCameraEnable+"=false",
 		config.EnvLogLevel+"=error",
 		// Explicitly empty: an inherited key would enable detection.
-		config.EnvOctoEverywhereAPIKey+"=",
+		detection.EnvAPIKey+"=",
 	)
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
@@ -500,6 +500,15 @@ func TestResolveConfigJobPreviewEnvSwitch(t *testing.T) {
 	})
 }
 
+func resolvedDetection(t *testing.T, cfg *config.Config) detection.Settings {
+	t.Helper()
+	settings, err := detection.SettingsOf(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return settings
+}
+
 // TestResolveConfigDetectionKeyPrecedence covers the startup and reload
 // path for the persisted detection section: the YAML key enables on its
 // own, a set environment variable overrides it on every resolve (the
@@ -521,9 +530,9 @@ detection:
 	}
 	unsetOcto := func(t *testing.T) {
 		t.Helper()
-		t.Setenv(config.EnvOctoEverywhereAPIKey, "")
-		if err := os.Unsetenv(config.EnvOctoEverywhereAPIKey); err != nil {
-			t.Fatalf("unset %s: %v", config.EnvOctoEverywhereAPIKey, err)
+		t.Setenv(detection.EnvAPIKey, "")
+		if err := os.Unsetenv(detection.EnvAPIKey); err != nil {
+			t.Fatalf("unset %s: %v", detection.EnvAPIKey, err)
 		}
 	}
 
@@ -533,14 +542,14 @@ detection:
 		if err != nil || !found {
 			t.Fatalf("resolveConfig: found=%v err=%v", found, err)
 		}
-		if !cfg.DetectionEnabled() || cfg.DetectionKey() != "file-key" {
+		if !resolvedDetection(t, cfg).On() || resolvedDetection(t, cfg).Key() != "file-key" {
 			t.Fatalf("enabled=%v key=%q, want the yaml key in effect",
-				cfg.DetectionEnabled(), cfg.DetectionKey())
+				resolvedDetection(t, cfg).On(), resolvedDetection(t, cfg).Key())
 		}
 	})
 
 	t.Run("environment key wins across reloads", func(t *testing.T) {
-		t.Setenv(config.EnvOctoEverywhereAPIKey, "env-key")
+		t.Setenv(detection.EnvAPIKey, "env-key")
 		// The second resolve mirrors the post-save reload: the environment
 		// is re-applied over the same file and must keep precedence.
 		for pass := 0; pass < 2; pass++ {
@@ -548,22 +557,22 @@ detection:
 			if err != nil {
 				t.Fatalf("resolveConfig pass %d: %v", pass, err)
 			}
-			if !cfg.DetectionEnabled() || cfg.DetectionKey() != "env-key" {
+			if !resolvedDetection(t, cfg).On() || resolvedDetection(t, cfg).Key() != "env-key" {
 				t.Fatalf("pass %d: enabled=%v key=%q, want the environment key",
-					pass, cfg.DetectionEnabled(), cfg.DetectionKey())
+					pass, resolvedDetection(t, cfg).On(), resolvedDetection(t, cfg).Key())
 			}
 		}
 	})
 
 	t.Run("empty environment clears the yaml key", func(t *testing.T) {
-		t.Setenv(config.EnvOctoEverywhereAPIKey, "")
+		t.Setenv(detection.EnvAPIKey, "")
 		cfg, _, err := resolveConfig(path)
 		if err != nil {
 			t.Fatalf("an empty override must not fail startup: %v", err)
 		}
-		if cfg.DetectionEnabled() || cfg.DetectionKey() != "" {
+		if resolvedDetection(t, cfg).On() || resolvedDetection(t, cfg).Key() != "" {
 			t.Fatalf("enabled=%v key=%q, want detection off",
-				cfg.DetectionEnabled(), cfg.DetectionKey())
+				resolvedDetection(t, cfg).On(), resolvedDetection(t, cfg).Key())
 		}
 	})
 
@@ -580,12 +589,12 @@ detection:
 		if err := os.WriteFile(offPath, []byte(offDoc), 0o600); err != nil {
 			t.Fatalf("write config: %v", err)
 		}
-		t.Setenv(config.EnvOctoEverywhereAPIKey, "env-key")
+		t.Setenv(detection.EnvAPIKey, "env-key")
 		cfg, _, err := resolveConfig(offPath)
 		if err != nil {
 			t.Fatalf("resolveConfig: %v", err)
 		}
-		if cfg.DetectionEnabled() {
+		if resolvedDetection(t, cfg).On() {
 			t.Fatal("enabled: false must win over the environment key")
 		}
 
@@ -596,11 +605,11 @@ detection:
 		if err != nil {
 			t.Fatalf("resolveConfig: %v", err)
 		}
-		if cfg.DetectionEnabled() {
+		if resolvedDetection(t, cfg).On() {
 			t.Fatal("the persisted false must survive a reload")
 		}
-		if cfg.DetectionKey() != "file-key" {
-			t.Fatalf("key = %q, want the stored file key preserved", cfg.DetectionKey())
+		if resolvedDetection(t, cfg).Key() != "file-key" {
+			t.Fatalf("key = %q, want the stored file key preserved", resolvedDetection(t, cfg).Key())
 		}
 	})
 }

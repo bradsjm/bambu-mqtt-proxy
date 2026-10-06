@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"bambu-mqtt-proxy/internal/config"
+	"bambu-mqtt-proxy/internal/detection"
 )
 
 // startProxyChild starts the real run() in a subprocess with one
@@ -45,7 +46,7 @@ func startProxyChild(t *testing.T, previewEnv, cameraEnv, mcpEnv string) (url st
 		config.EnvHTTPPort+"="+strconv.Itoa(httpPort),
 		config.EnvLogLevel+"=error",
 		// Explicitly empty: an inherited key would enable detection.
-		config.EnvOctoEverywhereAPIKey+"=",
+		detection.EnvAPIKey+"=",
 	)
 	switches := []struct{ name, value string }{
 		{config.EnvJobPreview, previewEnv},

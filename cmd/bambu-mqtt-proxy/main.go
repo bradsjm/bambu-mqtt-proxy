@@ -169,8 +169,12 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	// The engine is constructed here but started only after the broker is
 	// serving: a broker startup failure must not leave workers running.
 	var detector *detection.Engine
-	if cfg.DetectionEnabled() {
-		client := detection.NewGadgetClient(cfg.DetectionKey())
+	detectionSettings, err := detection.SettingsOf(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if detectionSettings.On() {
+		client := detection.NewGadgetClient(detectionSettings.Key())
 		if !cfg.CameraEnabled() {
 			detector = detection.New(cfg.Printers, client, detection.IdleFrames{}, state, pool, pool, logger)
 			detector.SetBlocked(detection.ReasonCameraDisabled)
@@ -451,7 +455,7 @@ func resolveConfig(configPath string) (*config.Config, bool, error) {
 	}
 	// Effective-only: the file alone may enable detection with a blank key
 	// because the environment can supply it.
-	if err := cfg.ValidateDetection(); err != nil {
+	if err := cfg.ValidateEffective(); err != nil {
 		return nil, false, err
 	}
 	return cfg, fileFound, nil

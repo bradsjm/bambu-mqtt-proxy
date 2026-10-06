@@ -20,17 +20,12 @@ import (
 	"github.com/eclipse/paho.mqtt.golang/packets"
 
 	"bambu-mqtt-proxy/internal/config"
-	"bambu-mqtt-proxy/internal/detection"
 )
 
 // testConnectTimeout bounds one printer test: dial, MQTT handshake, and the
 // whole request. It is deliberately independent of the configured upstream
 // connect timeout, so a draft test behaves the same wherever the page is.
 const testConnectTimeout = 10 * time.Second
-
-// detectionTestTimeout bounds the Gadget API key test; the client applies
-// its own per-request timeout inside it.
-const detectionTestTimeout = 20 * time.Second
 
 // probePrinterConn performs exactly one MQTT CONNECT to p and nothing else:
 // no subscriptions, no publishes, no warmup commands, no retry. The client
@@ -164,19 +159,4 @@ func classifyProbeError(err error, address string) string {
 		return fmt.Sprintf("The printer at %s rejected the username or access code.", address)
 	}
 	return fmt.Sprintf("Could not connect to %s: %s. Check the address, TLS setting, and access code.", address, err)
-}
-
-// classifyDetectionError converts a failed CreateContext into the
-// actionable message the page shows. Detection errors are already
-// sanitized — fixed classifications, status codes, and vendor error-type
-// tokens only: no provider text, no URLs, and never the key.
-func classifyDetectionError(err error) string {
-	var apiErr *detection.APIError
-	if errors.As(err, &apiErr) {
-		if apiErr.AccountTerminal() {
-			return "OctoEverywhere rejected the key or its account: the key may be invalid, disabled, out of free allowance, or restricted to other IP addresses. Check the key on octoeverywhere.com."
-		}
-		return "The Gadget service refused to create a context (" + apiErr.Error() + "). Try again later."
-	}
-	return "The Gadget service could not be reached: " + err.Error() + "."
 }

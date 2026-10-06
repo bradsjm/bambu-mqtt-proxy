@@ -107,31 +107,6 @@ func TestParsePrinterEntryUnknownKey(t *testing.T) {
 	}
 }
 
-func TestApplyEnvOctoEverywhereKey(t *testing.T) {
-	cfg := &Config{}
-	if cfg.DetectionEnabled() {
-		t.Fatal("detection must be disabled without the key")
-	}
-	t.Setenv(EnvOctoEverywhereAPIKey, "prod_key_from_env")
-	if _, err := cfg.ApplyEnv(); err != nil {
-		t.Fatalf("ApplyEnv: %v", err)
-	}
-	if cfg.Detection.APIKey != "prod_key_from_env" || !cfg.DetectionEnabled() {
-		t.Fatalf("key = %q, enabled = %v", cfg.Detection.APIKey, cfg.DetectionEnabled())
-	}
-
-	// The stored key lives in the nested detection section; the yaml tags
-	// keep the file round trip working.
-	typ := reflect.TypeOf(Config{})
-	f, ok := typ.FieldByName("Detection")
-	if !ok || f.Tag.Get("yaml") != "detection" {
-		t.Fatal("Detection must be tagged yaml:\"detection\"")
-	}
-	if k, ok := f.Type.FieldByName("APIKey"); !ok || k.Tag.Get("yaml") != "api_key" {
-		t.Fatal("Detection.APIKey must be tagged yaml:\"api_key\"")
-	}
-}
-
 // unsetEnvForTest clears inherited BMBPX_* values that would skew an
 // isolated fixture. t.Setenv records the original value and restores it at
 // cleanup; os.Unsetenv then removes the variable so LookupEnv reports
@@ -161,7 +136,6 @@ var allEnvKeys = []string{
 	EnvCameraEnable,
 	EnvMCPEnable,
 	EnvJobPreview,
-	EnvOctoEverywhereAPIKey,
 }
 
 // TestApplyEnvDefaultListener pins the env-only startup path used when the
@@ -335,127 +309,5 @@ func TestApplyEnvJobPreview(t *testing.T) {
 	}
 	if parsed.JobPreview != nil {
 		t.Fatal("a YAML job_preview field must not set the switch")
-	}
-}
-
-// TestDetectionEnabledSwitchStates covers the persisted Detection switch
-// itself: a nil Enabled keeps the historical key-based default in both
-// directions, an explicit false stays off even with a key, and validation
-// demands a usable key only from an enabled configuration.
-func TestDetectionEnabledSwitchStates(t *testing.T) {
-	on, off := true, false
-	cases := []struct {
-		name    string
-		enabled *bool
-		apiKey  string
-		want    bool
-	}{
-		{"nil without a key is off", nil, "", false},
-		{"nil with a stored key is on", nil, "stored-key", true},
-		{"nil with a padded key is on", nil, "  stored-key\t", true},
-		{"explicit false with a key is off", &off, "stored-key", false},
-		{"explicit true with a key is on", &on, "stored-key", true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg := &Config{Detection: Detection{Enabled: tc.enabled, APIKey: tc.apiKey}}
-			if got := cfg.DetectionEnabled(); got != tc.want {
-				t.Fatalf("DetectionEnabled = %v, want %v", got, tc.want)
-			}
-		})
-	}
-
-	// A whitespace-only key is no key: the padded default turns off, and
-	// only an enabled configuration demands one.
-	ws := &Config{Detection: Detection{APIKey: "   "}}
-	if ws.DetectionEnabled() {
-		t.Fatal("a whitespace-only key must not enable detection")
-	}
-	if err := (&Config{Detection: Detection{Enabled: &on}}).ValidateDetection(); err == nil {
-		t.Fatal("enabled without any usable key must fail validation")
-	}
-	if err := (&Config{Detection: Detection{Enabled: &on, APIKey: "  k "}}).ValidateDetection(); err != nil {
-		t.Fatalf("enabled with a padded key must validate: %v", err)
-	}
-	if err := (&Config{Detection: Detection{Enabled: &off}}).ValidateDetection(); err != nil {
-		t.Fatalf("disabled without a key must validate: %v", err)
-	}
-}
-
-// TestApplyEnvDetectionKeyOverridesStoredKey covers presence-based
-// overriding of the stored key: unset leaves the file value, any set value
-// replaces it trimmed, and set-but-empty or whitespace-only clears it so a
-// nil switch disables and an explicit enable fails validation.
-func TestApplyEnvDetectionKeyOverridesStoredKey(t *testing.T) {
-	unsetEnvForTest(t, EnvOctoEverywhereAPIKey)
-	on := true
-
-	// Unset: the stored key survives untouched.
-	stored := &Config{Detection: Detection{APIKey: "stored-key"}}
-	if _, err := stored.ApplyEnv(); err != nil {
-		t.Fatalf("ApplyEnv: %v", err)
-	}
-	if stored.Detection.APIKey != "stored-key" || !stored.DetectionEnabled() {
-		t.Fatalf("key = %q enabled = %v, want the stored key kept and detection on",
-			stored.Detection.APIKey, stored.DetectionEnabled())
-	}
-
-	// A nonempty override replaces the stored key, trimmed.
-	override := &Config{Detection: Detection{APIKey: "stored-key"}}
-	t.Setenv(EnvOctoEverywhereAPIKey, "  env-key\t")
-	if _, err := override.ApplyEnv(); err != nil {
-		t.Fatalf("ApplyEnv: %v", err)
-	}
-	if override.Detection.APIKey != "env-key" {
-		t.Fatalf("key = %q, want the trimmed environment override", override.Detection.APIKey)
-	}
-
-	// Set but empty clears the stored key: an explicitly enabled
-	// configuration then fails the effective-only startup check.
-	cleared := &Config{Detection: Detection{Enabled: &on, APIKey: "stored-key"}}
-	t.Setenv(EnvOctoEverywhereAPIKey, "")
-	if _, err := cleared.ApplyEnv(); err != nil {
-		t.Fatalf("ApplyEnv: %v", err)
-	}
-	if cleared.Detection.APIKey != "" {
-		t.Fatalf("key = %q, want the stored key cleared", cleared.Detection.APIKey)
-	}
-	if err := cleared.ValidateDetection(); err == nil {
-		t.Fatal("an enabled config whose key the empty override cleared must fail validation")
-	}
-
-	// Whitespace-only is also an empty override.
-	padded := &Config{Detection: Detection{APIKey: "stored-key"}}
-	t.Setenv(EnvOctoEverywhereAPIKey, " \t ")
-	if _, err := padded.ApplyEnv(); err != nil {
-		t.Fatalf("ApplyEnv: %v", err)
-	}
-	if padded.Detection.APIKey != "" || padded.DetectionEnabled() {
-		t.Fatalf("key = %q enabled = %v, want the whitespace override to clear and disable",
-			padded.Detection.APIKey, padded.DetectionEnabled())
-	}
-}
-
-// TestParseDetectionSection pins the persisted file shape: the detection
-// section round trips both fields, and its absence leaves them unset so
-// the key-based default applies.
-func TestParseDetectionSection(t *testing.T) {
-	parsed, err := Parse([]byte("detection:\n  enabled: false\n  api_key: file-key\n"))
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
-	if parsed.Detection.Enabled == nil || *parsed.Detection.Enabled {
-		t.Fatalf("enabled = %v, want an explicit false", parsed.Detection.Enabled)
-	}
-	if parsed.Detection.APIKey != "file-key" {
-		t.Fatalf("api_key = %q, want file-key", parsed.Detection.APIKey)
-	}
-
-	empty, err := Parse([]byte("printers: []\n"))
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
-	if empty.Detection.Enabled != nil || empty.Detection.APIKey != "" {
-		t.Fatalf("detection = %+v, want the zero section", empty.Detection)
 	}
 }

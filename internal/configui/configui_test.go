@@ -14,7 +14,28 @@ import (
 	"testing"
 
 	"bambu-mqtt-proxy/internal/config"
+	"bambu-mqtt-proxy/internal/detection"
 )
+
+func TestMain(m *testing.M) {
+	config.RegisterSection(detection.ConfigSection)
+	os.Exit(m.Run())
+}
+
+type detectionPage struct {
+	Enabled   bool   `json:"enabled"`
+	HasAPIKey bool   `json:"has_api_key"`
+	APIKey    string `json:"api_key,omitempty"`
+}
+
+func detectionSettings(t *testing.T, c *config.Config) detection.Settings {
+	t.Helper()
+	s, err := detection.SettingsOf(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
 
 type getResponse struct {
 	Config View `json:"config"`
@@ -25,7 +46,7 @@ func serve(t *testing.T, path string) (*Store, *httptest.Server) {
 	t.Helper()
 	for _, env := range []string{config.EnvPrinters, config.EnvListenPort, config.EnvListenTLS, config.EnvCertFile,
 		config.EnvKeyFile, config.EnvAuthMode, config.EnvLogLevel, config.EnvHTTPPort, config.EnvCameraEnable,
-		config.EnvMCPEnable, config.EnvJobPreview, config.EnvOctoEverywhereAPIKey} {
+		config.EnvMCPEnable, config.EnvJobPreview, detection.EnvAPIKey} {
 		t.Setenv(env, "") // restores the original value after the test
 		_ = os.Unsetenv(env)
 	}
@@ -44,10 +65,26 @@ func get(t *testing.T, srv *httptest.Server) getResponse {
 		t.Fatal(err)
 	}
 	defer res.Body.Close()
-	var out getResponse
-	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+	var body struct {
+		Config json.RawMessage `json:"config"`
+		Meta   meta            `json:"meta"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
 		t.Fatal(err)
 	}
+	out := getResponse{Meta: body.Meta}
+	if err := json.Unmarshal(body.Config, &out.Config); err != nil {
+		t.Fatal(err)
+	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(body.Config, &members); err != nil {
+		t.Fatal(err)
+	}
+	var d detectionPage
+	if err := json.Unmarshal(members["detection"], &d); err != nil {
+		t.Fatal(err)
+	}
+	out.Config.sections = map[string]any{"detection": &d}
 	return out
 }
 
@@ -449,13 +486,13 @@ func assertStoredDetection(t *testing.T, path, wantKey string, wantEnabled bool)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Detection.APIKey != wantKey {
-		t.Fatalf("stored api_key = %q, want %q", cfg.Detection.APIKey, wantKey)
+	if detectionSettings(t, cfg).APIKey != wantKey {
+		t.Fatalf("stored api_key = %q, want %q", detectionSettings(t, cfg).APIKey, wantKey)
 	}
-	if cfg.Detection.Enabled == nil || *cfg.Detection.Enabled != wantEnabled {
-		t.Fatalf("stored enabled = %v, want %v", cfg.Detection.Enabled, wantEnabled)
+	if detectionSettings(t, cfg).Enabled == nil || *detectionSettings(t, cfg).Enabled != wantEnabled {
+		t.Fatalf("stored enabled = %v, want %v", detectionSettings(t, cfg).Enabled, wantEnabled)
 	}
-	if got := cfg.DetectionEnabled(); got != wantEnabled {
+	if got := detectionSettings(t, cfg).On(); got != wantEnabled {
 		t.Fatalf("DetectionEnabled = %v, want %v", got, wantEnabled)
 	}
 }
@@ -488,24 +525,24 @@ func TestDetectionGetRedactsAndReportsEffectiveKey(t *testing.T) {
 	if raw := getRaw(t, srv); strings.Contains(raw, stored) {
 		t.Fatal("GET returned the stored detection key")
 	}
-	if d := get(t, srv).Config.Detection; !d.HasAPIKey || !d.Enabled || d.APIKey != "" {
+	if d := get(t, srv).Config.sections["detection"].(*detectionPage); !d.HasAPIKey || !d.Enabled || d.APIKey != "" {
 		t.Fatalf("detection view = %+v, want the stored key reported without revealing it", d)
 	}
 
 	// Environment key: the flag reports the effective override, still
 	// without either secret in the payload.
-	t.Setenv(config.EnvOctoEverywhereAPIKey, "env-detection-key")
+	t.Setenv(detection.EnvAPIKey, "env-detection-key")
 	if raw := getRaw(t, srv); strings.Contains(raw, "env-detection-key") || strings.Contains(raw, stored) {
 		t.Fatal("GET returned a detection secret")
 	}
-	if d := get(t, srv).Config.Detection; !d.HasAPIKey || !d.Enabled || d.APIKey != "" {
+	if d := get(t, srv).Config.sections["detection"].(*detectionPage); !d.HasAPIKey || !d.Enabled || d.APIKey != "" {
 		t.Fatalf("detection view = %+v, want the environment override reported", d)
 	}
 
 	// A set-but-empty variable clears the effective key: the flag turns
 	// off over a stored key.
-	t.Setenv(config.EnvOctoEverywhereAPIKey, "")
-	if d := get(t, srv).Config.Detection; d.HasAPIKey || d.Enabled {
+	t.Setenv(detection.EnvAPIKey, "")
+	if d := get(t, srv).Config.sections["detection"].(*detectionPage); d.HasAPIKey || d.Enabled {
 		t.Fatalf("detection view = %+v, want the empty override to clear the flag", d)
 	}
 
@@ -514,8 +551,8 @@ func TestDetectionGetRedactsAndReportsEffectiveKey(t *testing.T) {
 	only := filepath.Join(t.TempDir(), "env-only.yaml")
 	writeConfig(t, only)
 	_, onlySrv := serve(t, only)
-	t.Setenv(config.EnvOctoEverywhereAPIKey, "env-detection-key")
-	if d := get(t, onlySrv).Config.Detection; !d.HasAPIKey || !d.Enabled || d.APIKey != "" {
+	t.Setenv(detection.EnvAPIKey, "env-detection-key")
+	if d := get(t, onlySrv).Config.sections["detection"].(*detectionPage); !d.HasAPIKey || !d.Enabled || d.APIKey != "" {
 		t.Fatalf("detection view = %+v, want the environment-only key reported", d)
 	}
 }
@@ -533,7 +570,7 @@ func TestDetectionBlankSaveKeepsStoredKeyAndDisableRetains(t *testing.T) {
 
 	v := get(t, srv).Config
 	v.Printers[0].PreviousSerial = v.Printers[0].Serial
-	v.Detection.HasAPIKey = true // incoming flags are ignored on save
+	v.sections["detection"].(*detectionPage).HasAPIKey = true // incoming flags are ignored on save
 	if code, body := put(t, srv, v); code != http.StatusOK {
 		t.Fatalf("save = %d %v", code, body)
 	}
@@ -549,7 +586,7 @@ func TestDetectionBlankSaveKeepsStoredKeyAndDisableRetains(t *testing.T) {
 	// the off action.
 	v = get(t, srv).Config
 	v.Printers[0].PreviousSerial = v.Printers[0].Serial
-	v.Detection.Enabled = false
+	v.sections["detection"].(*detectionPage).Enabled = false
 	if code, body := put(t, srv, v); code != http.StatusOK {
 		t.Fatalf("disable save = %d %v", code, body)
 	}
@@ -559,7 +596,7 @@ func TestDetectionBlankSaveKeepsStoredKeyAndDisableRetains(t *testing.T) {
 	// A whitespace-only submission is blank: the stored key survives.
 	v = get(t, srv).Config
 	v.Printers[0].PreviousSerial = v.Printers[0].Serial
-	v.Detection.APIKey = "   "
+	v.sections["detection"].(*detectionPage).APIKey = "   "
 	if code, body := put(t, srv, v); code != http.StatusOK {
 		t.Fatalf("padded blank save = %d %v", code, body)
 	}
@@ -576,11 +613,11 @@ func TestDetectionEnvSecretIsNeverPersisted(t *testing.T) {
 	const stored = "stored-detection-key"
 	writeDetectionConfig(t, path, stored)
 	store, srv := serve(t, path)
-	t.Setenv(config.EnvOctoEverywhereAPIKey, "env-detection-secret")
+	t.Setenv(detection.EnvAPIKey, "env-detection-secret")
 
 	v := get(t, srv).Config // has_api_key true from the environment, api_key blank
-	if !v.Detection.Enabled || !v.Detection.HasAPIKey {
-		t.Fatalf("detection view = %+v, want the environment key reported as effective", v.Detection)
+	if !v.sections["detection"].(*detectionPage).Enabled || !v.sections["detection"].(*detectionPage).HasAPIKey {
+		t.Fatalf("detection view = %+v, want the environment key reported as effective", v.sections["detection"].(*detectionPage))
 	}
 	v.Printers[0].PreviousSerial = v.Printers[0].Serial
 	if code, body := put(t, srv, v); code != http.StatusOK {
@@ -608,9 +645,9 @@ func TestDetectionEnvSecretIsNeverPersisted(t *testing.T) {
 	if _, err := cfg.ApplyEnv(); err != nil {
 		t.Fatalf("ApplyEnv: %v", err)
 	}
-	if cfg.Detection.APIKey != "env-detection-secret" || !cfg.DetectionEnabled() {
+	if detectionSettings(t, cfg).APIKey != "env-detection-secret" || !detectionSettings(t, cfg).On() {
 		t.Fatalf("key = %q enabled = %v, want the environment key at reload",
-			cfg.Detection.APIKey, cfg.DetectionEnabled())
+			detectionSettings(t, cfg).APIKey, detectionSettings(t, cfg).On())
 	}
 }
 
@@ -624,7 +661,7 @@ func TestDetectionEnableWithoutKeyIsRejected(t *testing.T) {
 
 	// Fresh setup: no file, no stored key, no environment.
 	v := get(t, srv).Config
-	v.Detection.Enabled = true
+	v.sections["detection"].(*detectionPage).Enabled = true
 	code, body := put(t, srv, v)
 	requireDetectionRejection(t, code, body)
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
@@ -638,8 +675,8 @@ func TestDetectionEnableWithoutKeyIsRejected(t *testing.T) {
 
 	// The has_api_key flag is display-only and cannot stand in for a key.
 	v = get(t, srv).Config
-	v.Detection.Enabled = true
-	v.Detection.HasAPIKey = true
+	v.sections["detection"].(*detectionPage).Enabled = true
+	v.sections["detection"].(*detectionPage).HasAPIKey = true
 	code, body = put(t, srv, v)
 	requireDetectionRejection(t, code, body)
 
@@ -652,7 +689,7 @@ func TestDetectionEnableWithoutKeyIsRejected(t *testing.T) {
 	}
 	v = get(t, srv).Config
 	v.Printers[0].PreviousSerial = v.Printers[0].Serial
-	v.Detection.Enabled = true
+	v.sections["detection"].(*detectionPage).Enabled = true
 	code, body = put(t, srv, v)
 	requireDetectionRejection(t, code, body)
 	after, err := os.ReadFile(path)
@@ -677,14 +714,14 @@ func TestDetectionEnvEmptyOverrideRejectsEnable(t *testing.T) {
 	const stored = "stored-detection-key"
 	writeDetectionConfig(t, path, stored)
 	store, srv := serve(t, path)
-	t.Setenv(config.EnvOctoEverywhereAPIKey, "")
+	t.Setenv(detection.EnvAPIKey, "")
 
-	if d := get(t, srv).Config.Detection; d.HasAPIKey || d.Enabled {
+	if d := get(t, srv).Config.sections["detection"].(*detectionPage); d.HasAPIKey || d.Enabled {
 		t.Fatalf("detection view = %+v, want the empty override to clear the flag", d)
 	}
 	v := get(t, srv).Config
 	v.Printers[0].PreviousSerial = v.Printers[0].Serial
-	v.Detection.Enabled = true
+	v.sections["detection"].(*detectionPage).Enabled = true
 	code, body := put(t, srv, v)
 	requireDetectionRejection(t, code, body)
 
@@ -712,9 +749,9 @@ func TestDetectionEnvOverrideMetaReportsEmpty(t *testing.T) {
 	if got := get(t, srv).Meta.EnvOverrides["detection_api_key"]; got != "" {
 		t.Fatalf("unset variable listed as %q, want absent", got)
 	}
-	t.Setenv(config.EnvOctoEverywhereAPIKey, "")
-	if got := get(t, srv).Meta.EnvOverrides["detection_api_key"]; got != config.EnvOctoEverywhereAPIKey {
-		t.Fatalf("empty override listed as %q, want %s", got, config.EnvOctoEverywhereAPIKey)
+	t.Setenv(detection.EnvAPIKey, "")
+	if got := get(t, srv).Meta.EnvOverrides["detection_api_key"]; got != detection.EnvAPIKey {
+		t.Fatalf("empty override listed as %q, want %s", got, detection.EnvAPIKey)
 	}
 }
 

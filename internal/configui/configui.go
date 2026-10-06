@@ -5,6 +5,7 @@
 package configui
 
 import (
+	"bytes"
 	"context"
 	_ "embed"
 	"encoding/json"
@@ -23,7 +24,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"bambu-mqtt-proxy/internal/config"
-	"bambu-mqtt-proxy/internal/detection"
+	"bambu-mqtt-proxy/internal/jsonobj"
 	"bambu-mqtt-proxy/internal/notification"
 )
 
@@ -53,9 +54,6 @@ type Store struct {
 	// probePrinter performs the /config printer connection test; replaced
 	// by tests.
 	probePrinter func(context.Context, config.Printer) error
-	// probeDetection performs the /config Gadget API key test; replaced by
-	// tests.
-	probeDetection func(context.Context, string) error
 
 	mu         sync.Mutex
 	generation uint64
@@ -72,11 +70,6 @@ func NewStore(path string) *Store {
 		reloads:      make(chan Reload, 1),
 		sendTest:     notification.Send,
 		probePrinter: probePrinterConn,
-		probeDetection: func(ctx context.Context, key string) error {
-			// The session is discarded: the test never processes frames.
-			_, err := detection.NewGadgetClient(key).CreateContext(ctx)
-			return err
-		},
 	}
 }
 
@@ -111,11 +104,8 @@ func (s *Store) Restore(r Reload) error {
 	return s.writeFile(r.Previous)
 }
 
-// Register adds GET /config (page), GET /config/api (settings),
-// PUT /config/api (save and apply), POST /config/notifications/test
-// (one test notification), POST /config/printers/test (one draft printer
-// connection test), and POST /config/detection/test (one Gadget API key
-// check). Writes are protected against cross-origin browser requests.
+// Register adds the configuration page, its API, and test actions.
+// Writes are protected against cross-origin browser requests.
 func (s *Store) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /config", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -127,7 +117,13 @@ func (s *Store) Register(mux *http.ServeMux) {
 	mux.Handle("PUT /config/api", protection.Handler(http.HandlerFunc(s.handlePut)))
 	mux.Handle("POST /config/notifications/test", protection.Handler(http.HandlerFunc(s.handleNotificationTest)))
 	mux.Handle("POST /config/printers/test", protection.Handler(http.HandlerFunc(s.handlePrinterTest)))
-	mux.Handle("POST /config/detection/test", protection.Handler(http.HandlerFunc(s.handleDetectionTest)))
+	for _, section := range config.Sections() {
+		if section.Test != nil {
+			mux.Handle("POST /config/"+section.Key+"/test", protection.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				s.handleSectionTest(w, r, section)
+			})))
+		}
+	}
 }
 
 // View is the editable configuration exchanged with the page.
@@ -139,21 +135,20 @@ type View struct {
 	HTTPPort        int                  `json:"http_port"`
 	CameraEnabled   bool                 `json:"camera_enabled"`
 	MCPEnabled      bool                 `json:"mcp_enabled"`
-	Detection       DetectionView        `json:"detection"`
 	LogLevel        string               `json:"log_level"`
 	Behavior        BehaviorView         `json:"behavior"`
 	Notifications   NotificationsView    `json:"notifications"`
+	sections        map[string]any
 }
 
-// DetectionView is the Gadget AI detection section. APIKey is accepted on
-// save and never returned; has_api_key reports an effective key — the
-// stored file key or the BMBPX_OCTOEVERYWHERE_API_KEY environment value —
-// without revealing it. A blank submitted key keeps the stored file key,
-// and the environment secret is never written to the file.
-type DetectionView struct {
-	Enabled   bool   `json:"enabled"`
-	HasAPIKey bool   `json:"has_api_key"`
-	APIKey    string `json:"api_key,omitempty"`
+// MarshalJSON adds module-owned page members to the core view.
+func (v View) MarshalJSON() ([]byte, error) {
+	type core View
+	body, err := json.Marshal(core(v))
+	if err != nil {
+		return nil, err
+	}
+	return jsonobj.Append(body, v.sections)
 }
 
 // PrinterSettingView describes a module's optional printer field on the page.
@@ -223,9 +218,8 @@ type meta struct {
 	Generation uint64 `json:"generation"`
 	ApplyError string `json:"apply_error,omitempty"`
 	// CameraEnabled appears only while BMBPX_CAMERA_ENABLED overrides the
-	// stored value: it carries the parsed effective switch so the page can
-	// describe detection against the cameras that will actually run. The
-	// editable stored switch stays in config.camera_enabled.
+	// stored value: it carries the parsed effective switch for the page.
+	// The editable stored switch stays in config.camera_enabled.
 	CameraEnabled *bool             `json:"camera_enabled,omitempty"`
 	EnvOverrides  map[string]string `json:"env_overrides"`
 }
@@ -260,8 +254,24 @@ func (s *Store) handleGet(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Store) handlePut(w http.ResponseWriter, r *http.Request) {
-	var in View
+	var members map[string]json.RawMessage
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err := dec.Decode(&members); err != nil {
+		writeError(w, http.StatusBadRequest, "The settings could not be read: "+err.Error())
+		return
+	}
+	submitted := make(map[string]json.RawMessage)
+	for _, section := range config.Sections() {
+		submitted[section.Key] = members[section.Key]
+		delete(members, section.Key)
+	}
+	core, err := json.Marshal(members)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "The settings could not be read: "+err.Error())
+		return
+	}
+	var in View
+	dec = json.NewDecoder(bytes.NewReader(core))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&in); err != nil {
 		writeError(w, http.StatusBadRequest, "The settings could not be read: "+err.Error())
@@ -290,6 +300,14 @@ func (s *Store) handlePut(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusUnprocessableEntity, err.Error())
 		return
+	}
+	for _, section := range config.Sections() {
+		if section.Save != nil {
+			if err := section.Save(submitted[section.Key], stored, cfg); err != nil {
+				writeSectionError(w, http.StatusUnprocessableEntity, err)
+				return
+			}
+		}
 	}
 	body, err := yaml.Marshal(cfg)
 	if err != nil {
@@ -446,57 +464,35 @@ func (s *Store) handlePrinterTest(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// handleDetectionTest verifies one Gadget API key with a single
-// CreateContext request — the same free call the detection engine makes
-// before any print exists — and nothing else: no Process call, no image,
-// no engine. The application flow: the submitted key wins, a blank
-// submission falls back to the stored file key, and an existing
-// BMBPX_OCTOEVERYWHERE_API_KEY overrides both, even when set-but-empty,
-// exactly like startup. Nothing is saved.
-func (s *Store) handleDetectionTest(w http.ResponseWriter, r *http.Request) {
-	var in DetectionView
+func (s *Store) handleSectionTest(w http.ResponseWriter, r *http.Request, section config.Section) {
+	var submitted json.RawMessage
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&in); err != nil {
+	if err := dec.Decode(&submitted); err != nil {
 		writeError(w, http.StatusBadRequest, "The settings could not be read: "+err.Error())
 		return
 	}
-
-	key := strings.TrimSpace(in.APIKey)
-	if key == "" {
+	stored := func() (*config.Config, error) {
 		raw, existed, err := readFile(s.path)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
+		if err != nil || !existed {
+			return nil, err
 		}
-		if existed {
-			// An unreadable file has no stored key to fall back on.
-			if cur, perr := config.Parse(raw); perr == nil {
-				key = cur.Detection.APIKey
-			}
-		}
+		// An unreadable configuration has no stored section to fall back on.
+		file, _ := config.Parse(raw)
+		return file, nil
 	}
-	// Presence, not value: an empty environment variable clears the stored
-	// key, so an existing variable always decides, like ApplyEnv.
-	if v, ok := os.LookupEnv(config.EnvOctoEverywhereAPIKey); ok {
-		key = strings.TrimSpace(v)
-	}
-	if key == "" {
-		if _, ok := os.LookupEnv(config.EnvOctoEverywhereAPIKey); ok {
-			writeError(w, http.StatusUnprocessableEntity, config.EnvOctoEverywhereAPIKey+" is set but empty, so there is no key to test. Set the variable to a valid key.")
-			return
-		}
-		writeError(w, http.StatusUnprocessableEntity, "No Gadget API key is configured. Enter a key or set "+config.EnvOctoEverywhereAPIKey+".")
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), detectionTestTimeout)
-	defer cancel()
-	if err := s.probeDetection(ctx, key); err != nil {
-		writeError(w, http.StatusBadGateway, classifyDetectionError(err))
+	if err := section.Test(r.Context(), submitted, stored); err != nil {
+		writeSectionError(w, http.StatusBadGateway, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func writeSectionError(w http.ResponseWriter, status int, err error) {
+	var pageErr *config.PageError
+	if errors.As(err, &pageErr) {
+		status = pageErr.Status
+	}
+	writeError(w, status, err.Error())
 }
 
 // effectivePrinters returns the printers a test connect must stay away
@@ -546,37 +542,22 @@ func check(raw []byte) (*config.Config, error) {
 	if err := eff.Validate(); err != nil {
 		return nil, fmt.Errorf("with environment overrides: %w", err)
 	}
-	// The detection key requirement is effective-only: the file alone may
-	// enable detection with a blank key because the environment can supply
-	// it, so an environment-only deployment can enable detection from the
-	// page without persisting the secret.
-	if err := eff.ValidateDetection(); err != nil {
+	// Module requirements can depend on environment-supplied secrets.
+	if err := eff.ValidateEffective(); err != nil {
 		return nil, err
 	}
 	return eff, nil
 }
 
 func toView(c *config.Config) View {
-	// Effective detection flags for display: the environment key overrides
-	// the stored key without mutating the stored config. ApplyEnv stays the
-	// only runtime resolver; this copy exists so the page shows the state a
-	// restart would serve.
-	detEff := *c
-	if v, ok := os.LookupEnv(config.EnvOctoEverywhereAPIKey); ok {
-		detEff.Detection.APIKey = strings.TrimSpace(v)
-	}
 	v := View{
 		AuthMode:      c.Auth.Mode,
 		HTTPPort:      c.HTTP.Port,
 		CameraEnabled: c.CameraEnabled(),
 		MCPEnabled:    c.MCP.Enabled == nil || *c.MCP.Enabled,
-		Detection: DetectionView{
-			Enabled:   detEff.DetectionEnabled(),
-			HasAPIKey: detEff.DetectionKey() != "",
-		},
-		LogLevel: c.Log.Level,
-		Printers: []PrinterView{},
-		Listen:   []ListenerView{},
+		LogLevel:      c.Log.Level,
+		Printers:      []PrinterView{},
+		Listen:        []ListenerView{},
 		Behavior: BehaviorView{
 			WarmupCommands:        c.Behavior.WarmupCommands,
 			KeepaliveSeconds:      c.Behavior.UpstreamKeepaliveSeconds,
@@ -592,6 +573,12 @@ func toView(c *config.Config) View {
 				HasUserKey:  c.Notifications.Pushover.UserKey != "",
 			},
 		},
+	}
+	v.sections = make(map[string]any)
+	for _, section := range config.Sections() {
+		if section.View != nil {
+			v.sections[section.Key] = section.View(c)
+		}
 	}
 	v.PrinterSettings = []PrinterSettingView{}
 	for _, s := range config.PrinterSettings() {
@@ -639,24 +626,13 @@ func (v View) toConfig(stored *config.Config) (*config.Config, error) {
 		byserial[p.Serial] = p
 	}
 	camera, mcp := v.CameraEnabled, v.MCPEnabled
-	enabled := v.Detection.Enabled
-	detection := config.Detection{Enabled: &enabled}
-	if key := strings.TrimSpace(v.Detection.APIKey); key != "" {
-		detection.APIKey = key
-	} else if stored != nil {
-		// The page never receives stored or environment secrets back, so a
-		// blank key keeps the stored file key. Disabling preserves it too:
-		// the switch, not a key removal, is the off action.
-		detection.APIKey = stored.Detection.APIKey
-	}
 	c := &config.Config{
-		Auth:      config.Auth{Mode: v.AuthMode},
-		HTTP:      config.HTTP{Port: v.HTTPPort},
-		Camera:    config.Camera{Enabled: &camera},
-		MCP:       config.MCP{Enabled: &mcp},
-		Detection: detection,
-		Log:       config.Log{Level: v.LogLevel},
-		Printers:  []config.Printer{},
+		Auth:     config.Auth{Mode: v.AuthMode},
+		HTTP:     config.HTTP{Port: v.HTTPPort},
+		Camera:   config.Camera{Enabled: &camera},
+		MCP:      config.MCP{Enabled: &mcp},
+		Log:      config.Log{Level: v.LogLevel},
+		Printers: []config.Printer{},
 		Behavior: config.Behavior{
 			UpstreamKeepaliveSeconds:      v.Behavior.KeepaliveSeconds,
 			UpstreamConnectTimeoutSeconds: v.Behavior.ConnectTimeoutSeconds,
@@ -775,11 +751,12 @@ func envOverrides() map[string]string {
 	set("http_port", config.EnvHTTPPort)
 	set("camera_enabled", config.EnvCameraEnable)
 	set("mcp_enabled", config.EnvMCPEnable)
-	// The key override applies by presence, even when the value is empty:
-	// an empty variable clears a stored key, so the page must lock the
-	// field either way.
-	if _, ok := os.LookupEnv(config.EnvOctoEverywhereAPIKey); ok {
-		out["detection_api_key"] = config.EnvOctoEverywhereAPIKey
+	for _, section := range config.Sections() {
+		if section.EnvOverrides != nil {
+			for field, env := range section.EnvOverrides() {
+				out[field] = env
+			}
+		}
 	}
 	return out
 }
