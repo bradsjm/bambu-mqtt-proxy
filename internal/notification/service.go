@@ -210,6 +210,8 @@ func eventSummary(e activity.Entry) string {
 	switch e.Kind {
 	case "print_finished":
 		return "Print finished"
+	case "first_layer_complete":
+		return "First layer complete"
 	case "print_failed":
 		return "Print failed or was cancelled"
 	case "print_stopped":

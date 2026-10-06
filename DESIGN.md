@@ -106,6 +106,8 @@ Panda Breath is the first module with a wall display. Its panel (full detail lev
 
 A per-printer module option is a `config.PrinterSetting` that the module package defines (key, page label, hint, validation) and `cmd/bambu-mqtt-proxy/settings.go` registers at program initialization. The setting stays at the printer level in YAML (for example `panda_breath:`), as a `BMBPX_PRINTERS` key, and as a field in the `/config` printer dialog, with no core code per module. Unknown printer keys still load and are ignored, whatever their YAML shape.
 
+First-layer completion is an activity-only module: when a print session observed at layer 1 reaches layer 2, it records one `first_layer_complete` entry ("First layer complete"). With notifications enabled, that entry sends a push with a live camera frame, so someone away from the wall can check the first layer. It opens no camera connection itself, adds no report interest, and records nothing for a print first seen past layer 1.
+
 ## 4. Downstream endpoint (printer-compatible)
 
 - Listener: TCP + TLS on `:8883` (default) — the port every Bambu app already targets. Certificate: self-signed, ECDSA P-256, 10-year validity, generated on first start and persisted to `cert_file`/`key_file` paths. Apps skip certificate verification exactly as they do against the printer; the file paths also let an operator load a specific cert for tools that pin.

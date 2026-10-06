@@ -23,6 +23,7 @@ import (
 	"bambu-mqtt-proxy/internal/configui"
 	"bambu-mqtt-proxy/internal/control"
 	"bambu-mqtt-proxy/internal/detection"
+	"bambu-mqtt-proxy/internal/firstlayer"
 	"bambu-mqtt-proxy/internal/health"
 	"bambu-mqtt-proxy/internal/httpsrv"
 	"bambu-mqtt-proxy/internal/jobpreview"
@@ -182,6 +183,9 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		}
 		detector.SetActivity(activities)
 	}
+	// First-layer completion observes telemetry that is already live; it
+	// neither holds report interest nor opens a camera connection.
+	firstLayers := firstlayer.New(cfg.Printers, state, activities)
 	if renderer != nil && detector != nil {
 		renderer.SetDetection(detector)
 		renderer.SetDetectionControl(detector)
@@ -197,7 +201,8 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		notifier = notification.New(cfg.Notifications, state, cameras, logger)
 	}
 
-	// Optional modules, in start order. Their shared hooks are wired once,
+	// Optional modules start in order: notifications, job preview, Panda
+	// Breath, detection, first-layer completion. Wire their shared hooks
 	// before the broker can record activity or deliver reports.
 	var mods []module.Module
 	if notifier != nil {
@@ -212,6 +217,7 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	if detector != nil {
 		mods = append(mods, detector.Module())
 	}
+	mods = append(mods, firstLayers.Module())
 	var chamberSet bool
 	var observers []func(string, activity.Entry)
 	for _, mod := range mods {
@@ -279,9 +285,10 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	// The broker is up. Install the single teardown before starting the raw
 	// camera listener or modules, so later bind failures use the same path.
 	// MCP and HTTP stop first, then started modules stop in reverse order:
-	// detection, Panda Breath, job preview, notifications. Their consumers
-	// end before the modules and the cameras and pool they read. The raw
-	// listener stops next, before camera captures, the pool, and the broker.
+	// first-layer completion, detection, Panda Breath, job preview,
+	// notifications. Their consumers end before the modules and the cameras
+	// and pool they read. The raw listener stops next, before camera
+	// captures, the pool, and the broker.
 	// Modules whose Start never ran must not receive Stop.
 	var httpSrv *httpsrv.Server
 	var raw *camera.RawServer
