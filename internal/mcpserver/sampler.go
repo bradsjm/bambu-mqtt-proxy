@@ -29,7 +29,7 @@ const resourceNotifyTimeout = 10 * time.Second
 // change that happens while nobody watches still moves the counter and
 // turns stale tokens into an explicit resync_required. The map is bounded
 // by the configured fleet. There is no per-client timer and no per-printer
-// ticker, and the sampler never reads telemetry's WatchDetection channel,
+// ticker, and the sampler never reads telemetry's WatchReports channel,
 // which belongs to the detection engine.
 type sampler struct {
 	srv *Server

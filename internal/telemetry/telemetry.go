@@ -54,14 +54,14 @@ type State struct {
 	// external spool (the report's vt_tray object, legacy id 254). They are
 	// merged before the real-print report gate and read by nothing but the
 	// camera status endpoints, so they never touch session bookkeeping or
-	// detection freshness. Nested values follow copy-on-write: merges
+	// action freshness. Nested values follow copy-on-write: merges
 	// replace slices and slot values wholesale instead of editing them in
 	// place, so a published State or Snapshot never changes under a reader.
 	AMS      []AMSUnit
 	ExtSpool *AMSSlot
 
 	// Display-only extras merged before the real-print gate (see
-	// mergeExtras). None of them refresh detection freshness.
+	// mergeExtras). None of them refresh action freshness.
 	ChamberLight         string    // on|off|flashing; empty = never reported
 	StartedAt            time.Time // gcode_start_time; zero = unknown
 	SpeedPercent         *int      // spd_mag
@@ -78,15 +78,14 @@ type State struct {
 	// reading from a module, stamped onto State copies at read time by the
 	// optional chamber source. They are display-only: mergeReport never
 	// writes them, and they never refresh the report sequence, freshness,
-	// activity, or detection state, nor the native ChamberTemp. Nil means
+	// activity, or session state, nor the native ChamberTemp. Nil means
 	// nothing was observed; consumers decide freshness from
 	// AccessoryChamberAt against their own clock.
 	AccessoryChamberTemp *float64
 	AccessoryChamberAt   time.Time
 
-	// Detection session bookkeeping. Not display state: these fields track
-	// the current print session for the optional OctoEverywhere detection
-	// worker. Guarded by the Cache mutex like every other field.
+	// Print session bookkeeping. Not display state: these fields track the
+	// current print session for every consumer of Session. Guarded by the Cache mutex like every other field.
 	projectID        string    // raw project_id; "0" is a valid local print
 	taskID           string    // raw task_id
 	cookie           string    // projectID-taskID-subtaskName identity cookie
@@ -108,7 +107,7 @@ type State struct {
 	obsAt            time.Time // time of the last real report
 	lastSeq          uint64    // paho delivery order token of the last merge
 	// job is the private preview-job projection (job.go). It shares the
-	// report stream but never feeds detection or display values: it
+	// report stream but never feeds session or display values: it
 	// tracks preview generations, identity revisions and RUNNING settling
 	// evidence for the optional job preview service.
 	job jobTrack
@@ -161,7 +160,7 @@ type Cache struct {
 	chamberRead func(serial string) (temp float64, at time.Time, ok bool) // optional accessory chamber reading from a module
 	// now is the preview-job timing clock. Production uses time.Now;
 	// package-local preview-job tests replace it to drive gap and settling
-	// boundaries deterministically. Detection timing stays on time.Now.
+	// boundaries deterministically. Session timing stays on time.Now.
 	now func() time.Time
 }
 
@@ -213,7 +212,7 @@ func (c *Cache) Observe(serial string, payload []byte) {
 	c.ObserveReport(serial, 0, 0, payload)
 }
 
-// ObserveReport merges one upstream report with detection bookkeeping. Seq
+// ObserveReport merges one upstream report with session bookkeeping. Seq
 // is the per-connection paho delivery token assigned when the message
 // handler was entered (0 lets the cache assign one); paho dispatches
 // concurrently, so an older report that arrives after a newer one is
@@ -367,7 +366,7 @@ func collectActivityEvents(before activitySnapshot, st *State) []activityRecord 
 	return events
 }
 
-// notify wakes detection watchers, coalescing bursts into one token.
+// notify wakes report watchers, coalescing bursts into one token.
 func (c *Cache) notify(serial string) {
 	c.mu.Lock()
 	ch := c.watch[serial]
@@ -381,9 +380,11 @@ func (c *Cache) notify(serial string) {
 	}
 }
 
-// WatchDetection returns a level-triggered wake channel for one serial:
-// every merged real report leaves at most one pending token.
-func (c *Cache) WatchDetection(serial string) <-chan struct{} {
+// WatchReports returns a level-triggered wake channel for one serial:
+// every merged real report leaves at most one pending token. The channel
+// has a single consumer: a second caller shares the same channel and splits
+// the tokens with the first.
+func (c *Cache) WatchReports(serial string) <-chan struct{} {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	ch, ok := c.watch[serial]
@@ -394,9 +395,9 @@ func (c *Cache) WatchDetection(serial string) <-chan struct{} {
 	return ch
 }
 
-// SessionView is the detection-facing projection of one printer's report
-// state. It carries the session identity and freshness evidence the
-// detection worker needs; it never carries credentials.
+// SessionView is the shared print-session projection of one printer's
+// report state, used by several consumers. It carries the session identity
+// and freshness evidence they need; it never carries credentials.
 type SessionView struct {
 	Serial   string
 	Active   bool   // a print session is in progress
@@ -431,7 +432,7 @@ type SessionView struct {
 	StartedAt    time.Time
 }
 
-// Session returns the detection view for one serial.
+// Session returns the shared print-session projection for one serial.
 func (c *Cache) Session(serial string) (SessionView, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -469,7 +470,7 @@ func (c *Cache) Session(serial string) (SessionView, bool) {
 		view.RemainingMin = &v
 	}
 	// LayerNum is the current print's layer only: the display State keeps
-	// the last reported value for the camera wall, but the detection view
+	// the last reported value for the camera wall, but the session view
 	// exposes it only when it was reported in the current print session on
 	// the current connection, so a previous job's sticky layer can never
 	// authorize a new print and a reconnected printer must re-report it.
@@ -527,7 +528,7 @@ func (c *Cache) State(serial string) (State, bool) {
 // ("print"); values change type between prints (number or string), so
 // extraction goes through generic maps instead of a fixed struct. now is
 // the preview clock time, taken once per report for the preview-job
-// projection; detection timing is untouched.
+// projection; session timing is untouched.
 func mergeReport(st *State, gen uint64, payload []byte, now time.Time, log *slog.Logger) bool {
 	var report map[string]json.RawMessage
 	if err := json.Unmarshal(payload, &report); err != nil {
@@ -543,18 +544,18 @@ func mergeReport(st *State, gen uint64, payload []byte, now time.Time, log *slog
 	}
 	// Display-only extras merge before the real-print gate: stage and AMS
 	// deltas arrive in payloads whose print object the gate must keep
-	// rejecting for detection. Merging first changes neither the marker
+	// rejecting as real print state. Merging first changes neither the marker
 	// list nor the gate's freshness decisions.
 	mergeDisplay(st, printObj, log)
 	real := isRealPrintReport(printObj)
 	// Preview-job tracking runs for real and metadata-only reports alike:
 	// the projection keeps its own identity and freshness evidence, and
-	// metadata-only deltas never refresh detection's.
+	// metadata-only deltas never refresh session evidence.
 	st.trackJob(printObj, gen, now, real)
 	if !real {
 		// Command ACK objects (sequence_id/command/result) and other control
 		// payloads carry no print state. Ignoring them entirely keeps them
-		// from refreshing the action freshness the detection worker relies
+		// from refreshing the action freshness consumers rely
 		// on; only genuine print state reports may authorize actions.
 		return false
 	}
@@ -589,7 +590,7 @@ func mergeReport(st *State, gen uint64, payload []byte, now time.Time, log *slog
 	}
 	if _, present := lookup(printObj, "spd_lvl"); present {
 		// A reported but unsupported value invalidates an older known
-		// profile. Detection must not act on stale evidence after an
+		// profile. Consumers must not act on stale evidence after an
 		// unknown or malformed profile report.
 		st.speedProfile = nil
 		if v, ok := intField(printObj, "spd_lvl"); ok && v >= 1 && v <= 4 {
@@ -690,7 +691,7 @@ func idField(obj map[string]any, key string) (string, bool) {
 	return "", false
 }
 
-// trackSession maintains detection session bookkeeping: boundaries are
+// trackSession maintains print session bookkeeping: boundaries are
 // captured BEFORE the coalesced display merge so short state transitions
 // are never lost, and identity follows the OctoEverywhere Bambu model
 // (cookie project_id-task_id-subtask_name; "0" is a valid local id; missing

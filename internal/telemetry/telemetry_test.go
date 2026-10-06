@@ -295,7 +295,7 @@ func TestStateGenStampsOnlyStateReports(t *testing.T) {
 
 func TestCommandAckDoesNotRefreshDetectionEvidence(t *testing.T) {
 	c := NewCache([]config.Printer{{Serial: "S1", Name: "Shop"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	wake := c.WatchDetection("S1")
+	wake := c.WatchReports("S1")
 	c.ObserveReport("S1", 1, 4, []byte(`{"print":{"gcode_state":"RUNNING","project_id":1,"task_id":2,"subtask_name":"a.gcode"}}`))
 	before, _ := c.Session("S1")
 	<-wake
@@ -324,9 +324,9 @@ func TestCommandAckDoesNotRefreshDetectionEvidence(t *testing.T) {
 	}
 }
 
-func TestWatchDetectionWakesOncePerReport(t *testing.T) {
+func TestWatchReportsWakesOncePerReport(t *testing.T) {
 	c := NewCache([]config.Printer{{Serial: "S1", Name: "Shop"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	wake := c.WatchDetection("S1")
+	wake := c.WatchReports("S1")
 	c.ObserveReport("S1", 1, 1, []byte(`{"print":{"gcode_state":"RUNNING"}}`))
 	select {
 	case <-wake:
@@ -527,7 +527,7 @@ func TestExternalSpoolLifecycle(t *testing.T) {
 // the idle sentinel is stored for the camera projection to map.
 func TestStageMergeIsDisplayOnly(t *testing.T) {
 	c := NewCache([]config.Printer{{Serial: "S1", Name: "Shop"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	wake := c.WatchDetection("S1")
+	wake := c.WatchReports("S1")
 	c.Observe("S1", []byte(`{"print":{"stg_cur":4}}`))
 	st := c.Snapshot()[0]
 	if st.Stage == nil || *st.Stage != 4 {

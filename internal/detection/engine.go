@@ -317,9 +317,9 @@ func (e *Engine) Close() {
 // sessionsWatch bridges the telemetry cache to the worker wake channel.
 func (e *Engine) sessionsWatch(serial string) <-chan struct{} {
 	if wc, ok := e.sessions.(interface {
-		WatchDetection(string) <-chan struct{}
+		WatchReports(string) <-chan struct{}
 	}); ok {
-		return wc.WatchDetection(serial)
+		return wc.WatchReports(serial)
 	}
 	return nil
 }
