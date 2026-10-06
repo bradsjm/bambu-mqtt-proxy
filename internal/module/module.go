@@ -4,7 +4,8 @@
 // its hooks with one Module value. The service wiring constructs each
 // enabled module with the core services it needs, then hands the
 // declarations to the core, which owns lifecycle order, the shared report
-// interest, activity fan-out, and display placement.
+// interest, activity fan-out, display placement, and the members and
+// routes a module serves under its own name.
 //
 // Core services a module may take at construction, by narrow interface:
 //   - merged printer state and print sessions (*telemetry.Cache),
