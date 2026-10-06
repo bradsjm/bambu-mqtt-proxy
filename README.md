@@ -520,7 +520,7 @@ block) to send print alerts to one [Pushover](https://pushover.net/) account.
 ## Development
 
 ```sh
-go test -race ./...          # unit + fake-printer integration suite
+go test -race -p 1 ./...      # unit + fake-printer integration suite
 go build ./cmd/bambu-mqtt-proxy
 docker buildx build --platform linux/amd64,linux/arm64 -t bambu-mqtt-proxy .
 ```

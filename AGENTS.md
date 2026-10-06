@@ -107,13 +107,13 @@ The upstream device is a printer with a bare-bones ESP32 MQTT broker, not a gene
 ```sh
 go build -o bambu-mqtt-proxy ./cmd/bambu-mqtt-proxy
 ./bambu-mqtt-proxy -config bambu-mqtt-proxy.yaml
-go test -race ./...
+go test -race -p 1 ./...
 go vet ./...
 test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
 docker buildx build --platform linux/amd64,linux/arm64 -t bambu-mqtt-proxy .
 ```
 
-CI runs the formatting check, `go vet ./...`, and `go test -race ./...` on pushes to `main` and pull requests.
+CI runs the formatting check, `go vet ./...`, and `go test -race -p 1 ./...` on pushes to `main` and pull requests.
 
 ## Code Conventions & Common Patterns
 
@@ -143,6 +143,6 @@ Configuration can combine YAML and `BMBPX_*` variables; environment values overr
 
 ## Testing & QA
 
-Tests use Go's standard `testing` package. Unit tests live beside packages; `internal/integration/` runs the proxy against fake TLS MQTT printers. Prefer focused package tests during iteration, then run `go test -race ./...` and `go vet ./...` before completion. There is no stated numeric coverage threshold.
+Tests use Go's standard `testing` package. Unit tests live beside packages; `internal/integration/` runs the proxy against fake TLS MQTT printers. Prefer focused package tests during iteration, then run `go test -race -p 1 ./...` and `go vet ./...` before completion. There is no stated numeric coverage threshold.
 
 Use `DESIGN.md`'s verification plan and existing integration cases for MQTT routing, authentication, subscription merging, warmup, and outage behavior. Camera tests use fake camera servers; keep network waits bounded in tests.
