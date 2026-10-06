@@ -225,7 +225,8 @@ func eventSummary(e activity.Entry) string {
 			return "Printer error"
 		}
 		return ""
-	case "ai_warning", "ai_pause_sent", "ai_pause_failed", "ai_pause_unconfirmed":
+	case "ai_warning", "ai_pause_sent", "ai_pause_failed", "ai_pause_unconfirmed",
+		"platecheck_stop_requested", "platecheck_stop_failed", "platecheck_stop_unconfirmed":
 		return e.Message
 	case "print_paused":
 		return "Print paused"

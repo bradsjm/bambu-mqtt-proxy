@@ -79,3 +79,14 @@ behavior:
 
 log:
   level: info # debug logs per-packet routing decisions
+
+# Optional build-plate check (also editable on the /config page). One
+# fresh snapshot is uploaded per new print and `stop` is sent only when the
+# plate looks occupied. Best effort: errors let the print continue.
+# BMBPX_PLATECHECK_ENDPOINT and BMBPX_PLATECHECK_API_KEY override these values.
+# platecheck:
+#   enabled: true            # default: on when endpoint and api_key are both set
+#   endpoint: https://api.cloudflare.com/client/v4/accounts/<id>/ai/run/@cf/cloudflare/clef
+#   api_key: ""              # write-only on the /config page
+#   model: clef              # clef or clef-flash
+#   stop_confidence: 0.5     # 0.50-0.99; stop above this occupied probability

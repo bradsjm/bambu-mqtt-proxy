@@ -252,6 +252,12 @@ notifications:
     pushover:
         app_token: ""
         user_key: ""
+platecheck:
+    enabled: false
+    endpoint: ""
+    api_key: ""
+    model: clef
+    stop_confidence: 0.5
 `
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(path, []byte(fixture), 0o600); err != nil {

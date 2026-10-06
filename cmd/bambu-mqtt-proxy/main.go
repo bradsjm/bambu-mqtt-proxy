@@ -30,6 +30,7 @@ import (
 	"bambu-mqtt-proxy/internal/module"
 	"bambu-mqtt-proxy/internal/notification"
 	"bambu-mqtt-proxy/internal/pandabreath"
+	"bambu-mqtt-proxy/internal/platecheck"
 	"bambu-mqtt-proxy/internal/routing"
 	"bambu-mqtt-proxy/internal/telemetry"
 	"bambu-mqtt-proxy/internal/upstream"
@@ -150,10 +151,17 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		previews = jobpreview.New(cfg.Printers, state, pool, logger)
 	}
 
+	// Plate-check settings resolve before camera construction: automatic
+	// startup checks capture through the shared web manager even when the
+	// HTTP port is off, so the manager choice depends on them.
+	plateSettings, err := platecheck.SettingsOf(cfg)
+	if err != nil {
+		return nil, err
+	}
 	var cameras *camera.Manager
 	var renderer *camera.StatusRenderer
 	if cfg.CameraEnabled() {
-		if cfg.HTTP.Port > 0 {
+		if cfg.HTTP.Port > 0 || plateSettings.On() {
 			cameras = camera.NewWebManager(cfg.Printers, logger)
 		} else {
 			cameras = camera.NewManager(cfg.Printers, logger)
@@ -186,6 +194,28 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		}
 		detector.SetActivity(activities)
 	}
+	// Optional Clef build-plate checks: the YAML platecheck section with the
+	// BMBPX_PLATECHECK_ENDPOINT and BMBPX_PLATECHECK_API_KEY overrides. With
+	// credentials but the camera feature disabled the service stays visible
+	// in the blocked state and performs no camera or provider activity. With
+	// the feature off and cameras serving, a bare service keeps the snapshot
+	// diagnostic route available to the configuration page.
+	var plates *platecheck.Service
+	if plateSettings.On() || (cfg.HTTP.Port > 0 && cfg.CameraEnabled()) {
+		var client platecheck.DecisionClient // nil while off
+		if plateSettings.On() {
+			client = platecheck.NewClient(plateSettings, logger)
+		}
+		if !cfg.CameraEnabled() {
+			plates = platecheck.New(cfg.Printers, plateSettings, client, platecheck.IdleFrames{}, state, pool, logger)
+			plates.SetBlocked(platecheck.ReasonCameraDisabled)
+			logger.Warn("plate check blocked: the camera feature is disabled",
+				"env", config.EnvCameraEnable)
+		} else {
+			plates = platecheck.New(cfg.Printers, plateSettings, client, platecheck.CameraFrames(cameras), state, pool, logger)
+		}
+		plates.SetActivity(activities)
+	}
 	// First-layer completion observes telemetry that is already live; it
 	// neither holds report interest nor opens a camera connection.
 	firstLayers := firstlayer.New(cfg.Printers, state, activities)
@@ -202,8 +232,8 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	}
 
 	// Optional modules start in order: notifications, job preview, Panda
-	// Breath, detection, first-layer completion. Wire their shared hooks
-	// before the broker can record activity or deliver reports.
+	// Breath, detection, plate check, first-layer completion. Wire their
+	// shared hooks before the broker can record activity or deliver reports.
 	var mods []module.Module
 	if notifier != nil {
 		mods = append(mods, notifier.Module())
@@ -216,6 +246,9 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	}
 	if detector != nil {
 		mods = append(mods, detector.Module())
+	}
+	if plates != nil {
+		mods = append(mods, plates.Module())
 	}
 	mods = append(mods, firstLayers.Module())
 	if err := module.Check(mods); err != nil {
@@ -284,7 +317,7 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	// The broker is up. Install the single teardown before starting the raw
 	// camera listener or modules, so later bind failures use the same path.
 	// MCP and HTTP stop first, then started modules stop in reverse order:
-	// first-layer completion, detection, Panda Breath, job preview,
+	// first-layer completion, plate check, detection, Panda Breath, job preview,
 	// notifications. Their consumers end before the modules and the cameras
 	// and pool they read. The raw listener stops next, before camera
 	// captures, the pool, and the broker.

@@ -46,6 +46,27 @@ func newTestService(t *testing.T) (*Service, chan sentMsg) {
 	return s, sent
 }
 
+// TestEventSummaryPlatecheckKinds pins the plate-check notification map:
+// the stop lifecycle kinds notify with the recorded message, while routine
+// skipped and stopped entries stay silent.
+func TestEventSummaryPlatecheckKinds(t *testing.T) {
+	for _, tc := range []struct {
+		kind, message, want string
+	}{
+		{"platecheck_stop_requested",
+			"Build plate may be occupied; stop requested. Check the printer and clear the plate before sending the print again.",
+			"Build plate may be occupied; stop requested. Check the printer and clear the plate before sending the print again."},
+		{"platecheck_stop_failed", "The stop command did not reach the printer.", "The stop command did not reach the printer."},
+		{"platecheck_stop_unconfirmed", "Plate-check stop is unconfirmed. Check the printer now.", "Plate-check stop is unconfirmed. Check the printer now."},
+		{"platecheck_skipped", "Startup check skipped: the evidence expired.", ""},
+		{"platecheck_stopped", "Printer reports the job ended after the plate-check stop request.", ""},
+	} {
+		if got := eventSummary(activity.Entry{Kind: tc.kind, Message: tc.message}); got != tc.want {
+			t.Errorf("eventSummary(%s) = %q, want %q", tc.kind, got, tc.want)
+		}
+	}
+}
+
 // TestServiceSendsFinishedPrintWithSnapshot pins the happy path: one
 // message whose title is the printer name, whose body carries the summary
 // and the file line, and whose JPEG comes from the camera seam.

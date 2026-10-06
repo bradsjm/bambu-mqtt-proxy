@@ -132,6 +132,7 @@ MCP follows the same ownership. A module's per-printer data reaches agents only 
 | `jobpreview` | `BMBPX_JOB_PREVIEW` not false (an environment-only `config.Section`), HTTP on, and the wall or MCP on | `Start`/`Stop`, `State`, `Routes`, `MCP` | Tile and `state.modules.jobpreview`, `get_job_preview`, `GET /camera/{serial}/preview` |
 | `pandabreath` | HTTP on; one device connection per printer with `panda_breath` set | `Start`/`Stop`, `ChamberReading`, `Display`, `State` | Wall panel and badge, accessory chamber reading, `state.modules.pandabreath` |
 | `detection` | A Gadget key (or explicit enable) is configured (§6.1) | `Start`/`Stop`, `NeedsReports`, `State`, `FleetValues`, `StatusValue`, `Routes`, `MCP` | Tile `detection`, fleet `detection_suspended`/`detection_message`, `/status` `detection`, `PUT /detection/{serial}`, `state.modules.detection`, `set_ai_monitoring` |
+| `platecheck` | Cameras on and HTTP on (diagnostics), or endpoint and key set (§6.2) | `Start`/`Stop`, `NeedsReports`, `ObserveActivity`, `State`, `Display`, `StatusValue`, `Routes` | Tile `platecheck` and panel, `/status` `platecheck`, `POST /platecheck/snapshots`, `state.modules.platecheck` |
 | `firstlayer` | Always | `Start`/`Stop` | The `first_layer_complete` activity entry |
 
 Two kinds of module-specific markup remain in the embedded pages, because the generic hooks cannot express them: the interactive detection controls in `camwall.html` and the section forms in `config.html`. The notification module's summaries for other modules' activity kinds (`ai_*`, `first_layer_complete`) are accepted module-to-module knowledge. An environment-only module switch is a `config.Section` with only `ApplyEnv`, which always replaces the section from the environment: `job_preview` is never read from the file and never shown on `/config`.
@@ -459,6 +460,18 @@ training.
   and pause booleans, positive intervals retained as provider timing floors), and error
   details are sanitized — no provider text, raw URLs, or response bodies
   reach logs or status.
+
+### 6.2 Build-plate check (optional)
+
+The `platecheck` module (`internal/platecheck`) evaluates one fresh camera frame per print job against a Clef endpoint (`clef` or `clef-flash`, Cloudflare Workers AI schema or a self-hosted equivalent) and sends only `stop` through the generation-guarded `upstream.Pool`. It adds no MQTT subscription or upstream connection.
+
+- **Config.** The `platecheck` section holds `enabled`, `endpoint`, `api_key`, `model`, and `stop_confidence`. `BMBPX_PLATECHECK_ENDPOINT` and `BMBPX_PLATECHECK_API_KEY` override by presence. A key is bound to its endpoint: a blank submitted key falls back to the stored or environment key only for the identical endpoint, and the client pins its bearer key to its construction-time HTTPS endpoint.
+- **Decision.** Two fixed questions return numbers in [0,1]. `p_assessable < 0.8` is inconclusive. A stop needs `p_clear < (100 - N)/100` for cutoff `N` percent, so exact equality does not stop. All errors are fail-open and use fixed categories; provider bodies, URLs, and image bytes never enter logs or errors.
+- **Admission.** `print_preparing` and `print_started` activity hints admit a job generation. `state_initial` suppresses the attached job. A direct-RUNNING start needs a reported layer 0. At most one evaluation runs per generation.
+- **Authorization.** Before each dispatch the service rereads Job and Session (up to three coherent attempts) and requires the admission generation, revision, connection, epoch rules, report freshness, and, in RUNNING, explicit layer 0. One stop in PREPARE plus at most one in the first RUNNING epoch; the verdict is never re-evaluated. A stop counts as confirmed only by a fresh post-dispatch IDLE or FAILED observation of the same job.
+- **Diagnostics.** `POST /platecheck/snapshots` captures and scores each configured camera in turn using the submitted settings, returns the exact uploaded JPEGs, and touches no commands, activity, or worker state. The `/config` page calls `POST /config/platecheck/test` (key check, text only) first.
+- **Limits.** QoS 0 publication is not scoped to a printer job, so a same-connection job replacement after the final local check can still receive the stop. Model accuracy and firmware acceptance of stop during PREPARE are unverified.
+
 ## 7. Routing model (core)
 
 Topic grammar: `device/{serial}/report` and `device/{serial}/request`. The serial is the second level. Any other topic shape is denied/dropped and logged. This routing model covers MQTT only: the raw camera endpoint (§6) carries no topics and routes by the access code instead.
