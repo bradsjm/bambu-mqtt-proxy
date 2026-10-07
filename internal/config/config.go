@@ -474,6 +474,7 @@ func (c *Config) ApplyDefaults() {
 		if c.Printers[i].Username == "" {
 			c.Printers[i].Username = "bblp"
 		}
+		c.Printers[i].Address = WithDefaultPrinterPort(c.Printers[i].Address)
 	}
 }
 

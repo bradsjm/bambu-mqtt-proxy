@@ -39,7 +39,7 @@ topic path.
 | **Printer outages ride out** | Capped exponential backoff with jitter, automatic reconnect and resubscribe, and a `pushall` warmup. Late joiners get full state (P1 printers otherwise send deltas only). |
 | **Cameras, two ways** | A live multi-printer dashboard wall — P1/A1 cameras natively, X1/P2S/H2-series cameras through bundled FFmpeg — and a printer-compatible raw passthrough on port 6000. |
 | **Optional AI failure detection** | With an OctoEverywhere Gadget key, snapshots from active prints are analyzed and the proxy pauses likely failures. No key, no uploads, no automatic pauses. |
-| **Optional build-plate check** | With a Clef endpoint and key, one fresh snapshot is checked at print startup and the proxy sends `stop` when the plate looks occupied. Off without both. |
+| **Optional build-plate check** | With a vision provider (Cloudflare or a custom HTTPS endpoint) and key, one fresh snapshot is checked at print startup and the proxy sends `stop` when the plate looks occupied. Runs comfortably inside Cloudflare's free daily allowance. Off without both. |
 | **MCP endpoint** | `/mcp` exposes printer state, camera snapshots, and printer controls (pause, resume, emergency stop, chamber light, speed profile, AI monitoring toggle) to AI agents. |
 | **Supervision-friendly** | `/livez`, `/readyz`, and `/status` for Docker/Kubernetes probes. |
 | **Stateless and multi-arch** | No database, no volumes required; `linux/amd64` and `linux/arm64` images. |
@@ -163,7 +163,7 @@ log:
 
 | Environment variable | Default | Meaning |
 |---|---|---|
-| `BMBPX_PRINTERS` | — | Semicolon-separated printers: `serial=…,address=…,password=…[,name=…][,model=…][,username=…][,tls=…][,insecure_skip_verify=…][,panda_breath=ws://…][,panda_pwr=http://…]` |
+| `BMBPX_PRINTERS` | — | Semicolon-separated printers: `serial=…,address=…,password=…[,name=…][,model=…][,username=…][,tls=…][,insecure_skip_verify=…][,panda_breath=host[:port]][,panda_pwr=host[:port]]`; a printer `address` without a port uses 8883 |
 | `BMBPX_LISTEN_PORT` | `8883` | Downstream MQTT port |
 | `BMBPX_LISTEN_TLS` | `true` | TLS on the downstream listener |
 | `BMBPX_CERT_FILE` / `BMBPX_KEY_FILE` | *(empty)* | Empty = ephemeral in-memory self-signed certificate |
@@ -172,8 +172,10 @@ log:
 | `BMBPX_HTTP_PORT` | `8080` | Shared health, camera, and MCP HTTP port; `0` disables HTTP (the raw camera listener on 6000 keeps serving while cameras are enabled) |
 | `BMBPX_CAMERA_ENABLED` | `true` | `false` removes the camera routes, the camera wall, their MQTT report subscriptions, and the raw camera listener on port 6000 |
 | `BMBPX_MCP_ENABLED` | `true` | `false` removes the MCP endpoint at `/mcp`; the endpoint is also off when `http.port` is `0` |
-| `BMBPX_PLATECHECK_ENDPOINT` | *(empty)* | Overrides the stored Clef endpoint whenever the variable exists (an empty value clears it). See [Build-plate check](#build-plate-check-optional) |
-| `BMBPX_PLATECHECK_API_KEY` | *(empty)* | Overrides the stored Clef API key whenever the variable exists. The key is sent only to the endpoint it is paired with. See [Build-plate check](#build-plate-check-optional) |
+| `BMBPX_PLATECHECK_PROVIDER` | `cloudflare` | Overrides the stored provider (`cloudflare` or `custom`) whenever the variable exists. See [Build-plate check](#build-plate-check-optional) |
+| `BMBPX_PLATECHECK_ACCOUNT_ID` | *(empty)* | Overrides the stored Cloudflare account ID whenever the variable exists. See [Build-plate check](#build-plate-check-optional) |
+| `BMBPX_PLATECHECK_ENDPOINT` | *(empty)* | Overrides the stored custom endpoint whenever the variable exists (an empty value clears it). See [Build-plate check](#build-plate-check-optional) |
+| `BMBPX_PLATECHECK_API_KEY` | *(empty)* | Overrides the stored vision provider API key whenever the variable exists. The key is sent only to the endpoint it is paired with. See [Build-plate check](#build-plate-check-optional) |
 | `BMBPX_OCTOEVERYWHERE_API_KEY` | *(empty)* | Overrides the stored Gadget API key whenever the variable exists — an empty value clears the stored key. Setting a key consents to external snapshot uploads and automatic pauses — see [Gadget AI print-failure detection](#gadget-ai-print-failure-detection-optional) |
 
 ## HTTP endpoints
@@ -190,7 +192,7 @@ disabled.
 | `/` | Redirects to `/config` until a printer is configured, then to `/camwall` (no redirect while cameras are disabled) |
 | `/livez`, `/readyz` | `200 ok` once serving (printer state deliberately excluded — clients stay connected while printers recover) |
 | `/status` | JSON: `{"status":"ok","upstreams":{"<serial>":true\|false}}`, plus a `detection` map per printer when AI detection is enabled and a `platecheck` state when the camera feature is on |
-| `POST /platecheck/snapshots` | Plate-check dry run used by the `/config` page: checks one fresh snapshot per camera-capable printer and returns the exact images and scores. Sends no printer command. Mounted when cameras are on |
+| `POST /platecheck/snapshots` | Plate-check dry run used by the `/config` page: checks one fresh snapshot per online, camera-capable printer in parallel and streams the exact images and scores as NDJSON (`start`, one `result` per printer, `done`). Offline printers are skipped. Sends no printer command. Mounted when cameras are on |
 | `/activity`, `/activity/{serial}` | Recent per-printer events (in memory; cleared when the proxy restarts) |
 | `/camera/{serial}/snapshot` | Single JPEG frame (P1/A1 native; X1/P2S/H2-series converted server-side with FFmpeg) |
 | `/camera/{serial}/stream` | Live multipart MJPEG stream (same model support as the snapshot) |
@@ -359,14 +361,16 @@ On by default; disable with `BMBPX_MCP_ENABLED=false`. MCP protocol
 ## Build-plate check (optional)
 
 The `platecheck` section (editable on the `/config` page) checks the build
-plate when a print starts. Set `endpoint` (a full HTTPS URL of a Cloudflare
-Workers AI or self-hosted Clef model), `api_key`, `model` (`clef` or
-`clef-flash`), and `stop_confidence` (0.50 to 0.99 in 0.01 steps, default
-0.50). Without an explicit `enabled`, the check runs when both endpoint and key
-are set. `BMBPX_PLATECHECK_ENDPOINT` and `BMBPX_PLATECHECK_API_KEY` override the
+plate when a print starts. Set `provider` (`cloudflare`, the default, or `custom`). Cloudflare needs
+`account_id` (32 hexadecimal characters), `api_key`, and `model` (`clef` or
+`clef-flash`); the proxy builds the Workers AI URL. Custom needs `endpoint` (a
+full HTTPS URL that accepts the same request and answer format), `api_key`, and
+a free-text `model`. Also set `stop_confidence` (0.50 to 0.99 in 0.01 steps, default
+0.50). Without an explicit `enabled`, the check runs when the provider target and key
+are set. `BMBPX_PLATECHECK_PROVIDER`, `BMBPX_PLATECHECK_ACCOUNT_ID`, `BMBPX_PLATECHECK_ENDPOINT`, and `BMBPX_PLATECHECK_API_KEY` override the
 stored values whenever they exist. The key is write-only on the page, a blank
 value keeps the stored key, and a stored or environment key is never sent to a
-different endpoint than the one it belongs to.
+different account or endpoint than the one it belongs to.
 
 For each new print job, the proxy waits for a fresh camera frame, may turn the
 chamber light on, uploads that one JPEG to the endpoint, and sends `stop` only
@@ -376,6 +380,37 @@ command. Every failure, unclear image, or missing camera lets the print
 continue. It checks only prints that start while the proxy watches; a print
 already underway when the proxy attaches is never stopped. A stop sent during
 PREPARE may be repeated once when the job first reaches RUNNING with layer 0.
+
+### How a decision is made
+
+The model returns two probabilities for the snapshot, and the proxy combines
+them into one of three outcomes:
+
+| Outcome | Condition | Result |
+|---|---|---|
+| **Stop** | `assessable` ≥ 0.8 **and** `occupied` > `stop_confidence` | The proxy sends one `stop` and records it in the activity log. |
+| **Unclear** | `assessable` < 0.8 (blocked view, dark chamber, bad angle) | The print continues; the result is recorded. |
+| **Clear** | `assessable` ≥ 0.8 **and** `occupied` ≤ `stop_confidence` | The print continues. |
+
+Raise `stop_confidence` to avoid false stops; lower it to catch more objects
+on the plate. Any error, timeout, or missing camera is treated like an unclear
+result: the print is never stopped on a failure.
+
+### Cloudflare free allowance
+
+Cloudflare Workers AI gives every account 10,000 neurons per day at no charge,
+reset at 00:00 UTC. At list price that allowance is worth about $0.11 a day.
+Because the proxy makes one request per print start, it is more than enough
+for a home fleet. Converted to work:
+
+| Model | Free input tokens per day | Decisions per day (about 500 tokens each) |
+|---|---|---|
+| `clef` | about 458,000 | roughly 900 |
+| `clef-flash` | about 1.22 million | roughly 2,400 |
+
+See [Workers AI pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/)
+for current rates. Dry runs from the `/config` page count against the same
+allowance.
 
 This is a best-effort check, not a collision interlock. Slicers connect to the
 printer directly, so the print may already be moving when the stop arrives, and

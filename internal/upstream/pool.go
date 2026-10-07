@@ -252,6 +252,12 @@ func (p *Pool) Generation(serial string) uint64 {
 	return c.generation
 }
 
+// Connected reports whether serial's upstream MQTT connection is established.
+func (p *Pool) Connected(serial string) bool {
+	c, ok := p.existing(serial)
+	return ok && c.isConnected()
+}
+
 // PausePrint sends the pause command upstream. It fails unless the printer is
 // connected on exactly the generation the caller validated against, so a
 // decision made before a reconnect can never act on the new connection. QoS 0

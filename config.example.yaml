@@ -33,8 +33,8 @@ printers:
     username: "bblp"
     password: "12345678"
     # Optional accessory modules, each addressed on the local network:
-    # panda_breath: "ws://panda-breath-blue.iot/ws" # Panda Breath sensor; chamber temperature
-    # panda_pwr: http://192.168.4.1 # Panda PWR smart plug; printer power draw over HTTP
+    # panda_breath: panda-breath-blue.iot # Panda Breath host or IP (optional :port); chamber temperature
+    # panda_pwr: 192.168.4.1 # Panda PWR host or IP (optional :port); printer power draw
   # Non-standard endpoint (custom firmware or fronting relay):
   # - serial: "01P00A987654321"
   #   address: "192.168.1.43:1883"
@@ -86,10 +86,12 @@ log:
 # Optional build-plate check (also editable on the /config page). One
 # fresh snapshot is uploaded per new print and `stop` is sent only when the
 # plate looks occupied. Best effort: errors let the print continue.
-# BMBPX_PLATECHECK_ENDPOINT and BMBPX_PLATECHECK_API_KEY override these values.
+# BMBPX_PLATECHECK_PROVIDER, _ACCOUNT_ID, _ENDPOINT and _API_KEY override these values.
 # platecheck:
-#   enabled: true            # default: on when endpoint and api_key are both set
-#   endpoint: https://api.cloudflare.com/client/v4/accounts/<id>/ai/run/@cf/cloudflare/clef
+#   enabled: true            # default: on when the account/endpoint and api_key are set
+#   provider: cloudflare     # cloudflare or custom
+#   account_id: ""           # cloudflare: 32 hex characters
+#   endpoint: ""             # custom: full HTTPS URL
 #   api_key: ""              # write-only on the /config page
-#   model: clef              # clef or clef-flash
+#   model: clef              # cloudflare: clef or clef-flash; custom: any name
 #   stop_confidence: 0.5     # 0.50-0.99; stop above this occupied probability

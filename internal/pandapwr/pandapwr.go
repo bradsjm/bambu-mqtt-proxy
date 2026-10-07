@@ -11,7 +11,7 @@
 // the loop returns to the steady cadence. Readings carry their observation
 // time, so a device that stops answering stops projecting instead of
 // freezing a stale value. Failures are logged as bounded reason classes
-// only: the configured URL and the response body never reach the log.
+// only: the configured host and the response body never reach the log.
 package pandapwr
 
 import (
@@ -24,7 +24,6 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -80,7 +79,7 @@ var timeNow = time.Now
 // target is one polled device.
 type target struct {
 	serial string // routing key shared with the telemetry cache
-	addr   string // validated http:// or https:// base URL from the printer config
+	addr   string // fixed http:// base built from the configured host
 }
 
 // reading is one accepted power observation.
@@ -93,7 +92,7 @@ type reading struct {
 // loop per configured Panda PWR address. The zero value is not usable;
 // construct with New.
 type Store struct {
-	log     *slog.Logger // process logger; URLs and bodies never reach it
+	log     *slog.Logger // process logger; hosts and bodies never reach it
 	targets []target     // printers configured with a Panda PWR address
 
 	mu       sync.Mutex         // guards readings
@@ -110,8 +109,12 @@ func New(printers []config.Printer, log *slog.Logger) *Store {
 	s := &Store{log: log, readings: make(map[string]reading)}
 	for _, p := range printers {
 		if addr := p.Setting(AddressKey); addr != "" {
-			// Trim a trailing slash so the fixed endpoint path never doubles it.
-			s.targets = append(s.targets, target{serial: p.Serial, addr: strings.TrimRight(addr, "/")})
+			host, err := config.HostOnly(addr)
+			if err != nil {
+				// Validate rejects this value before New runs.
+				continue
+			}
+			s.targets = append(s.targets, target{serial: p.Serial, addr: "http://" + host})
 		}
 	}
 	return s
@@ -161,7 +164,7 @@ func (s *Store) Stop() {
 // restores the steady cadence, so a busy device that answers the retry
 // loses far less fresh coverage than a backoff would accept. Failures are
 // logged only as bounded reason classes on transitions between failing
-// and succeeding streaks; the configured URL never enters the log.
+// and succeeding streaks; the configured host never enters the log.
 func (s *Store) pollLoop(ctx context.Context, t target) {
 	kind := delayInitial
 	failing := false // last poll already failed and the failure was logged
@@ -241,7 +244,7 @@ func (s *Store) poll(ctx context.Context, t target) (ok bool, reason string) {
 }
 
 // failReason classifies a request failure into a bounded, payload-free
-// reason class for the log. Transport errors can echo the configured URL,
+// reason class for the log. Transport errors can echo the configured host,
 // including userinfo it may hold, so the raw error stays out of the log.
 func failReason(err error) string {
 	var ne net.Error

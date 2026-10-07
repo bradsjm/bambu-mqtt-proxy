@@ -13,7 +13,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 )
 
@@ -23,9 +22,9 @@ const (
 	requestTimeout = 15 * time.Second
 	// maxResponseBytes bounds provider JSON.
 	maxResponseBytes = 64 << 10
-	// maxImageBytes is Clef's per-image byte limit.
+	// maxImageBytes is the provider's per-image byte limit.
 	maxImageBytes = 4 << 20
-	// maxImagePixels is Clef's per-image pixel limit.
+	// maxImagePixels is the provider's per-image pixel limit.
 	maxImagePixels = 16_000_000
 	// assessableMin is a local view-quality heuristic, not a physical guarantee.
 	assessableMin = 0.8
@@ -70,9 +69,9 @@ type Client struct {
 // NewClient constructs a client without making connections.
 func NewClient(settings Settings, log *slog.Logger) *Client {
 	if log != nil {
-		log = log.With("origin", "platecheck", "component", "clef_client")
+		log = log.With("origin", "platecheck", "component", "vision_client")
 	}
-	return &Client{settings: settings, keyEndpoint: strings.TrimSpace(settings.Endpoint), log: log, http: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
+	return &Client{settings: settings, keyEndpoint: settings.URL(), log: log, http: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 }
 
 // safeError stores a fixed category without provider text.
@@ -107,23 +106,25 @@ func errorCategory(err error) string {
 func fixedSentence(code string) string {
 	switch code {
 	case "auth_rejected":
-		return "Clef rejected the API key. Check the key and its permissions."
+		return "The provider rejected the API key. Check the key and its permissions."
 	case "endpoint_unreachable":
-		return "The Clef endpoint could not be reached. Check the endpoint and try again."
+		return "The provider could not be reached. Check the provider settings and try again."
 	case "timeout":
-		return "The Clef request timed out. Try again."
+		return "The provider request timed out. Try again."
 	case "rate_limited":
-		return "Clef rate-limited the request. Try again later."
+		return "The provider rate-limited the request. Try again later."
 	case "bad_response":
-		return "Clef returned an invalid response. Check the endpoint and model."
+		return "The provider returned an invalid response. Check the provider settings and model."
 	case "model_error":
-		return "Clef could not evaluate the request. Try again later."
+		return "The provider could not evaluate the request. Try again later."
 	case "invalid_image":
 		return "The camera image is not a valid JPEG. The print would continue."
 	case "image_too_large":
-		return "The camera image exceeds the Clef image limit. The print would continue."
+		return "The camera image exceeds the provider image limit. The print would continue."
 	case "canceled":
 		return "The plate check was canceled."
+	case "printer_offline":
+		return "The printer is offline, so no snapshot was taken."
 	case "unsupported_camera":
 		return "This printer model has no supported camera."
 	case "camera_unavailable":
@@ -135,7 +136,7 @@ func fixedSentence(code string) string {
 	}
 }
 
-// question is Clef's noul question input.
+// question is the provider's noul question input.
 type question struct {
 	// Type is always noul.
 	Type string `json:"type"`
@@ -153,7 +154,7 @@ type imageInput struct {
 	Base64 string `json:"base64"`
 }
 
-// requestInput is the bounded Clef wire input.
+// requestInput is the bounded provider wire input.
 type requestInput struct {
 	// Model selects the configured model.
 	Model string `json:"model"`
@@ -205,7 +206,7 @@ func (c *Client) Probe(ctx context.Context) error {
 	return nil
 }
 
-// imageDimensions checks JPEG headers and Clef limits without a full decode.
+// imageDimensions checks JPEG headers and provider limits without a full decode.
 func imageDimensions(data []byte) (int, int, error) {
 	if len(data) > maxImageBytes {
 		return 0, 0, &safeError{code: "image_too_large"}
@@ -264,11 +265,11 @@ func (c *Client) request(ctx context.Context, in requestInput) (out responseResu
 			if out.Usage.InputTokens != nil && out.Usage.OutputTokens != nil {
 				attrs = append(attrs, "input_tokens", *out.Usage.InputTokens, "output_tokens", *out.Usage.OutputTokens)
 			}
-			c.log.DebugContext(ctx, "Clef request completed", attrs...)
+			c.log.DebugContext(ctx, "Provider request completed", attrs...)
 		}
 	}()
 	// Never attach a retained bearer credential to a changed or insecure destination.
-	endpoint := strings.TrimSpace(c.settings.Endpoint)
+	endpoint := c.settings.URL()
 	u, parseErr := url.Parse(endpoint)
 	if parseErr != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || endpoint != c.keyEndpoint {
 		return out, &safeError{code: "auth_rejected"}

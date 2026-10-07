@@ -25,8 +25,10 @@ type StateSource interface {
 	Session(string) (telemetry.SessionView, bool)
 }
 
-// PrinterCommands supplies only guarded light and stop commands.
+// PrinterCommands supplies connection status and guarded light and stop commands.
 type PrinterCommands interface {
+	// Connected reports whether the upstream MQTT connection is established.
+	Connected(string) bool
 	// Generation returns the current upstream connection generation.
 	Generation(string) uint64
 	// StopPrint sends a generation-guarded QoS 0 stop request.
@@ -176,7 +178,7 @@ func New(printers []config.Printer, settings Settings, client DecisionClient, fr
 		frames = IdleFrames{}
 	}
 	if settings.On() && client == nil {
-		client = NewClient(settings, log.With("component", "clef_client"))
+		client = NewClient(settings, log.With("component", "vision_client"))
 	}
 	s := &Service{printers: append([]config.Printer(nil), printers...), settings: settings, client: client, frames: frames, state: state, commands: commands, log: log, workers: map[string]*worker{}, now: time.Now, kPoll: time.Second, kHint: 30 * time.Second, kRunningHint: 5 * time.Second, kFresh: 15 * time.Second, kCheck: 25 * time.Second, kConfirm: 30 * time.Second}
 	s.newClient = func(settings Settings, log *slog.Logger) DecisionClient { return NewClient(settings, log) }

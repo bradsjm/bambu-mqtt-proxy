@@ -254,6 +254,8 @@ notifications:
         user_key: ""
 platecheck:
     enabled: false
+    provider: cloudflare
+    account_id: ""
     endpoint: ""
     api_key: ""
     model: clef

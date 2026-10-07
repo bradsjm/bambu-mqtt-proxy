@@ -154,47 +154,53 @@ main input:user-invalid { border-color: var(--error); }
             padding: .55rem; border: 1px solid var(--line); border-radius: 9px; background: var(--bg); }
 .listener input[type=number] { max-width: none; }
 .listener .tls { display: inline-flex; align-items: center; gap: .4rem; font-size: .85rem; color: var(--dim); }
-.listener input[type=text]:disabled, #f-ai-key:disabled, #f-clef-key:disabled, #f-clef-endpoint:disabled { opacity: .4; }
+.listener input[type=text]:disabled, #f-ai-key:disabled, #f-platecheck-key:disabled, #f-platecheck-provider:disabled,
+#f-platecheck-account:disabled, #f-platecheck-endpoint:disabled { opacity: .4; }
 
-/* Clef plate check: slider and dry-run result items. */
+/* Test status lines: muted while busy, colored once a result arrives. In a
+   settings row the line wraps below its button. */
+.test-status { margin: 0; font-size: .85rem; color: var(--dim); }
+.test-status[data-state="ok"] { color: var(--ok); }
+.test-status[data-state="error"] { color: var(--error); }
+.control:has(> .test-status) { flex-wrap: wrap; align-items: center; }
+.control > .test-status { flex: 1 1 100%; text-align: right; }
+
+/* Plate check: slider and dry-run result items. */
 .control.range { align-items: center; gap: .75rem; }
 .control.range input[type=range] { flex: 1; min-width: 0; min-height: 44px; margin: 0; cursor: pointer; }
 .control.range output { min-width: 4ch; text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
-.clef-status { margin: 0; color: var(--text); }
-.clef-status:empty { display: none; }
-.clef-status.stale { color: var(--pending); }
-.clef-results { display: grid; gap: .6rem; margin-top: .75rem; }
-.clef-results:empty { display: none; }
-.clef-results.stale .clef-item { opacity: .5; }
-.clef-item { display: grid; grid-template-columns: minmax(0, 15rem) minmax(0, 1fr); gap: .75rem 1rem; align-items: start;
-             padding: .75rem; border: 1px solid var(--line); border-radius: 9px; background: var(--bg); }
-.clef-item.open { grid-template-columns: minmax(0, 1fr); }
-#f-clef-endpoint-hint code { overflow-wrap: anywhere; }
-.clef-shot { margin: 0; min-width: 0; }
-.clef-thumb { display: block; width: 100%; padding: 0; border: 1px solid var(--line); border-radius: 7px; overflow: hidden;
-              background: var(--panel); cursor: zoom-in; }
-.clef-item.open .clef-thumb { cursor: zoom-out; }
-.clef-thumb img { display: block; width: 100%; height: auto; }
-.clef-noimg { display: grid; place-items: center; aspect-ratio: 16 / 9; border: 1px dashed var(--line); border-radius: 7px;
-              color: var(--dim); font-size: .82rem; }
-.clef-shot figcaption { margin-top: .35rem; color: var(--dim); font: .75rem/1.4 var(--mono); font-variant-numeric: tabular-nums;
-                        overflow-wrap: anywhere; }
-.clef-body { min-width: 0; display: grid; gap: .45rem; }
-.clef-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: .35rem .75rem; }
-.clef-name { margin: 0; font-size: .95rem; font-weight: 650; overflow-wrap: anywhere; }
-.clef-name .mono { margin-left: .4rem; color: var(--dim); font-size: .78rem; font-weight: 500; letter-spacing: .06em; }
-.clef-chip { display: inline-flex; align-items: center; gap: .4rem; padding: .15rem .55rem; border-radius: 999px;
-             border: 1px solid var(--line); font-size: .78rem; font-weight: 650; white-space: nowrap; color: var(--dim); }
-.clef-chip::before { content: ""; width: .45rem; height: .45rem; border-radius: 50%; background: currentColor; }
-.clef-chip[data-decision="would_stop"] { color: var(--error); border-color: color-mix(in srgb, var(--error) 45%, var(--line)); }
-.clef-chip[data-decision="below_threshold"], .clef-chip[data-decision="error"] { color: var(--pending);
-             border-color: color-mix(in srgb, var(--pending) 40%, var(--line)); }
-.clef-chip[data-decision="clear"] { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, var(--line)); }
-.clef-note { margin: 0; color: var(--dim); font-size: .84rem; }
-.clef-scores { display: grid; grid-template-columns: auto 1fr; gap: .2rem .9rem; margin: 0; font-size: .84rem; }
-.clef-scores dt { color: var(--dim); }
-.clef-scores dd { margin: 0; font-family: var(--mono); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
-.clef-foot { margin: .75rem 0 0; }
+.platecheck-results { display: grid; gap: .6rem; }
+.platecheck-results:empty { display: none; }
+.platecheck-item { display: grid; grid-template-columns: minmax(0, 15rem) minmax(0, 1fr); gap: .75rem 1rem; align-items: start;
+                   padding: .75rem; border: 1px solid var(--line); border-radius: 9px; background: var(--bg); }
+.platecheck-item.open { grid-template-columns: minmax(0, 1fr); }
+.platecheck-shot { margin: 0; min-width: 0; }
+.platecheck-thumb { display: block; width: 100%; padding: 0; border: 1px solid var(--line); border-radius: 7px; overflow: hidden;
+                    background: var(--panel); cursor: zoom-in; }
+.platecheck-item.open .platecheck-thumb { cursor: zoom-out; }
+.platecheck-thumb img { display: block; width: 100%; height: auto; }
+.platecheck-noimg { display: grid; place-items: center; aspect-ratio: 16 / 9; border: 1px dashed var(--line); border-radius: 7px;
+                    color: var(--dim); font-size: .82rem; }
+.platecheck-shot figcaption { margin-top: .35rem; color: var(--dim); font: .75rem/1.4 var(--mono); font-variant-numeric: tabular-nums;
+                              overflow-wrap: anywhere; }
+.platecheck-body { min-width: 0; display: grid; gap: .45rem; }
+.platecheck-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: .35rem .75rem; }
+.platecheck-name { margin: 0; font-size: .95rem; font-weight: 650; overflow-wrap: anywhere; }
+.platecheck-name .mono { margin-left: .4rem; color: var(--dim); font-size: .78rem; font-weight: 500; letter-spacing: .06em; }
+.platecheck-chip { display: inline-flex; align-items: center; gap: .4rem; padding: .15rem .55rem; border-radius: 999px;
+                   border: 1px solid var(--line); font-size: .78rem; font-weight: 650; white-space: nowrap; color: var(--dim); }
+.platecheck-chip::before { content: ""; width: .45rem; height: .45rem; border-radius: 50%; background: currentColor; }
+.platecheck-chip[data-decision="would_stop"] { color: var(--error); border-color: color-mix(in srgb, var(--error) 45%, var(--line)); }
+.platecheck-chip[data-decision="below_threshold"], .platecheck-chip[data-decision="error"] { color: var(--pending);
+                   border-color: color-mix(in srgb, var(--pending) 40%, var(--line)); }
+.platecheck-chip[data-decision="clear"] { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, var(--line)); }
+.platecheck-chip[data-decision="pending"] { color: var(--focus); border-color: color-mix(in srgb, var(--focus) 40%, var(--line)); }
+.platecheck-chip[data-decision="pending"]::before { animation: pulse 1.2s infinite; }
+.platecheck-note { margin: 0; color: var(--dim); font-size: .84rem; }
+.platecheck-scores { display: grid; grid-template-columns: auto 1fr; gap: .2rem .9rem; margin: 0; font-size: .84rem; }
+.platecheck-scores dt { color: var(--dim); }
+.platecheck-scores dd { margin: 0; font-family: var(--mono); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.platecheck-foot { margin: .75rem 0 0; }
 
 .btn { display: inline-flex; align-items: center; justify-content: center; gap: .45rem; padding: .5rem .95rem;
        border-radius: 9px; border: 1px solid var(--line); background: var(--panel-2); cursor: pointer;
@@ -250,7 +256,8 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
   .control { justify-content: flex-start; }
   .listener { grid-template-columns: 1fr auto auto; }
   .listener input[type=text] { grid-column: 1 / -1; }
-  .clef-item { grid-template-columns: 1fr; }
+  .platecheck-item { grid-template-columns: 1fr; }
+  .control > .test-status { text-align: left; }
   .pair { grid-template-columns: 1fr; }
   .savebar .msg span { font-size: .85rem; }
   .bar nav a span { display: none; }
@@ -382,7 +389,7 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
 
   <section aria-labelledby="ai-h">
     <div class="sec-head"><h2 id="ai-h">AI detection</h2></div>
-    <p class="sec-lede">Optional print-failure detection through OctoEverywhere's Gadget service, and an optional build-plate check at print start through a Clef endpoint.</p>
+    <p class="sec-lede">Optional print-failure detection through OctoEverywhere's Gadget service, and an optional build-plate check at print start through a vision model provider.</p>
     <div class="groups">
       <fieldset class="group">
         <legend>Gadget AI</legend>
@@ -399,56 +406,76 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
           <div class="control"><input id="f-ai-key" type="password" autocomplete="new-password" spellcheck="false" data-field="detection.api_key"></div>
         </div>
         <div class="row">
-          <div><span class="label">Test API key</span>
+          <div><span class="label">Test</span>
             <span class="hint">Asks OctoEverywhere to create one context, proving the key works. No images are uploaded; the provider may associate this key with your public IP.</span></div>
           <div class="control"><button class="btn quiet" type="button" id="ai-test">Test API key</button>
-            <span id="ai-test-status" role="status" aria-live="polite"></span></div>
+            <span class="test-status" id="ai-test-status" role="status" aria-live="polite" hidden></span></div>
         </div>
       </fieldset>
 
-      <fieldset class="group" id="clef">
-        <legend>Clef plate check</legend>
+      <fieldset class="group" id="platecheck">
+        <legend>Vision checks</legend>
         <div class="row">
-          <div><label for="f-clef">Plate check</label>
-            <span class="hint" id="f-clef-hint">When a print starts, the proxy uploads one current camera snapshot to the Clef endpoint. If the chamber light is off, the proxy turns it on for the snapshot. If the plate looks occupied above the cutoff, the proxy sends Stop to the printer without asking. If the check fails or the view is unclear, the print continues. This is a best-effort check at print start, not a safety interlock.</span>
-            <span class="env" id="clef-blocked" hidden></span></div>
-          <div class="control"><input id="f-clef" class="switch" type="checkbox" role="switch" aria-describedby="f-clef-hint" data-field="platecheck.enabled"></div>
+          <div><label for="f-platecheck">Plate check at print start</label>
+            <span class="hint" id="f-platecheck-hint">When a print starts, the proxy uploads one current camera snapshot to the selected provider. If the chamber light is off, the proxy turns it on for the snapshot. If the plate looks occupied above the cutoff, the proxy sends Stop to the printer without asking. If the check fails or the view is unclear, the print continues. This is a best-effort check at print start, not a safety interlock.</span>
+            <span class="env" id="platecheck-blocked" hidden></span></div>
+          <div class="control"><input id="f-platecheck" class="switch" type="checkbox" role="switch" aria-describedby="f-platecheck-hint" data-field="platecheck.enabled"></div>
         </div>
         <div class="row">
-          <div><label for="f-clef-endpoint">Endpoint</label>
-            <span class="hint" id="f-clef-endpoint-hint">The full HTTPS URL of the Workers AI Clef model or of a self-hosted Clef service, for example <code>https://api.cloudflare.com/client/v4/accounts/ACCOUNT_ID/ai/run/@cf/cloudflare/clef</code>.</span>
-            <span class="env" data-env="platecheck_endpoint" id="f-clef-endpoint-env" hidden></span></div>
-          <div class="control"><input id="f-clef-endpoint" type="url" inputmode="url" autocomplete="off" spellcheck="false" placeholder="https://" aria-describedby="f-clef-endpoint-hint" data-field="platecheck.endpoint"></div>
-        </div>
-        <div class="row">
-          <div><label for="f-clef-key">API key</label>
-            <span class="hint" id="f-clef-key-hint">A Cloudflare API token with Workers AI access, or the key of your Clef service. It is stored in the config file and never shown here.</span>
-            <span class="env" data-env="platecheck_api_key" hidden></span></div>
-          <div class="control"><input id="f-clef-key" type="password" autocomplete="new-password" spellcheck="false" aria-describedby="f-clef-key-hint" data-field="platecheck.api_key"></div>
-        </div>
-        <div class="row">
-          <div><label for="f-clef-model">Model</label>
-            <span class="hint" id="f-clef-model-hint">Clef Flash answers faster. For a Workers AI endpoint, the model must match the end of the URL.</span></div>
-          <div class="control"><select id="f-clef-model" aria-describedby="f-clef-model-hint" data-field="platecheck.model" style="max-width:12rem">
-            <option value="clef">Clef</option><option value="clef-flash">Clef Flash</option>
+          <div><label for="f-platecheck-provider">Service provider</label>
+            <span class="hint" id="f-platecheck-provider-hint">Cloudflare runs the plate-check models on Workers AI. Custom sends requests to your own HTTPS endpoint, which must accept the same request and answer format.</span>
+            <span class="env" data-env="platecheck_provider" hidden></span></div>
+          <div class="control"><select id="f-platecheck-provider" aria-describedby="f-platecheck-provider-hint" data-field="platecheck.provider" style="max-width:12rem">
+            <option value="cloudflare">Cloudflare</option><option value="custom">Custom</option>
           </select></div>
         </div>
+        <div class="row" data-provider="cloudflare">
+          <div><label for="f-platecheck-account">Account ID</label>
+            <span class="hint" id="f-platecheck-account-hint">Your Cloudflare account ID, 32 hexadecimal characters, shown in the Cloudflare dashboard.</span>
+            <span class="env" data-env="platecheck_account_id" id="f-platecheck-account-env" hidden></span></div>
+          <div class="control"><input id="f-platecheck-account" class="mono" type="text" autocomplete="off" spellcheck="false" placeholder="32-character account ID" aria-describedby="f-platecheck-account-hint" data-field="platecheck.account_id"></div>
+        </div>
+        <div class="row" data-provider="custom">
+          <div><label for="f-platecheck-endpoint">Endpoint</label>
+            <span class="hint" id="f-platecheck-endpoint-hint">The full HTTPS URL of your endpoint.</span>
+            <span class="env" data-env="platecheck_endpoint" id="f-platecheck-endpoint-env" hidden></span></div>
+          <div class="control"><input id="f-platecheck-endpoint" type="url" inputmode="url" autocomplete="off" spellcheck="false" placeholder="https://" aria-describedby="f-platecheck-endpoint-hint" data-field="platecheck.endpoint"></div>
+        </div>
+        <div class="row" data-provider="cloudflare">
+          <div><label for="f-platecheck-model">Model</label>
+            <span class="hint" id="f-platecheck-model-hint">The Flash model answers faster.</span></div>
+          <div class="control"><select id="f-platecheck-model" aria-describedby="f-platecheck-model-hint" data-field="platecheck.model" style="max-width:12rem">
+            <option value="clef">Clef</option>
+            <option value="clef-flash">Clef Flash</option>
+          </select></div>
+        </div>
+        <div class="row" data-provider="custom">
+          <div><label for="f-platecheck-model-custom">Model</label>
+            <span class="hint" id="f-platecheck-model-custom-hint">The model name your endpoint expects.</span></div>
+          <div class="control"><input id="f-platecheck-model-custom" type="text" autocomplete="off" spellcheck="false" aria-describedby="f-platecheck-model-custom-hint" data-field="platecheck.model"></div>
+        </div>
         <div class="row">
-          <div><label for="f-clef-threshold">Stop above</label>
-            <span class="hint" id="f-clef-threshold-hint">The proxy stops a print only when the occupied score is above this value. Higher values mean fewer stops. A score equal to this value does not stop.</span></div>
-          <div class="control range"><input id="f-clef-threshold" type="range" min="50" max="99" step="1" value="50" aria-describedby="f-clef-threshold-hint" aria-valuetext="Stop above 50 percent" data-field="platecheck.stop_confidence" data-type="percent">
-            <output id="f-clef-threshold-out" for="f-clef-threshold" class="mono">50%</output></div>
+          <div><label for="f-platecheck-key">API key</label>
+            <span class="hint" id="f-platecheck-key-hint">A Cloudflare API token with Workers AI access, or the key of your custom endpoint. It is stored in the config file and never shown here.</span>
+            <span class="env" data-env="platecheck_api_key" hidden></span></div>
+          <div class="control"><input id="f-platecheck-key" type="password" autocomplete="new-password" spellcheck="false" aria-describedby="f-platecheck-key-hint" data-field="platecheck.api_key"></div>
+        </div>
+        <div class="row">
+          <div><label for="f-platecheck-threshold">Stop above</label>
+            <span class="hint" id="f-platecheck-threshold-hint">The proxy stops a print only when the occupied score is above this value. Higher values mean fewer stops. A score equal to this value does not stop.</span></div>
+          <div class="control range"><input id="f-platecheck-threshold" type="range" min="50" max="99" step="1" value="50" aria-describedby="f-platecheck-threshold-hint" aria-valuetext="Stop above 50 percent" data-field="platecheck.stop_confidence" data-type="percent">
+            <output id="f-platecheck-threshold-out" for="f-platecheck-threshold" class="mono">50%</output></div>
         </div>
         <div class="row">
           <div><span class="label">Test</span>
-            <span class="hint" id="clef-test-hint">Checks the key, then one current snapshot from each camera on the running proxy, one printer at a time. Uses the values on this page. Saves nothing and sends no notification or printer command. Snapshots are uploaded to the endpoint.</span></div>
-          <div class="control"><button class="btn quiet" type="button" id="clef-test" aria-describedby="clef-test-hint">Test plate check</button></div>
+            <span class="hint" id="platecheck-test-hint">Checks the key, then takes one current snapshot from each online printer with a supported camera, all at the same time. Offline printers are skipped. Uses the values on this page. Saves nothing and sends no notification or printer command. Snapshots are uploaded to the provider.</span></div>
+          <div class="control"><button class="btn quiet" type="button" id="platecheck-test" aria-describedby="platecheck-test-hint">Test plate check</button>
+            <span class="test-status" id="platecheck-test-status" role="status" aria-live="polite" hidden></span></div>
         </div>
-        <div class="row wide" id="clef-results-row" hidden>
+        <div class="row wide" id="platecheck-results-row" hidden>
           <div>
-            <p class="clef-status" id="clef-test-status" role="status" aria-live="polite"></p>
-            <div class="clef-results" id="clef-results"></div>
-            <p class="hint clef-foot" id="clef-foot">Dry run: nothing was saved and no printer received a command. Unsaved printer and camera changes apply after Save and apply. Detailed scores are in the browser console at the Info and Verbose levels, and in the server log at the info and debug levels.</p>
+            <div class="platecheck-results" id="platecheck-results"></div>
+            <p class="hint platecheck-foot" id="platecheck-foot">Dry run: nothing was saved and no printer received a command. Unsaved printer and camera changes apply after Save and apply. Detailed scores are in the browser console at the Info and Verbose levels, and in the server log at the info and debug levels.</p>
           </div>
         </div>
       </fieldset>
@@ -491,7 +518,7 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
           <div><span class="label">Test</span>
             <span class="hint">Sends one message to confirm delivery. Nothing is saved.</span></div>
           <div class="control"><button class="btn quiet" type="button" id="notify-test">Send test notification</button>
-            <span id="notify-test-status" role="status" aria-live="polite"></span></div>
+            <span class="test-status" id="notify-test-status" role="status" aria-live="polite" hidden></span></div>
         </div>
       </fieldset>
     </div>
@@ -526,8 +553,8 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
     </div>
     <div class="field">
       <label for="p-address">Address</label>
-      <input id="p-address" type="text" required autocomplete="off" spellcheck="false" placeholder="192.168.1.42:8883">
-      <p class="hint">The printer's IP address and MQTT port.</p>
+      <input id="p-address" type="text" required autocomplete="off" spellcheck="false" placeholder="192.168.1.42">
+      <p class="hint">The printer's IP address or host name. Port 8883 is used unless you add another, for example 192.168.1.42:1883.</p>
     </div>
     <div class="field">
       <label for="p-code">Access code</label>
@@ -545,7 +572,7 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
       <label class="check"><input id="p-skip" type="checkbox"><span>Skip certificate check<span class="hint">Printers use self-signed certificates, so this is normally on.</span></span></label>
     </details>
     <p class="dlg-error" id="dlg-error" role="alert" hidden></p>
-    <p class="hint" id="p-test-status" role="status" aria-live="polite" hidden></p>
+    <p class="test-status" id="p-test-status" role="status" aria-live="polite" hidden></p>
     <div class="dlg-foot">
       <button class="btn quiet" type="button" id="dlg-cancel">Cancel</button>
       <button class="btn" type="button" id="p-test">Test connection</button>
@@ -677,7 +704,7 @@ function renderFields() {
   }
   pushoverHints();
   aiHints();
-  clefHints();
+  platecheckHints();
 }
 
 /* The sanitized API never returns notification credentials; the stored
@@ -716,29 +743,38 @@ function aiHints() {
   }
 }
 
-/* The sanitized API never returns the Clef key. endpoint and has_api_key
-   are EFFECTIVE values: BMBPX_PLATECHECK_ENDPOINT and
-   BMBPX_PLATECHECK_API_KEY win whenever they exist, even empty, so their
-   fields lock and the env badges explain. The server validates the
-   effective override; the page never reads a locked field as user input. */
-function clefHints() {
+/* The sanitized API never returns the plate-check key. provider,
+   account_id, endpoint, and has_api_key are EFFECTIVE values: the
+   BMBPX_PLATECHECK_* variables win whenever they exist, even empty, so their
+   fields lock and the env badges explain. One destination variable locks
+   every destination field, because the server binds the key to the whole
+   destination. The server validates the effective override; the page never
+   reads a locked field as user input. */
+function platecheckHints() {
   if (!cfg) return;
   const pc = cfg.platecheck;
-  $("#clef").hidden = !pc;
+  $("#platecheck").hidden = !pc;
   if (!pc) return;
   const env = meta.env_overrides;
-  const key = $("#f-clef-key"), endpoint = $("#f-clef-endpoint");
+  for (const row of document.querySelectorAll("#platecheck [data-provider]")) row.hidden = row.dataset.provider !== pc.provider;
+  const provider = $("#f-platecheck-provider"), account = $("#f-platecheck-account");
+  const endpoint = $("#f-platecheck-endpoint"), key = $("#f-platecheck-key");
+  const locked = !!(env.platecheck_provider || env.platecheck_account_id || env.platecheck_endpoint);
+  provider.disabled = account.disabled = endpoint.disabled = locked;
   key.disabled = !!env.platecheck_api_key;
-  endpoint.disabled = !!env.platecheck_endpoint;
   key.placeholder = !key.disabled && pc.has_api_key && !key.value ? "Stored. Leave blank to keep it" : "";
   endpoint.placeholder = endpoint.disabled ? "" : "https://";
+  account.placeholder = account.disabled ? "" : "32-character account ID";
   if (env.platecheck_endpoint && !String(pc.endpoint || "").trim()) {
-    $("#f-clef-endpoint-env").textContent = `${env.platecheck_endpoint} is set but empty, so there is no endpoint. Set the variable or turn plate check off.`;
+    $("#f-platecheck-endpoint-env").textContent = `${env.platecheck_endpoint} is set but empty, so there is no endpoint. Set the variable or turn plate check off.`;
   }
-  const range = $("#f-clef-threshold"), pct = Number(range.value);
-  $("#f-clef-threshold-out").textContent = `${pct}%`;
+  if (env.platecheck_account_id && !String(pc.account_id || "").trim()) {
+    $("#f-platecheck-account-env").textContent = `${env.platecheck_account_id} is set but empty, so there is no account ID. Set the variable or turn plate check off.`;
+  }
+  const range = $("#f-platecheck-threshold"), pct = Number(range.value);
+  $("#f-platecheck-threshold-out").textContent = `${pct}%`;
   range.setAttribute("aria-valuetext", `Stop above ${pct} percent`);
-  const blocked = $("#clef-blocked"), camEnv = env.camera_enabled;
+  const blocked = $("#platecheck-blocked"), camEnv = env.camera_enabled;
   blocked.hidden = camerasOn() || !pc.enabled;
   if (!blocked.hidden) {
     blocked.innerHTML = camEnv
@@ -749,9 +785,10 @@ function clefHints() {
 
 function render() {
   renderFile(); renderNotices(); renderPlates(); renderListeners(); renderFields(); refreshDirty();
-  invalidatePrinterTest();
-  invalidateAiTest();
-  invalidateClefTest(false);
+  printerTest.invalidate();
+  notifyTest.invalidate();
+  aiTest.invalidate();
+  plateTest.invalidate();
 }
 
 /* ---- Change tracking and the save bar ---- */
@@ -816,32 +853,12 @@ function validateForm() {
     }
     return false;
   }
-  // Locked fields hold environment values, which the server validates.
-  const pc = cfg.platecheck, env = meta.env_overrides;
-  if (pc && !env.platecheck_endpoint) {
-    const endpoint = $("#f-clef-endpoint"), value = String(pc.endpoint || "").trim();
-    if (value && (!endpoint.checkValidity() || !/^https:\/\//i.test(value))) {
-      setBar("error", "Enter the full HTTPS URL of the Clef endpoint.");
-      endpoint.focus();
-      return false;
-    }
-    if (pc.enabled && !value) {
-      setBar("error", "Enter the Clef endpoint or turn plate check off.");
-      endpoint.focus();
-      return false;
-    }
-  }
-  if (pc && pc.enabled && !env.platecheck_api_key && !pc.has_api_key && !String(pc.api_key || "").trim()) {
-    setBar("error", "Enter the Clef API key or turn plate check off.");
-    $("#f-clef-key").focus();
-    return false;
-  }
   return true;
 }
 
 async function save() {
   if (!validateForm()) return;
-  invalidateClefTest(false);
+  plateTest.invalidate();
   const oldGen = meta.generation;
   setBar("busy", "Saving…");
   let res, body;
@@ -923,7 +940,7 @@ function openPrinter(i) {
   $("#p-model").placeholder = "Detected from serial";
   $("#p-more").open = false;
   $("#dlg-error").hidden = true;
-  invalidatePrinterTest();
+  printerTest.invalidate();
   codeHint();
   dlg.showModal();
   $(i >= 0 ? "#p-name" : "#p-serial").focus();
@@ -955,7 +972,7 @@ function submitPrinter(e) {
   const code = $("#p-code").value;
   if (!serial) return fail("Enter the printer's serial number.", $("#p-serial"));
   if (cfg.printers.some((p, i) => i !== editing && p.serial === serial)) return fail(`Printer ${serial} is already on the list.`, $("#p-serial"));
-  if (!address) return fail("Enter the printer's address, for example 192.168.1.42:8883.", $("#p-address"));
+  if (!address) return fail("Enter the printer's IP address or host name, for example 192.168.1.42.", $("#p-address"));
   if (!code && codeNeeded()) return fail("Enter the printer's access code.", $("#p-code"));
   const prev = editing >= 0 ? cfg.printers[editing] : {};
   const p = {
@@ -992,77 +1009,105 @@ $("#dlg-form").addEventListener("submit", submitPrinter);
 $("#dlg-cancel").addEventListener("click", () => dlg.close());
 $("#p-address").addEventListener("input", codeHint);
 
-/* ---- Printer connection test: one bounded connect with the draft
-   settings, no subscriptions and no commands. Any input change or dialog
-   close invalidates the run — aborting the request — so a late answer
-   never lands anywhere. ---- */
-let pTestSeq = 0, pTestAbort = null;
-function invalidatePrinterTest() {
-  pTestSeq++;
-  if (pTestAbort) { pTestAbort.abort(); pTestAbort = null; }
-  const b = $("#p-test"), out = $("#p-test-status");
-  b.disabled = false;
-  out.hidden = true;
-  out.textContent = "";
+/* ---- Test controls. Every Test button on this page uses one runner: a run
+   sequence, an AbortController, a disabled button while running, and one
+   status line whose data-state is busy, ok, or error. invalidate() aborts a
+   request in flight and clears the result, so a late answer never lands. ---- */
+function testRunner(button, status, onClear = () => {}) {
+  let seq = 0, abort = null;
+  function invalidate() {
+    seq++;
+    abort?.abort();
+    abort = null;
+    button.disabled = false;
+    status.textContent = "";
+    status.dataset.state = "";
+    status.hidden = true;
+    onClear();
+  }
+  async function run(task) {
+    invalidate();
+    const mine = seq, controller = new AbortController();
+    abort = controller;
+    button.disabled = true;
+    const live = () => mine === seq;
+    const report = (state, text) => {
+      if (!live()) return;
+      status.dataset.state = state;
+      status.textContent = text;
+      status.hidden = false;
+    };
+    try {
+      await task({ signal: controller.signal, live, report });
+    } catch {
+      report("error", "The proxy could not be reached.");
+    } finally {
+      if (abort === controller) abort = null;
+      if (live()) button.disabled = false;
+    }
+  }
+  return { invalidate, run };
 }
-for (const id of ["p-serial", "p-address", "p-code", "p-user", "p-tls", "p-skip"]) {
-  $("#" + id).addEventListener("input", invalidatePrinterTest);
+async function postJSON(url, payload, signal) {
+  const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, signal, body: JSON.stringify(payload) });
+  const body = await res.json().catch(() => null);
+  return { res, body: body && typeof body === "object" ? body : {} };
 }
-dlg.addEventListener("close", invalidatePrinterTest);
-$("#p-test").addEventListener("click", async () => {
+const failText = (res, body) => typeof body?.error === "string" && body.error ? body.error : `The test failed with status ${res.status}.`;
+
+/* Printer connection test: one bounded connect with the draft settings, no
+   subscriptions and no commands. Editing a dialog input that the test sends,
+   or closing the dialog, clears the result. */
+const printerTest = testRunner($("#p-test"), $("#p-test-status"));
+for (const id of ["p-serial", "p-name", "p-model", "p-address", "p-code", "p-user", "p-tls", "p-skip"]) {
+  $("#" + id).addEventListener("input", () => printerTest.invalidate());
+}
+dlg.addEventListener("close", () => printerTest.invalidate());
+$("#p-test").addEventListener("click", () => {
   const fail = (msg, el) => { $("#dlg-error").textContent = msg; $("#dlg-error").hidden = false; el.focus(); };
   const serial = $("#p-serial").value.trim().toUpperCase();
   const address = $("#p-address").value.trim();
   const code = $("#p-code").value;
   if (!serial) return fail("Enter the printer's serial number.", $("#p-serial"));
-  if (!address) return fail("Enter the printer's address, for example 192.168.1.42:8883.", $("#p-address"));
+  if (!address) return fail("Enter the printer's IP address or host name, for example 192.168.1.42.", $("#p-address"));
   if (!code && codeNeeded()) return fail("Enter the printer's access code.", $("#p-code"));
-  const b = $("#p-test"), out = $("#p-test-status");
-  const seq = ++pTestSeq;
-  const abort = new AbortController();
-  pTestAbort = abort;
-  b.disabled = true;
-  out.hidden = false;
-  out.textContent = "Connecting…";
-  try {
-    const res = await fetch("/config/printers/test", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      signal: abort.signal,
-      body: JSON.stringify({
-        serial, name: $("#p-name").value.trim(), model: $("#p-model").value.trim(), address,
-        tls: $("#p-tls").checked, insecure_skip_verify: $("#p-skip").checked,
-        username: $("#p-user").value.trim() || "bblp",
-        has_access_code: false, access_code: code,
-      }),
-    });
-    const body = await res.json().catch(() => ({}));
-    if (seq !== pTestSeq || !dlg.open) return;   // superseded inputs or a closed dialog
-    out.textContent = res.ok
-      ? "Connected. The printer accepted the username and access code."
-      : body.error || `The test failed with status ${res.status}.`;
-  } catch {
-    if (seq !== pTestSeq || !dlg.open) return;
-    out.textContent = "The proxy could not be reached.";
-  } finally {
-    if (pTestAbort === abort) pTestAbort = null;
-    if (seq === pTestSeq) b.disabled = false;
-  }
+  const payload = {
+    serial, name: $("#p-name").value.trim(), model: $("#p-model").value.trim(), address,
+    tls: $("#p-tls").checked, insecure_skip_verify: $("#p-skip").checked,
+    username: $("#p-user").value.trim() || "bblp",
+    has_access_code: false, access_code: code,
+  };
+  printerTest.run(async ({ signal, live, report }) => {
+    report("busy", "Connecting…");
+    const { res, body } = await postJSON("/config/printers/test", payload, signal);
+    if (!live() || !dlg.open) return;   // superseded inputs or a closed dialog
+    if (res.ok) report("ok", "Connected. The printer accepted the username and access code.");
+    else report("error", failText(res, body));
+  });
 });
 
 $("#main").addEventListener("input", e => {
   const el = e.target;
-  if (el.dataset.field) {
+  const field = el.dataset.field;
+  if (field) {
     const t = el.dataset.type;
     let v = el.type === "checkbox" ? el.checked : el.value;
     if (t === "int") v = el.value === "" ? 0 : Number(el.value);
     if (t === "lines") v = el.value.split("\n").map(s => s.trim()).filter(Boolean);
     if (t === "percent") v = Number(el.value) / 100;
-    setPath(el.dataset.field, v);
-    if (el.dataset.field.startsWith("notifications.pushover.")) pushoverHints();
-    if (el.dataset.field === "camera_enabled" || el.dataset.field.startsWith("detection.")) aiHints();
-    if (el.dataset.field === "camera_enabled" || el.dataset.field.startsWith("platecheck.")) clefHints();
-    if (CLEF_TEST_FIELDS.has(el.dataset.field)) invalidateClefTest(true);
+    setPath(field, v);
+    // The Cloudflare model select and the custom model field share one value.
+    if (field === "platecheck.provider") {
+      if (v === "cloudflare" && !CLOUDFLARE_MODELS.includes(cfg.platecheck.model)) setPath("platecheck.model", CLOUDFLARE_MODELS[0]);
+      $("#f-platecheck-model").value = cfg.platecheck.model;
+      $("#f-platecheck-model-custom").value = cfg.platecheck.model;
+    }
+    if (field.startsWith("notifications.pushover.")) pushoverHints();
+    if (field === "camera_enabled" || field.startsWith("detection.")) aiHints();
+    if (field === "camera_enabled" || field.startsWith("platecheck.")) platecheckHints();
+    if (field.startsWith("notifications.")) notifyTest.invalidate();
+    if (field.startsWith("detection.")) aiTest.invalidate();
+    if (PLATECHECK_TEST_FIELDS.has(field)) plateTest.invalidate();
   } else if (el.dataset.l) {
     const l = cfg.listen[Number(el.dataset.l)], k = el.dataset.k;
     l[k] = k === "tls" ? el.checked : k === "port" ? Number(el.value) : el.value;
@@ -1070,82 +1115,46 @@ $("#main").addEventListener("input", e => {
   }
   refreshDirty();
 });
-$("#notify-test").addEventListener("click", async () => {
-  const b = $("#notify-test"), out = $("#notify-test-status");
-  b.disabled = true;
-  out.textContent = "Sending…";
-  try {
-    const res = await fetch("/config/notifications/test", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(cfg.notifications),
-    });
-    const body = await res.json().catch(() => ({}));
-    out.textContent = res.ok ? "Sent. Check your phone." :
-      body.error || `The test failed with status ${res.status}.`;
-  } catch {
-    out.textContent = "The proxy could not be reached.";
-  } finally {
-    b.disabled = false;
-  }
-});
 
-/* ---- Gadget API key test: one free CreateContext call, no images. The
-   button works with detection off; changing the key field, reloading, or
-   discarding invalidates the result and aborts a request in flight. ---- */
-let aiTestSeq = 0, aiTestAbort = null;
-function invalidateAiTest() {
-  aiTestSeq++;
-  if (aiTestAbort) { aiTestAbort.abort(); aiTestAbort = null; }
-  $("#ai-test").disabled = false;
-  $("#ai-test-status").textContent = "";
-}
-$("#f-ai-key").addEventListener("input", invalidateAiTest);
-$("#ai-test").addEventListener("click", async () => {
-  const b = $("#ai-test"), out = $("#ai-test-status");
-  const seq = ++aiTestSeq;
-  const abort = new AbortController();
-  aiTestAbort = abort;
-  b.disabled = true;
-  out.textContent = "Checking…";
-  try {
-    const res = await fetch("/config/detection/test", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      signal: abort.signal,
-      body: JSON.stringify(cfg.detection),
-    });
-    const body = await res.json().catch(() => ({}));
-    if (seq !== aiTestSeq) return;   // the key changed while checking
-    out.textContent = res.ok
-      ? "Key verified. OctoEverywhere accepted it and created a context; no images were uploaded."
-      : body.error || `The test failed with status ${res.status}.`;
-  } catch {
-    if (seq !== aiTestSeq) return;
-    out.textContent = "The proxy could not be reached.";
-  } finally {
-    if (aiTestAbort === abort) aiTestAbort = null;
-    if (seq === aiTestSeq) b.disabled = false;
-  }
-});
+/* Pushover test: one message with the values on this page. */
+const notifyTest = testRunner($("#notify-test"), $("#notify-test-status"));
+$("#notify-test").addEventListener("click", () => notifyTest.run(async ({ signal, report }) => {
+  report("busy", "Sending…");
+  const { res, body } = await postJSON("/config/notifications/test", cfg.notifications, signal);
+  if (res.ok) report("ok", "Sent. Check your phone.");
+  else report("error", failText(res, body));
+}));
 
-/* ---- Clef plate check test: one key check, then one dry-run evaluation
-   of a current snapshot from each running camera. The server computes
-   every decision; the page only shows it. Editing the endpoint, key,
-   model, or cutoff aborts a run in flight and marks finished results
-   stale. Reload, discard, and save clear them. No timers, no polling. ---- */
-const CLEF_TEST_FIELDS = new Set(["platecheck.endpoint", "platecheck.api_key", "platecheck.model", "platecheck.stop_confidence"]);
-const CLEF_LABELS = { would_stop: "Would stop", below_threshold: "Below cutoff", clear: "Clear", inconclusive: "Inconclusive", error: "Check failed" };
-let clefTestSeq = 0, clefTestAbort = null, clefTestState = "idle"; // idle | running | done | stale
+/* Gadget API key test: one free CreateContext call, no images. The button
+   works with detection off. */
+const aiTest = testRunner($("#ai-test"), $("#ai-test-status"));
+$("#ai-test").addEventListener("click", () => aiTest.run(async ({ signal, report }) => {
+  report("busy", "Checking key…");
+  const { res, body } = await postJSON("/config/detection/test", cfg.detection, signal);
+  if (res.ok) report("ok", "Key verified. OctoEverywhere accepted it and created a context; no images were uploaded.");
+  else report("error", failText(res, body));
+}));
+
+/* ---- Plate check test: one key check, then one dry-run evaluation of a
+   current snapshot from each online printer with a supported camera. The
+   server streams one JSON event per line (start, one result per printer,
+   done) and computes every decision; the page only shows it. ---- */
+const PLATECHECK_TEST_FIELDS = new Set(["platecheck.provider", "platecheck.account_id", "platecheck.endpoint",
+  "platecheck.api_key", "platecheck.model", "platecheck.stop_confidence"]);
+// The model select lists the Cloudflare model IDs; the first one is the default.
+const CLOUDFLARE_MODELS = [...$("#f-platecheck-model").options].map(o => o.value);
+const PLATE_LABELS = { would_stop: "Would stop", below_threshold: "Below cutoff", clear: "Clear", inconclusive: "Inconclusive",
+  error: "Check failed", skipped: "Skipped" };
+const plural = (k, one, many) => `${k} ${k === 1 ? one : many}`;
 
 /* Console records carry only these fields, as numbers, booleans, or short
    plain strings: never images, credentials, endpoints, or whole objects. */
-const CLEF_LOG_FIELDS = ["run", "outcome", "status", "cameras", "model", "cutoff", "checked", "failed", "would_stop",
+const PLATE_LOG_FIELDS = ["run", "outcome", "status", "model", "cutoff", "checked", "failed", "skipped", "would_stop",
   "elapsed_ms", "serial", "printer_model", "decision", "p_clear", "p_occupied", "p_assessable", "error_code",
   "image_bytes", "width", "height", "captured_at", "frame_sequence"];
-function clefLog(level, fields) {
+function plateLog(level, fields) {
   const out = {};
-  for (const k of CLEF_LOG_FIELDS) {
+  for (const k of PLATE_LOG_FIELDS) {
     const v = fields[k];
     if (typeof v === "number" && Number.isFinite(v)) out[k] = v;
     else if (typeof v === "boolean") out[k] = v;
@@ -1154,202 +1163,225 @@ function clefLog(level, fields) {
   (level === "debug" ? console.debug : console.info)("plate check", out);
 }
 
-function setClefStatus(text, stale = false) {
-  const out = $("#clef-test-status");
-  out.textContent = text;
-  out.classList.toggle("stale", stale);
-}
+let plateRuns = 0, plateActive = 0;   // console run numbers; plateActive is the run still in flight
+const plateTest = testRunner($("#platecheck-test"), $("#platecheck-test-status"), () => {
+  $("#platecheck-results").replaceChildren();
+  $("#platecheck-results-row").hidden = true;
+  if (plateActive) plateLog("info", { run: plateActive, outcome: "aborted" });
+  plateActive = 0;
+});
 
-function invalidateClefTest(stale) {
-  const run = clefTestSeq, state = clefTestState;
-  if (stale && (state === "idle" || state === "stale")) return;
-  clefTestSeq++;
-  if (clefTestAbort) { clefTestAbort.abort(); clefTestAbort = null; }
-  $("#clef-test").disabled = false;
-  if (stale && state === "done") {
-    clefTestState = "stale";
-    $("#clef-results").classList.add("stale");
-    setClefStatus("Settings changed after this test. Run it again to see current decisions.", true);
-    clefLog("info", { run, outcome: "stale" });
-    return;
-  }
-  clefTestState = "idle";
-  $("#clef-results").replaceChildren();
-  $("#clef-results").classList.remove("stale");
-  if (stale && state === "running") {
-    setClefStatus("The test stopped because the settings changed. Run it again.", true);
-    clefLog("info", { run, outcome: "aborted" });
-    return;
-  }
-  setClefStatus("");
-  $("#clef-results-row").hidden = true;
-  if (state === "running") clefLog("info", { run, outcome: "aborted" });
-}
-
-const clefNumber = v => typeof v === "number" && Number.isFinite(v) ? v : null;
+const plateNumber = v => typeof v === "number" && Number.isFinite(v) ? v : null;
 
 /* Fixed digits, extended while the rounded value would read as equal to a
    different reference value, so a score never seems to match the cutoff. */
-function clefDigits(v, ref, scale, digits) {
+function plateDigits(v, ref, scale, digits) {
   let d = digits, s = (v * scale).toFixed(d);
   if (ref !== null && v !== ref) while (d < 9 && s === (ref * scale).toFixed(d)) s = (v * scale).toFixed(++d);
   return s;
 }
-const clefScore = (v, ref) => `${clefDigits(v, ref, 1, 3)} (${clefDigits(v, ref, 100, 1)}%)`;
+const plateScore = (v, ref) => `${plateDigits(v, ref, 1, 3)} (${plateDigits(v, ref, 100, 1)}%)`;
 
-function clefEl(tag, cls, text) {
+function plateEl(tag, cls, text) {
   const el = document.createElement(tag);
   if (cls) el.className = cls;
   if (text !== undefined) el.textContent = text;
   return el;
 }
 
-function clefRow(row, answer) {
+/* One result card: the image column, and a body that starts with the
+   printer name, its serial, and a decision chip. */
+function plateCard(row, label, decision) {
   const name = typeof row.name === "string" && row.name ? row.name : "Unnamed printer";
   const serial = typeof row.serial === "string" ? row.serial : "";
-  const decision = typeof row.decision === "string" ? row.decision : "";
-  const cutoff = clefNumber(answer.cutoff), min = clefNumber(answer.assessable_min);
-  const cutPct = cutoff === null ? null : Math.round(cutoff * 100);
-  const item = clefEl("article", "clef-item");
+  const item = plateEl("article", "platecheck-item");
+  item.dataset.serial = serial;
   item.setAttribute("aria-label", `Plate check result for ${name}`);
+  const shot = plateEl("figure", "platecheck-shot");
+  const body = plateEl("div", "platecheck-body");
+  const head = plateEl("div", "platecheck-head");
+  const title = plateEl("h3", "platecheck-name", name);
+  if (serial) title.append(plateEl("span", "mono", serial));
+  const chip = plateEl("span", "platecheck-chip", label);
+  chip.dataset.decision = decision;
+  head.append(title, chip);
+  body.append(head);
+  item.append(shot, body);
+  return { item, shot, body, name };
+}
 
-  const shot = clefEl("figure", "clef-shot");
+function platePending(printer) {
+  const { item, shot, body } = plateCard(printer, "Checking", "pending");
+  shot.append(plateEl("div", "platecheck-noimg", "No image yet"));
+  body.append(plateEl("p", "platecheck-note", "Capturing and evaluating a snapshot…"));
+  return item;
+}
+
+function plateRow(row, answer) {
+  const decision = typeof row.decision === "string" ? row.decision : "";
+  const cutoff = plateNumber(answer.cutoff), min = plateNumber(answer.assessable_min);
+  const cutPct = cutoff === null ? null : Math.round(cutoff * 100);
+  const { item, shot, body, name } = plateCard(row, PLATE_LABELS[decision] || "Unknown result", decision);
+
   const img = row.image;
   const data = img && img.type === "image/jpeg" && typeof img.data === "string" && /^[A-Za-z0-9+/]+={0,2}$/.test(img.data) ? img.data : "";
   if (data) {
-    const button = clefEl("button", "clef-thumb");
+    const button = plateEl("button", "platecheck-thumb");
     button.type = "button";
     button.setAttribute("aria-expanded", "false");
     button.setAttribute("aria-label", `Snapshot from ${name} at full width`);
     const pic = document.createElement("img");
     pic.alt = "";
-    const w = clefNumber(img.width), h = clefNumber(img.height);
+    const w = plateNumber(img.width), h = plateNumber(img.height);
     if (w && h) { pic.width = w; pic.height = h; }
     pic.src = "data:image/jpeg;base64," + data;
     button.append(pic);
     shot.append(button);
   } else {
-    shot.append(clefEl("div", "clef-noimg", "No image"));
+    shot.append(plateEl("div", "platecheck-noimg", "No image"));
   }
   const facts = [];
   const when = typeof row.captured_at === "string" ? new Date(row.captured_at) : null;
   if (when && !Number.isNaN(when.getTime())) facts.push(when.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "medium" }));
-  const iw = clefNumber(img?.width), ih = clefNumber(img?.height);
+  const iw = plateNumber(img?.width), ih = plateNumber(img?.height);
   if (data && iw && ih) facts.push(`${iw}×${ih}`);
-  const bytes = clefNumber(row.image_bytes);
+  const bytes = plateNumber(row.image_bytes);
   if (bytes) facts.push(`${(bytes / 1024).toFixed(1)} KB`);
-  const seq = clefNumber(row.frame_sequence);
+  const seq = plateNumber(row.frame_sequence);
   if (seq !== null) facts.push(`frame ${seq}`);
-  if (facts.length) shot.append(clefEl("figcaption", "", facts.join(" · ")));
-
-  const body = clefEl("div", "clef-body");
-  const head = clefEl("div", "clef-head");
-  const title = clefEl("h3", "clef-name", name);
-  if (serial) title.append(clefEl("span", "mono", serial));
-  const chip = clefEl("span", "clef-chip", CLEF_LABELS[decision] || "Unknown result");
-  chip.dataset.decision = decision;
-  head.append(title, chip);
-  body.append(head);
+  if (facts.length) shot.append(plateEl("figcaption", "", facts.join(" · ")));
 
   const cut = cutPct === null ? "the cutoff" : `the ${cutPct}% cutoff`;
-  const error = typeof row.error === "string" && row.error ? row.error : "The check failed.";
+  const error = typeof row.error === "string" && row.error ? row.error : "";
   const notes = {
     would_stop: `The occupied score is above ${cut}. Dry run: at print start the proxy would stop this print. No command was sent.`,
     below_threshold: `The plate may be occupied, but the occupied score is not above ${cut}. The print would continue.`,
     clear: "The plate looks clear. The print would continue.",
     inconclusive: `The view is not clear enough to judge${min === null ? "" : `: the assessable score is below ${Math.round(min * 100)}%`}. The print would continue.`,
-    error: `${error} The print would continue.`,
+    error: `${error || "The check failed."} The print would continue.`,
+    skipped: error || "This printer was skipped.",
   };
-  body.append(clefEl("p", "clef-note", notes[decision] || "The proxy returned a decision that this page does not know."));
+  body.append(plateEl("p", "platecheck-note", notes[decision] || "The proxy returned a decision that this page does not know."));
 
-  const scores = clefEl("dl", "clef-scores");
-  const add = (label, value) => scores.append(clefEl("dt", "", label), clefEl("dd", "", value));
-  const pOcc = clefNumber(row.p_occupied), pClear = clefNumber(row.p_clear), pView = clefNumber(row.p_assessable);
-  if (pOcc !== null) add("Occupied", clefScore(pOcc, cutoff));
-  if (pClear !== null) add("Clear", clefScore(pClear, cutPct === null ? null : (100 - cutPct) / 100));
-  if (pView !== null) add("Assessable", clefScore(pView, min));
+  const scores = plateEl("dl", "platecheck-scores");
+  const add = (label, value) => scores.append(plateEl("dt", "", label), plateEl("dd", "", value));
+  const pOcc = plateNumber(row.p_occupied), pClear = plateNumber(row.p_clear), pView = plateNumber(row.p_assessable);
+  if (pOcc !== null) add("Occupied", plateScore(pOcc, cutoff));
+  if (pClear !== null) add("Clear", plateScore(pClear, cutPct === null ? null : (100 - cutPct) / 100));
+  if (pView !== null) add("Assessable", plateScore(pView, min));
   if (cutoff !== null) add("Stop above", `${cutoff.toFixed(2)} (${cutPct}%)`);
   if (typeof answer.model === "string" && answer.model) add("Model", answer.model);
   if (typeof row.model === "string" && row.model) add("Printer", row.model);
   if (typeof row.error_code === "string" && row.error_code) add("Error code", row.error_code);
   body.append(scores);
-  item.append(shot, body);
   return item;
 }
 
-$("#clef-results").addEventListener("click", e => {
-  const b = e.target.closest(".clef-thumb");
+$("#platecheck-results").addEventListener("click", e => {
+  const b = e.target.closest(".platecheck-thumb");
   if (!b) return;
-  const open = b.closest(".clef-item").classList.toggle("open");
+  const open = b.closest(".platecheck-item").classList.toggle("open");
   b.setAttribute("aria-expanded", String(open));
 });
 
-$("#clef-test").addEventListener("click", async () => {
+$("#platecheck-test").addEventListener("click", () => {
   if (!cfg || !cfg.platecheck) return;
-  invalidateClefTest(false);
-  const b = $("#clef-test"), list = $("#clef-results");
-  const seq = ++clefTestSeq, abort = new AbortController();
-  clefTestAbort = abort;
-  clefTestState = "running";
-  b.disabled = true;
-  $("#clef-results-row").hidden = false;
-  setClefStatus("Checking key and current snapshots…");
-  const started = performance.now();
-  const body = JSON.stringify(cfg.platecheck);
-  const model = cfg.platecheck.model, cutoff = cfg.platecheck.stop_confidence;
-  clefLog("info", { run: seq, outcome: "started", model, cutoff });
-  const post = url => fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, signal: abort.signal, body });
-  const finish = (text, outcome, extra = {}) => {
-    clefTestState = "done";
-    setClefStatus(text);
-    clefLog("info", { run: seq, outcome, model, cutoff, elapsed_ms: Math.round(performance.now() - started), ...extra });
-  };
-  try {
-    const res = await post("/config/platecheck/test");
-    const key = await res.json().catch(() => ({}));
-    if (seq !== clefTestSeq) return;   // settings changed, reloaded, or saved
-    if (!res.ok) {
-      const msg = typeof key?.error === "string" && key.error ? key.error : `The key check failed with status ${res.status}.`;
-      return finish(msg, "key_failed", { status: res.status });
-    }
-    if (!camerasOn()) return finish("Key verified. Cameras are off, so no snapshots were checked.", "cameras_off", { status: res.status });
-    if (!cfg.printers.length) return finish("Key verified. Add and save printers to check snapshots.", "no_printers", { status: res.status });
-    const snap = await post("/platecheck/snapshots");
-    if (seq !== clefTestSeq) return;
-    if (snap.status === 404) return finish("Key verified. Snapshot checks start after printers and cameras are saved and applied.", "not_mounted", { status: 404 });
-    const answer = await snap.json().catch(() => null);
-    if (seq !== clefTestSeq) return;
-    if (!snap.ok) {
-      const msg = typeof answer?.error === "string" && answer.error ? answer.error : `The snapshot check failed with status ${snap.status}.`;
-      return finish(`Key verified. ${msg}`, "snapshots_failed", { status: snap.status });
-    }
-    if (!answer || answer.dry_run !== true || !Array.isArray(answer.printers)) {
-      return finish("The proxy returned an unexpected answer.", "unexpected", { status: snap.status });
-    }
-    if (answer.cameras === "none") return finish("Key verified. No configured printer has a supported camera.", "no_cameras", { status: snap.status, cameras: "none" });
-    const rows = answer.printers.filter(r => r && typeof r === "object");
-    list.replaceChildren(...rows.map(r => clefRow(r, answer)));
-    for (const r of rows) {
-      clefLog("debug", {
-        run: seq, serial: r.serial, printer_model: r.model, decision: r.decision,
-        p_clear: r.p_clear, p_occupied: r.p_occupied, p_assessable: r.p_assessable, error_code: r.error_code,
-        image_bytes: r.image_bytes, width: r.image?.width, height: r.image?.height,
-        captured_at: r.captured_at, frame_sequence: r.frame_sequence,
+  const payload = structuredClone(cfg.platecheck);
+  plateTest.run(async ({ signal, live, report }) => {
+    const run = ++plateRuns;
+    plateActive = run;
+    const started = performance.now();
+    const model = payload.model, cutoff = payload.stop_confidence;
+    const finish = (state, text, outcome, extra = {}) => {
+      if (!live()) return;
+      plateActive = 0;
+      report(state, text);
+      plateLog("info", { run, outcome, model, cutoff, elapsed_ms: Math.round(performance.now() - started), ...extra });
+    };
+    plateLog("info", { run, outcome: "started", model, cutoff });
+    try {
+      report("busy", "Checking API key…");
+      const key = await postJSON("/config/platecheck/test", payload, signal);
+      if (!live()) return;
+      if (!key.res.ok) return finish("error", failText(key.res, key.body), "key_failed", { status: key.res.status });
+      if (!camerasOn()) return finish("ok", "Key verified. Cameras are off, so no snapshots were checked.", "cameras_off", { status: key.res.status });
+      if (!cfg.printers.length) return finish("ok", "Key verified. Add and save printers to check snapshots.", "no_printers", { status: key.res.status });
+
+      report("busy", "Key verified. Checking which printers are online…");
+      const res = await fetch("/platecheck/snapshots", {
+        method: "POST", headers: { "Content-Type": "application/json" }, signal, body: JSON.stringify(payload),
       });
+      if (!live()) return;
+      if (res.status === 404) return finish("ok", "Key verified. Snapshot checks start after printers and cameras are saved and applied.", "not_mounted", { status: 404 });
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        return finish("error", `Key verified. ${failText(res, body)}`, "snapshots_failed", { status: res.status });
+      }
+      const unexpected = () => finish("error", "The proxy returned an unexpected answer.", "unexpected", { status: res.status });
+      if (!res.body) return unexpected();
+
+      $("#platecheck-results-row").hidden = false;
+      const list = $("#platecheck-results");
+      const rows = [];
+      let start = null, done = null;
+      // handle returns false when an event breaks the stream contract.
+      const handle = ev => {
+        if (done) return true;
+        if (!ev || typeof ev !== "object") return false;
+        if (!start) {
+          if (ev.type !== "start" || ev.dry_run !== true || !Array.isArray(ev.printers)) return false;
+          start = ev;
+          const printers = ev.printers.filter(p => p && typeof p === "object");
+          list.replaceChildren(...printers.map(platePending));
+          const online = printers.filter(p => p.status === "checking").length;
+          report("busy", `Key verified. ${online} of ${plural(printers.length, "printer", "printers")} online. Checking snapshots…`);
+          return true;
+        }
+        if (ev.type === "done") { done = ev; return true; }
+        if (ev.type !== "result" || !ev.printer || typeof ev.printer !== "object") return false;
+        const row = ev.printer;
+        rows.push(row);
+        const card = plateRow(row, start);
+        const slot = [...list.children].find(c => c.dataset.serial === card.dataset.serial);
+        if (slot) slot.replaceWith(card); else list.append(card);
+        plateLog("debug", {
+          run, serial: row.serial, printer_model: row.model, decision: row.decision,
+          p_clear: row.p_clear, p_occupied: row.p_occupied, p_assessable: row.p_assessable, error_code: row.error_code,
+          image_bytes: row.image_bytes, width: row.image?.width, height: row.image?.height,
+          captured_at: row.captured_at, frame_sequence: row.frame_sequence,
+        });
+        return true;
+      };
+      const consume = line => {
+        if (!line.trim()) return true;
+        try { return handle(JSON.parse(line)); } catch { return false; }
+      };
+
+      const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+      let buf = "", ok = true;
+      for (;;) {
+        const { value, done: end } = await reader.read();
+        if (!live()) { reader.cancel().catch(() => {}); return; }
+        const lines = (buf + (end ? "" : value)).split("\n");
+        buf = end ? "" : lines.pop();
+        ok = lines.every(consume);
+        if (!ok || end) break;
+      }
+      if (!ok || !done) { reader.cancel().catch(() => {}); return unexpected(); }
+
+      const failed = rows.filter(r => r.decision === "error").length;
+      const skipped = rows.filter(r => r.decision === "skipped").length;
+      const stops = rows.filter(r => r.decision === "would_stop").length;
+      const evaluated = rows.length - failed - skipped;
+      const summary = `Key verified. ${plural(rows.length, "printer", "printers")}: ${evaluated} evaluated, ${failed} failed, ${skipped} skipped. ` +
+        (stops ? `${plural(stops, "printer", "printers")} would stop. This is a dry run.` : "No printer would stop.");
+      finish(failed ? "error" : "ok", summary, done.outcome, {
+        status: res.status, model: start.model, cutoff: start.cutoff, checked: evaluated, failed, skipped, would_stop: stops,
+      });
+    } catch {
+      finish("error", "The proxy could not be reached.", "unreachable");
     }
-    const failed = rows.filter(r => r.decision === "error").length;
-    const stops = rows.filter(r => r.decision === "would_stop").length;
-    const n = rows.length, plural = (k, one, many) => `${k} ${k === 1 ? one : many}`;
-    const summary = `Key verified. ${plural(n, "printer", "printers")} checked: ${n - failed} evaluated, ${failed} failed. ` +
-      (stops ? `${plural(stops, "printer", "printers")} would stop. This is a dry run.` : "No printer would stop.");
-    finish(summary, "done", { status: snap.status, cameras: answer.cameras, model: answer.model, cutoff: answer.cutoff, checked: n, failed, would_stop: stops });
-  } catch {
-    if (seq !== clefTestSeq) return;
-    finish("The proxy could not be reached.", "unreachable");
-  } finally {
-    if (clefTestAbort === abort) clefTestAbort = null;
-    if (seq === clefTestSeq) b.disabled = false;
-  }
+  });
 });
 $("#listeners").addEventListener("click", e => {
   const b = e.target.closest("[data-drop]");

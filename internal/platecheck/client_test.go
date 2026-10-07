@@ -265,7 +265,7 @@ func TestClientPinsCredentialDestination(t *testing.T) {
 	if contacts != 0 {
 		t.Fatal("retained credential sent to a changed endpoint")
 	}
-	c = NewClient(Settings{Endpoint: "http://insecure.example/check", APIKey: "secret", Model: "clef"}, nil)
+	c = NewClient(Settings{Provider: ProviderCustom, Endpoint: "http://insecure.example/check", APIKey: "secret", Model: "clef"}, nil)
 	c.http = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) { t.Fatal("insecure credential request"); return nil, nil })}
 	if err := c.Probe(context.Background()); err == nil {
 		t.Fatal("insecure endpoint accepted")

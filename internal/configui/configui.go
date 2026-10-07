@@ -341,25 +341,28 @@ func (s *Store) handlePrinterTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if p.Address == "" {
-		writeError(w, http.StatusUnprocessableEntity, "Enter the printer's address, for example 192.168.1.42:8883.")
+		writeError(w, http.StatusUnprocessableEntity, "Enter the printer's IP address or host name, for example 192.168.1.42.")
 		return
 	}
 	if strings.Contains(p.Address, "://") {
-		writeError(w, http.StatusUnprocessableEntity, "Enter the address without a scheme, for example 192.168.1.42:8883.")
+		writeError(w, http.StatusUnprocessableEntity, "Enter the address without a scheme, for example 192.168.1.42.")
 		return
 	}
 	// URL delimiters never belong in a host:port. Without this check a
 	// userinfo or path fragment would reach the dialer or a URL parser and
 	// send the test somewhere the user did not type.
 	if strings.ContainsAny(p.Address, "/?#@") {
-		writeError(w, http.StatusUnprocessableEntity, "Enter the address as host:port, for example 192.168.1.42:8883.")
+		writeError(w, http.StatusUnprocessableEntity, "Enter the address as a host name or IP address with an optional port, for example 192.168.1.42 or 192.168.1.42:1883.")
 		return
 	}
+	// The page accepts a bare host, so the address is normalized to use the
+	// printer's fixed MQTT TLS port before the digit checks below.
+	p.Address = config.WithDefaultPrinterPort(p.Address)
 	// The port must be explicit and numeric: paho would otherwise dial the
 	// plain-MQTT default port 1883, which no Bambu printer serves.
 	host, port, err := net.SplitHostPort(p.Address)
 	if n, perr := strconv.Atoi(port); err != nil || host == "" || perr != nil || n < 1 || n > 65535 {
-		writeError(w, http.StatusUnprocessableEntity, "Enter the address as host:port, for example 192.168.1.42:8883.")
+		writeError(w, http.StatusUnprocessableEntity, "Enter the address as a host name or IP address with an optional port, for example 192.168.1.42 or 192.168.1.42:1883.")
 		return
 	}
 	if p.Password == "" {
@@ -384,7 +387,7 @@ func (s *Store) handlePrinterTest(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, fmt.Sprintf("Printer %s is already configured. Test is only available for new printers.", c.Serial))
 			return
 		}
-		if c.Address == p.Address {
+		if config.WithDefaultPrinterPort(c.Address) == p.Address {
 			writeError(w, http.StatusConflict, fmt.Sprintf("Address %s is already used by printer %s.", p.Address, c.Serial))
 			return
 		}
@@ -610,7 +613,7 @@ func (v View) toConfig(stored *config.Config) (*config.Config, error) {
 			switch {
 			case !ok || prev.Password == "":
 				return nil, fmt.Errorf("Enter the access code for printer %s.", out.Serial)
-			case prev.Address != out.Address:
+			case config.WithDefaultPrinterPort(prev.Address) != config.WithDefaultPrinterPort(out.Address):
 				return nil, fmt.Errorf("Enter the access code again for printer %s: its address changed.", out.Serial)
 			}
 			out.Password = prev.Password

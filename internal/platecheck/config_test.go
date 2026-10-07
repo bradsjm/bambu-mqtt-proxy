@@ -15,7 +15,7 @@ import (
 
 func TestMain(m *testing.M) { config.RegisterSection(ConfigSection); os.Exit(m.Run()) }
 func testSettings() Settings {
-	return Settings{Endpoint: "https://clef.example/check", APIKey: "private-key", Model: "clef", StopConfidence: .5}
+	return Settings{Provider: ProviderCustom, Endpoint: "https://vision.example/check", APIKey: "private-key", Model: "clef", StopConfidence: .5}
 }
 func settingsConfig(s Settings) *config.Config {
 	c := &config.Config{}
@@ -24,7 +24,7 @@ func settingsConfig(s Settings) *config.Config {
 }
 func unsetEnv(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{EnvEndpoint, EnvAPIKey} {
+	for _, k := range []string{EnvProvider, EnvAccountID, EnvEndpoint, EnvAPIKey} {
 		t.Setenv(k, "")
 		if err := os.Unsetenv(k); err != nil {
 			t.Fatal(err)
@@ -32,14 +32,14 @@ func unsetEnv(t *testing.T) {
 	}
 }
 func settingsJSON(s Settings) []byte {
-	b, _ := json.Marshal(settingsView{Enabled: s.On(), Endpoint: s.Endpoint, APIKey: s.APIKey, Model: s.Model, StopConfidence: s.StopConfidence})
+	b, _ := json.Marshal(settingsView{Enabled: s.On(), Provider: s.Provider, AccountID: s.AccountID, Endpoint: s.Endpoint, APIKey: s.APIKey, Model: s.Model, StopConfidence: s.StopConfidence})
 	return b
 }
 
 func TestConfigurationDefaultsAndEnable(t *testing.T) {
 	unsetEnv(t)
 	s, err := SettingsOf(&config.Config{})
-	if err != nil || s.On() || s.Model != "clef" || s.StopConfidence != .5 {
+	if err != nil || s.On() || s.Provider != ProviderCloudflare || s.Model != "clef" || s.StopConfidence != .5 {
 		t.Fatalf("default %+v %v", s, err)
 	}
 	for _, tc := range []struct {
@@ -55,7 +55,7 @@ func TestConfigurationDefaultsAndEnable(t *testing.T) {
 			t.Fatalf("On %+v", tc)
 		}
 	}
-	parsed, err := config.Parse([]byte("platecheck:\n  enabled: false\n  api_key: 012345\n  endpoint: https://a.example/check\n  model: clef-flash\n  stop_confidence: 0.7\n"))
+	parsed, err := config.Parse([]byte("platecheck:\n  enabled: false\n  provider: custom\n  api_key: 012345\n  endpoint: https://a.example/check\n  model: clef-flash\n  stop_confidence: 0.7\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +82,7 @@ func TestSettingsValidation(t *testing.T) {
 		{"fractional percent", func(s *Settings) { s.StopConfidence = .585 }, false},
 		{"nan", func(s *Settings) { s.StopConfidence = math.NaN() }, false},
 		{"inf", func(s *Settings) { s.StopConfidence = math.Inf(1) }, false},
-		{"bad disabled model", func(s *Settings) { s.Enabled = new(false); s.Model = "other" }, false},
+		{"blank disabled model", func(s *Settings) { s.Enabled = new(false); s.Model = "" }, false},
 		{"http", func(s *Settings) { s.Endpoint = "http://example/check" }, false},
 		{"relative", func(s *Settings) { s.Endpoint = "/check" }, false},
 		{"credential", func(s *Settings) { s.Endpoint = "https://user:secret@example/check" }, false},
@@ -90,9 +90,6 @@ func TestSettingsValidation(t *testing.T) {
 		{"empty query", func(s *Settings) { s.Endpoint = "https://example/check?" }, false},
 		{"fragment", func(s *Settings) { s.Endpoint = "https://example/check#secret" }, false},
 		{"disabled invalid endpoint", func(s *Settings) { s.Enabled = new(false); s.Endpoint = "http://example/check" }, false},
-		{"cloudflare mismatch", func(s *Settings) {
-			s.Endpoint = "https://api.cloudflare.com/client/v4/accounts/account/ai/run/@cf/cloudflare/clef-flash"
-		}, false},
 		{"enabled missing key", func(s *Settings) { s.Enabled = new(true); s.APIKey = "" }, false},
 		{"enabled missing endpoint", func(s *Settings) { s.Enabled = new(true); s.Endpoint = "" }, false},
 	} {
@@ -286,7 +283,7 @@ func TestConfigTestMissingCredentialsAndStoredEndpointUnderLock(t *testing.T) {
 			return settingsConfig(missing), nil
 		})
 		var page *config.PageError
-		if !errors.As(err, &page) || page.Status != 422 || !strings.HasPrefix(page.Message, "No Clef ") {
+		if !errors.As(err, &page) || page.Status != 422 || !strings.HasPrefix(page.Message, "No ") {
 			t.Fatalf("missing %s: %v", field, err)
 		}
 	}
@@ -428,5 +425,129 @@ func TestTypedKeyForLockedEffectiveEndpointIsNotSavedUnderStoredEndpoint(t *test
 				t.Fatalf("typed key changed the stored endpoint/key pair: %+v", saved)
 			}
 		})
+	}
+}
+
+func TestProviderValidationMessages(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		edit    func(*Settings)
+		env     string
+		require bool
+		message string
+	}{
+		{"provider", func(s *Settings) { s.Provider = "" }, "", false, "The plate-check provider must be cloudflare or custom."},
+		{"cutoff", func(s *Settings) { s.StopConfidence = .585 }, "", false, "Stop above must be a whole percentage from 50 through 99 percent."},
+		{"cloudflare endpoint", func(s *Settings) { s.Endpoint = "https://old.example/check" }, "", false, "The Cloudflare provider builds the endpoint from the account ID. Remove the endpoint or BMBPX_PLATECHECK_ENDPOINT, or choose the custom provider."},
+		{"cloudflare model", func(s *Settings) { s.Model = "other" }, "", false, "The Cloudflare model must be clef or clef-flash."},
+		{"account format", func(s *Settings) { s.AccountID = "xyz" }, "", false, "The Cloudflare account ID must be 32 hexadecimal characters."},
+		{"account empty env", func(s *Settings) { s.AccountID = "" }, EnvAccountID, true, EnvAccountID + " is set but empty, so there is no account ID to test. Set the variable to a valid account ID."},
+		{"account missing", func(s *Settings) { s.AccountID = "" }, "", true, "No Cloudflare account ID is configured. Enter the account ID or set BMBPX_PLATECHECK_ACCOUNT_ID."},
+		{"custom model", func(s *Settings) { s.Provider = ProviderCustom; s.Model = "" }, "", false, "Enter the model name for the custom endpoint."},
+		{"custom URL", func(s *Settings) { s.Provider = ProviderCustom; s.Endpoint = "http://example/check" }, "", false, "The endpoint must be a full HTTPS URL without credentials, a query, or a fragment."},
+		{"endpoint empty env", func(s *Settings) { s.Provider = ProviderCustom }, EnvEndpoint, true, EnvEndpoint + " is set but empty, so there is no endpoint to test. Set the variable to a valid HTTPS endpoint."},
+		{"endpoint missing", func(s *Settings) { s.Provider = ProviderCustom }, "", true, "No endpoint is configured. Enter an HTTPS endpoint or set BMBPX_PLATECHECK_ENDPOINT."},
+		{"key empty env", func(s *Settings) { s.APIKey = "" }, EnvAPIKey, true, EnvAPIKey + " is set but empty, so there is no key to test. Set the variable to a valid key."},
+		{"key missing", func(s *Settings) { s.APIKey = "" }, "", true, "No API key is configured. Enter a key or set BMBPX_PLATECHECK_API_KEY."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			unsetEnv(t)
+			s := Settings{Provider: ProviderCloudflare, AccountID: "0123456789abcdef0123456789abcdef", APIKey: "private-key", Model: "clef", StopConfidence: .5}
+			tc.edit(&s)
+			if tc.env != "" {
+				t.Setenv(tc.env, "")
+			}
+			_, err := validateSettings(s, tc.require)
+			if err == nil || err.Error() != tc.message {
+				t.Fatalf("error %v, want %q", err, tc.message)
+			}
+		})
+	}
+	unsetEnv(t)
+	s := testSettings()
+	s.Model = "  arbitrary model / with punctuation  "
+	got, err := validateSettings(s, true)
+	if err != nil || got.Model != strings.TrimSpace(s.Model) {
+		t.Fatalf("custom model %+v: %v", got, err)
+	}
+	old, err := config.Parse([]byte("platecheck:\n  endpoint: https://old.example/check\n  api_key: key\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ConfigSection.Validate(old); err == nil || !strings.HasPrefix(err.Error(), "The Cloudflare provider builds") {
+		t.Fatalf("legacy endpoint accepted: %v", err)
+	}
+}
+
+func TestCloudflareURLAndKeyBinding(t *testing.T) {
+	unsetEnv(t)
+	const account = "0123456789abcdef0123456789abcdef"
+	const other = "fedcba9876543210fedcba9876543210"
+	stored := Settings{Provider: ProviderCloudflare, AccountID: account, APIKey: "stored-key", Model: "clef-flash", StopConfidence: .5}
+	want := "https://api.cloudflare.com/client/v4/accounts/" + account + "/ai/run/@cf/cloudflare/clef-flash"
+	if stored.URL() != want || !stored.On() {
+		t.Fatalf("URL %s, on %v", stored.URL(), stored.On())
+	}
+	in := stored
+	in.AccountID = "  " + strings.ToUpper(account) + "  "
+	in.Model, in.APIKey = "clef", ""
+	out := &config.Config{}
+	if err := ConfigSection.Save(settingsJSON(in), settingsConfig(stored), out); err != nil {
+		t.Fatal(err)
+	}
+	saved, _ := SettingsOf(out)
+	if saved.Key() != stored.Key() || saved.Model != "clef" || saved.AccountID != account {
+		t.Fatalf("same account save %+v", saved)
+	}
+	in.AccountID = other
+	in.Enabled = new(false)
+	if err := ConfigSection.Save(settingsJSON(in), settingsConfig(stored), out); err != nil {
+		t.Fatal(err)
+	}
+	saved, _ = SettingsOf(out)
+	if saved.Key() != "" || saved.AccountID != other {
+		t.Fatalf("changed account save %+v", saved)
+	}
+	t.Setenv(EnvAccountID, other)
+	if effective := applyEnv(stored); effective.Key() != "" || effective.AccountID != other {
+		t.Fatalf("environment moved stored key: %+v", effective)
+	}
+	if _, err := resolveTestSettings(settingsView{Provider: ProviderCloudflare, AccountID: other, Model: "clef", StopConfidence: .5}, stored); err == nil || err.Error() != endpointKeyMessage {
+		t.Fatalf("diagnostic moved stored key: %v", err)
+	}
+	t.Setenv(EnvAPIKey, "paired-key")
+	view := ConfigSection.View(settingsConfig(stored)).(settingsView)
+	if view.AccountID != other || view.Provider != ProviderCloudflare || !view.HasAPIKey {
+		t.Fatalf("effective account view %+v", view)
+	}
+	raw, _ := json.Marshal(view)
+	if err := ConfigSection.Save(raw, settingsConfig(stored), out); err != nil {
+		t.Fatal(err)
+	}
+	saved, _ = SettingsOf(out)
+	if saved.AccountID != account || saved.Provider != stored.Provider || saved.Key() != stored.Key() || saved.Endpoint != "" {
+		t.Fatalf("locked destination changed file pair: %+v", saved)
+	}
+	if effective, err := resolveTestSettings(view, stored); err != nil || effective.Key() != "paired-key" || effective.AccountID != other {
+		t.Fatalf("paired account diagnostic %+v: %v", effective, err)
+	}
+	if ConfigSection.EnvOverrides()["platecheck_account_id"] != EnvAccountID {
+		t.Fatal("missing account lock")
+	}
+}
+
+// TestEnvKeyNotSentToSubmittedDestination checks that an environment key never follows a submitted destination that no variable pins.
+func TestEnvKeyNotSentToSubmittedDestination(t *testing.T) {
+	unsetEnv(t)
+	t.Setenv(EnvProvider, ProviderCustom)
+	t.Setenv(EnvAPIKey, "env-key")
+	stored := Settings{Provider: ProviderCustom, Endpoint: "https://stored.example/check", Model: "m", StopConfidence: .5}
+	view := settingsView{Provider: ProviderCustom, Endpoint: "https://attacker.example/check", Model: "m", StopConfidence: .5}
+	if _, err := resolveTestSettings(view, stored); err == nil || err.Error() != endpointKeyMessage {
+		t.Fatalf("different endpoint accepted: %v", err)
+	}
+	view.Endpoint = stored.Endpoint
+	if s, err := resolveTestSettings(view, stored); err != nil || s.Key() != "env-key" {
+		t.Fatalf("stored endpoint %+v %v", s, err)
 	}
 }

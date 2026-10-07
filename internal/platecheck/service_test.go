@@ -59,6 +59,7 @@ func (f *fakeState) edit(fn func(*telemetry.JobView, *telemetry.SessionView)) {
 
 type fakeCommands struct {
 	mu                  sync.Mutex
+	offline             map[string]bool
 	gen                 uint64
 	stops, lights       []uint64
 	stopErr, lightErr   error
@@ -66,6 +67,11 @@ type fakeCommands struct {
 }
 
 func (f *fakeCommands) Generation(string) uint64 { f.mu.Lock(); defer f.mu.Unlock(); return f.gen }
+func (f *fakeCommands) Connected(serial string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return !f.offline[serial]
+}
 func (f *fakeCommands) StopPrint(_ string, g uint64) error {
 	f.mu.Lock()
 	f.stops = append(f.stops, g)
@@ -94,6 +100,7 @@ func (f frameFunc) Capture(ctx context.Context, s string, t time.Time) (Frame, e
 }
 
 type fakeDecision struct {
+	mu     sync.Mutex
 	result Result
 	err    error
 	calls  int
@@ -102,7 +109,9 @@ type fakeDecision struct {
 
 func (f *fakeDecision) Probe(context.Context) error { return f.err }
 func (f *fakeDecision) Evaluate(context.Context, []byte, string) (Result, error) {
+	f.mu.Lock()
 	f.calls++
+	f.mu.Unlock()
 	if f.hook != nil {
 		f.hook()
 	}

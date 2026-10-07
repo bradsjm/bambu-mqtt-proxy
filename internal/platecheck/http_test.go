@@ -1,6 +1,7 @@
 package platecheck
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -13,7 +14,9 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -29,14 +32,64 @@ func snapshotRequest(s *Service, raw []byte) *httptest.ResponseRecorder {
 	s.handleSnapshots(w, req)
 	return w
 }
-func decodeSnapshots(t *testing.T, w *httptest.ResponseRecorder) snapshotResponse {
+
+type snapshotStream struct {
+	snapshotStart
+	Results map[string]snapshotRow
+	Rows    []snapshotRow
+	Done    snapshotDone
+}
+
+func decodeStream(t *testing.T, w *httptest.ResponseRecorder) snapshotStream {
 	t.Helper()
 	if w.Code != 200 {
 		t.Fatalf("HTTP %d %s", w.Code, w.Body.String())
 	}
-	var out snapshotResponse
-	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
-		t.Fatal(err)
+	if w.Header().Get("Content-Type") != "application/x-ndjson" {
+		t.Fatalf("content type %s", w.Header().Get("Content-Type"))
+	}
+	var out snapshotStream
+	out.Results = map[string]snapshotRow{}
+	lines := bytes.Split(bytes.TrimSpace(w.Body.Bytes()), []byte("\n"))
+	for i, line := range lines {
+		var event struct{ Type string }
+		if err := json.Unmarshal(line, &event); err != nil {
+			t.Fatal(err)
+		}
+		switch event.Type {
+		case "start":
+			if i != 0 {
+				t.Fatal("start must be first")
+			}
+			if err := json.Unmarshal(line, &out.snapshotStart); err != nil {
+				t.Fatal(err)
+			}
+		case "result":
+			if i == 0 || i == len(lines)-1 {
+				t.Fatal("result outside start/done")
+			}
+			var result snapshotResult
+			if err := json.Unmarshal(line, &result); err != nil {
+				t.Fatal(err)
+			}
+			if _, exists := out.Results[result.Printer.Serial]; exists {
+				t.Fatal("duplicate result")
+			}
+			out.Results[result.Printer.Serial] = result.Printer
+			out.Rows = append(out.Rows, result.Printer)
+		case "done":
+			if i != len(lines)-1 {
+				t.Fatal("done must be last")
+			}
+			if err := json.Unmarshal(line, &out.Done); err != nil {
+				t.Fatal(err)
+			}
+		default:
+			t.Fatalf("unexpected event %q", event.Type)
+		}
+	}
+	if out.Type != "start" || out.Done.Type != "done" || len(out.Results) != len(out.Printers) {
+		t.Fatalf("incomplete stream %+v", out)
 	}
 	return out
 }
@@ -47,8 +100,11 @@ func TestSnapshotRowsConfiguredOrderFailureContinuationAndNoControlEffects(t *te
 	clock := &testClock{t: time.Date(2026, 1, 1, 1, 0, 0, 0, time.UTC)}
 	data := testJPEG(t)
 	captures := []string{}
+	var captureMu sync.Mutex
 	frames := frameFunc(func(ctx context.Context, serial string, after time.Time) (Frame, error) {
+		captureMu.Lock()
 		captures = append(captures, serial)
+		captureMu.Unlock()
 		if serial == "01S1" {
 			return Frame{}, &safeError{code: "camera_unavailable"}
 		}
@@ -64,18 +120,24 @@ func TestSnapshotRowsConfiguredOrderFailureContinuationAndNoControlEffects(t *te
 	s.newClient = func(settings Settings, log *slog.Logger) DecisionClient { factoryCalls++; return client }
 	before := s.statusMap()
 	w := snapshotRequest(s, settingsJSON(testSettings()))
-	out := decodeSnapshots(t, w)
-	if !out.DryRun || out.Cameras != "available" || out.Model != "clef" || out.Cutoff != .5 || out.AssessableMin != .8 || len(out.Printers) != 4 {
+	out := decodeStream(t, w)
+	if !out.DryRun || out.Model != "clef" || out.Cutoff != .5 || out.AssessableMin != .8 || len(out.Printers) != 4 || out.Done.Outcome != "completed" {
 		t.Fatalf("response %+v", out)
 	}
-	if !reflect.DeepEqual(captures, []string{"01S1", "00M1", "0391"}) || client.calls != 2 || factoryCalls != 1 {
+	sort.Strings(captures)
+	if !reflect.DeepEqual(captures, []string{"00M1", "01S1", "0391"}) || client.calls != 2 || factoryCalls != 1 {
 		t.Fatalf("captures %v calls %d", captures, client.calls)
 	}
-	for i, row := range out.Printers {
-		if row.Serial != printers[i].Serial {
-			t.Fatal("order changed")
+	for i, p := range printers {
+		if out.Printers[i].Serial != p.Serial {
+			t.Fatal("start order changed")
 		}
-		if i == 0 || i == 3 {
+		row := out.Results[p.Serial]
+		if i == 3 {
+			if row.Decision != "skipped" || row.ErrorCode != "unsupported_camera" || row.Image != nil || row.PClear != nil {
+				t.Fatalf("unsupported row %+v", row)
+			}
+		} else if i == 0 {
 			if row.Decision != "error" || row.PClear != nil || row.Image != nil {
 				t.Fatalf("error row %+v", row)
 			}
@@ -94,7 +156,7 @@ func TestSnapshotRowsConfiguredOrderFailureContinuationAndNoControlEffects(t *te
 			t.Fatal("diagnostics changed automatic markers/activity")
 		}
 	}
-	if w.Header().Get("Cache-Control") != "no-store" || w.Header().Get("Content-Type") != "application/json" {
+	if w.Header().Get("Cache-Control") != "no-store" {
 		t.Fatal("headers")
 	}
 }
@@ -123,14 +185,14 @@ func TestSnapshotKeepsExactUploadedJPEGWithTLSProvider(t *testing.T) {
 	frames := frameFunc(func(ctx context.Context, serial string, after time.Time) (Frame, error) {
 		return Frame{JPEG: data, Seq: 7, Captured: after.Add(time.Nanosecond), Width: 8, Height: 6}, nil
 	})
-	s := New([]config.Printer{{Serial: "01S1", Model: "P1S"}}, settings, nil, frames, nil, nil, nil)
+	s := New([]config.Printer{{Serial: "01S1", Model: "P1S"}}, settings, nil, frames, nil, &fakeCommands{}, nil)
 	s.newClient = func(settings Settings, log *slog.Logger) DecisionClient {
 		c := NewClient(settings, log)
 		c.http.Transport = provider.Client().Transport
 		return c
 	}
-	out := decodeSnapshots(t, snapshotRequest(s, settingsJSON(settings)))
-	decoded, err := base64.StdEncoding.DecodeString(out.Printers[0].Image.Data)
+	out := decodeStream(t, snapshotRequest(s, settingsJSON(settings)))
+	decoded, err := base64.StdEncoding.DecodeString(out.Results["01S1"].Image.Data)
 	if err != nil || calls != 1 || !bytes.Equal(decoded, uploaded) || !bytes.Equal(decoded, data) {
 		t.Fatal("diagnostic image differs from upload")
 	}
@@ -146,7 +208,7 @@ func TestSnapshotValidationBeforeActivityAndEffectiveSettings(t *testing.T) {
 	running := testSettings()
 	running.Enabled = new(false)
 	running.APIKey = "running-key"
-	s := New([]config.Printer{{Serial: "01S1", Model: "P1S"}}, running, nil, frames, nil, nil, nil)
+	s := New([]config.Printer{{Serial: "01S1", Model: "P1S"}}, running, nil, frames, nil, &fakeCommands{}, nil)
 	var got Settings
 	s.newClient = func(settings Settings, log *slog.Logger) DecisionClient {
 		factory++
@@ -164,13 +226,13 @@ func TestSnapshotValidationBeforeActivityAndEffectiveSettings(t *testing.T) {
 	submitted.Enabled = new(false)
 	submitted.Model = "clef-flash"
 	submitted.StopConfidence = .73
-	out := decodeSnapshots(t, snapshotRequest(s, settingsJSON(submitted)))
+	out := decodeStream(t, snapshotRequest(s, settingsJSON(submitted)))
 	if out.Model != "clef-flash" || out.Cutoff != .73 || got.Key() != "running-key" {
 		t.Fatalf("effective settings %+v", got)
 	}
 	t.Setenv(EnvEndpoint, "https://env.example/evaluate")
 	t.Setenv(EnvAPIKey, "env-key")
-	_ = decodeSnapshots(t, snapshotRequest(s, settingsJSON(submitted)))
+	_ = decodeStream(t, snapshotRequest(s, settingsJSON(submitted)))
 	if got.Endpoint != "https://env.example/evaluate" || got.Key() != "env-key" {
 		t.Fatalf("env precedence %+v", got)
 	}
@@ -187,10 +249,10 @@ func TestSnapshotNoSupportedCamerasMakesNoCapture(t *testing.T) {
 		t.Fatal("capture without supported cameras")
 		return Frame{}, nil
 	})
-	s := New([]config.Printer{{Serial: "unknown", Model: "UNKNOWN"}}, testSettings(), nil, frames, nil, nil, nil)
+	s := New([]config.Printer{{Serial: "unknown", Model: "UNKNOWN"}}, testSettings(), nil, frames, nil, &fakeCommands{}, nil)
 	s.newClient = func(Settings, *slog.Logger) DecisionClient { t.Fatal("client without supported cameras"); return nil }
-	out := decodeSnapshots(t, snapshotRequest(s, settingsJSON(testSettings())))
-	if out.Cameras != "none" || len(out.Printers) != 0 {
+	out := decodeStream(t, snapshotRequest(s, settingsJSON(testSettings())))
+	if len(out.Printers) != 1 || out.Printers[0].Status != "unsupported" || out.Results["unknown"].Decision != "skipped" || out.Results["unknown"].ErrorCode != "unsupported_camera" {
 		t.Fatalf("none %+v", out)
 	}
 }
@@ -201,31 +263,36 @@ func TestSnapshotInferenceFailureRetainsImageAndSafeErrors(t *testing.T) {
 	f.s.newClient = func(Settings, *slog.Logger) DecisionClient {
 		return &fakeDecision{err: errors.New("secret-endpoint credential-marker\nforged")}
 	}
-	out := decodeSnapshots(t, snapshotRequest(f.s, settingsJSON(testSettings())))
-	row := out.Printers[0]
+	out := decodeStream(t, snapshotRequest(f.s, settingsJSON(testSettings())))
+	row := out.Results["01S1"]
 	if row.Image == nil || row.PClear != nil || row.Decision != "error" || row.ErrorCode != "endpoint_unreachable" || strings.Contains(row.Error, "marker") || strings.Contains(row.Error, "forged") {
 		t.Fatalf("error row %+v", row)
 	}
 }
 
-func TestSnapshotCancellationStopsFurtherCapturesAndUploads(t *testing.T) {
+func TestSnapshotCancellationStopsUploads(t *testing.T) {
 	unsetEnv(t)
-	captures, evaluations := 0, 0
+	var captures, evaluations atomic.Int32
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	frames := frameFunc(func(context.Context, string, time.Time) (Frame, error) {
-		captures++
+	frames := frameFunc(func(ctx context.Context, _ string, _ time.Time) (Frame, error) {
+		captures.Add(1)
 		cancel()
-		return Frame{}, context.Canceled
+		return Frame{}, ctx.Err()
 	})
-	s := New([]config.Printer{{Serial: "01S1", Model: "P1S"}, {Serial: "01S2", Model: "P1S"}}, testSettings(), nil, frames, nil, nil, nil)
-	s.newClient = func(Settings, *slog.Logger) DecisionClient { return &fakeDecision{hook: func() { evaluations++ }} }
+	s := New([]config.Printer{{Serial: "01S1", Model: "P1S"}, {Serial: "01S2", Model: "P1S"}}, testSettings(), nil, frames, nil, &fakeCommands{}, nil)
+	s.newClient = func(Settings, *slog.Logger) DecisionClient { return &fakeDecision{hook: func() { evaluations.Add(1) }} }
 	req := httptest.NewRequest("POST", "/platecheck/snapshots", bytes.NewReader(settingsJSON(testSettings()))).WithContext(ctx)
 	w := httptest.NewRecorder()
 	s.handleSnapshots(w, req)
-	out := decodeSnapshots(t, w)
-	if captures != 1 || evaluations != 0 || len(out.Printers) != 1 || out.Printers[0].ErrorCode != "canceled" {
-		t.Fatalf("canceled response %+v captures=%d uploads=%d", out, captures, evaluations)
+	out := decodeStream(t, w)
+	if captures.Load() != 2 || evaluations.Load() != 0 || len(out.Results) != 2 || out.Done.Outcome != "canceled" {
+		t.Fatalf("canceled response %+v captures=%d uploads=%d", out, captures.Load(), evaluations.Load())
+	}
+	for _, row := range out.Results {
+		if row.ErrorCode != "canceled" || row.Decision != "error" {
+			t.Fatalf("canceled row %+v", row)
+		}
 	}
 }
 
@@ -240,11 +307,11 @@ func TestSnapshotLogsSafeScoresAndMetadata(t *testing.T) {
 	frames := frameFunc(func(ctx context.Context, serial string, after time.Time) (Frame, error) {
 		return Frame{JPEG: data, Seq: 7, Captured: after.Add(time.Millisecond), Width: 8, Height: 6}, nil
 	})
-	s := New([]config.Printer{{Serial: "01S1", Model: "P1S"}}, settings, nil, frames, nil, nil, logger)
+	s := New([]config.Printer{{Serial: "01S1", Model: "P1S"}}, settings, nil, frames, nil, &fakeCommands{}, logger)
 	s.newClient = func(Settings, *slog.Logger) DecisionClient {
 		return &fakeDecision{result: Result{PClear: .127, POccupied: 1 - .127, PAssessable: .962}}
 	}
-	_ = decodeSnapshots(t, snapshotRequest(s, settingsJSON(settings)))
+	_ = decodeStream(t, snapshotRequest(s, settingsJSON(settings)))
 	for _, marker := range []string{"credential-marker", "endpoint-marker", "account-marker", base64.StdEncoding.EncodeToString(data)} {
 		if strings.Contains(logs.String(), marker) {
 			t.Fatalf("log leak %s", marker)
@@ -273,7 +340,7 @@ func TestDiagnosticPOSTsNeverMoveSavedOrEnvironmentKeys(t *testing.T) {
 				t.Setenv(EnvAPIKey, "environment-secret")
 			}
 			path := filepath.Join(t.TempDir(), "config.yaml")
-			file := "platecheck:\n  enabled: false\n  endpoint: " + base.Endpoint + "\n  api_key: stored-secret\n  model: clef\n  stop_confidence: 0.5\n"
+			file := "platecheck:\n  enabled: false\n  provider: custom\n  endpoint: " + base.Endpoint + "\n  api_key: stored-secret\n  model: clef\n  stop_confidence: 0.5\n"
 			if err := os.WriteFile(path, []byte(file), 0600); err != nil {
 				t.Fatal(err)
 			}
@@ -298,7 +365,7 @@ func TestDiagnosticPOSTsNeverMoveSavedOrEnvironmentKeys(t *testing.T) {
 			}
 			captures := 0
 			frames := frameFunc(func(context.Context, string, time.Time) (Frame, error) { captures++; return Frame{}, nil })
-			s := New([]config.Printer{{Serial: "01S1", Model: "P1S"}}, base, nil, frames, nil, nil, nil)
+			s := New([]config.Printer{{Serial: "01S1", Model: "P1S"}}, base, nil, frames, nil, &fakeCommands{}, nil)
 			s.newClient = func(settings Settings, log *slog.Logger) DecisionClient {
 				client := NewClient(settings, log)
 				client.http.Transport = attacker.Client().Transport
@@ -318,7 +385,7 @@ func TestDiagnosticPOSTsNeverMoveSavedOrEnvironmentKeys(t *testing.T) {
 func TestDiagnosticCredentialBindingAllowsTypedKeyAndPairedEnvironment(t *testing.T) {
 	unsetEnv(t)
 	base := testSettings()
-	in := settingsView{Endpoint: "https://new.example/check", APIKey: "typed-key", Model: "clef", StopConfidence: .5}
+	in := settingsView{Provider: ProviderCustom, Endpoint: "https://new.example/check", APIKey: "typed-key", Model: "clef", StopConfidence: .5}
 	effective, err := resolveTestSettings(in, base)
 	if err != nil || effective.APIKey != "typed-key" || effective.Endpoint != in.Endpoint {
 		t.Fatalf("explicit destination %+v %v", effective, err)
@@ -335,5 +402,107 @@ func TestDiagnosticCredentialBindingAllowsTypedKeyAndPairedEnvironment(t *testin
 	effective, err = resolveTestSettings(in, base)
 	if err != nil || effective.Endpoint != "https://configured.example/check" || effective.APIKey != "paired-environment-key" {
 		t.Fatalf("paired environment %+v %v", effective, err)
+	}
+}
+
+func TestSnapshotStreamSkipsOfflineAndRunsInParallel(t *testing.T) {
+	unsetEnv(t)
+	printers := []config.Printer{{Serial: "01S1", Model: "P1S"}, {Serial: "01S2", Model: "P1S"}, {Serial: "01S3", Model: "P1S"}}
+	data := testJPEG(t)
+	started := make(chan string, 2)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	frames := frameFunc(func(ctx context.Context, serial string, after time.Time) (Frame, error) {
+		if serial == "01S3" {
+			t.Error("offline printer captured")
+			return Frame{}, errors.New("offline")
+		}
+		deadline, ok := ctx.Deadline()
+		if !ok || deadline.After(time.Now().Add(snapshotCaptureTimeout)) {
+			t.Error("missing short capture deadline")
+		}
+		started <- serial
+		select {
+		case <-release:
+			return Frame{JPEG: data, Seq: 7, Captured: after.Add(time.Nanosecond)}, nil
+		case <-ctx.Done():
+			return Frame{}, ctx.Err()
+		}
+	})
+	s := New(printers, testSettings(), nil, frames, nil, &fakeCommands{offline: map[string]bool{"01S3": true}}, nil)
+	client := &fakeDecision{result: Result{PClear: .9, PAssessable: .9}}
+	factories := 0
+	s.newClient = func(Settings, *slog.Logger) DecisionClient { factories++; return client }
+	srv := httptest.NewServer(http.HandlerFunc(s.handleSnapshots))
+	defer func() { unblock(); srv.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL, bytes.NewReader(settingsJSON(testSettings())))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 || resp.Header.Get("Content-Type") != "application/x-ndjson" || resp.Header.Get("Cache-Control") != "no-store" {
+		t.Fatalf("stream headers: %d %v", resp.StatusCode, resp.Header)
+	}
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	captured := make([]string, 0, 2)
+	for range 2 {
+		select {
+		case serial := <-started:
+			captured = append(captured, serial)
+		case <-timer.C:
+			t.Fatal("online captures did not start in parallel")
+		}
+	}
+	sort.Strings(captured)
+	if !reflect.DeepEqual(captured, []string{"01S1", "01S2"}) {
+		t.Fatalf("captures %v", captured)
+	}
+	reader := bufio.NewReader(resp.Body)
+	first, err := reader.ReadBytes('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	var start snapshotStart
+	if err := json.Unmarshal(first, &start); err != nil {
+		t.Fatal(err)
+	}
+	if start.Type != "start" || len(start.Printers) != 3 || start.Printers[0].Status != "checking" || start.Printers[1].Status != "checking" || start.Printers[2].Status != "offline" {
+		t.Fatalf("start %+v", start)
+	}
+	second, err := reader.ReadBytes('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	var skipped snapshotResult
+	if err := json.Unmarshal(second, &skipped); err != nil {
+		t.Fatal(err)
+	}
+	if skipped.Type != "result" || skipped.Printer.Serial != "01S3" || skipped.Printer.Decision != "skipped" || skipped.Printer.ErrorCode != "printer_offline" {
+		t.Fatalf("skipped %+v", skipped)
+	}
+	unblock()
+	rest, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+	_, _ = w.Write(append(append(first, second...), rest...))
+	out := decodeStream(t, w)
+	if out.Done.Outcome != "completed" || factories != 1 || client.calls != 2 {
+		t.Fatalf("completion %+v, factories %d, calls %d", out.Done, factories, client.calls)
+	}
+	for _, serial := range captured {
+		if out.Results[serial].Decision != "clear" || out.Results[serial].Image == nil {
+			t.Fatalf("online row %+v", out.Results[serial])
+		}
 	}
 }

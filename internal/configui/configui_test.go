@@ -2,6 +2,7 @@ package configui
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 
@@ -828,5 +830,110 @@ func TestMetaCameraEnabledCarriesEffectiveOverride(t *testing.T) {
 	t.Setenv(config.EnvCameraEnable, "yes")
 	if got := get(t, srv).Meta.CameraEnabled; got != nil {
 		t.Fatalf("meta.camera_enabled = %v for an invalid override, want absent", *got)
+	}
+}
+
+// probeRecorder records the printers the printer-test endpoint probes.
+type probeRecorder struct {
+	mu     sync.Mutex
+	probed []string
+}
+
+// probe appends the probed address and reports success.
+func (r *probeRecorder) probe(_ context.Context, p config.Printer) error {
+	r.mu.Lock()
+	r.probed = append(r.probed, p.Address)
+	r.mu.Unlock()
+	return nil
+}
+
+// addresses returns the recorded addresses.
+func (r *probeRecorder) addresses() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.probed...)
+}
+
+// writeConfigAddress writes a one-printer file whose address is bare, so
+// the stored address has no port.
+func writeConfigAddress(t *testing.T, path, address string) {
+	t.Helper()
+	y := fmt.Sprintf(`printers:
+  - serial: "01P00A123456789"
+    address: %q
+    tls: true
+    insecure_skip_verify: true
+    password: "secret-code"
+`, address)
+	if err := os.WriteFile(path, []byte(y), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestPrinterTestDefaultPortAndNormalizedComparisons requires the printer
+// test to accept a bare host, normalize it to the default MQTT TLS port,
+// and compare stored addresses with the same normalization everywhere: the
+// destination duplicate check and the access-code address-change check.
+func TestPrinterTestDefaultPortAndNormalizedComparisons(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "c.yaml")
+	writeConfigAddress(t, path, "10.0.0.9")
+	store, srv := serve(t, path)
+	probe := &probeRecorder{}
+	store.probePrinter = probe.probe
+
+	// (a) A test POST with a bare host probes the normalized address.
+	body := `{"serial":"02SNEWPRINTER000","address":"192.168.1.50","tls":true,
+		"insecure_skip_verify":true,"username":"bblp","access_code":"12345678"}`
+	res, err := http.Post(srv.URL+"/config/printers/test", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("printer test = %d, want 200", res.StatusCode)
+	}
+	got := probe.addresses()
+	if len(got) != 1 || got[0] != "192.168.1.50:8883" {
+		t.Fatalf("probe addresses = %v, want [192.168.1.50:8883]", got)
+	}
+
+	// (b) A test of a new serial at the stored address, given bare, is a
+	// 409 duplicate reported with the normalized address.
+	body = `{"serial":"03SNEWPRINTER000","address":"10.0.0.9","tls":true,
+		"insecure_skip_verify":true,"username":"bblp","access_code":"12345678"}`
+	res, err = http.Post(srv.URL+"/config/printers/test", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dup map[string]any
+	_ = json.NewDecoder(res.Body).Decode(&dup)
+	res.Body.Close()
+	if res.StatusCode != http.StatusConflict {
+		t.Fatalf("duplicate-address test = %d %v, want 409", res.StatusCode, dup)
+	}
+	if msg, _ := dup["error"].(string); !strings.Contains(msg, "Address 10.0.0.9:8883 is already used") {
+		t.Fatalf("duplicate message = %q, want the normalized address", msg)
+	}
+	if got := probe.addresses(); len(got) != 1 {
+		t.Fatalf("duplicate check probed the printer: %v", got)
+	}
+
+	// (c) A save that round-trips the GET view keeps the stored access
+	// code although the GET shows the address with the appended port.
+	v := get(t, srv).Config
+	if len(v.Printers) != 1 || v.Printers[0].Address != "10.0.0.9:8883" {
+		t.Fatalf("view printers = %+v, want the normalized address", v.Printers)
+	}
+	v.Printers[0].PreviousSerial = v.Printers[0].Serial
+	v.Printers[0].AccessCode = ""
+	if code, body := put(t, srv, v); code != http.StatusOK {
+		t.Fatalf("save = %d %v, want 200 with the blank access code", code, body)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Printers) != 1 || cfg.Printers[0].Password != "secret-code" {
+		t.Fatalf("saved printers = %+v, want the stored access code kept", cfg.Printers)
 	}
 }

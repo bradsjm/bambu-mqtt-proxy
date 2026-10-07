@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -19,10 +20,8 @@ import (
 
 const platecheckContractSerial = "01S00CPLATE001"
 
-// platecheckContractEndpoint is an HTTPS endpoint URL that fails fast: the
-// diagnostics capture locally first, so no provider request can leave the
-// test process.
-const platecheckContractEndpoint = "https://127.0.0.1:1/ai/run/@cf/cloudflare/clef"
+// platecheckContractEndpoint is an HTTPS endpoint URL that fails fast.
+const platecheckContractEndpoint = "https://127.0.0.1:1/check"
 
 // TestPlatecheckConfigTestRoute pins that the key-check route exists in
 // setup mode and at runtime, rejects cross-site posts, and reports missing
@@ -34,7 +33,7 @@ func TestPlatecheckConfigTestRoute(t *testing.T) {
 		name, site, body, message string
 		code                      int
 	}{
-		{"setup missing endpoint", "same-origin", `{"enabled":true,"model":"clef","stop_confidence":0.5}`, "No Clef endpoint is configured. Enter an HTTPS endpoint or set BMBPX_PLATECHECK_ENDPOINT.", 422},
+		{"setup missing account", "same-origin", `{"enabled":true,"model":"clef","stop_confidence":0.5}`, "No Cloudflare account ID is configured. Enter the account ID or set BMBPX_PLATECHECK_ACCOUNT_ID.", 422},
 		{"setup cross-site", "cross-site", `{"api_key":"must-not-be-probed","model":"clef"}`, "", 403},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -54,14 +53,13 @@ func TestPlatecheckConfigTestRoute(t *testing.T) {
 	if code != 422 {
 		t.Fatalf("runtime probe = %d %s, want 422", code, body)
 	}
-	if detectionContractObject(t, body)["error"] != "No Clef endpoint is configured. Enter an HTTPS endpoint or set BMBPX_PLATECHECK_ENDPOINT." {
+	if detectionContractObject(t, body)["error"] != "No Cloudflare account ID is configured. Enter the account ID or set BMBPX_PLATECHECK_ACCOUNT_ID." {
 		t.Fatalf("runtime probe body = %s", body)
 	}
 }
 
-// TestPlatecheckSnapshotsWhenCamerasOn pins the diagnostics contract while
-// the feature runs: the response keeps the dry-run shape, configured order,
-// and a safe error row when no camera frame is available.
+// TestPlatecheckSnapshotsWhenCamerasOn pins the streamed diagnostics contract.
+// The configured printer never connects, so the snapshot is skipped as offline.
 func TestPlatecheckSnapshotsWhenCamerasOn(t *testing.T) {
 	platecheckContractCleanEnv(t)
 	base := platecheckContractServe(t, true, true)
@@ -69,29 +67,31 @@ func TestPlatecheckSnapshotsWhenCamerasOn(t *testing.T) {
 	if code != http.StatusOK {
 		t.Fatalf("snapshots = %d %s, want 200", code, body)
 	}
-	payload := detectionContractObject(t, body)
-	if payload["dry_run"] != true {
-		t.Fatalf("dry_run = %#v, want true", payload["dry_run"])
+	events := platecheckContractEvents(t, body)
+	if len(events) != 3 {
+		t.Fatalf("events = %v, want start, result, done", events)
 	}
-	if payload["cameras"] != "available" {
-		t.Fatalf("cameras = %#v, want available", payload["cameras"])
+	start := events[0]
+	if start["dry_run"] != true || start["model"] != "clef" || start["cutoff"] != 0.5 {
+		t.Fatalf("start = %#v", start)
 	}
-	if payload["model"] != "clef" || payload["cutoff"] != 0.5 {
-		t.Fatalf("model/cutoff = %#v/%#v, want clef/0.5", payload["model"], payload["cutoff"])
+	printers, ok := start["printers"].([]any)
+	if !ok || len(printers) != 1 {
+		t.Fatalf("printers = %#v, want one printer", start["printers"])
 	}
-	rows, ok := payload["printers"].([]any)
-	if !ok || len(rows) != 1 {
-		t.Fatalf("printers = %#v, want one row", payload["printers"])
+	printer := printers[0].(map[string]any)
+	if printer["serial"] != platecheckContractSerial || printer["status"] != "offline" {
+		t.Fatalf("printer = %#v", printer)
 	}
-	row := rows[0].(map[string]any)
-	if row["serial"] != platecheckContractSerial {
-		t.Fatalf("row serial = %#v, want %s", row["serial"], platecheckContractSerial)
+	row := events[1]["printer"].(map[string]any)
+	if events[1]["type"] != "result" || row["serial"] != platecheckContractSerial || row["decision"] != "skipped" || row["error_code"] != "printer_offline" {
+		t.Fatalf("result = %#v", events[1])
 	}
-	if code, _ := row["error_code"].(string); code == "" {
-		t.Fatalf("unavailable camera row lacks a fixed error code: %s", body)
+	if row["p_clear"] != nil || row["p_occupied"] != nil || row["p_assessable"] != nil || row["image"] != nil {
+		t.Fatalf("skipped row carries evidence: %s", body)
 	}
-	if row["p_clear"] != nil || row["p_occupied"] != nil || row["p_assessable"] != nil {
-		t.Fatalf("failed row carries probabilities: %s", body)
+	if events[2]["outcome"] != "completed" {
+		t.Fatalf("done = %#v", events[2])
 	}
 }
 
@@ -101,13 +101,13 @@ func TestPlatecheckSnapshotsWhenCamerasOn(t *testing.T) {
 func TestPlatecheckSnapshotsWhileOff(t *testing.T) {
 	platecheckContractCleanEnv(t)
 	base := platecheckContractServe(t, false, true)
-	body := fmt.Sprintf(`{"enabled":false,"endpoint":%q,"api_key":"contract-dummy-key","model":"clef","stop_confidence":0.5}`,
+	body := fmt.Sprintf(`{"enabled":false,"provider":"custom","endpoint":%q,"api_key":"contract-dummy-key","model":"clef","stop_confidence":0.5}`,
 		platecheckContractEndpoint)
 	code, raw := platecheckContractRequest(t, http.MethodPost, base+"/platecheck/snapshots", body, "same-origin")
 	if code != http.StatusOK {
 		t.Fatalf("snapshots while off = %d %s, want 200", code, raw)
 	}
-	payload := detectionContractObject(t, raw)
+	payload := platecheckContractEvents(t, raw)[0]
 	if payload["dry_run"] != true {
 		t.Fatalf("dry_run = %#v, want true", payload["dry_run"])
 	}
@@ -152,6 +152,7 @@ func TestPlatecheckAbsentWhenCamerasOff(t *testing.T) {
 func TestPlatecheckRouteAfterReload(t *testing.T) {
 	platecheckContractCleanEnv(t)
 	t.Setenv("BMBPX_CAMERA_ENABLED", "true")
+	t.Setenv(platecheck.EnvProvider, platecheck.ProviderCustom)
 	t.Setenv(platecheck.EnvEndpoint, platecheckContractEndpoint)
 	t.Setenv(platecheck.EnvAPIKey, "contract-dummy-key")
 	httpPort := freePort(t)
@@ -251,7 +252,7 @@ log:
 	if code != http.StatusOK {
 		t.Fatalf("snapshots after reload = %d %s, want 200", code, raw)
 	}
-	payload := detectionContractObject(t, raw)
+	payload := platecheckContractEvents(t, raw)[0]
 	if payload["dry_run"] != true {
 		t.Fatalf("after-reload dry_run = %#v, want true", payload["dry_run"])
 	}
@@ -265,6 +266,7 @@ func platecheckContractServe(t *testing.T, feature, cameras bool) string {
 	platecheckContractCleanEnv(t)
 	t.Setenv("BMBPX_CAMERA_ENABLED", fmt.Sprint(cameras))
 	if feature {
+		t.Setenv(platecheck.EnvProvider, platecheck.ProviderCustom)
 		t.Setenv(platecheck.EnvEndpoint, platecheckContractEndpoint)
 		t.Setenv(platecheck.EnvAPIKey, "contract-dummy-key")
 	}
@@ -334,6 +336,24 @@ func platecheckContractRequest(t *testing.T, method, url, body, site string) (in
 		t.Fatal(err)
 	}
 	return resp.StatusCode, raw
+}
+
+// platecheckContractEvents parses a complete NDJSON diagnostic stream.
+func platecheckContractEvents(t *testing.T, raw []byte) []map[string]any {
+	t.Helper()
+	lines := bytes.Split(bytes.TrimSpace(raw), []byte("\n"))
+	events := make([]map[string]any, 0, len(lines))
+	for _, line := range lines {
+		var event map[string]any
+		if err := json.Unmarshal(line, &event); err != nil {
+			t.Fatalf("invalid stream line %q: %v", line, err)
+		}
+		events = append(events, event)
+	}
+	if len(events) < 2 || events[0]["type"] != "start" || events[len(events)-1]["type"] != "done" {
+		t.Fatalf("incomplete stream: %s", raw)
+	}
+	return events
 }
 
 // platecheckContractStore serves one configuration store, like setup mode.

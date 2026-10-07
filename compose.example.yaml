@@ -21,8 +21,8 @@ services:
         serial=01S00C351100139,address=192.168.1.43:8883,tls=true,insecure_skip_verify=true,password=87654321
       # BMBPX_CAMERA_ENABLED: "false"  # disable camera endpoints, the camera wall, and the raw camera listener on 6000
       # BMBPX_OCTOEVERYWHERE_API_KEY: ""  # optional: enables OctoEverywhere Gadget AI failure detection
-      # BMBPX_PLATECHECK_ENDPOINT: ""  # optional: Clef endpoint (HTTPS) for the build-plate check
-      # BMBPX_PLATECHECK_API_KEY: ""   # optional: Clef API key; with the endpoint it enables the check
+      # BMBPX_PLATECHECK_ACCOUNT_ID: ""  # optional: Cloudflare account ID for the build-plate check (or set PROVIDER=custom and ENDPOINT)
+      # BMBPX_PLATECHECK_API_KEY: ""   # optional: provider API key; with the account ID it enables the check
       # BMBPX_LOG_LEVEL: debug
     # Alternative: configure printers at http://<host>:8080/config instead of
     # BMBPX_PRINTERS. Remove BMBPX_PRINTERS above, then uncomment; saving

@@ -1,26 +1,19 @@
 package pandabreath
 
-import (
-	"fmt"
-	"net/url"
+import "bambu-mqtt-proxy/internal/config"
 
-	"bambu-mqtt-proxy/internal/config"
-)
-
-// AddressKey is the per-printer setting key for a Panda Breath WebSocket address.
+// AddressKey is the per-printer setting key for a Panda Breath address.
 const AddressKey = "panda_breath"
 
-// AddressSetting describes and validates the optional Panda Breath address.
+// AddressSetting describes and validates the optional Panda Breath address:
+// the proxy connects with ws://<host>/ws from the host form HostOnly gives.
 var AddressSetting = config.PrinterSetting{
 	Key:         AddressKey,
 	Label:       "Panda Breath address",
-	Placeholder: "ws://panda-breath-blue.iot/ws",
-	Hint:        "WebSocket address of a Panda Breath sensor. It supplies the chamber temperature for printers without a chamber sensor, such as the P1 and A1 series.",
+	Placeholder: "panda-breath-blue.iot",
+	Hint:        "Host name or IP address of a Panda Breath sensor, with an optional port. It supplies the chamber temperature for printers without a chamber sensor, such as the P1 and A1 series.",
 	Validate: func(value string) error {
-		u, err := url.Parse(value)
-		if err != nil || (u.Scheme != "ws" && u.Scheme != "wss") || u.Host == "" || u.User != nil || u.Fragment != "" {
-			return fmt.Errorf("must be a ws:// or wss:// URL with a host and no credentials or fragment")
-		}
-		return nil
+		_, err := config.HostOnly(value)
+		return err
 	},
 }

@@ -52,7 +52,7 @@ const (
 // target is one observed device.
 type target struct {
 	serial string // routing key shared with the telemetry cache
-	addr   string // validated ws:// or wss:// URL from the printer config
+	addr   string // WebSocket URL built from the configured host
 }
 
 // reading is one accepted warehouse_temper observation.
@@ -85,7 +85,12 @@ func New(printers []config.Printer, log *slog.Logger) *Store {
 		history: make(map[string][]reading), connected: make(map[string]bool)}
 	for _, p := range printers {
 		if addr := p.Setting(AddressKey); addr != "" {
-			s.targets = append(s.targets, target{serial: p.Serial, addr: addr})
+			host, err := config.HostOnly(addr)
+			if err != nil {
+				// Validate rejects this value before New runs.
+				continue
+			}
+			s.targets = append(s.targets, target{serial: p.Serial, addr: "ws://" + host + "/ws"})
 		}
 	}
 	return s
@@ -201,8 +206,7 @@ func (s *Store) connect(ctx context.Context, t target) (bool, string) {
 		// accepted the TCP connection would hold Stop until the handshake
 		// timeout. Closing the connection the moment it exists, and
 		// stopping that callback when the handshake returned, bounds
-		// cancellation by the dial. Verified TLS for wss:// is untouched:
-		// the custom dial only wraps the TCP dial.
+		// cancellation by the dial.
 		NetDialContext: func(dialCtx context.Context, network, addr string) (net.Conn, error) {
 			nc, err := (&net.Dialer{}).DialContext(dialCtx, network, addr)
 			if err != nil {

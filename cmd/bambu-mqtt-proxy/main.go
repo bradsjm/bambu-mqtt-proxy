@@ -203,8 +203,8 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		}
 		detector.SetActivity(activities)
 	}
-	// Optional Clef build-plate checks: the YAML platecheck section with the
-	// BMBPX_PLATECHECK_ENDPOINT and BMBPX_PLATECHECK_API_KEY overrides. With
+	// Optional build-plate checks through a vision provider: the YAML platecheck
+	// section with the BMBPX_PLATECHECK_* overrides. With
 	// credentials but the camera feature disabled the service stays visible
 	// in the blocked state and performs no camera or provider activity. With
 	// the feature off and cameras serving, a bare service keeps the snapshot
