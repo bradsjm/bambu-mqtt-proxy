@@ -10,23 +10,27 @@ services:
       - "8883:8883" # MQTT (TLS) — point your apps here
       - "6000:6000" # raw camera (TLS) — camera apps authenticate with bblp + the printer's access code
       - "8080:8080" # HTTP: health + camera endpoints + camera wall
-    environment:
-      # One entry per printer, separated by ';'. Replace the placeholders.
-      # name= sets an optional friendly camera wall label; MQTT routing always uses
-      # the serial (the raw camera endpoint on 6000 routes by access code instead).
-      # Camera support is auto-detected from the serial prefix (01P/01S/030/039 native;
-      # 00W/00M/03W/22E/093/094 via FFmpeg, which this image bundles).
-      BMBPX_PRINTERS: >-
-        serial=01P00A123456789,address=192.168.1.42:8883,tls=true,insecure_skip_verify=true,password=12345678,name=Garage P1S;
-        serial=01S00C351100139,address=192.168.1.43:8883,tls=true,insecure_skip_verify=true,password=87654321
-      # BMBPX_CAMERA_ENABLED: "false"  # disable camera endpoints, the camera wall, and the raw camera listener on 6000
-      # BMBPX_OCTOEVERYWHERE_API_KEY: ""  # optional: enables OctoEverywhere Gadget AI failure detection
-      # BMBPX_PLATECHECK_ACCOUNT_ID: ""  # optional: Cloudflare account ID for the build-plate check (or set PROVIDER=custom and ENDPOINT)
-      # BMBPX_PLATECHECK_API_KEY: ""   # optional: provider API key; with the account ID it enables the check
-      # BMBPX_LOG_LEVEL: debug
+    volumes:
+      # Configuration file: copy config.example.yaml to ./bambu-mqtt-proxy.yaml
+      # and edit the printers section. Delete the cert_file and key_file lines
+      # under listen: the container cannot write ./certs, and the proxy then
+      # generates an in-memory certificate. One printer entry looks like:
+      #   printers:
+      #     - serial: "01P00A123456789"
+      #       name: "Garage P1S" # optional friendly camera wall label; never used for routing
+      #       address: "192.168.1.42:8883"
+      #       tls: true
+      #       insecure_skip_verify: true
+      #       username: "bblp"
+      #       password: "12345678"
+      - ./bambu-mqtt-proxy.yaml:/config/bambu-mqtt-proxy.yaml
+    # Only two environment variables exist: BMBPX_HTTP_PORT overrides http.port
+    # and BMBPX_LOG_LEVEL overrides log.level in the YAML file. To use one:
+    # environment:
+    #   BMBPX_LOG_LEVEL: debug
     # Alternative: configure printers at http://<host>:8080/config instead of
-    # BMBPX_PRINTERS. Remove BMBPX_PRINTERS above, then uncomment; saving
-    # creates ./config/bambu-mqtt-proxy.yaml (the directory must be writable
-    # by the container user):
+    # mounting a file. Remove the volume above, then uncomment; saving creates
+    # ./config/bambu-mqtt-proxy.yaml (the directory must be writable by the
+    # container user):
     # volumes:
     #   - ./config:/config

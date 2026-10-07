@@ -17,11 +17,9 @@ import (
 	"time"
 
 	"bambu-mqtt-proxy/internal/configui"
-	"bambu-mqtt-proxy/internal/jobpreview"
 )
 
 const detectionContractSerial = "01S00CDETECT001"
-const detectionContractEnv = "BMBPX_OCTOEVERYWHERE_API_KEY"
 
 // TestDetectionHTTPContract pins no-report detection across wall JSON, SSE, health, and protected per-print writes.
 func TestDetectionHTTPContract(t *testing.T) {
@@ -135,21 +133,16 @@ func TestDetectionCameraDisabledHTTPContract(t *testing.T) {
 	})
 }
 
-// TestDetectionConfigHTTPShape pins the exact public member set and fills the no-key and nonempty-override coverage gaps.
+// TestDetectionConfigHTTPShape pins the exact public member set and fills the no-key coverage gap.
 func TestDetectionConfigHTTPShape(t *testing.T) {
 	// Existing stable HTTP tests in internal/configui/configui_test.go cover
-	// effective enabled/has_api_key values and secret redaction for stored,
-	// environment, and empty keys (TestDetectionGetRedactsAndReportsEffectiveKey),
-	// empty override metadata (TestDetectionEnvOverrideMetaReportsEmpty), and
-	// non-persistence of env secrets (TestDetectionEnvSecretIsNeverPersisted).
+	// effective enabled/has_api_key values and secret redaction for stored
+	// keys (TestDetectionGetRedactsAndReportsEffectiveKey).
 	for _, tc := range []struct {
-		name, fileKey, envKey string
-		envPresent            bool
+		name, fileKey string
 	}{
-		{"stored", "contract-stored-secret", "", false},
-		{"environment", "", "contract-env-secret", true},
-		{"empty environment", "contract-stored-secret", "", true},
-		{"no key", "", "", false},
+		{"stored", "contract-stored-secret"},
+		{"no key", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			detectionContractCleanEnv(t)
@@ -158,9 +151,6 @@ func TestDetectionConfigHTTPShape(t *testing.T) {
 				if err := os.WriteFile(path, []byte(fmt.Sprintf("detection:\n  api_key: %q\n", tc.fileKey)), 0o600); err != nil {
 					t.Fatal(err)
 				}
-			}
-			if tc.envPresent {
-				t.Setenv(detectionContractEnv, tc.envKey)
 			}
 			base := detectionContractStore(t, path)
 			_, raw := detectionContractRequest(t, http.MethodGet, base+"/config/api", "", "")
@@ -177,12 +167,6 @@ func TestDetectionConfigHTTPShape(t *testing.T) {
 			if tc.name == "no key" && !reflect.DeepEqual(d, map[string]any{"enabled": false, "has_api_key": false}) {
 				t.Fatalf("no-key detection = %#v", d)
 			}
-			if tc.envKey != "" {
-				overrides := doc["meta"].(map[string]any)["env_overrides"].(map[string]any)
-				if overrides["detection_api_key"] != detectionContractEnv {
-					t.Fatalf("nonempty key override metadata = %#v", overrides)
-				}
-			}
 		})
 	}
 }
@@ -194,16 +178,11 @@ func TestDetectionConfigProbePreflight(t *testing.T) {
 	for _, tc := range []struct {
 		name, site, body, message string
 		code                      int
-		emptyEnv                  bool
 	}{
-		{"no key", "same-origin", `{}`, "No Gadget API key is configured. Enter a key or set BMBPX_OCTOEVERYWHERE_API_KEY.", 422, false},
-		{"cross-site", "cross-site", `{"api_key":"must-not-be-probed"}`, "", 403, false},
-		{"empty override", "same-origin", `{"api_key":"must-not-be-probed"}`, "BMBPX_OCTOEVERYWHERE_API_KEY is set but empty, so there is no key to test. Set the variable to a valid key.", 422, true},
+		{"no key", "same-origin", `{}`, "No Gadget API key is configured. Enter a key.", 422},
+		{"cross-site", "cross-site", `{"api_key":"must-not-be-probed"}`, "", 403},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if tc.emptyEnv {
-				t.Setenv(detectionContractEnv, "")
-			}
 			code, body := detectionContractRequest(t, http.MethodPost, base+"/config/detection/test", tc.body, tc.site)
 			if code != tc.code {
 				t.Fatalf("probe = %d %s, want %d", code, body, tc.code)
@@ -312,13 +291,6 @@ func detectionContractStore(t *testing.T, path string) string {
 func detectionContractServe(t *testing.T, enabled, cameras bool, previews ...bool) string {
 	t.Helper()
 	detectionContractCleanEnv(t)
-	if enabled {
-		t.Setenv(detectionContractEnv, "contract-dummy-key")
-	}
-	t.Setenv("BMBPX_CAMERA_ENABLED", fmt.Sprint(cameras))
-	if len(previews) > 0 {
-		t.Setenv(jobpreview.EnvSwitch, fmt.Sprint(previews[0]))
-	}
 	port := freePort(t)
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	fixture := fmt.Sprintf(`listen:
@@ -331,9 +303,16 @@ printers:
     password: "00008888"
 http:
   port: %d
-log:
-  level: error
-`, freePort(t), detectionContractSerial, port)
+camera:
+  enabled: %t
+`, freePort(t), detectionContractSerial, port, cameras)
+	if enabled {
+		fixture += "detection:\n  enabled: true\n  api_key: contract-dummy-key\n"
+	}
+	if len(previews) > 0 {
+		fixture += fmt.Sprintf("job_preview:\n  enabled: %t\n", previews[0])
+	}
+	fixture += "log:\n  level: error\n"
 	if err := os.WriteFile(path, []byte(fixture), 0o600); err != nil {
 		t.Fatal(err)
 	}

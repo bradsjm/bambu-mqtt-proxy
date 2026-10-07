@@ -18,14 +18,13 @@ RUN addgroup -S proxy && adduser -S -G proxy proxy \
     && mkdir /config && chown proxy:proxy /config
 COPY --from=build --chown=proxy:proxy /out/bambu-mqtt-proxy /bambu-mqtt-proxy
 USER proxy
-# No BMBPX_* environment defaults: any listen variable replaces the whole
-# listener definition, so image defaults would shadow a mounted config file.
-# With no file and no BMBPX_* variables, application defaults apply: TLS MQTT
-# on 8883, HTTP health on 8080.
+# The YAML configuration file owns the settings; the image sets no
+# environment defaults that could shadow a mounted file. With no file,
+# application defaults apply: TLS MQTT on 8883, HTTP health on 8080.
 EXPOSE 8883 6000 8080
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD wget -qO- http://127.0.0.1:8080/livez >/dev/null 2>&1 || exit 1
 ENTRYPOINT ["/bambu-mqtt-proxy"]
-# The file is optional: without it the proxy runs from BMBPX_* variables,
-# or serves only the /config page, which creates the file on save.
+# The file is optional: without it the proxy serves only the /config page,
+# which creates the file on save.
 CMD ["-config=/config/bambu-mqtt-proxy.yaml"]

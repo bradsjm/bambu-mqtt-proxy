@@ -1,5 +1,7 @@
 # bambu-mqtt-proxy example configuration.
 # Copy to bambu-mqtt-proxy.yaml and edit the printers section.
+# The YAML file is the configuration; only BMBPX_HTTP_PORT (http.port) and
+# BMBPX_LOG_LEVEL (log.level) override it.
 
 listen:
   # Default: the port every Bambu app expects. TLS with a self-signed
@@ -65,7 +67,7 @@ notifications:
   # completions, failures and stops, printer errors and HMS warnings, AI
   # detection alerts, and pauses that leave an active alert. Also editable
   # on the /config page, where credentials are write-only: a blank value
-  # keeps the stored one. No BMBPX_* variable exists for this section.
+  # keeps the stored one.
   # enabled: true
   # provider: pushover
   # pushover:
@@ -86,7 +88,6 @@ log:
 # Optional build-plate check (also editable on the /config page). One
 # fresh snapshot is uploaded per new print and `stop` is sent only when the
 # plate looks occupied. Best effort: errors let the print continue.
-# BMBPX_PLATECHECK_PROVIDER, _ACCOUNT_ID, _ENDPOINT and _API_KEY override these values.
 # platecheck:
 #   enabled: true            # default: on when the account/endpoint and api_key are set
 #   provider: cloudflare     # cloudflare or custom

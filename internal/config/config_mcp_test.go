@@ -27,40 +27,6 @@ func TestMCPDefaultOn(t *testing.T) {
 	}
 }
 
-// TestMCPEnvOverride pins BMBPX_MCP_ENABLED parsing.
-func TestMCPEnvOverride(t *testing.T) {
-	t.Setenv(EnvPrinters, "serial=S1,address=10.0.0.1:8883,password=1111")
-	t.Setenv(EnvHTTPPort, "8080")
-	t.Setenv(EnvMCPEnable, "false")
-
-	cfg := &Config{}
-	if _, err := cfg.ApplyEnv(); err != nil {
-		t.Fatalf("ApplyEnv: %v", err)
-	}
-	cfg.ApplyDefaults()
-	// The BMBPX_* surface configures printers, HTTP, and MCP only; the
-	// downstream MQTT listener still comes from the file, so a valid
-	// fixture supplies one.
-	cfg.Listen = []Listener{{Port: 8883, TLS: true}}
-	if cfg.MCPEnabled() {
-		t.Fatal("BMBPX_MCP_ENABLED=false must disable MCP")
-	}
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("Validate with mcp on http 8080: %v", err)
-	}
-}
-
-// TestMCPEnvInvalid pins the rejection of unparsable booleans.
-func TestMCPEnvInvalid(t *testing.T) {
-	t.Setenv(EnvPrinters, "serial=S1,address=10.0.0.1:8883,password=1111")
-	t.Setenv(EnvMCPEnable, "sometimes")
-
-	cfg := &Config{}
-	if _, err := cfg.ApplyEnv(); err == nil {
-		t.Fatal("invalid BMBPX_MCP_ENABLED accepted")
-	}
-}
-
 // TestMCPDisabledWithoutHTTP pins the graceful rule: the endpoint mounts on
 // the shared HTTP listener, so http.port 0 keeps it off without failing
 // validation.

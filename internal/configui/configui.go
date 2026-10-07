@@ -193,25 +193,15 @@ type meta struct {
 	FileError  string `json:"file_error,omitempty"`
 	Generation uint64 `json:"generation"`
 	ApplyError string `json:"apply_error,omitempty"`
-	// CameraEnabled appears only while BMBPX_CAMERA_ENABLED overrides the
-	// stored value: it carries the parsed effective switch for the page.
-	// The editable stored switch stays in config.camera_enabled.
-	CameraEnabled *bool             `json:"camera_enabled,omitempty"`
-	EnvOverrides  map[string]string `json:"env_overrides"`
+	// EnvOverrides lists page fields a surviving environment variable
+	// (.env file) overrides. Only http_port and log_level can be overridden.
+	EnvOverrides map[string]string `json:"env_overrides"`
 }
 
 func (s *Store) handleGet(w http.ResponseWriter, _ *http.Request) {
 	s.mu.Lock()
 	m := meta{Path: s.path, Generation: s.generation, ApplyError: s.applyErr, EnvOverrides: envOverrides()}
 	s.mu.Unlock()
-	// Same presence rule as ApplyEnv: a nonempty value overrides the file.
-	// An unparseable value is left alone here — startup already rejects it
-	// — rather than guessing an effective state for display.
-	if v := os.Getenv(config.EnvCameraEnable); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			m.CameraEnabled = &b
-		}
-	}
 
 	cfg := &config.Config{HTTP: config.HTTP{Port: config.PortUnset}}
 	raw, existed, err := readFile(s.path)
@@ -372,8 +362,8 @@ func (s *Store) handlePrinterTest(w http.ResponseWriter, r *http.Request) {
 	// A simple rejection, no alias resolution: a test connect may never
 	// touch a destination a configured printer already owns, so both the
 	// serial and the address are refused when they match the effective
-	// configuration (stored file printers with the BMBPX_* environment
-	// applied, exactly as startup resolves them).
+	// configuration (the stored file printers, exactly as startup resolves
+	// them).
 	configured, err := s.effectivePrinters()
 	if err != nil {
 		// Fail closed: without the configured list the proxy cannot tell
@@ -434,10 +424,9 @@ func writeSectionError(w http.ResponseWriter, status int, err error) {
 }
 
 // effectivePrinters returns the printers a test connect must stay away
-// from: the stored file list when the file parses, with the BMBPX_*
-// environment applied as startup would — BMBPX_PRINTERS replaces the list
-// entirely when set. Read, parse, and environment failures are errors, so
-// the caller can fail closed instead of testing against an empty list.
+// from: the stored file list when the file parses, exactly as startup
+// resolves it. Read and parse failures are errors, so the caller can fail
+// closed instead of testing against an empty list.
 func (s *Store) effectivePrinters() ([]config.Printer, error) {
 	var ps []config.Printer
 	raw, existed, err := readFile(s.path)
@@ -452,7 +441,7 @@ func (s *Store) effectivePrinters() ([]config.Printer, error) {
 		ps = c.Printers
 	}
 	c := &config.Config{Printers: ps}
-	if _, aerr := c.ApplyEnv(); aerr != nil {
+	if aerr := c.ApplyEnv(); aerr != nil {
 		return nil, aerr
 	}
 	return c.Printers, nil
@@ -473,14 +462,14 @@ func check(raw []byte) (*config.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := eff.ApplyEnv(); err != nil {
+	if err := eff.ApplyEnv(); err != nil {
 		return nil, err
 	}
 	eff.ApplyDefaults()
 	if err := eff.Validate(); err != nil {
 		return nil, fmt.Errorf("with environment overrides: %w", err)
 	}
-	// Module requirements can depend on environment-supplied secrets.
+	// Module requirements can depend on values the overrides replace.
 	if err := eff.ValidateEffective(); err != nil {
 		return nil, err
 	}
@@ -623,7 +612,7 @@ func (v View) toConfig(stored *config.Config) (*config.Config, error) {
 	return c, nil
 }
 
-// envOverrides maps page field names to the BMBPX_* variable that
+// envOverrides maps page field names to the environment variable that
 // overrides them, using the same presence rules as config.ApplyEnv.
 func envOverrides() map[string]string {
 	out := map[string]string{}
@@ -634,26 +623,8 @@ func envOverrides() map[string]string {
 			}
 		}
 	}
-	set("printers", config.EnvPrinters)
-	for _, env := range []string{config.EnvListenPort, config.EnvListenTLS, config.EnvCertFile, config.EnvKeyFile} {
-		if _, ok := os.LookupEnv(env); ok {
-			if _, dup := out["listen"]; !dup {
-				out["listen"] = env
-			}
-		}
-	}
-	set("auth_mode", config.EnvAuthMode)
 	set("log_level", config.EnvLogLevel)
 	set("http_port", config.EnvHTTPPort)
-	set("camera_enabled", config.EnvCameraEnable)
-	set("mcp_enabled", config.EnvMCPEnable)
-	for _, section := range config.Sections() {
-		if section.EnvOverrides != nil {
-			for field, env := range section.EnvOverrides() {
-				out[field] = env
-			}
-		}
-	}
 	return out
 }
 

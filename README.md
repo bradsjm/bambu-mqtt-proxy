@@ -70,16 +70,29 @@ creates `/config/bambu-mqtt-proxy.yaml`. Prefer a bind mount? Use
 `-v $(pwd)/config:/config`; add `:ro` to lock the configuration — saving then
 fails and leaves the running settings unchanged.
 
-**Docker, environment variables only (stateless)**
+**Docker, with a configuration file**
 
 ```sh
 docker run -d --name bambu-mqtt-proxy -p 8883:8883 -p 6000:6000 -p 8080:8080 \
-  -e BMBPX_PRINTERS='serial=01P00A123456789,address=192.168.1.42:8883,tls=true,password=12345678,name=Garage P1S' \
+  -v ./bambu-mqtt-proxy.yaml:/config/bambu-mqtt-proxy.yaml \
   ghcr.io/bradsjm/bambu-mqtt-proxy:latest
 ```
 
-The optional `name=…` is a friendly display label for the camera wall; MQTT
-always routes by serial.
+The mounted YAML file lists the printers. One entry looks like this (see
+[`config.example.yaml`](config.example.yaml) for a full annotated example):
+
+```yaml
+printers:
+  - serial: "01P00A123456789"
+    name: "Garage P1S" # optional friendly label for the camera wall; never used for routing
+    address: "192.168.1.42:8883"
+    tls: true
+    insecure_skip_verify: true
+    username: "bblp"
+    password: "12345678"
+```
+
+MQTT always routes by serial; the `name` label only decorates the camera wall.
 
 **Docker Compose**
 
@@ -110,13 +123,13 @@ not reject duplicates, and MQTT routing is unaffected).
 
 ## Configuration
 
-A YAML file and `BMBPX_*` environment variables may be combined; env values
-override file values per field.
+The YAML file is the configuration. Only two environment variables override
+it: `BMBPX_HTTP_PORT` overrides `http.port`, and `BMBPX_LOG_LEVEL` overrides
+`log.level`.
 
 | Source | Best for |
 |---|---|
 | [`/config`](#configuration-page-config) web page | Adding or editing printers in a browser; saving applies changes without a container restart |
-| `BMBPX_*` variables | Container deployments and secret overrides |
 | YAML file | Full control over listeners, TLS, and behavior tuning — see [`config.example.yaml`](config.example.yaml) and [DESIGN.md §9](DESIGN.md) for the full reference |
 
 ```yaml
@@ -163,20 +176,8 @@ log:
 
 | Environment variable | Default | Meaning |
 |---|---|---|
-| `BMBPX_PRINTERS` | — | Semicolon-separated printers: `serial=…,address=…,password=…[,name=…][,model=…][,username=…][,tls=…][,insecure_skip_verify=…][,panda_breath=host[:port]][,panda_pwr=host[:port]]`; a printer `address` without a port uses 8883 |
-| `BMBPX_LISTEN_PORT` | `8883` | Downstream MQTT port |
-| `BMBPX_LISTEN_TLS` | `true` | TLS on the downstream listener |
-| `BMBPX_CERT_FILE` / `BMBPX_KEY_FILE` | *(empty)* | Empty = ephemeral in-memory self-signed certificate |
-| `BMBPX_AUTH_MODE` | `printer` | `printer` or `accept_all` |
-| `BMBPX_LOG_LEVEL` | `info` | `info` logs client and upstream state, subscriptions, retries, and backoff delays; `debug` adds per-packet request routing |
-| `BMBPX_HTTP_PORT` | `8080` | Shared health, camera, and MCP HTTP port; `0` disables HTTP (the raw camera listener on 6000 keeps serving while cameras are enabled) |
-| `BMBPX_CAMERA_ENABLED` | `true` | `false` removes the camera routes, the camera wall, their MQTT report subscriptions, and the raw camera listener on port 6000 |
-| `BMBPX_MCP_ENABLED` | `true` | `false` removes the MCP endpoint at `/mcp`; the endpoint is also off when `http.port` is `0` |
-| `BMBPX_PLATECHECK_PROVIDER` | `cloudflare` | Overrides the stored provider (`cloudflare` or `custom`) whenever the variable exists. See [Build-plate check](#build-plate-check-optional) |
-| `BMBPX_PLATECHECK_ACCOUNT_ID` | *(empty)* | Overrides the stored Cloudflare account ID whenever the variable exists. See [Build-plate check](#build-plate-check-optional) |
-| `BMBPX_PLATECHECK_ENDPOINT` | *(empty)* | Overrides the stored custom endpoint whenever the variable exists (an empty value clears it). See [Build-plate check](#build-plate-check-optional) |
-| `BMBPX_PLATECHECK_API_KEY` | *(empty)* | Overrides the stored vision provider API key whenever the variable exists. The key is sent only to the endpoint it is paired with. See [Build-plate check](#build-plate-check-optional) |
-| `BMBPX_OCTOEVERYWHERE_API_KEY` | *(empty)* | Overrides the stored Gadget API key whenever the variable exists — an empty value clears the stored key. Setting a key consents to external snapshot uploads and automatic pauses — see [Gadget AI print-failure detection](#gadget-ai-print-failure-detection-optional) |
+| `BMBPX_LOG_LEVEL` | *(unset)* | A non-empty value overrides `log.level`: `info` logs client and upstream state, subscriptions, retries, and backoff delays; `debug` adds per-packet request routing |
+| `BMBPX_HTTP_PORT` | *(unset)* | A value from 0 to 65535 overrides `http.port`: the shared health, camera, and MCP HTTP port; `0` disables HTTP (the raw camera listener on 6000 keeps serving while cameras are enabled) |
 
 ## HTTP endpoints
 
@@ -201,7 +202,7 @@ disabled.
 | `/camwall` | Multi-printer camera wall dashboard |
 | `/config`, `/config/api` | Browser configuration page and its JSON API (`GET` never returns access codes; `PUT` saves and applies) |
 | `/favicon.ico`, `/apple-touch-icon.png` | Browser-tab, bookmark, and home-screen icons |
-| `/mcp` | Model Context Protocol endpoint (off with `BMBPX_MCP_ENABLED=false` or `http.port: 0`) |
+| `/mcp` | Model Context Protocol endpoint (off with `mcp.enabled: false` or `http.port: 0`) |
 | `/control/{serial}` | Printer control from the camera wall: `POST` `{"action":"light\|pause\|resume\|speed\|stop"}` (see below) |
 
 ### Camera wall
@@ -312,7 +313,7 @@ contains `chamber_temper`.
 
 ### MCP endpoint (`/mcp`)
 
-On by default; disable with `BMBPX_MCP_ENABLED=false`. MCP protocol
+On by default; disable with `mcp.enabled: false`. MCP protocol
 2026-07-28 over Streamable HTTP:
 
 - **Core read-only tools** — `list_printers`, `get_printer_state`,
@@ -351,8 +352,9 @@ On by default; disable with `BMBPX_MCP_ENABLED=false`. MCP protocol
   already in use), the previous file is restored and the page shows the error.
 - Never displays or returns access codes: a blank code keeps the stored one,
   and changing a printer's address requires entering its code again.
-- Marks each setting overridden by a `BMBPX_*` variable; those still win.
-  Saving rewrites the file, so comments in it are not kept.
+- Marks the HTTP port and the log level when `BMBPX_HTTP_PORT` or
+  `BMBPX_LOG_LEVEL` is set; those variables still win. Saving rewrites the
+  file, so comments in it are not kept.
 - Handles Pushover credentials the same way in the Notifications section:
   they are never displayed or returned, a blank field keeps the stored
   value, and **Send test notification** sends one test message without
@@ -367,10 +369,9 @@ plate when a print starts. Set `provider` (`cloudflare`, the default, or `custom
 full HTTPS URL that accepts the same request and answer format), `api_key`, and
 a free-text `model`. Also set `stop_confidence` (0.50 to 0.99 in 0.01 steps, default
 0.50). Without an explicit `enabled`, the check runs when the provider target and key
-are set. `BMBPX_PLATECHECK_PROVIDER`, `BMBPX_PLATECHECK_ACCOUNT_ID`, `BMBPX_PLATECHECK_ENDPOINT`, and `BMBPX_PLATECHECK_API_KEY` override the
-stored values whenever they exist. The key is write-only on the page, a blank
-value keeps the stored key, and a stored or environment key is never sent to a
-different account or endpoint than the one it belongs to.
+are set. The key is write-only on the page, a blank value keeps the stored key, and a
+stored key is never sent to a different account or endpoint than the one it
+belongs to.
 
 For each new print job, the proxy waits for a fresh camera frame, may turn the
 chamber light on, uploads that one JPEG to the endpoint, and sends `stop` only
@@ -440,8 +441,7 @@ even when a key exists, and enabling without any key fails validation. The
 key cannot be removed from the page — use the switch. There is no usage
 bookkeeping; the proxy stays stateless.
 
-`BMBPX_OCTOEVERYWHERE_API_KEY` overrides the stored key whenever the
-variable exists, including set-but-empty, which clears it. While a print is
+While a print is
 active on a
 camera-capable printer, the proxy uploads the current camera snapshot to the
 Gadget service at a policy-selected pace, based on the minimum and recommended
@@ -472,9 +472,9 @@ are not used for AI model training.
 **Eligibility.** Detection rides on the camera pipeline, so it covers exactly
 the camera-capable models (P1P, P1S, A1, A1MINI) and only while telemetry
 shows a print actively running. It requires the camera feature
-(`BMBPX_CAMERA_ENABLED`): with cameras disabled and a key set, nothing runs
+(`camera.enabled`): with cameras disabled and a key set, nothing runs
 and every printer's `detection` object reports `blocked`. Detection keeps
-running with `BMBPX_HTTP_PORT=0`; only its status endpoints are then absent.
+running with `http.port: 0`; only its status endpoints are then absent.
 
 **Allowance.** Enforcement lives entirely on OctoEverywhere's side. Each
 account includes 90,000 free inspection calls per monthly billing period —
@@ -521,18 +521,17 @@ block) to send print alerts to one [Pushover](https://pushover.net/) account.
   messages arrive from your own application, so you can filter them.
 - **Delivery is best-effort** — one attempt per message, no retry queue, and
   nothing is stored; a busy queue or failed delivery logs a warning and the
-  proxy moves on. A restart may repeat one active alert. No `BMBPX_*`
-  variable exists for this feature: YAML and `/config` own it.
+  proxy moves on. A restart may repeat one active alert.
 - **Privacy** — enabling this sends print metadata (event text, file name,
   error codes) and, when a camera is available, camera frames to Pushover's
   servers. Leave notifications disabled to keep everything local.
 
 ## Security notes
 
-- Runs as a non-root user in the container. The config file and environment
-  contain printer access codes, and the config file also holds the Pushover
-  app token and user key when notifications are configured — protect them
-  accordingly, and never commit `bambu-mqtt-proxy.yaml`.
+- Runs as a non-root user in the container. The config file contains printer
+  access codes and, when notifications are configured, the Pushover app token
+  and user key — protect it accordingly, and never commit
+  `bambu-mqtt-proxy.yaml`.
 - TLS certificates are unverified on both hops, matching Bambu's own LAN
   protocol; the proxy is intended for trusted home LANs.
 - The camera endpoints, `/mcp`, and the `/config` page are unauthenticated:
@@ -542,15 +541,15 @@ block) to send print alerts to one [Pushover](https://pushover.net/) account.
   `POST /control/{serial}` and the MCP control tools can also pause, resume,
   change speed, toggle the chamber light, and **emergency-stop** prints
   without login; heater and temperature commands are never exposed. Browser
-  requests from other sites are rejected. Set `BMBPX_MCP_ENABLED=false`,
-  mount the config file read-only, or set `http.port: 0` to narrow the
-  surface.
+  requests from other sites are rejected. Set `mcp.enabled: false`, mount the config
+  file read-only, or set `http.port: 0` to narrow the surface.
 - The raw camera endpoint on port 6000 authenticates with `bblp` plus a
   configured printer access code; the code selects the printer.
-- The OctoEverywhere key is a secret: keep it in your environment (`.env` is
-  git-ignored) and share the account with caution — it authorizes external
-  snapshot uploads and automatic pauses, and usage is billed per
-  OctoEverywhere account, not per proxy.
+- The OctoEverywhere key is a secret: the configuration API never returns it
+  and the config file stores it with owner-only permissions (0600) — share
+  the account with caution, because the key authorizes external snapshot
+  uploads and automatic pauses, and usage is billed per OctoEverywhere
+  account, not per proxy.
 
 ## Development
 

@@ -1,7 +1,8 @@
 // Command bambu-mqtt-proxy is a multiplexing MQTT proxy for Bambu Lab
 // printers: one TLS MQTT endpoint for many clients, one upstream connection
 // per printer, routed by the serial number in device/{serial}/... topics.
-// Configuration comes from a YAML file, BMBPX_* environment variables, or both.
+// Configuration comes from a YAML file; BMBPX_HTTP_PORT and BMBPX_LOG_LEVEL
+// override the HTTP port and the log level.
 package main
 
 import (
@@ -44,9 +45,9 @@ func main() {
 	}
 }
 
-// run resolves configuration (file, environment, or both), serves until an
-// interrupt signal, and restarts every service whenever the /config page
-// saves the file. A saved config that fails to start is rolled back.
+// run resolves the configuration, serves until an interrupt signal, and
+// restarts every service whenever the /config page saves the file. A saved
+// config that fails to start is rolled back.
 func run() error {
 	configPath := flag.String("config", "", "path to the YAML config file (optional; the /config page creates it)")
 	logLevel := flag.String("log-level", "", "override log level (debug, info, warn, error)")
@@ -87,7 +88,7 @@ func run() error {
 // It returns a reload request when the /config page saved the file, or nil
 // when the process should exit.
 func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.Store) (*configui.Reload, error) {
-	cfg, fileFound, err := resolveConfig(path)
+	cfg, _, err := resolveConfig(path)
 	if err != nil {
 		return nil, err
 	}
@@ -98,9 +99,6 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	}
 	if len(cfg.Printers) == 0 {
 		return serveSetup(sigCtx, cfg, path, store, logger)
-	}
-	if !fileFound {
-		logger.Info("config file not found; using environment configuration", "path", path)
 	}
 
 	serials := make([]string, 0, len(cfg.Printers))
@@ -152,11 +150,10 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	// print's sliced 3MF render and metadata per settled job, shared by the
 	// camera wall and MCP. It serves through the shared HTTP listener and
 	// needs at least one consumer; with neither consumer the service must
-	// not exist, so no FTPS socket can ever open. Like the other optional
-	// dependencies, a disabled feature must leave the consumer side truly
-	// nil.
+	// not exist, so no FTPS socket can ever open. A disabled feature must
+	// leave the consumer side truly nil.
 	var previews *jobpreview.Service
-	if jobpreview.Enabled(cfg) && cfg.HTTP.Port > 0 && (cfg.CameraEnabled() || cfg.MCPEnabled()) {
+	if cfg.HTTP.Port > 0 && (cfg.CameraEnabled() || cfg.MCPEnabled()) {
 		previews = jobpreview.New(cfg.Printers, state, pool, logger)
 	}
 
@@ -179,10 +176,9 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		renderer.SetActivity(activities)
 		renderer.SetControl(controls)
 	}
-	// Optional OctoEverywhere Gadget detection: the YAML detection section
-	// with the BMBPX_OCTOEVERYWHERE_API_KEY override. With a key but the
-	// camera feature disabled the engine stays visible in the blocked state
-	// and performs no camera or API activity.
+	// Optional OctoEverywhere Gadget detection: the YAML detection section.
+	// With a key but the camera feature disabled the engine stays visible in
+	// the blocked state and performs no camera or API activity.
 	// The engine is constructed here but started only after the broker is
 	// serving: a broker startup failure must not leave workers running.
 	var detector *detection.Engine
@@ -195,20 +191,19 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		if !cfg.CameraEnabled() {
 			detector = detection.New(cfg.Printers, client, detection.IdleFrames{}, state, pool, pool, logger)
 			detector.SetBlocked(detection.ReasonCameraDisabled)
-			logger.Warn("detection blocked: the camera feature is disabled",
-				"env", config.EnvCameraEnable)
+			logger.Warn("detection blocked: the camera feature is disabled")
 		} else {
 			detector = detection.New(cfg.Printers, client, detection.CameraFrames(cameras), state, pool, pool, logger)
 			logger.Info("octoeverywhere detection enabled")
 		}
 		detector.SetActivity(activities)
 	}
-	// Optional build-plate checks through a vision provider: the YAML platecheck
-	// section with the BMBPX_PLATECHECK_* overrides. With
-	// credentials but the camera feature disabled the service stays visible
-	// in the blocked state and performs no camera or provider activity. With
-	// the feature off and cameras serving, a bare service keeps the snapshot
-	// diagnostic route available to the configuration page.
+	// Optional build-plate checks through a vision provider: the YAML
+	// platecheck section. With credentials but the camera feature disabled
+	// the service stays visible in the blocked state and performs no camera
+	// or provider activity. With the feature off and cameras serving, a bare
+	// service keeps the snapshot diagnostic route available to the
+	// configuration page.
 	var plates *platecheck.Service
 	if plateSettings.On() || (cfg.HTTP.Port > 0 && cfg.CameraEnabled()) {
 		var client platecheck.DecisionClient // nil while off
@@ -218,8 +213,7 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		if !cfg.CameraEnabled() {
 			plates = platecheck.New(cfg.Printers, plateSettings, client, platecheck.IdleFrames{}, state, pool, logger)
 			plates.SetBlocked(platecheck.ReasonCameraDisabled)
-			logger.Warn("plate check blocked: the camera feature is disabled",
-				"env", config.EnvCameraEnable)
+			logger.Warn("plate check blocked: the camera feature is disabled")
 		} else {
 			plates = platecheck.New(cfg.Printers, plateSettings, client, platecheck.CameraFrames(cameras), state, pool, logger)
 		}
@@ -291,7 +285,7 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		}
 	}
 	// MCP endpoint on the shared HTTP listener, on by default and disabled
-	// with mcp.enabled: false / BMBPX_MCP_ENABLED=false. Its sampler reads
+	// with mcp.enabled: false. Its sampler reads
 	// cached state for every configured printer; printer commands go only
 	// through the allow-listed control service. Disabled features must leave the
 	// Deps interface fields truly nil: a typed nil would pass the nil check
@@ -439,8 +433,8 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 func serveSetup(sigCtx context.Context, cfg *config.Config, path string, store *configui.Store,
 	logger *slog.Logger) (*configui.Reload, error) {
 	if cfg.HTTP.Port == 0 {
-		return nil, fmt.Errorf("no printers configured in %q or %s, and HTTP is disabled (http.port: 0)",
-			path, config.EnvPrinters)
+		return nil, fmt.Errorf("no printers configured in %q, and HTTP is disabled (http.port: 0); "+
+			"add printers on the configuration page", path)
 	}
 	pool := upstream.NewPool(nil, nil, cfg.Behavior, logger)
 	defer pool.Stop()
@@ -468,10 +462,10 @@ func waitReload(sigCtx context.Context, store *configui.Store) *configui.Reload 
 	}
 }
 
-// resolveConfig builds the configuration from an optional YAML file with
-// BMBPX_* environment overrides on top. With neither present it returns the
-// defaults with no printers (setup mode). It reports whether the file was
-// found.
+// resolveConfig builds the configuration from an optional YAML file.
+// BMBPX_HTTP_PORT and BMBPX_LOG_LEVEL override the HTTP port and the log
+// level. Without a file it returns the defaults with no printers (setup
+// mode). It reports whether the file was found.
 func resolveConfig(configPath string) (*config.Config, bool, error) {
 	cfg := &config.Config{HTTP: config.HTTP{Port: config.PortUnset}}
 	fileFound := false
@@ -483,15 +477,14 @@ func resolveConfig(configPath string) (*config.Config, bool, error) {
 		}
 		fileFound = true
 	}
-	if _, err := cfg.ApplyEnv(); err != nil {
+	if err := cfg.ApplyEnv(); err != nil {
 		return nil, false, err
 	}
 	cfg.ApplyDefaults()
 	if err := cfg.Validate(); err != nil {
 		return nil, false, err
 	}
-	// Effective-only: the file alone may enable detection with a blank key
-	// because the environment can supply it.
+	// Effective-only: the module sections re-check the effective values.
 	if err := cfg.ValidateEffective(); err != nil {
 		return nil, false, err
 	}

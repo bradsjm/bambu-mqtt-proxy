@@ -95,7 +95,6 @@ func decodeStream(t *testing.T, w *httptest.ResponseRecorder) snapshotStream {
 }
 
 func TestSnapshotRowsConfiguredOrderFailureContinuationAndNoControlEffects(t *testing.T) {
-	unsetEnv(t)
 	printers := []config.Printer{{Serial: "01S1", Name: "First", Model: "P1S"}, {Serial: "00M1", Name: "Second", Model: "X1C"}, {Serial: "0391", Name: "Third", Model: "A1"}, {Serial: "dead", Name: "Unsupported", Model: "UNKNOWN"}}
 	clock := &testClock{t: time.Date(2026, 1, 1, 1, 0, 0, 0, time.UTC)}
 	data := testJPEG(t)
@@ -162,7 +161,6 @@ func TestSnapshotRowsConfiguredOrderFailureContinuationAndNoControlEffects(t *te
 }
 
 func TestSnapshotKeepsExactUploadedJPEGWithTLSProvider(t *testing.T) {
-	unsetEnv(t)
 	var uploaded []byte
 	calls := 0
 	provider := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -199,7 +197,6 @@ func TestSnapshotKeepsExactUploadedJPEGWithTLSProvider(t *testing.T) {
 }
 
 func TestSnapshotValidationBeforeActivityAndEffectiveSettings(t *testing.T) {
-	unsetEnv(t)
 	captures, factory := 0, 0
 	frames := frameFunc(func(ctx context.Context, serial string, after time.Time) (Frame, error) {
 		captures++
@@ -230,21 +227,9 @@ func TestSnapshotValidationBeforeActivityAndEffectiveSettings(t *testing.T) {
 	if out.Model != "clef-flash" || out.Cutoff != .73 || got.Key() != "running-key" {
 		t.Fatalf("effective settings %+v", got)
 	}
-	t.Setenv(EnvEndpoint, "https://env.example/evaluate")
-	t.Setenv(EnvAPIKey, "env-key")
-	_ = decodeStream(t, snapshotRequest(s, settingsJSON(submitted)))
-	if got.Endpoint != "https://env.example/evaluate" || got.Key() != "env-key" {
-		t.Fatalf("env precedence %+v", got)
-	}
-	t.Setenv(EnvAPIKey, "")
-	w := snapshotRequest(s, settingsJSON(submitted))
-	if w.Code != 422 || captures != 2 || factory != 2 || !strings.Contains(w.Body.String(), "set but empty") {
-		t.Fatalf("validation side effect: %d %d %d %s", w.Code, captures, factory, w.Body.String())
-	}
 }
 
 func TestSnapshotNoSupportedCamerasMakesNoCapture(t *testing.T) {
-	unsetEnv(t)
 	frames := frameFunc(func(context.Context, string, time.Time) (Frame, error) {
 		t.Fatal("capture without supported cameras")
 		return Frame{}, nil
@@ -258,7 +243,6 @@ func TestSnapshotNoSupportedCamerasMakesNoCapture(t *testing.T) {
 }
 
 func TestSnapshotInferenceFailureRetainsImageAndSafeErrors(t *testing.T) {
-	unsetEnv(t)
 	f := newFixture(t, "PREPARE")
 	f.s.newClient = func(Settings, *slog.Logger) DecisionClient {
 		return &fakeDecision{err: errors.New("secret-endpoint credential-marker\nforged")}
@@ -271,7 +255,6 @@ func TestSnapshotInferenceFailureRetainsImageAndSafeErrors(t *testing.T) {
 }
 
 func TestSnapshotCancellationStopsUploads(t *testing.T) {
-	unsetEnv(t)
 	var captures, evaluations atomic.Int32
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -297,7 +280,6 @@ func TestSnapshotCancellationStopsUploads(t *testing.T) {
 }
 
 func TestSnapshotLogsSafeScoresAndMetadata(t *testing.T) {
-	unsetEnv(t)
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	data := testJPEG(t)
@@ -324,66 +306,57 @@ func TestSnapshotLogsSafeScoresAndMetadata(t *testing.T) {
 	}
 }
 
-func TestDiagnosticPOSTsNeverMoveSavedOrEnvironmentKeys(t *testing.T) {
-	for _, mode := range []string{"stored", "environment-key-only"} {
-		t.Run(mode, func(t *testing.T) {
-			unsetEnv(t)
-			var contacts atomic.Int32
-			attacker := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				contacts.Add(1)
-				_, _ = io.WriteString(w, resultJSON(.1, .9))
-			}))
-			defer attacker.Close()
-			base := testSettings()
-			base.Enabled = new(false)
-			if mode == "environment-key-only" {
-				t.Setenv(EnvAPIKey, "environment-secret")
-			}
-			path := filepath.Join(t.TempDir(), "config.yaml")
-			file := "platecheck:\n  enabled: false\n  provider: custom\n  endpoint: " + base.Endpoint + "\n  api_key: stored-secret\n  model: clef\n  stop_confidence: 0.5\n"
-			if err := os.WriteFile(path, []byte(file), 0600); err != nil {
-				t.Fatal(err)
-			}
-			store := configui.NewStore(path)
-			mux := http.NewServeMux()
-			store.Register(mux)
-			oldProbe := probe
-			defer func() { probe = oldProbe }()
-			probe = func(ctx context.Context, settings Settings) error {
-				client := NewClient(settings, nil)
-				client.http.Transport = attacker.Client().Transport
-				return client.Probe(ctx)
-			}
-			submitted := base
-			submitted.Endpoint = attacker.URL
-			submitted.APIKey = ""
-			keyRequest := httptest.NewRequest("POST", "/config/platecheck/test", bytes.NewReader(settingsJSON(submitted)))
-			keyResponse := httptest.NewRecorder()
-			mux.ServeHTTP(keyResponse, keyRequest)
-			if keyResponse.Code != 422 || !strings.Contains(keyResponse.Body.String(), endpointKeyMessage) {
-				t.Fatalf("key route HTTP %d: %s", keyResponse.Code, keyResponse.Body.String())
-			}
-			captures := 0
-			frames := frameFunc(func(context.Context, string, time.Time) (Frame, error) { captures++; return Frame{}, nil })
-			s := New([]config.Printer{{Serial: "01S1", Model: "P1S"}}, base, nil, frames, nil, &fakeCommands{}, nil)
-			s.newClient = func(settings Settings, log *slog.Logger) DecisionClient {
-				client := NewClient(settings, log)
-				client.http.Transport = attacker.Client().Transport
-				return client
-			}
-			response := snapshotRequest(s, settingsJSON(submitted))
-			if response.Code != 422 || !strings.Contains(response.Body.String(), endpointKeyMessage) {
-				t.Fatalf("snapshot HTTP %d: %s", response.Code, response.Body.String())
-			}
-			if contacts.Load() != 0 || captures != 0 {
-				t.Fatalf("credential attack caused contacts=%d captures=%d", contacts.Load(), captures)
-			}
-		})
+func TestDiagnosticPOSTsNeverMoveSavedKeys(t *testing.T) {
+	var contacts atomic.Int32
+	attacker := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		contacts.Add(1)
+		_, _ = io.WriteString(w, resultJSON(.1, .9))
+	}))
+	defer attacker.Close()
+	base := testSettings()
+	base.Enabled = new(false)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	file := "platecheck:\n  enabled: false\n  provider: custom\n  endpoint: " + base.Endpoint + "\n  api_key: stored-secret\n  model: clef\n  stop_confidence: 0.5\n"
+	if err := os.WriteFile(path, []byte(file), 0600); err != nil {
+		t.Fatal(err)
+	}
+	store := configui.NewStore(path)
+	mux := http.NewServeMux()
+	store.Register(mux)
+	oldProbe := probe
+	defer func() { probe = oldProbe }()
+	probe = func(ctx context.Context, settings Settings) error {
+		client := NewClient(settings, nil)
+		client.http.Transport = attacker.Client().Transport
+		return client.Probe(ctx)
+	}
+	submitted := base
+	submitted.Endpoint = attacker.URL
+	submitted.APIKey = ""
+	keyRequest := httptest.NewRequest("POST", "/config/platecheck/test", bytes.NewReader(settingsJSON(submitted)))
+	keyResponse := httptest.NewRecorder()
+	mux.ServeHTTP(keyResponse, keyRequest)
+	if keyResponse.Code != 422 || !strings.Contains(keyResponse.Body.String(), endpointKeyMessage) {
+		t.Fatalf("key route HTTP %d: %s", keyResponse.Code, keyResponse.Body.String())
+	}
+	captures := 0
+	frames := frameFunc(func(context.Context, string, time.Time) (Frame, error) { captures++; return Frame{}, nil })
+	s := New([]config.Printer{{Serial: "01S1", Model: "P1S"}}, base, nil, frames, nil, &fakeCommands{}, nil)
+	s.newClient = func(settings Settings, log *slog.Logger) DecisionClient {
+		client := NewClient(settings, log)
+		client.http.Transport = attacker.Client().Transport
+		return client
+	}
+	response := snapshotRequest(s, settingsJSON(submitted))
+	if response.Code != 422 || !strings.Contains(response.Body.String(), endpointKeyMessage) {
+		t.Fatalf("snapshot HTTP %d: %s", response.Code, response.Body.String())
+	}
+	if contacts.Load() != 0 || captures != 0 {
+		t.Fatalf("credential attack caused contacts=%d captures=%d", contacts.Load(), captures)
 	}
 }
 
-func TestDiagnosticCredentialBindingAllowsTypedKeyAndPairedEnvironment(t *testing.T) {
-	unsetEnv(t)
+func TestDiagnosticCredentialBindingAllowsTypedKeyAndStoredFallback(t *testing.T) {
 	base := testSettings()
 	in := settingsView{Provider: ProviderCustom, Endpoint: "https://new.example/check", APIKey: "typed-key", Model: "clef", StopConfidence: .5}
 	effective, err := resolveTestSettings(in, base)
@@ -396,17 +369,13 @@ func TestDiagnosticCredentialBindingAllowsTypedKeyAndPairedEnvironment(t *testin
 	if err != nil || effective.Key() != base.Key() {
 		t.Fatalf("trimmed endpoint binding %+v %v", effective, err)
 	}
-	t.Setenv(EnvEndpoint, "https://configured.example/check")
-	t.Setenv(EnvAPIKey, "paired-environment-key")
 	in.Endpoint = "https://attacker.example/check"
-	effective, err = resolveTestSettings(in, base)
-	if err != nil || effective.Endpoint != "https://configured.example/check" || effective.APIKey != "paired-environment-key" {
-		t.Fatalf("paired environment %+v %v", effective, err)
+	if _, err := resolveTestSettings(in, base); err == nil || err.Error() != endpointKeyMessage {
+		t.Fatalf("stored key followed another endpoint: %v", err)
 	}
 }
 
 func TestSnapshotStreamSkipsOfflineAndRunsInParallel(t *testing.T) {
-	unsetEnv(t)
 	printers := []config.Printer{{Serial: "01S1", Model: "P1S"}, {Serial: "01S2", Model: "P1S"}, {Serial: "01S3", Model: "P1S"}}
 	data := testJPEG(t)
 	started := make(chan string, 2)

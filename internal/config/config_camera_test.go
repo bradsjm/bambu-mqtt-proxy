@@ -81,7 +81,7 @@ func TestPortZeroDisablesHTTP(t *testing.T) {
 		Printers: []Printer{{Serial: "S", Model: "P1S", Address: "h:8883", Password: "p"}},
 	}
 	t.Setenv(EnvHTTPPort, "0")
-	if _, err := cfg.ApplyEnv(); err != nil {
+	if err := cfg.ApplyEnv(); err != nil {
 		t.Fatalf("ApplyEnv: %v", err)
 	}
 	cfg.ApplyDefaults()

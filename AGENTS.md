@@ -6,7 +6,7 @@
 
 ## Architecture & Data Flow
 
-`cmd/bambu-mqtt-proxy/main.go` loads YAML and `BMBPX_*` overrides, applies defaults, validates configuration, wires services, and handles shutdown signals. MQTT reports flow from the per-printer connections through the broker to downstream subscribers. Client requests flow through broker ACL and routing hooks to the matching printer; payloads pass through unchanged.
+`cmd/bambu-mqtt-proxy/main.go` loads the YAML configuration, applies the `BMBPX_HTTP_PORT` and `BMBPX_LOG_LEVEL` overrides and defaults, validates configuration, wires services, and handles shutdown signals. MQTT reports flow from the per-printer connections through the broker to downstream subscribers. Client requests flow through broker ACL and routing hooks to the matching printer; payloads pass through unchanged.
 
 - `internal/config` owns config parsing, defaults, environment overrides, and validation.
 - `internal/broker` adapts the mochi MQTT server and its hooks. `internal/routing` resolves topic filters against configured serials.
@@ -49,7 +49,7 @@ The core is the MQTT proxy path (config, broker, routing, upstream), telemetry, 
 
 - Put a per-printer option in a `config.PrinterSetting` in the module package.
 - Put a top-level config section in a `config.Section` in the module package.
-- Register both in `cmd/bambu-mqtt-proxy/settings.go`. Core config, `BMBPX_PRINTERS`, and the `/config` page then handle them generically.
+- Register both in `cmd/bambu-mqtt-proxy/settings.go`. Core config and the `/config` page then handle them generically.
 
 ### MCP
 
@@ -73,7 +73,6 @@ The core is the MQTT proxy path (config, broker, routing, upstream), telemetry, 
 
 The `notification` module maps activity kinds that other modules record (`ai_*`, `platecheck_*`, `first_layer_complete`). This module-to-module knowledge is accepted. Core packages hold no capability code. Keep it that way.
 
-An environment-only module switch is a `config.Section` with only `ApplyEnv`. `ApplyEnv` always replaces the section from the environment. See `jobpreview.ConfigSection`.
 
 ### Module tests
 
@@ -139,7 +138,7 @@ CI runs the formatting check, `go vet ./...`, and `go test -race -p 1 ./...` on 
 
 Use Go `1.26.5` and Go modules, as declared in `go.mod`. No other package manager or lint tool is configured. The container build uses `CGO_ENABLED=0` and supports `linux/amd64` and `linux/arm64`.
 
-Configuration can combine YAML and `BMBPX_*` variables; environment values override file values per field. Use `config.example.yaml` and the README's environment-variable table for supported settings. Do not commit `bambu-mqtt-proxy.yaml` or printer credentials.
+The YAML file is the configuration; only `BMBPX_HTTP_PORT` and `BMBPX_LOG_LEVEL` override `http.port` and `log.level`. Use `config.example.yaml` for supported settings. Do not commit `bambu-mqtt-proxy.yaml` or printer credentials.
 
 ## Testing & QA
 

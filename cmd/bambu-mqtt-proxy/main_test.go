@@ -21,7 +21,6 @@ import (
 	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/detection"
 	"bambu-mqtt-proxy/internal/health"
-	"bambu-mqtt-proxy/internal/jobpreview"
 	"bambu-mqtt-proxy/internal/upstream"
 )
 
@@ -80,31 +79,41 @@ func TestDetectionModuleNoKeyWiring(t *testing.T) {
 	}
 }
 
-// TestNoKeyStartupStatus starts the real run() in a subprocess with an
-// env-only configuration, no detection key, and one unreachable printer,
-// then requires /status to serve without the detection field and the
-// process to exit cleanly on SIGTERM.
+// TestNoKeyStartupStatus starts the real run() in a subprocess with a YAML
+// configuration file, no detection key, and one unreachable printer, then
+// requires /status to serve without the detection field and the process to
+// exit cleanly on SIGTERM.
 func TestNoKeyStartupStatus(t *testing.T) {
 	httpPort := freePort(t)
 	listenPort := freePort(t)
-	absent := filepath.Join(t.TempDir(), "absent.yaml")
+	configPath := filepath.Join(t.TempDir(), "bambu-mqtt-proxy.yaml")
+	configuration := fmt.Sprintf(`listen:
+  - port: %d
+    tls: false
+auth:
+  mode: printer
+printers:
+  - serial: "01NOKEYTEST0001"
+    model: "P1S"
+    address: "127.0.0.1:1"
+    username: "bblp"
+    password: "00008888"
+camera:
+  enabled: false
+`, listenPort)
+	if err := os.WriteFile(configPath, []byte(configuration), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
 
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatalf("test binary: %v", err)
 	}
-	cmd := exec.Command(exe, "-config", absent)
+	cmd := exec.Command(exe, "-config", configPath)
 	cmd.Env = append(bmbpxFreeEnv(),
 		childEnv+"=1",
-		config.EnvPrinters+"=serial=01NOKEYTEST0001,address=127.0.0.1:1,password=00008888",
-		config.EnvListenPort+"="+strconv.Itoa(listenPort),
-		config.EnvListenTLS+"=false",
-		config.EnvAuthMode+"="+config.AuthModePrinter,
 		config.EnvHTTPPort+"="+strconv.Itoa(httpPort),
-		config.EnvCameraEnable+"=false",
 		config.EnvLogLevel+"=error",
-		// Explicitly empty: an inherited key would enable detection.
-		detection.EnvAPIKey+"=",
 	)
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
@@ -419,88 +428,6 @@ log:
 	terminate(t, cmd, &out, &stopped)
 }
 
-// TestResolveConfigJobPreviewEnvSwitch covers the real startup path for the
-// environment-only job preview switch: unset or empty keeps the enabled
-// default, false survives parse and the environment re-apply after a
-// configuration-page save, and an invalid value fails startup with the
-// existing-style error.
-func TestResolveConfigJobPreviewEnvSwitch(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "bambu-mqtt-proxy.yaml")
-	const yamlDoc = `printers:
-  - serial: "01P00AJOBPREVIEW1"
-    address: "127.0.0.1:1883"
-    password: "00008888"
-`
-	if err := os.WriteFile(path, []byte(yamlDoc), 0o600); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-
-	// unsetEnv removes one BMBPX_* variable for the current process the
-	// same way the config package tests do: t.Setenv records the original
-	// value for restoration, then Unsetenv reports absence.
-	unsetEnv := func(t *testing.T, name string) {
-		t.Helper()
-		t.Setenv(name, "")
-		if err := os.Unsetenv(name); err != nil {
-			t.Fatalf("unset %s: %v", name, err)
-		}
-	}
-
-	t.Run("unset defaults to enabled", func(t *testing.T) {
-		unsetEnv(t, jobpreview.EnvSwitch)
-		cfg, _, err := resolveConfig(path)
-		if err != nil {
-			t.Fatalf("resolveConfig: %v", err)
-		}
-		if !jobpreview.Enabled(cfg) {
-			t.Fatal("job preview must default to enabled")
-		}
-	})
-
-	t.Run("empty defaults to enabled", func(t *testing.T) {
-		t.Setenv(jobpreview.EnvSwitch, "")
-		cfg, _, err := resolveConfig(path)
-		if err != nil {
-			t.Fatalf("resolveConfig: %v", err)
-		}
-		if !jobpreview.Enabled(cfg) {
-			t.Fatal("an empty switch must keep the enabled default")
-		}
-	})
-
-	t.Run("false disables across a reload", func(t *testing.T) {
-		t.Setenv(jobpreview.EnvSwitch, "false")
-		cfg, found, err := resolveConfig(path)
-		if err != nil {
-			t.Fatalf("resolveConfig: %v", err)
-		}
-		if !found {
-			t.Fatal("config file not found")
-		}
-		if jobpreview.Enabled(cfg) {
-			t.Fatal("an explicit false must disable job preview")
-		}
-
-		// Re-running the startup path mirrors the post-save reload: the
-		// environment is re-applied over the same file and stays false.
-		cfg, _, err = resolveConfig(path)
-		if err != nil {
-			t.Fatalf("resolveConfig reload: %v", err)
-		}
-		if jobpreview.Enabled(cfg) {
-			t.Fatal("the switch must survive a resolveConfig reload")
-		}
-	})
-
-	t.Run("invalid fails startup", func(t *testing.T) {
-		t.Setenv(jobpreview.EnvSwitch, "bogus")
-		_, _, err := resolveConfig(path)
-		if err == nil || err.Error() != `BMBPX_JOB_PREVIEW: invalid bool "bogus"` {
-			t.Fatalf("error = %v, want BMBPX_JOB_PREVIEW: invalid bool \"bogus\"", err)
-		}
-	})
-}
-
 func resolvedDetection(t *testing.T, cfg *config.Config) detection.Settings {
 	t.Helper()
 	settings, err := detection.SettingsOf(cfg)
@@ -510,13 +437,10 @@ func resolvedDetection(t *testing.T, cfg *config.Config) detection.Settings {
 	return settings
 }
 
-// TestResolveConfigDetectionKeyPrecedence covers the startup and reload
-// path for the persisted detection section: the YAML key enables on its
-// own, a set environment variable overrides it on every resolve (the
-// post-save reload included), an empty variable disables without failing
-// startup, and an explicit enabled: false stays off while its stored key
-// stays usable.
-func TestResolveConfigDetectionKeyPrecedence(t *testing.T) {
+// TestResolveConfigDetectionKey covers the startup and reload path for the
+// persisted detection section: the YAML key enables on its own, and an
+// explicit enabled: false stays off while its stored key stays usable.
+func TestResolveConfigDetectionKey(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "bambu-mqtt-proxy.yaml")
 	const keyed = `printers:
@@ -529,51 +453,19 @@ detection:
 	if err := os.WriteFile(path, []byte(keyed), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
-	unsetOcto := func(t *testing.T) {
-		t.Helper()
-		t.Setenv(detection.EnvAPIKey, "")
-		if err := os.Unsetenv(detection.EnvAPIKey); err != nil {
-			t.Fatalf("unset %s: %v", detection.EnvAPIKey, err)
-		}
-	}
 
-	t.Run("yaml key enables without environment", func(t *testing.T) {
-		unsetOcto(t)
-		cfg, found, err := resolveConfig(path)
-		if err != nil || !found {
-			t.Fatalf("resolveConfig: found=%v err=%v", found, err)
-		}
-		if !resolvedDetection(t, cfg).On() || resolvedDetection(t, cfg).Key() != "file-key" {
-			t.Fatalf("enabled=%v key=%q, want the yaml key in effect",
-				resolvedDetection(t, cfg).On(), resolvedDetection(t, cfg).Key())
-		}
-	})
-
-	t.Run("environment key wins across reloads", func(t *testing.T) {
-		t.Setenv(detection.EnvAPIKey, "env-key")
-		// The second resolve mirrors the post-save reload: the environment
-		// is re-applied over the same file and must keep precedence.
+	t.Run("yaml key enables", func(t *testing.T) {
+		// The second resolve mirrors the post-save reload: the same file is
+		// resolved again and must keep enabling detection.
 		for pass := 0; pass < 2; pass++ {
-			cfg, _, err := resolveConfig(path)
-			if err != nil {
-				t.Fatalf("resolveConfig pass %d: %v", pass, err)
+			cfg, found, err := resolveConfig(path)
+			if err != nil || !found {
+				t.Fatalf("resolveConfig pass %d: found=%v err=%v", pass, found, err)
 			}
-			if !resolvedDetection(t, cfg).On() || resolvedDetection(t, cfg).Key() != "env-key" {
-				t.Fatalf("pass %d: enabled=%v key=%q, want the environment key",
+			if !resolvedDetection(t, cfg).On() || resolvedDetection(t, cfg).Key() != "file-key" {
+				t.Fatalf("pass %d: enabled=%v key=%q, want the yaml key in effect",
 					pass, resolvedDetection(t, cfg).On(), resolvedDetection(t, cfg).Key())
 			}
-		}
-	})
-
-	t.Run("empty environment clears the yaml key", func(t *testing.T) {
-		t.Setenv(detection.EnvAPIKey, "")
-		cfg, _, err := resolveConfig(path)
-		if err != nil {
-			t.Fatalf("an empty override must not fail startup: %v", err)
-		}
-		if resolvedDetection(t, cfg).On() || resolvedDetection(t, cfg).Key() != "" {
-			t.Fatalf("enabled=%v key=%q, want detection off",
-				resolvedDetection(t, cfg).On(), resolvedDetection(t, cfg).Key())
 		}
 	})
 
@@ -590,24 +482,12 @@ detection:
 		if err := os.WriteFile(offPath, []byte(offDoc), 0o600); err != nil {
 			t.Fatalf("write config: %v", err)
 		}
-		t.Setenv(detection.EnvAPIKey, "env-key")
 		cfg, _, err := resolveConfig(offPath)
 		if err != nil {
 			t.Fatalf("resolveConfig: %v", err)
 		}
 		if resolvedDetection(t, cfg).On() {
-			t.Fatal("enabled: false must win over the environment key")
-		}
-
-		// Without the override the stored file key is still usable, but the
-		// persisted switch keeps detection off.
-		unsetOcto(t)
-		cfg, _, err = resolveConfig(offPath)
-		if err != nil {
-			t.Fatalf("resolveConfig: %v", err)
-		}
-		if resolvedDetection(t, cfg).On() {
-			t.Fatal("the persisted false must survive a reload")
+			t.Fatal("enabled: false must keep detection off")
 		}
 		if resolvedDetection(t, cfg).Key() != "file-key" {
 			t.Fatalf("key = %q, want the stored file key preserved", resolvedDetection(t, cfg).Key())

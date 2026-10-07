@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -21,48 +22,51 @@ import (
 	"time"
 
 	"bambu-mqtt-proxy/internal/config"
-	"bambu-mqtt-proxy/internal/detection"
-	"bambu-mqtt-proxy/internal/jobpreview"
 )
 
 // startProxyChild starts the real run() in a subprocess with one
 // unreachable printer and the shared HTTP listener on, then waits for
-// /livez. Each env argument is applied only when nonempty; empty keeps the
-// enabled default. The returned stop func terminates the child and
-// requires a clean exit.
-func startProxyChild(t *testing.T, previewEnv, cameraEnv, mcpEnv string) (url string, cmd *exec.Cmd, out *bytes.Buffer, stop func()) {
+// /livez. The camera and MCP arguments are "" for the enabled default or
+// "false" to write the disable switch into the file. The returned stop func
+// terminates the child and requires a clean exit.
+func startProxyChild(t *testing.T, cameraEnv, mcpEnv string) (url string, cmd *exec.Cmd, out *bytes.Buffer, stop func()) {
 	t.Helper()
 	httpPort := freePort(t)
 	listenPort := freePort(t)
-	absent := filepath.Join(t.TempDir(), "absent.yaml")
+	printer := noKeyPrinter()
+	var doc strings.Builder
+	fmt.Fprintf(&doc, `listen:
+  - port: %d
+    tls: false
+auth:
+  mode: printer
+printers:
+  - serial: %q
+    model: "P1S"
+    address: %q
+    password: %q
+`, listenPort, printer.Serial, printer.Address, printer.Password)
+	if cameraEnv != "" {
+		fmt.Fprintf(&doc, "camera:\n  enabled: %s\n", cameraEnv)
+	}
+	if mcpEnv != "" {
+		fmt.Fprintf(&doc, "mcp:\n  enabled: %s\n", mcpEnv)
+	}
+	configPath := filepath.Join(t.TempDir(), "bambu-mqtt-proxy.yaml")
+	if err := os.WriteFile(configPath, []byte(doc.String()), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
 
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatalf("test binary: %v", err)
 	}
-	printer := noKeyPrinter()
 	env := append(bmbpxFreeEnv(),
 		childEnv+"=1",
-		config.EnvPrinters+"=serial="+printer.Serial+",address="+printer.Address+",password="+printer.Password,
-		config.EnvListenPort+"="+strconv.Itoa(listenPort),
-		config.EnvListenTLS+"=false",
-		config.EnvAuthMode+"="+config.AuthModePrinter,
 		config.EnvHTTPPort+"="+strconv.Itoa(httpPort),
 		config.EnvLogLevel+"=error",
-		// Explicitly empty: an inherited key would enable detection.
-		detection.EnvAPIKey+"=",
 	)
-	switches := []struct{ name, value string }{
-		{jobpreview.EnvSwitch, previewEnv},
-		{config.EnvCameraEnable, cameraEnv},
-		{config.EnvMCPEnable, mcpEnv},
-	}
-	for _, sw := range switches {
-		if sw.value != "" {
-			env = append(env, sw.name+"="+sw.value)
-		}
-	}
-	c := exec.Command(exe, "-config", absent)
+	c := exec.Command(exe, "-config", configPath)
 	c.Env = env
 	out = &bytes.Buffer{}
 	c.Stdout, c.Stderr = out, out
@@ -116,32 +120,26 @@ func getPreviewWrongVersion(t *testing.T, url, path string) int {
 }
 
 // TestJobPreviewRouteFollowsFeatureSwitch drives real run() child processes
-// across the consumer combinations. With the feature on, the route exists
-// for either consumer alone — MCP with cameras off, and cameras with MCP
-// explicitly off. With BMBPX_JOB_PREVIEW=false, or with both consumers off,
-// the route must be entirely absent so no FTPS service can exist behind it.
+// across the consumer combinations. The route exists for either consumer
+// alone — MCP with cameras off, and cameras with MCP explicitly off. With
+// both consumers off the route must be entirely absent so no FTPS service
+// can exist behind it.
 func TestJobPreviewRouteFollowsFeatureSwitch(t *testing.T) {
 	const previewPath = "/camera/01NOKEYTEST0001/preview"
 	cases := []struct {
 		name        string
 		cameraEnv   string
 		mcpEnv      string
-		previewOn   bool
 		wantPOST    int
 		wantGETCode int
 	}{
-		{"enabled serves route for mcp without cameras", "false", "", true, http.StatusMethodNotAllowed, http.StatusNotFound},
-		{"enabled serves route for cameras without mcp", "", "false", true, http.StatusMethodNotAllowed, http.StatusNotFound},
-		{"disabled removes the route", "false", "", false, http.StatusNotFound, http.StatusNotFound},
-		{"no consumer removes the route", "false", "false", true, http.StatusNotFound, http.StatusNotFound},
+		{"enabled serves route for mcp without cameras", "false", "", http.StatusMethodNotAllowed, http.StatusNotFound},
+		{"enabled serves route for cameras without mcp", "", "false", http.StatusMethodNotAllowed, http.StatusNotFound},
+		{"no consumer removes the route", "false", "false", http.StatusNotFound, http.StatusNotFound},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			previewEnv := ""
-			if !tc.previewOn {
-				previewEnv = "false"
-			}
-			url, _, out, stop := startProxyChild(t, previewEnv, tc.cameraEnv, tc.mcpEnv)
+			url, _, out, stop := startProxyChild(t, tc.cameraEnv, tc.mcpEnv)
 			defer stop()
 
 			if got := postPreview(t, url, previewPath); got != tc.wantPOST {
@@ -156,7 +154,8 @@ func TestJobPreviewRouteFollowsFeatureSwitch(t *testing.T) {
 
 // TestModuleMCPWiring checks the real serveOnce module list in both
 // configurations. Cameras are on with detection, because a blocked
-// detection engine registers no tool.
+// detection engine registers no tool. Job preview always runs with MCP as
+// its consumer, so its tool is present in both configurations.
 func TestModuleMCPWiring(t *testing.T) {
 	for _, on := range []bool{true, false} {
 		t.Run(strconv.FormatBool(on), func(t *testing.T) {
@@ -213,10 +212,13 @@ func TestModuleMCPWiring(t *testing.T) {
 			if on {
 				want = 1
 			}
-			for _, name := range []string{"set_ai_monitoring", "get_job_preview"} {
-				if counts[name] != want {
-					t.Fatalf("%s count = %d, want %d", name, counts[name], want)
-				}
+			if got := counts["set_ai_monitoring"]; got != want {
+				t.Fatalf("set_ai_monitoring count = %d, want %d", got, want)
+			}
+			// Job preview has no switch: with MCP enabled it always runs and
+			// serves its tool in both configurations.
+			if got := counts["get_job_preview"]; got != 1 {
+				t.Fatalf("get_job_preview count = %d, want 1", got)
 			}
 		})
 	}
@@ -224,7 +226,7 @@ func TestModuleMCPWiring(t *testing.T) {
 
 // TestJobPreviewTileModulePath checks the jobpreview.job_preview tile member.
 func TestJobPreviewTileModulePath(t *testing.T) {
-	base, _, _, stop := startProxyChild(t, "", "", "false")
+	base, _, _, stop := startProxyChild(t, "", "false")
 	defer stop()
 	resp, err := http.Get(base + "/camera/status")
 	if err != nil {

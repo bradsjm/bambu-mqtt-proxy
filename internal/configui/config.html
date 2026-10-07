@@ -307,15 +307,13 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
           <div>
             <span class="label">Listeners</span>
             <span class="hint">Ports your apps connect to. Bambu apps expect TLS on 8883. Leave the certificate paths empty to use a generated certificate.</span>
-            <span class="env" data-env="listen" hidden></span>
             <div class="listeners" id="listeners"></div>
             <button class="btn quiet" type="button" id="add-listener" style="margin-top:.5rem"><svg class="ic" aria-hidden="true"><use href="#i-plus"/></svg>Add listener</button>
           </div>
         </div>
         <div class="row">
           <div><span class="label" id="auth-l">App login</span>
-            <span class="hint">Printer access code: apps log in as <code>bblp</code> with any configured printer's code.</span>
-            <span class="env" data-env="auth_mode" hidden></span></div>
+            <span class="hint">Printer access code: apps log in as <code>bblp</code> with any configured printer's code.</span></div>
           <div class="control"><div class="seg" role="radiogroup" aria-labelledby="auth-l">
             <label><input type="radio" name="auth_mode" value="printer" data-field="auth_mode">Printer access code</label>
             <label><input type="radio" name="auth_mode" value="accept_all" data-field="auth_mode">Anyone</label>
@@ -333,14 +331,12 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
         </div>
         <div class="row">
           <div><label for="f-camera">Cameras</label>
-            <span class="hint">Camera wall, snapshots and streams on HTTP, and the raw camera port 6000 for P1 and A1 printers.</span>
-            <span class="env" data-env="camera_enabled" hidden></span></div>
+            <span class="hint">Camera wall, snapshots and streams on HTTP, and the raw camera port 6000 for P1 and A1 printers.</span></div>
           <div class="control"><input id="f-camera" class="switch" type="checkbox" role="switch" data-field="camera_enabled"></div>
         </div>
         <div class="row">
           <div><label for="f-mcp">MCP endpoint</label>
-            <span class="hint">Read-only printer state for AI assistants at <code>/mcp</code>. It cannot control printers.</span>
-            <span class="env" data-env="mcp_enabled" hidden></span></div>
+            <span class="hint">Read-only printer state for AI assistants at <code>/mcp</code>. It cannot control printers.</span></div>
           <div class="control"><input id="f-mcp" class="switch" type="checkbox" role="switch" data-field="mcp_enabled"></div>
         </div>
       </fieldset>
@@ -401,8 +397,7 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
         </div>
         <div class="row">
           <div><label for="f-ai-key">Gadget API key</label>
-            <span class="hint">From <a href="https://octoeverywhere.com/gadgetapi" rel="noreferrer">octoeverywhere.com</a>. With detection on, the proxy uploads camera snapshots from active prints to OctoEverywhere's servers and can slow a print to Silent or pause it without asking. Turn detection off to keep every image local.</span>
-            <span class="env" data-env="detection_api_key" hidden></span></div>
+            <span class="hint">From <a href="https://octoeverywhere.com/gadgetapi" rel="noreferrer">octoeverywhere.com</a>. With detection on, the proxy uploads camera snapshots from active prints to OctoEverywhere's servers and can slow a print to Silent or pause it without asking. Turn detection off to keep every image local.</span></div>
           <div class="control"><input id="f-ai-key" type="password" autocomplete="new-password" spellcheck="false" data-field="detection.api_key"></div>
         </div>
         <div class="row">
@@ -423,22 +418,19 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
         </div>
         <div class="row">
           <div><label for="f-platecheck-provider">Service provider</label>
-            <span class="hint" id="f-platecheck-provider-hint">Cloudflare runs the plate-check models on Workers AI. Custom sends requests to your own HTTPS endpoint, which must accept the same request and answer format.</span>
-            <span class="env" data-env="platecheck_provider" hidden></span></div>
+            <span class="hint" id="f-platecheck-provider-hint">Cloudflare runs the plate-check models on Workers AI. Custom sends requests to your own HTTPS endpoint, which must accept the same request and answer format.</span></div>
           <div class="control"><select id="f-platecheck-provider" aria-describedby="f-platecheck-provider-hint" data-field="platecheck.provider" style="max-width:12rem">
             <option value="cloudflare">Cloudflare</option><option value="custom">Custom</option>
           </select></div>
         </div>
         <div class="row" data-provider="cloudflare">
           <div><label for="f-platecheck-account">Account ID</label>
-            <span class="hint" id="f-platecheck-account-hint">Your Cloudflare account ID, 32 hexadecimal characters, shown in the Cloudflare dashboard.</span>
-            <span class="env" data-env="platecheck_account_id" id="f-platecheck-account-env" hidden></span></div>
+            <span class="hint" id="f-platecheck-account-hint">Your Cloudflare account ID, 32 hexadecimal characters, shown in the Cloudflare dashboard.</span></div>
           <div class="control"><input id="f-platecheck-account" class="mono" type="text" autocomplete="off" spellcheck="false" placeholder="32-character account ID" aria-describedby="f-platecheck-account-hint" data-field="platecheck.account_id"></div>
         </div>
         <div class="row" data-provider="custom">
           <div><label for="f-platecheck-endpoint">Endpoint</label>
-            <span class="hint" id="f-platecheck-endpoint-hint">The full HTTPS URL of your endpoint.</span>
-            <span class="env" data-env="platecheck_endpoint" id="f-platecheck-endpoint-env" hidden></span></div>
+            <span class="hint" id="f-platecheck-endpoint-hint">The full HTTPS URL of your endpoint.</span></div>
           <div class="control"><input id="f-platecheck-endpoint" type="url" inputmode="url" autocomplete="off" spellcheck="false" placeholder="https://" aria-describedby="f-platecheck-endpoint-hint" data-field="platecheck.endpoint"></div>
         </div>
         <div class="row" data-provider="cloudflare">
@@ -456,8 +448,7 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
         </div>
         <div class="row">
           <div><label for="f-platecheck-key">API key</label>
-            <span class="hint" id="f-platecheck-key-hint">A Cloudflare API token with Workers AI access, or the key of your custom endpoint. It is stored in the config file and never shown here.</span>
-            <span class="env" data-env="platecheck_api_key" hidden></span></div>
+            <span class="hint" id="f-platecheck-key-hint">A Cloudflare API token with Workers AI access, or the key of your custom endpoint. It is stored in the config file and never shown here.</span></div>
           <div class="control"><input id="f-platecheck-key" type="password" autocomplete="new-password" spellcheck="false" aria-describedby="f-platecheck-key-hint" data-field="platecheck.api_key"></div>
         </div>
         <div class="row">
@@ -635,7 +626,6 @@ function renderNotices() {
   if (meta.apply_error) note(`<strong>The last save could not start, so the previous settings were restored.</strong> ${esc(meta.apply_error)}`, "error");
   if (meta.file_error) note(`<strong>The config file could not be read.</strong> ${esc(meta.file_error)} Saving replaces it, so re-enter each printer's access code.`, "error");
   if (!meta.file_exists && !meta.file_error) note(`<strong>No config file yet.</strong> Add your printers and save to create <code>${esc(meta.path)}</code>.`);
-  if (meta.env_overrides.printers) note(`Printers come from <code>${esc(meta.env_overrides.printers)}</code> while it is set. Printers saved here are written to the file and used once the variable is removed.`);
   $("#notices").innerHTML = n.join("");
 }
 
@@ -717,69 +707,37 @@ function pushoverHints() {
   user.placeholder = n.has_user_key && !user.value ? "Stored. Leave blank to keep it" : "";
 }
 
-/* Under BMBPX_CAMERA_ENABLED the stored camera switch lies: the backend
-   sends the effective state only while the variable validly applies. */
-function camerasOn() {
-  const forced = meta.camera_enabled;
-  return forced === undefined ? !!cfg.camera_enabled : !!forced;
-}
-
-/* The sanitized API never returns the Gadget key; has_api_key marks an
-   EFFECTIVE key (stored file key or BMBPX_OCTOEVERYWHERE_API_KEY). The
-   environment wins whenever the variable exists — even empty — so the
-   field locks and the env badge explains. Disabling keeps the key. */
+/* The sanitized API never returns the Gadget key; has_api_key marks a
+   stored key, and a blank submission keeps it. Disabling keeps the key. */
 function aiHints() {
   if (!cfg) return;
   const key = $("#f-ai-key");
-  const overridden = !!meta.env_overrides.detection_api_key;
-  key.disabled = overridden;
-  key.placeholder = !overridden && cfg.detection.has_api_key && !key.value ? "Stored. Leave blank to keep it" : "";
-  const blocked = $("#ai-blocked"), camEnv = meta.env_overrides.camera_enabled;
-  blocked.hidden = camerasOn() || !cfg.detection.enabled;
+  key.placeholder = cfg.detection.has_api_key && !key.value ? "Stored. Leave blank to keep it" : "";
+  const blocked = $("#ai-blocked");
+  blocked.hidden = !!cfg.camera_enabled || !cfg.detection.enabled;
   if (!blocked.hidden) {
-    blocked.innerHTML = camEnv
-      ? `Cameras are off and set by <code>${esc(camEnv)}</code>, so AI detection is blocked: no uploads and no automatic pauses.`
-      : `Cameras are off, so AI detection is blocked: no uploads and no automatic pauses. Turn on Cameras under Web and extras.`;
+    blocked.innerHTML = "Cameras are off, so AI detection is blocked: no uploads and no automatic pauses. Turn on Cameras under Web and extras.";
   }
 }
 
-/* The sanitized API never returns the plate-check key. provider,
-   account_id, endpoint, and has_api_key are EFFECTIVE values: the
-   BMBPX_PLATECHECK_* variables win whenever they exist, even empty, so their
-   fields lock and the env badges explain. One destination variable locks
-   every destination field, because the server binds the key to the whole
-   destination. The server validates the effective override; the page never
-   reads a locked field as user input. */
+/* The sanitized API never returns the plate-check key; has_api_key marks a
+   stored key, and a blank submission keeps it. The server validates the
+   stored settings; the page only reports what was stored. */
 function platecheckHints() {
   if (!cfg) return;
   const pc = cfg.platecheck;
   $("#platecheck").hidden = !pc;
   if (!pc) return;
-  const env = meta.env_overrides;
   for (const row of document.querySelectorAll("#platecheck [data-provider]")) row.hidden = row.dataset.provider !== pc.provider;
-  const provider = $("#f-platecheck-provider"), account = $("#f-platecheck-account");
-  const endpoint = $("#f-platecheck-endpoint"), key = $("#f-platecheck-key");
-  const locked = !!(env.platecheck_provider || env.platecheck_account_id || env.platecheck_endpoint);
-  provider.disabled = account.disabled = endpoint.disabled = locked;
-  key.disabled = !!env.platecheck_api_key;
-  key.placeholder = !key.disabled && pc.has_api_key && !key.value ? "Stored. Leave blank to keep it" : "";
-  endpoint.placeholder = endpoint.disabled ? "" : "https://";
-  account.placeholder = account.disabled ? "" : "32-character account ID";
-  if (env.platecheck_endpoint && !String(pc.endpoint || "").trim()) {
-    $("#f-platecheck-endpoint-env").textContent = `${env.platecheck_endpoint} is set but empty, so there is no endpoint. Set the variable or turn plate check off.`;
-  }
-  if (env.platecheck_account_id && !String(pc.account_id || "").trim()) {
-    $("#f-platecheck-account-env").textContent = `${env.platecheck_account_id} is set but empty, so there is no account ID. Set the variable or turn plate check off.`;
-  }
+  const key = $("#f-platecheck-key");
+  key.placeholder = pc.has_api_key && !key.value ? "Stored. Leave blank to keep it" : "";
   const range = $("#f-platecheck-threshold"), pct = Number(range.value);
   $("#f-platecheck-threshold-out").textContent = `${pct}%`;
   range.setAttribute("aria-valuetext", `Stop above ${pct} percent`);
-  const blocked = $("#platecheck-blocked"), camEnv = env.camera_enabled;
-  blocked.hidden = camerasOn() || !pc.enabled;
+  const blocked = $("#platecheck-blocked");
+  blocked.hidden = !!cfg.camera_enabled || !pc.enabled;
   if (!blocked.hidden) {
-    blocked.innerHTML = camEnv
-      ? `Cameras are off and set by <code>${esc(camEnv)}</code>, so plate check is blocked: no uploads and no automatic stops.`
-      : `Cameras are off, so plate check is blocked: no uploads and no automatic stops. Turn on Cameras under Web and extras.`;
+    blocked.innerHTML = "Cameras are off, so plate check is blocked: no uploads and no automatic stops. Turn on Cameras under Web and extras.";
   }
 }
 
@@ -844,13 +802,8 @@ function validateForm() {
     if (blank(n.user_key, n.has_user_key)) { setBar("error", "Enter the Pushover user key."); $("#f-pushover-user").focus(); return false; }
   }
   if (cfg.detection.enabled && !cfg.detection.has_api_key && !String(cfg.detection.api_key || "").trim()) {
-    if (meta.env_overrides.detection_api_key) {
-      setBar("error", `${meta.env_overrides.detection_api_key} is set but empty, so there is no API key. Set the variable or turn AI detection off.`);
-      $("#f-ai").focus();
-    } else {
-      setBar("error", "Enter the Gadget API key or turn AI detection off.");
-      $("#f-ai-key").focus();
-    }
+    setBar("error", "Enter the Gadget API key or turn AI detection off.");
+    $("#f-ai-key").focus();
     return false;
   }
   return true;
@@ -1304,7 +1257,7 @@ $("#platecheck-test").addEventListener("click", () => {
       const key = await postJSON("/config/platecheck/test", payload, signal);
       if (!live()) return;
       if (!key.res.ok) return finish("error", failText(key.res, key.body), "key_failed", { status: key.res.status });
-      if (!camerasOn()) return finish("ok", "Key verified. Cameras are off, so no snapshots were checked.", "cameras_off", { status: key.res.status });
+      if (!cfg.camera_enabled) return finish("ok", "Key verified. Cameras are off, so no snapshots were checked.", "cameras_off", { status: key.res.status });
       if (!cfg.printers.length) return finish("ok", "Key verified. Add and save printers to check snapshots.", "no_printers", { status: key.res.status });
 
       report("busy", "Key verified. Checking which printers are online…");

@@ -9,19 +9,14 @@ import (
 )
 
 // Section describes a module-owned top-level YAML section. Register it during
-// program initialization. Hooks must not mutate configs except ApplyEnv's c
-// and Save's out.
+// program initialization. Hooks must not mutate configs except Save's out.
 type Section struct {
 	// Key names the YAML section, page API member, and test route segment.
 	Key string
 	// New returns a pointer to the zero section value for YAML decoding.
 	New func() any
-	// ApplyEnv applies the section's environment overrides.
-	ApplyEnv func(c *Config) error
-	// Validate checks the effective configuration after environment overrides.
+	// Validate checks the effective configuration.
 	Validate func(c *Config) error
-	// EnvOverrides returns page fields overridden by environment variables.
-	EnvOverrides func() map[string]string
 	// View returns the stored section's secret-free page representation.
 	View func(file *Config) any
 	// Save builds the file section from a submitted page member.
@@ -89,7 +84,7 @@ func (c *Config) SetSection(key string, v any) {
 	c.Sections[key] = node
 }
 
-// ValidateEffective checks module requirements after environment overrides.
+// ValidateEffective checks module requirements on the effective configuration.
 func (c *Config) ValidateEffective() error {
 	for _, s := range sections {
 		if s.Validate != nil {

@@ -17,14 +17,12 @@ import (
 
 	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/detection"
-	"bambu-mqtt-proxy/internal/jobpreview"
 	"bambu-mqtt-proxy/internal/notification"
 )
 
 func TestMain(m *testing.M) {
 	config.RegisterSection(detection.ConfigSection)
 	config.RegisterSection(notification.ConfigSection)
-	config.RegisterSection(jobpreview.ConfigSection)
 	os.Exit(m.Run())
 }
 
@@ -50,9 +48,7 @@ type getResponse struct {
 
 func serve(t *testing.T, path string) (*Store, *httptest.Server) {
 	t.Helper()
-	for _, env := range []string{config.EnvPrinters, config.EnvListenPort, config.EnvListenTLS, config.EnvCertFile,
-		config.EnvKeyFile, config.EnvAuthMode, config.EnvLogLevel, config.EnvHTTPPort, config.EnvCameraEnable,
-		config.EnvMCPEnable, jobpreview.EnvSwitch, detection.EnvAPIKey} {
+	for _, env := range []string{config.EnvLogLevel, config.EnvHTTPPort} {
 		t.Setenv(env, "") // restores the original value after the test
 		_ = os.Unsetenv(env)
 	}
@@ -400,48 +396,6 @@ func writeConfig(t *testing.T, path string) {
 	}
 }
 
-// TestJobPreviewStaysEnvOnlyAcrossConfigPageSave saves a configuration
-// through the page while BMBPX_JOB_PREVIEW=false is set, then requires the
-// written file to carry no job-preview field and the reload-time
-// Load-plus-ApplyEnv sequence to keep the switch explicitly disabled.
-func TestJobPreviewStaysEnvOnlyAcrossConfigPageSave(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "bambu-mqtt-proxy.yaml")
-	store, srv := serve(t, path)
-	t.Setenv(jobpreview.EnvSwitch, "false")
-
-	v := get(t, srv).Config
-	v.Printers = []PrinterView{{Serial: "01P00A123456789", Address: "192.168.1.42:8883", TLS: true,
-		InsecureSkipVerify: true, AccessCode: "12345678"}}
-	if code, body := put(t, srv, v); code != http.StatusOK {
-		t.Fatalf("save = %d %v", code, body)
-	}
-	select {
-	case <-store.Reloads():
-	default:
-		t.Fatal("save did not request a reload")
-	}
-
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(raw), "job_preview") || strings.Contains(string(raw), "jobpreview") {
-		t.Fatalf("written file must not persist a job-preview field:\n%s", raw)
-	}
-
-	// The reload path re-applies the environment after every save.
-	cfg, err := config.Load(path)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if _, err := cfg.ApplyEnv(); err != nil {
-		t.Fatalf("ApplyEnv: %v", err)
-	}
-	if jobpreview.Enabled(cfg) {
-		t.Fatal("BMBPX_JOB_PREVIEW=false must survive the configuration-page save and reload")
-	}
-}
-
 // writeDetectionConfig stores the standard printer fixture plus a stored
 // Gadget key, using the same owner-only write pattern as writeConfig.
 func writeDetectionConfig(t *testing.T, path, key string) {
@@ -517,12 +471,10 @@ func requireDetectionRejection(t *testing.T, code int, body map[string]any) {
 	}
 }
 
-// TestDetectionGetRedactsAndReportsEffectiveKey requires the settings GET
-// to keep both the stored and the environment Gadget secret out of the
-// payload while has_api_key reports the effective key in every direction:
-// stored only, environment override, environment only, and a set-but-empty
-// variable that clears an otherwise stored key.
-func TestDetectionGetRedactsAndReportsEffectiveKey(t *testing.T) {
+// TestDetectionGetRedactsAndReportsStoredKey requires the settings GET
+// to keep the stored Gadget secret out of the payload while has_api_key
+// reports whether the file stores a key.
+func TestDetectionGetRedactsAndReportsStoredKey(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "c.yaml")
 	const stored = "stored-detection-key"
 	writeDetectionConfig(t, path, stored)
@@ -536,31 +488,12 @@ func TestDetectionGetRedactsAndReportsEffectiveKey(t *testing.T) {
 		t.Fatalf("detection view = %+v, want the stored key reported without revealing it", d)
 	}
 
-	// Environment key: the flag reports the effective override, still
-	// without either secret in the payload.
-	t.Setenv(detection.EnvAPIKey, "env-detection-key")
-	if raw := getRaw(t, srv); strings.Contains(raw, "env-detection-key") || strings.Contains(raw, stored) {
-		t.Fatal("GET returned a detection secret")
-	}
-	if d := get(t, srv).Config.sections["detection"].(*detectionPage); !d.HasAPIKey || !d.Enabled || d.APIKey != "" {
-		t.Fatalf("detection view = %+v, want the environment override reported", d)
-	}
-
-	// A set-but-empty variable clears the effective key: the flag turns
-	// off over a stored key.
-	t.Setenv(detection.EnvAPIKey, "")
-	if d := get(t, srv).Config.sections["detection"].(*detectionPage); d.HasAPIKey || d.Enabled {
-		t.Fatalf("detection view = %+v, want the empty override to clear the flag", d)
-	}
-
-	// Environment-only deployment: no stored key, the variable alone sets
-	// the flag.
-	only := filepath.Join(t.TempDir(), "env-only.yaml")
+	// A file without a detection section: the flag is off and nothing leaks.
+	only := filepath.Join(t.TempDir(), "no-key.yaml")
 	writeConfig(t, only)
 	_, onlySrv := serve(t, only)
-	t.Setenv(detection.EnvAPIKey, "env-detection-key")
-	if d := get(t, onlySrv).Config.sections["detection"].(*detectionPage); !d.HasAPIKey || !d.Enabled || d.APIKey != "" {
-		t.Fatalf("detection view = %+v, want the environment-only key reported", d)
+	if d := get(t, onlySrv).Config.sections["detection"].(*detectionPage); d.HasAPIKey || d.Enabled {
+		t.Fatalf("detection view = %+v, want no key reported", d)
 	}
 }
 
@@ -609,53 +542,6 @@ func TestDetectionBlankSaveKeepsStoredKeyAndDisableRetains(t *testing.T) {
 	}
 	drainSave(t, store)
 	assertStoredDetection(t, path, stored, false)
-}
-
-// TestDetectionEnvSecretIsNeverPersisted saves through the page while the
-// environment key supplies the secret: the written file must keep the
-// stored key and never contain the environment secret, while the
-// reload-time resolver still prefers the environment.
-func TestDetectionEnvSecretIsNeverPersisted(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "c.yaml")
-	const stored = "stored-detection-key"
-	writeDetectionConfig(t, path, stored)
-	store, srv := serve(t, path)
-	t.Setenv(detection.EnvAPIKey, "env-detection-secret")
-
-	v := get(t, srv).Config // has_api_key true from the environment, api_key blank
-	if !v.sections["detection"].(*detectionPage).Enabled || !v.sections["detection"].(*detectionPage).HasAPIKey {
-		t.Fatalf("detection view = %+v, want the environment key reported as effective", v.sections["detection"].(*detectionPage))
-	}
-	v.Printers[0].PreviousSerial = v.Printers[0].Serial
-	if code, body := put(t, srv, v); code != http.StatusOK {
-		t.Fatalf("save = %d %v", code, body)
-	}
-	drainSave(t, store)
-
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(raw), "env-detection-secret") {
-		t.Fatalf("the environment secret was written to the file:\n%s", raw)
-	}
-	if !strings.Contains(string(raw), stored) {
-		t.Fatalf("the blank submission must keep the stored key:\n%s", raw)
-	}
-
-	// Reload time: the runtime resolver keeps environment precedence over
-	// the stored file key.
-	cfg, err := config.Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := cfg.ApplyEnv(); err != nil {
-		t.Fatalf("ApplyEnv: %v", err)
-	}
-	if detectionSettings(t, cfg).APIKey != "env-detection-secret" || !detectionSettings(t, cfg).On() {
-		t.Fatalf("key = %q enabled = %v, want the environment key at reload",
-			detectionSettings(t, cfg).APIKey, detectionSettings(t, cfg).On())
-	}
 }
 
 // TestDetectionEnableWithoutKeyIsRejected requires the effective-only key
@@ -713,123 +599,31 @@ func TestDetectionEnableWithoutKeyIsRejected(t *testing.T) {
 	}
 }
 
-// TestDetectionEnvEmptyOverrideRejectsEnable covers the lock-out: the
-// variable exists but is empty, so the stored key is effectively gone and
-// enabling detection from the page must fail without touching the file.
-func TestDetectionEnvEmptyOverrideRejectsEnable(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "c.yaml")
-	const stored = "stored-detection-key"
-	writeDetectionConfig(t, path, stored)
-	store, srv := serve(t, path)
-	t.Setenv(detection.EnvAPIKey, "")
-
-	if d := get(t, srv).Config.sections["detection"].(*detectionPage); d.HasAPIKey || d.Enabled {
-		t.Fatalf("detection view = %+v, want the empty override to clear the flag", d)
-	}
-	v := get(t, srv).Config
-	v.Printers[0].PreviousSerial = v.Printers[0].Serial
-	v.sections["detection"].(*detectionPage).Enabled = true
-	code, body := put(t, srv, v)
-	requireDetectionRejection(t, code, body)
-
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(raw), stored) {
-		t.Fatal("the rejected save must not disturb the stored key")
-	}
-	select {
-	case <-store.Reloads():
-		t.Fatal("rejected save requested a reload")
-	default:
-	}
-}
-
-// TestDetectionEnvOverrideMetaReportsEmpty requires the page lock to apply
-// by presence: an empty variable still locks the key field even though no
-// other override lists empty values.
-func TestDetectionEnvOverrideMetaReportsEmpty(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "c.yaml")
-	_, srv := serve(t, path)
-
-	if got := get(t, srv).Meta.EnvOverrides["detection_api_key"]; got != "" {
-		t.Fatalf("unset variable listed as %q, want absent", got)
-	}
-	t.Setenv(detection.EnvAPIKey, "")
-	if got := get(t, srv).Meta.EnvOverrides["detection_api_key"]; got != detection.EnvAPIKey {
-		t.Fatalf("empty override listed as %q, want %s", got, detection.EnvAPIKey)
-	}
-}
-
-// TestMetaCameraEnabledCarriesEffectiveOverride requires the GET meta to
-// report the effective camera switch only while BMBPX_CAMERA_ENABLED
-// validly applies, so the AI section never describes the stored switch as
-// the cameras that will actually run. config.camera_enabled stays the
-// stored value and the file bytes stay untouched.
-func TestMetaCameraEnabledCarriesEffectiveOverride(t *testing.T) {
-	ptr := func(b bool) *bool { return &b }
-	const printerYAML = `printers:
-  - serial: "01P00A123456789"
-    address: "192.168.1.42:8883"
-    tls: true
-    insecure_skip_verify: true
-    password: "secret-code"
-`
-	cases := []struct {
-		name       string
-		cameraYAML string
-		env        string
-		wantMeta   *bool
-		wantStored bool
-	}{
-		{"env true overrides file false", "camera:\n  enabled: false\n", "true", ptr(true), false},
-		{"env false overrides file true", "camera:\n  enabled: true\n", "false", ptr(false), true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "c.yaml")
-			y := printerYAML + tc.cameraYAML
-			if err := os.WriteFile(path, []byte(y), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			_, srv := serve(t, path)
-			t.Setenv(config.EnvCameraEnable, tc.env)
-
-			got := get(t, srv)
-			if got.Meta.CameraEnabled == nil || *got.Meta.CameraEnabled != *tc.wantMeta {
-				t.Fatalf("meta.camera_enabled = %v, want %v", got.Meta.CameraEnabled, *tc.wantMeta)
-			}
-			if got.Config.CameraEnabled != tc.wantStored {
-				t.Fatalf("config.camera_enabled = %v, want the stored %v", got.Config.CameraEnabled, tc.wantStored)
-			}
-			// The stored switch itself is unchanged on disk.
-			cfg, err := config.Load(path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if cfg.Camera.Enabled == nil || *cfg.Camera.Enabled != tc.wantStored {
-				t.Fatalf("stored camera switch = %v, want %v", cfg.Camera.Enabled, tc.wantStored)
-			}
-		})
-	}
-
-	// No variable: the key is absent (JSON omitempty), the file decides.
+// TestMetaEnvOverridesKeptVariables requires the page meta to report only
+// the two surviving environment variables, by their presence rules, and
+// nothing for removed variables.
+func TestMetaEnvOverridesKeptVariables(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "c.yaml")
 	writeConfig(t, path)
 	_, srv := serve(t, path)
-	got := get(t, srv)
-	if got.Meta.CameraEnabled != nil {
-		t.Fatalf("meta.camera_enabled = %v, want the key absent", *got.Meta.CameraEnabled)
-	}
-	if !got.Config.CameraEnabled {
-		t.Fatal("config.camera_enabled must reflect the file")
-	}
 
-	// An unparseable override claims nothing: the field stays absent.
-	t.Setenv(config.EnvCameraEnable, "yes")
-	if got := get(t, srv).Meta.CameraEnabled; got != nil {
-		t.Fatalf("meta.camera_enabled = %v for an invalid override, want absent", *got)
+	got := get(t, srv).Meta.EnvOverrides
+	for _, field := range []string{"http_port", "log_level"} {
+		if _, present := got[field]; present {
+			t.Fatalf("unset variable %s listed as %q, want absent", field, got[field])
+		}
+	}
+	t.Setenv(config.EnvHTTPPort, "9090")
+	t.Setenv(config.EnvLogLevel, "debug")
+	got = get(t, srv).Meta.EnvOverrides
+	if got["http_port"] != config.EnvHTTPPort {
+		t.Fatalf("http_port override listed as %q, want %s", got["http_port"], config.EnvHTTPPort)
+	}
+	if got["log_level"] != config.EnvLogLevel {
+		t.Fatalf("log_level override listed as %q, want %s", got["log_level"], config.EnvLogLevel)
+	}
+	if len(got) != 2 {
+		t.Fatalf("env overrides = %v, want only http_port and log_level", got)
 	}
 }
 

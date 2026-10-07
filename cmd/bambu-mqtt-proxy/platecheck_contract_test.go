@@ -33,7 +33,7 @@ func TestPlatecheckConfigTestRoute(t *testing.T) {
 		name, site, body, message string
 		code                      int
 	}{
-		{"setup missing account", "same-origin", `{"enabled":true,"model":"clef","stop_confidence":0.5}`, "No Cloudflare account ID is configured. Enter the account ID or set BMBPX_PLATECHECK_ACCOUNT_ID.", 422},
+		{"setup missing account", "same-origin", `{"enabled":true,"model":"clef","stop_confidence":0.5}`, "No Cloudflare account ID is configured. Enter the account ID.", 422},
 		{"setup cross-site", "cross-site", `{"api_key":"must-not-be-probed","model":"clef"}`, "", 403},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -53,7 +53,7 @@ func TestPlatecheckConfigTestRoute(t *testing.T) {
 	if code != 422 {
 		t.Fatalf("runtime probe = %d %s, want 422", code, body)
 	}
-	if detectionContractObject(t, body)["error"] != "No Cloudflare account ID is configured. Enter the account ID or set BMBPX_PLATECHECK_ACCOUNT_ID." {
+	if detectionContractObject(t, body)["error"] != "No Cloudflare account ID is configured. Enter the account ID." {
 		t.Fatalf("runtime probe body = %s", body)
 	}
 }
@@ -63,7 +63,9 @@ func TestPlatecheckConfigTestRoute(t *testing.T) {
 func TestPlatecheckSnapshotsWhenCamerasOn(t *testing.T) {
 	platecheckContractCleanEnv(t)
 	base := platecheckContractServe(t, true, true)
-	code, body := platecheckContractRequest(t, http.MethodPost, base+"/platecheck/snapshots", `{"enabled":true,"model":"clef","stop_confidence":0.5}`, "same-origin")
+	snapBody := fmt.Sprintf(`{"enabled":true,"provider":"custom","endpoint":%q,"api_key":"contract-dummy-key","model":"clef","stop_confidence":0.5}`,
+		platecheckContractEndpoint)
+	code, body := platecheckContractRequest(t, http.MethodPost, base+"/platecheck/snapshots", snapBody, "same-origin")
 	if code != http.StatusOK {
 		t.Fatalf("snapshots = %d %s, want 200", code, body)
 	}
@@ -97,7 +99,7 @@ func TestPlatecheckSnapshotsWhenCamerasOn(t *testing.T) {
 
 // TestPlatecheckSnapshotsWhileOff pins that the diagnostics route stays
 // mounted while the feature is off and cameras serve, using submitted
-// values without any stored or environment credential.
+// values without any stored credential.
 func TestPlatecheckSnapshotsWhileOff(t *testing.T) {
 	platecheckContractCleanEnv(t)
 	base := platecheckContractServe(t, false, true)
@@ -151,10 +153,6 @@ func TestPlatecheckAbsentWhenCamerasOff(t *testing.T) {
 // the previous binding.
 func TestPlatecheckRouteAfterReload(t *testing.T) {
 	platecheckContractCleanEnv(t)
-	t.Setenv("BMBPX_CAMERA_ENABLED", "true")
-	t.Setenv(platecheck.EnvProvider, platecheck.ProviderCustom)
-	t.Setenv(platecheck.EnvEndpoint, platecheckContractEndpoint)
-	t.Setenv(platecheck.EnvAPIKey, "contract-dummy-key")
 	httpPort := freePort(t)
 	listenPort := freePort(t)
 	path := filepath.Join(t.TempDir(), "config.yaml")
@@ -168,9 +166,16 @@ printers:
     password: "00008888"
 http:
   port: %d
+camera:
+  enabled: true
+platecheck:
+  enabled: true
+  provider: %s
+  endpoint: %q
+  api_key: contract-dummy-key
 log:
   level: error
-`, listenPort, platecheckContractSerial, httpPort)
+`, listenPort, platecheckContractSerial, httpPort, platecheck.ProviderCustom, platecheckContractEndpoint)
 	if err := os.WriteFile(path, []byte(fixture), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -248,7 +253,9 @@ log:
 	// The next /livez answer is the restarted server; the diagnostics route
 	// must serve from the fresh camera binding.
 	waitFor(t, 15*time.Second, func() bool { return probeOK(base + "/livez") })
-	code, raw := platecheckContractRequest(t, http.MethodPost, base+"/platecheck/snapshots", `{"enabled":true,"model":"clef","stop_confidence":0.5}`, "same-origin")
+	code, raw := platecheckContractRequest(t, http.MethodPost, base+"/platecheck/snapshots",
+		fmt.Sprintf(`{"enabled":true,"provider":"custom","endpoint":%q,"model":"clef","stop_confidence":0.5}`, platecheckContractEndpoint),
+		"same-origin")
 	if code != http.StatusOK {
 		t.Fatalf("snapshots after reload = %d %s, want 200", code, raw)
 	}
@@ -259,17 +266,11 @@ log:
 }
 
 // platecheckContractServe starts one full serveOnce with the camera feature
-// and, when enabled, the plate-check environment credentials. Like
+// and, when enabled, the plate-check section credentials. Like
 // detectionContractServe, it must not run in parallel with other fixtures.
 func platecheckContractServe(t *testing.T, feature, cameras bool) string {
 	t.Helper()
 	platecheckContractCleanEnv(t)
-	t.Setenv("BMBPX_CAMERA_ENABLED", fmt.Sprint(cameras))
-	if feature {
-		t.Setenv(platecheck.EnvProvider, platecheck.ProviderCustom)
-		t.Setenv(platecheck.EnvEndpoint, platecheckContractEndpoint)
-		t.Setenv(platecheck.EnvAPIKey, "contract-dummy-key")
-	}
 	port := freePort(t)
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	fixture := fmt.Sprintf(`listen:
@@ -282,9 +283,14 @@ printers:
     password: "00008888"
 http:
   port: %d
-log:
-  level: error
-`, freePort(t), platecheckContractSerial, port)
+camera:
+  enabled: %t
+`, freePort(t), platecheckContractSerial, port, cameras)
+	if feature {
+		fixture += fmt.Sprintf("platecheck:\n  enabled: true\n  provider: %s\n  endpoint: %q\n  api_key: contract-dummy-key\n",
+			platecheck.ProviderCustom, platecheckContractEndpoint)
+	}
+	fixture += "log:\n  level: error\n"
 	if err := os.WriteFile(path, []byte(fixture), 0o600); err != nil {
 		t.Fatal(err)
 	}

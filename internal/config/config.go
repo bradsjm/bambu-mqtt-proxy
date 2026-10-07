@@ -1,5 +1,6 @@
-// Package config loads and validates the bambu-mqtt-proxy configuration from
-// a YAML file, environment variables, or both.
+// Package config loads and validates the bambu-mqtt-proxy configuration
+// from a YAML file. BMBPX_LOG_LEVEL and BMBPX_HTTP_PORT override two file
+// values; every other setting is YAML only.
 package config
 
 import (
@@ -24,31 +25,22 @@ const (
 	AuthModeAcceptAll = "accept_all"
 )
 
-// Environment variables that configure the proxy without a file. Per-field
-// overrides replace the file value; BMBPX_PRINTERS replaces the printers list.
-// Setting any listen variable replaces the listener definition with a single
-// listener assembled from the listen variables.
+// Environment variables that override the YAML file. A nonempty value
+// replaces the file value; every other setting is YAML only.
 const (
-	EnvPrinters     = "BMBPX_PRINTERS"
-	EnvListenPort   = "BMBPX_LISTEN_PORT"
-	EnvListenTLS    = "BMBPX_LISTEN_TLS"
-	EnvCertFile     = "BMBPX_CERT_FILE"
-	EnvKeyFile      = "BMBPX_KEY_FILE"
-	EnvAuthMode     = "BMBPX_AUTH_MODE"
-	EnvLogLevel     = "BMBPX_LOG_LEVEL"
-	EnvHTTPPort     = "BMBPX_HTTP_PORT"
-	EnvCameraEnable = "BMBPX_CAMERA_ENABLED"
-	// EnvMCPEnable controls the Model Context Protocol endpoint on the
-	// shared HTTP port. MCP is enabled by default; an explicit false
-	// disables it.
-	EnvMCPEnable    = "BMBPX_MCP_ENABLED"
+	// EnvLogLevel overrides log.level: a nonempty value replaces the
+	// stored file value.
+	EnvLogLevel = "BMBPX_LOG_LEVEL"
+	// EnvHTTPPort overrides http.port: a valid value 0-65535 replaces the
+	// stored file value, and 0 disables the HTTP endpoint.
+	EnvHTTPPort = "BMBPX_HTTP_PORT"
+
 	defaultFileName = "bambu-mqtt-proxy.yaml"
 )
 
 // defaultListenPort is the design-default downstream MQTT port. ApplyDefaults
-// pairs it with TLS and a generated self-signed certificate when neither the
-// file nor the environment configures a listener, and ApplyEnv starts its
-// replacement listener from the same base.
+// pairs it with TLS and a generated self-signed certificate when the file
+// does not configure a listener.
 const defaultListenPort = 8883
 
 // Listener describes one downstream MQTT listener.
@@ -267,8 +259,8 @@ func (c *Config) MCPEnabled() bool {
 	return c.MCP.Enabled == nil || *c.MCP.Enabled
 }
 
-// Load reads and parses the YAML configuration at path. Defaults and
-// validation are applied by the caller after environment overrides.
+// Load reads and parses the YAML configuration at path. Defaults,
+// validation, and the two environment overrides are applied by the caller.
 func Load(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -287,157 +279,22 @@ func Parse(raw []byte) (*Config, error) {
 	return &cfg, nil
 }
 
-// ApplyEnv applies BMBPX_* environment overrides onto the configuration. It
-// reports whether the printers list came from the environment.
-func (c *Config) ApplyEnv() (bool, error) {
-	printersFromEnv := false
-	if v := os.Getenv(EnvPrinters); v != "" {
-		ps, err := parsePrintersEnv(v)
-		if err != nil {
-			return false, err
-		}
-		c.Printers = ps
-		printersFromEnv = true
-	}
-
-	_, portSet := os.LookupEnv(EnvListenPort)
-	_, tlsSet := os.LookupEnv(EnvListenTLS)
-	_, certSet := os.LookupEnv(EnvCertFile)
-	_, keySet := os.LookupEnv(EnvKeyFile)
-	if portSet || tlsSet || certSet || keySet {
-		ln := Listener{
-			Port:     defaultListenPort,
-			TLS:      true,
-			CertFile: os.Getenv(EnvCertFile),
-			KeyFile:  os.Getenv(EnvKeyFile),
-		}
-		if v := os.Getenv(EnvListenPort); v != "" {
-			n, err := strconv.Atoi(v)
-			if err != nil || n < 1 || n > 65535 {
-				return false, fmt.Errorf("%s: invalid port %q", EnvListenPort, v)
-			}
-			ln.Port = n
-		}
-		if v := os.Getenv(EnvListenTLS); v != "" {
-			b, err := strconv.ParseBool(v)
-			if err != nil {
-				return false, fmt.Errorf("%s: invalid bool %q", EnvListenTLS, v)
-			}
-			ln.TLS = b
-		}
-		c.Listen = []Listener{ln}
-	}
-
-	if v, ok := os.LookupEnv(EnvAuthMode); ok && v != "" {
-		c.Auth.Mode = v
-	}
+// ApplyEnv applies the two surviving environment variables onto the
+// configuration: BMBPX_LOG_LEVEL overrides log.level and BMBPX_HTTP_PORT
+// overrides http.port. A nonempty value replaces the file value, and an
+// invalid BMBPX_HTTP_PORT value is an error.
+func (c *Config) ApplyEnv() error {
 	if v, ok := os.LookupEnv(EnvLogLevel); ok && v != "" {
 		c.Log.Level = v
 	}
 	if v, ok := os.LookupEnv(EnvHTTPPort); ok && v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 0 || n > 65535 {
-			return false, fmt.Errorf("%s: invalid port %q", EnvHTTPPort, v)
+			return fmt.Errorf("%s: invalid port %q", EnvHTTPPort, v)
 		}
 		c.HTTP.Port = n
 	}
-	if v, ok := os.LookupEnv(EnvCameraEnable); ok && v != "" {
-		b, err := strconv.ParseBool(v)
-		if err != nil {
-			return false, fmt.Errorf("%s: invalid bool %q", EnvCameraEnable, v)
-		}
-		c.Camera.Enabled = &b
-	}
-	if v, ok := os.LookupEnv(EnvMCPEnable); ok && v != "" {
-		b, err := strconv.ParseBool(v)
-		if err != nil {
-			return false, fmt.Errorf("%s: invalid bool %q", EnvMCPEnable, v)
-		}
-		c.MCP.Enabled = &b
-	}
-	for _, s := range sections {
-		if s.ApplyEnv != nil {
-			if err := s.ApplyEnv(c); err != nil {
-				return false, err
-			}
-		}
-	}
-	return printersFromEnv, nil
-}
-
-// parsePrintersEnv parses the BMBPX_PRINTERS format: printer entries
-// separated by ';', each a comma-separated key=value list with keys serial,
-// address, name, model, password, username, tls, insecure_skip_verify,
-// and registered module printer setting keys.
-func parsePrintersEnv(v string) ([]Printer, error) {
-	var out []Printer
-	for _, entry := range strings.Split(v, ";") {
-		entry = strings.TrimSpace(entry)
-		if entry == "" {
-			continue
-		}
-		p, err := parsePrinterEntry(entry)
-		if err != nil {
-			return nil, fmt.Errorf("%s: %w", EnvPrinters, err)
-		}
-		out = append(out, p)
-	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("%s: no printer entries found", EnvPrinters)
-	}
-	return out, nil
-}
-
-// parsePrinterEntry parses one comma-separated printer definition.
-func parsePrinterEntry(entry string) (Printer, error) {
-	p := Printer{Username: "bblp", TLS: true, InsecureSkipVerify: true}
-	for _, kv := range strings.Split(entry, ",") {
-		k, val, found := strings.Cut(strings.TrimSpace(kv), "=")
-		if !found {
-			return Printer{}, fmt.Errorf("expected key=value, got %q", kv)
-		}
-		var err error
-		switch strings.ToLower(k) {
-		case "serial":
-			p.Serial = val
-		case "address":
-			p.Address = val
-		case "name":
-			p.Name = strings.TrimSpace(val)
-		case "model":
-			p.Model = val
-		case "password":
-			p.Password = val
-		case "username":
-			p.Username = val
-		case "tls":
-			p.TLS, err = strconv.ParseBool(val)
-		case "insecure_skip_verify":
-			p.InsecureSkipVerify, err = strconv.ParseBool(val)
-		default:
-			registered := false
-			for _, s := range printerSettings {
-				if s.Key == strings.ToLower(k) {
-					if p.Settings == nil {
-						p.Settings = make(map[string]any)
-					}
-					p.Settings[s.Key] = strings.TrimSpace(val)
-					registered = true
-					break
-				}
-			}
-			if !registered {
-				return Printer{}, fmt.Errorf("unknown key %q", k)
-			}
-		}
-		if err != nil {
-			return Printer{}, fmt.Errorf("key %q: %w", k, err)
-		}
-	}
-	if p.Serial == "" || p.Address == "" || p.Password == "" {
-		return Printer{}, fmt.Errorf("serial, address and password are required")
-	}
-	return p, nil
+	return nil
 }
 
 // ApplyDefaults fills unset values with the design defaults so callers may

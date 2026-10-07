@@ -5,26 +5,21 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
 	"bambu-mqtt-proxy/internal/config"
 )
 
-// EnvAPIKey overrides the stored key by presence, including an empty value.
-const EnvAPIKey = "BMBPX_OCTOEVERYWHERE_API_KEY"
-
 // Settings configures Gadget detection. An unset Enabled follows the key-based
-// default; explicit true requires an effective key and explicit false stays off.
+// default; explicit true requires a key and explicit false stays off.
 type Settings struct {
 	Enabled *bool  `yaml:"enabled"`
 	APIKey  string `yaml:"api_key"`
 }
 
-// On reports whether detection should run after environment resolution.
+// On reports whether detection should run with the stored settings.
 func (s Settings) On() bool {
 	if s.Enabled != nil {
 		return *s.Enabled
@@ -65,43 +60,22 @@ func decodeSettingsView(raw json.RawMessage) (settingsView, error) {
 	return in, nil
 }
 
-// ConfigSection owns detection's file, environment, and configuration-page policy.
+// ConfigSection owns detection's file and configuration-page policy.
 var ConfigSection = config.Section{
 	Key: "detection",
 	New: func() any { return &Settings{} },
-	ApplyEnv: func(c *config.Config) error {
-		if v, ok := os.LookupEnv(EnvAPIKey); ok {
-			s, err := SettingsOf(c)
-			if err != nil {
-				return err
-			}
-			s.APIKey = strings.TrimSpace(v)
-			c.SetSection("detection", s)
-		}
-		return nil
-	},
 	Validate: func(c *config.Config) error {
 		s, err := SettingsOf(c)
 		if err != nil {
 			return err
 		}
 		if s.On() && s.Key() == "" {
-			return fmt.Errorf("detection: enabled requires an API key (detection.api_key or %s)", EnvAPIKey)
+			return errors.New("detection: enabled requires an API key (detection.api_key)")
 		}
 		return nil
 	},
-	EnvOverrides: func() map[string]string {
-		out := map[string]string{}
-		if _, ok := os.LookupEnv(EnvAPIKey); ok {
-			out["detection_api_key"] = EnvAPIKey
-		}
-		return out
-	},
 	View: func(file *config.Config) any {
 		s, _ := SettingsOf(file)
-		if v, ok := os.LookupEnv(EnvAPIKey); ok {
-			s.APIKey = strings.TrimSpace(v)
-		}
 		return settingsView{Enabled: s.On(), HasAPIKey: s.Key() != ""}
 	},
 	Save: func(raw json.RawMessage, stored, out *config.Config) error {
@@ -135,14 +109,8 @@ var ConfigSection = config.Section{
 				}
 			}
 		}
-		if v, ok := os.LookupEnv(EnvAPIKey); ok {
-			key = strings.TrimSpace(v)
-		}
 		if key == "" {
-			if _, ok := os.LookupEnv(EnvAPIKey); ok {
-				return &config.PageError{Status: http.StatusUnprocessableEntity, Message: EnvAPIKey + " is set but empty, so there is no key to test. Set the variable to a valid key."}
-			}
-			return &config.PageError{Status: http.StatusUnprocessableEntity, Message: "No Gadget API key is configured. Enter a key or set " + EnvAPIKey + "."}
+			return &config.PageError{Status: http.StatusUnprocessableEntity, Message: "No Gadget API key is configured. Enter a key."}
 		}
 		ctx, cancel := context.WithTimeout(ctx, detectionTestTimeout)
 		defer cancel()

@@ -135,9 +135,6 @@ func TestViewRedactsCredentials(t *testing.T) {
 	if got, want := string(raw), `{"enabled":true,"provider":"pushover","pushover":{"has_app_token":true,"has_user_key":true}}`; got != want {
 		t.Fatalf("View = %s, want %s", got, want)
 	}
-	if ConfigSection.ApplyEnv != nil || ConfigSection.EnvOverrides != nil {
-		t.Fatal("notifications must not have environment overrides")
-	}
 }
 
 func TestSaveTrimsAndKeepsCredentials(t *testing.T) {

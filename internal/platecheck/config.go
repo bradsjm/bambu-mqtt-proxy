@@ -9,7 +9,6 @@ import (
 	"io"
 	"math"
 	"net/url"
-	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -17,20 +16,11 @@ import (
 	"bambu-mqtt-proxy/internal/config"
 )
 
-// Environment settings replace file settings by presence, including empty values.
 const (
 	// ProviderCloudflare selects Cloudflare Workers AI.
 	ProviderCloudflare = "cloudflare"
 	// ProviderCustom selects a custom HTTPS endpoint.
 	ProviderCustom = "custom"
-	// EnvProvider overrides the stored provider.
-	EnvProvider = "BMBPX_PLATECHECK_PROVIDER"
-	// EnvAccountID overrides the stored Cloudflare account ID.
-	EnvAccountID = "BMBPX_PLATECHECK_ACCOUNT_ID"
-	// EnvEndpoint overrides the stored custom endpoint.
-	EnvEndpoint = "BMBPX_PLATECHECK_ENDPOINT"
-	// EnvAPIKey overrides the stored provider API key.
-	EnvAPIKey = "BMBPX_PLATECHECK_API_KEY"
 	// platecheckTestTimeout bounds the configuration key test.
 	platecheckTestTimeout = 20 * time.Second
 	// endpointKeyMessage explains why a saved credential cannot move to a new destination.
@@ -122,7 +112,7 @@ type settingsView struct {
 	Endpoint string `json:"endpoint"`
 	// APIKey is accepted only on submission.
 	APIKey string `json:"api_key,omitempty"`
-	// HasAPIKey reports effective credential presence.
+	// HasAPIKey reports stored credential presence.
 	HasAPIKey bool `json:"has_api_key"`
 	// Model selects the provider model.
 	Model string `json:"model"`
@@ -151,39 +141,6 @@ func decodeSettingsView(raw json.RawMessage) (settingsView, error) {
 	return in, nil
 }
 
-// destinationEnvSet reports whether the environment overrides any destination field.
-func destinationEnvSet() bool {
-	for _, key := range []string{EnvProvider, EnvAccountID, EnvEndpoint} {
-		if _, ok := os.LookupEnv(key); ok {
-			return true
-		}
-	}
-	return false
-}
-
-// applyEnv binds an overridden credential to its configured destination.
-func applyEnv(s Settings) Settings {
-	before := s.normalized().destination()
-	if provider, ok := os.LookupEnv(EnvProvider); ok {
-		s.Provider = provider
-	}
-	if account, ok := os.LookupEnv(EnvAccountID); ok {
-		s.AccountID = account
-	}
-	if endpoint, ok := os.LookupEnv(EnvEndpoint); ok {
-		s.Endpoint = endpoint
-	}
-	s = s.normalized()
-	key, keySet := os.LookupEnv(EnvAPIKey)
-	if !keySet && s.destination() != before {
-		s.APIKey = ""
-	}
-	if keySet {
-		s.APIKey = strings.TrimSpace(key)
-	}
-	return s
-}
-
 // accountIDPattern matches a normalized Cloudflare account ID.
 var accountIDPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
@@ -200,7 +157,7 @@ func validateSettings(s Settings, require bool) (Settings, error) {
 	s.StopConfidence = n / 100
 	if s.Provider == ProviderCloudflare {
 		if s.Endpoint != "" {
-			return s, errors.New("The Cloudflare provider builds the endpoint from the account ID. Remove the endpoint or BMBPX_PLATECHECK_ENDPOINT, or choose the custom provider.")
+			return s, errors.New("The Cloudflare provider builds the endpoint from the account ID. Remove the endpoint or choose the custom provider.")
 		}
 		if s.Model != "clef" && s.Model != "clef-flash" {
 			return s, errors.New("The Cloudflare model must be clef or clef-flash.")
@@ -209,10 +166,7 @@ func validateSettings(s Settings, require bool) (Settings, error) {
 			return s, errors.New("The Cloudflare account ID must be 32 hexadecimal characters.")
 		}
 		if require && s.AccountID == "" {
-			if _, ok := os.LookupEnv(EnvAccountID); ok {
-				return s, errors.New(EnvAccountID + " is set but empty, so there is no account ID to test. Set the variable to a valid account ID.")
-			}
-			return s, errors.New("No Cloudflare account ID is configured. Enter the account ID or set BMBPX_PLATECHECK_ACCOUNT_ID.")
+			return s, errors.New("No Cloudflare account ID is configured. Enter the account ID.")
 		}
 	} else {
 		if s.Model == "" {
@@ -225,17 +179,11 @@ func validateSettings(s Settings, require bool) (Settings, error) {
 			}
 		}
 		if require && s.Endpoint == "" {
-			if _, ok := os.LookupEnv(EnvEndpoint); ok {
-				return s, errors.New(EnvEndpoint + " is set but empty, so there is no endpoint to test. Set the variable to a valid HTTPS endpoint.")
-			}
-			return s, errors.New("No endpoint is configured. Enter an HTTPS endpoint or set BMBPX_PLATECHECK_ENDPOINT.")
+			return s, errors.New("No endpoint is configured. Enter an HTTPS endpoint.")
 		}
 	}
 	if require && s.Key() == "" {
-		if _, ok := os.LookupEnv(EnvAPIKey); ok {
-			return s, errors.New(EnvAPIKey + " is set but empty, so there is no key to test. Set the variable to a valid key.")
-		}
-		return s, errors.New("No API key is configured. Enter a key or set BMBPX_PLATECHECK_API_KEY.")
+		return s, errors.New("No API key is configured. Enter a key.")
 	}
 	return s, nil
 }
@@ -254,43 +202,24 @@ func submittedSettings(in settingsView, key string) Settings {
 	return s
 }
 
-// resolveTestSettings binds fallback and environment credentials before diagnostic calls.
+// resolveTestSettings binds the stored credential before diagnostic calls.
+// The stored key only follows a submission for its own account or endpoint.
 func resolveTestSettings(in settingsView, base Settings) (Settings, error) {
 	s := submittedSettings(in, "")
-	submittedDestination := s.destination()
-	key, keySet := os.LookupEnv(EnvAPIKey)
-	s = applyEnv(s)
 	base = base.normalized()
-	if keySet {
-		// An environment key belongs to the effective stored destination only.
-		if s.destination() != applyEnv(base).destination() {
-			return s, errors.New(endpointKeyMessage)
-		}
-		s.APIKey = strings.TrimSpace(key)
-	} else if s.Key() == "" {
-		if submittedDestination != base.destination() || s.destination() != base.destination() {
+	if s.Key() == "" {
+		if s.destination() != base.destination() {
 			return s, errors.New(endpointKeyMessage)
 		}
 		s.APIKey = base.Key()
-	} else if s.destination() != submittedDestination {
-		// A typed key is an explicit choice for the submitted destination only.
-		return s, errors.New(endpointKeyMessage)
 	}
 	return validateSettings(s, true)
 }
 
-// ConfigSection owns file settings, effective overrides, and page operations.
+// ConfigSection owns file settings and configuration-page operations.
 var ConfigSection = config.Section{
 	Key: "platecheck",
 	New: func() any { return &Settings{Provider: ProviderCloudflare, Model: "clef", StopConfidence: 0.5} },
-	ApplyEnv: func(c *config.Config) error {
-		s, err := SettingsOf(c)
-		if err != nil {
-			return err
-		}
-		c.SetSection("platecheck", applyEnv(s))
-		return nil
-	},
 	Validate: func(c *config.Config) error {
 		s, err := SettingsOf(c)
 		if err != nil {
@@ -299,25 +228,8 @@ var ConfigSection = config.Section{
 		_, err = validateSettings(s, s.On())
 		return err
 	},
-	EnvOverrides: func() map[string]string {
-		out := map[string]string{}
-		if _, ok := os.LookupEnv(EnvProvider); ok {
-			out["platecheck_provider"] = EnvProvider
-		}
-		if _, ok := os.LookupEnv(EnvAccountID); ok {
-			out["platecheck_account_id"] = EnvAccountID
-		}
-		if _, ok := os.LookupEnv(EnvEndpoint); ok {
-			out["platecheck_endpoint"] = EnvEndpoint
-		}
-		if _, ok := os.LookupEnv(EnvAPIKey); ok {
-			out["platecheck_api_key"] = EnvAPIKey
-		}
-		return out
-	},
 	View: func(file *config.Config) any {
 		s, _ := SettingsOf(file)
-		s = applyEnv(s)
 		return settingsView{Enabled: s.On(), Provider: s.Provider, AccountID: s.AccountID, Endpoint: s.Endpoint, HasAPIKey: s.Key() != "", Model: s.Model, StopConfidence: s.StopConfidence}
 	},
 	Save: func(raw json.RawMessage, stored, out *config.Config) error {
@@ -334,24 +246,7 @@ var ConfigSection = config.Section{
 			key = old.Key()
 		}
 		s := submittedSettings(in, key)
-		// A locked destination shown by View must not replace its stored file values.
-		if destinationEnvSet() {
-			s.Provider, s.AccountID, s.Endpoint = old.Provider, old.AccountID, old.Endpoint
-			// A blank submission preserves the file credential with its restored destination.
-			if strings.TrimSpace(in.APIKey) == "" {
-				s.APIKey = old.Key()
-			} else if submittedSettings(in, "").destination() != old.destination() {
-				// Ignore the effective destination's typed key and preserve the original file pair.
-				s.APIKey = old.Key()
-			}
-		}
-		_, environmentKeySet := os.LookupEnv(EnvAPIKey)
-		environmentDestinationSet := destinationEnvSet()
-		if environmentKeySet && !environmentDestinationSet && s.destination() != old.destination() {
-			return &config.PageError{Status: 400, Message: endpointKeyMessage}
-		}
-		// Effective overrides are checked by the page's effective-config validation.
-		checked, err := validateSettings(applyEnv(s), applyEnv(s).On())
+		checked, err := validateSettings(s, s.On())
 		if err != nil {
 			return &config.PageError{Status: 400, Message: err.Error()}
 		}
@@ -365,8 +260,7 @@ var ConfigSection = config.Section{
 			return err
 		}
 		var old Settings
-		_, environmentKeySet := os.LookupEnv(EnvAPIKey)
-		if strings.TrimSpace(in.APIKey) == "" || environmentKeySet {
+		if strings.TrimSpace(in.APIKey) == "" {
 			file, err := stored()
 			if err != nil {
 				return &config.PageError{Status: 500, Message: "The stored plate-check settings could not be read."}
