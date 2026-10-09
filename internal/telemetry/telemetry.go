@@ -96,6 +96,7 @@ type State struct {
 	stateGen         uint64    // upstream generation of the last gcode_state report
 	layerSessionGen  uint64    // print session in which layer_num was last reported
 	layerGen         uint64    // upstream generation of the last layer_num report
+	layerJobGen      uint64    // Job generation of the last layer_num report.
 	speedProfile     *int      // last reported Bambu spd_lvl (1..4)
 	speedGen         uint64    // upstream generation of speedProfile
 	speedSessionGen  uint64    // print session in which speedProfile was reported
@@ -106,10 +107,13 @@ type State struct {
 	obsGen           uint64    // upstream connection generation of the last report
 	obsAt            time.Time // time of the last real report
 	lastSeq          uint64    // paho delivery order token of the last merge
-	// job is the private preview-job projection (job.go). It shares the
-	// report stream but never feeds session or display values: it
-	// tracks preview generations, identity revisions and RUNNING settling
-	// evidence for the optional job preview service.
+	// job is the private preview-job projection (job.go): preview
+	// generations, identity revisions and RUNNING settling evidence for the
+	// optional job preview service. It never feeds display values, and its
+	// only effect on session bookkeeping is the generation that guards
+	// layer_num provenance: a preview-job boundary (for example a changed
+	// positive gcode_start_time on the same cookie) invalidates an
+	// un-re-reported layer without touching the session generation.
 	job jobTrack
 }
 
@@ -427,6 +431,11 @@ type SessionView struct {
 	// value unknown instead of showing a meaningless 0.
 	Progress     *float64
 	RemainingMin *float64
+	// LayerNum is the current print's layer. It is present only while the
+	// last valid layer_num report belongs to the current print session and
+	// upstream connection and no preview-job boundary has happened since.
+	// Nil means no layer evidence is current, even though the display
+	// State keeps the sticky last value for the camera wall.
 	LayerNum     *int
 	ChamberLight string
 	StartedAt    time.Time
@@ -472,10 +481,13 @@ func (c *Cache) Session(serial string) (SessionView, bool) {
 	// LayerNum is the current print's layer only: the display State keeps
 	// the last reported value for the camera wall, but the session view
 	// exposes it only when it was reported in the current print session on
-	// the current connection, so a previous job's sticky layer can never
-	// authorize a new print and a reconnected printer must re-report it.
+	// the current connection and after the last preview-job boundary, so a
+	// previous job's sticky layer can never authorize a new print, a report
+	// that started a new job without carrying a layer cannot leave the old
+	// layer current, and a reconnected printer must re-report it.
 	if st.LayerNum != nil && st.sessionGen != 0 &&
-		st.layerSessionGen == st.sessionGen && st.layerGen == st.obsGen {
+		st.layerSessionGen == st.sessionGen && st.layerGen == st.obsGen &&
+		st.layerJobGen == st.job.generation {
 		v := *st.LayerNum
 		view.LayerNum = &v
 	}
@@ -573,19 +585,25 @@ func mergeReport(st *State, gen uint64, payload []byte, now time.Time, log *slog
 			st.LayerNum = &v
 			// Stamp the layer's evidence so Session can tell the current
 			// print's layer from the sticky display value, following the
-			// speedGen/speedSessionGen pattern. A report that omits
-			// layer_num restamps nothing: on one connection the
+			// speedGen/speedSessionGen pattern. trackJob has already run for
+			// this report, so the job generation names the print job the
+			// layer belongs to. A report that omits layer_num restamps
+			// nothing: on one connection, one session and one job the
 			// generations cannot move, so the last reported layer stays
-			// current until a reconnect or a new print session.
+			// current until a reconnect, a new print session, or a
+			// preview-job boundary.
 			st.layerSessionGen = st.sessionGen
 			st.layerGen = gen
+			st.layerJobGen = st.job.generation
 		} else {
 			// Present but invalid: the printer contradicted the last valid
-			// layer. Keep the sticky display value, but drop the evidence
-			// (session 0 matches no real session) so an unparseable report
-			// cannot leave the previous layer authorizing indefinitely.
+			// layer. Keep the sticky display value, but drop every piece of
+			// evidence (session 0 matches no real session) so an
+			// unparseable report cannot leave the previous layer
+			// authorizing indefinitely.
 			st.layerSessionGen = 0
 			st.layerGen = 0
+			st.layerJobGen = 0
 		}
 	}
 	if _, present := lookup(printObj, "spd_lvl"); present {

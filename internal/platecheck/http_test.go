@@ -358,7 +358,7 @@ func TestDiagnosticPOSTsNeverMoveSavedKeys(t *testing.T) {
 
 func TestDiagnosticCredentialBindingAllowsTypedKeyAndStoredFallback(t *testing.T) {
 	base := testSettings()
-	in := settingsView{Provider: ProviderCustom, Endpoint: "https://new.example/check", APIKey: "typed-key", Model: "clef", StopConfidence: .5}
+	in := settingsView{Provider: ProviderCustom, Endpoint: "https://new.example/check", APIKey: "typed-key", Model: "clef", StopConfidence: .5, FirstLayer: FirstLayerSettings{PauseConfidence: DefaultPauseConfidence}}
 	effective, err := resolveTestSettings(in, base)
 	if err != nil || effective.APIKey != "typed-key" || effective.Endpoint != in.Endpoint {
 		t.Fatalf("explicit destination %+v %v", effective, err)

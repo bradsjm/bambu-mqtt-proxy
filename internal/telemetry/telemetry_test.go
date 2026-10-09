@@ -225,6 +225,79 @@ func TestSessionLayerRequiresCurrentSessionAndConnection(t *testing.T) {
 	}
 }
 
+// TestSessionLayerRequiresCurrentJobGeneration is a regression for the
+// layer-provenance finding: a preview-job boundary that no session or
+// connection evidence catches must invalidate an un-re-reported layer. A
+// changed positive gcode_start_time on the same cookie, session and upstream
+// connection starts a new print job at layer 1, so the previous job's sticky
+// layer must not stay current and re-arm a consumer against the new job.
+func TestSessionLayerRequiresCurrentJobGeneration(t *testing.T) {
+	c := NewCache([]config.Printer{{Serial: "S1", Name: "Shop"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	report := func(seq uint64, payload string) {
+		t.Helper()
+		c.ObserveReport("S1", seq, 4, []byte(payload))
+	}
+
+	// Job A runs at layer 1 and its report is current evidence.
+	report(1, `{"print":{"gcode_state":"RUNNING","project_id":1,"task_id":2,"subtask_name":"a.3mf","gcode_start_time":1000,"layer_num":1}}`)
+	v, _ := c.Session("S1")
+	if v.LayerNum == nil || *v.LayerNum != 1 {
+		t.Fatalf("layer = %v, want job A's layer 1", v.LayerNum)
+	}
+
+	// A real report restamps the same identity with a different positive
+	// start time and omits layer_num: the job generation advances while the
+	// cookie, session generation, epoch and upstream connection stay put,
+	// and job B starts at layer 1, so job A's sticky layer must not stay
+	// current in the session view while the display keeps it.
+	report(2, `{"print":{"gcode_start_time":2000,"mc_percent":1}}`)
+	jobB, _ := c.Job("S1")
+	v, _ = c.Session("S1")
+	if jobB.Generation != 2 {
+		t.Fatalf("job generation = %d, want 2 after the changed start time", jobB.Generation)
+	}
+	if v.SessionGen != 1 || v.Epoch != 0 || v.Cookie != "1-2-a.3mf" {
+		t.Fatalf("session evidence moved with the job boundary: %+v", v)
+	}
+	if v.LayerNum != nil {
+		t.Fatalf("layer = %v, want nil after the start time started a new job", v.LayerNum)
+	}
+	if st, _ := c.State("S1"); st.LayerNum == nil || *st.LayerNum != 1 {
+		t.Fatalf("display layer = %v, want the sticky display value kept", st.LayerNum)
+	}
+
+	// Job B's own layer report restores the current evidence.
+	report(3, `{"print":{"gcode_state":"RUNNING","layer_num":3}}`)
+	v, _ = c.Session("S1")
+	if v.LayerNum == nil || *v.LayerNum != 3 {
+		t.Fatalf("layer = %v, want job B's layer 3", v.LayerNum)
+	}
+
+	// A later report of the same job that omits layer_num keeps it current:
+	// the same start time restarts nothing.
+	report(4, `{"print":{"gcode_state":"RUNNING","gcode_start_time":2000,"mc_percent":42.5}}`)
+	v, _ = c.Session("S1")
+	if v.LayerNum == nil || *v.LayerNum != 3 {
+		t.Fatalf("layer = %v, want layer 3 preserved inside job B", v.LayerNum)
+	}
+
+	// A metadata-only delta that changes the start time starts job C
+	// without refreshing the detection evidence: the layer must drop even
+	// though the session and connection evidence still match.
+	before := v
+	report(5, `{"print":{"gcode_start_time":3000}}`)
+	v, _ = c.Session("S1")
+	if v.LayerNum != nil {
+		t.Fatalf("layer = %v, want nil after a metadata-only job boundary", v.LayerNum)
+	}
+	if v.Obs != before.Obs || v.SessionGen != before.SessionGen || v.ObsGen != before.ObsGen {
+		t.Fatalf("metadata-only delta moved detection evidence: %+v -> %+v", before, v)
+	}
+	if st, _ := c.State("S1"); st.LayerNum == nil || *st.LayerNum != 3 {
+		t.Fatalf("display layer = %v, want the sticky display value kept", st.LayerNum)
+	}
+}
+
 func TestSessionViewCarriesFreshnessEvidence(t *testing.T) {
 	c := NewCache([]config.Printer{{Serial: "S1", Name: "Shop"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	c.ObserveReport("S1", 1, 42, []byte(`{"print":{"gcode_state":"RUNNING","layer_num":12}}`))

@@ -204,7 +204,9 @@ func (s *Service) deliverBatch(ctx context.Context, batch []event) {
 
 // eventSummary maps an activity entry to its notification summary; empty
 // means the kind never notifies. Print pauses and HMS severities qualify
-// further at delivery time.
+// further at delivery time. Routine plate-check lifecycle entries (a
+// confirmed first-layer pause, a pass, or a skip) stay in the activity log
+// only.
 func eventSummary(e activity.Entry) string {
 	switch e.Kind {
 	case "print_finished":
@@ -225,8 +227,11 @@ func eventSummary(e activity.Entry) string {
 			return "Printer error"
 		}
 		return ""
+	// Message-bearing kinds: the recording module owns the operator text.
 	case "ai_warning", "ai_pause_sent", "ai_pause_failed", "ai_pause_unconfirmed",
-		"platecheck_stop_requested", "platecheck_stop_failed", "platecheck_stop_unconfirmed":
+		"platecheck_stop_requested", "platecheck_stop_failed", "platecheck_stop_unconfirmed",
+		"platecheck_layer1_warning", "platecheck_layer1_pause_sent",
+		"platecheck_layer1_pause_failed", "platecheck_layer1_pause_unconfirmed":
 		return e.Message
 	case "print_paused":
 		return "Print paused"

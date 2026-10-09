@@ -1,4 +1,5 @@
-// Package platecheck checks a fresh startup build-plate image and requests stop only.
+// Package platecheck checks build-plate images: a startup snapshot that can stop
+// the print and post-first-layer snapshots that can pause it.
 package platecheck
 
 import (
@@ -21,13 +22,17 @@ const (
 	ProviderCloudflare = "cloudflare"
 	// ProviderCustom selects a custom HTTPS endpoint.
 	ProviderCustom = "custom"
+	// DefaultPauseConfidence is the default strict defect-probability cutoff
+	// for the post-layer-1 pause phase. Constructors and page decoders apply
+	// it; an explicit invalid value is never silently replaced.
+	DefaultPauseConfidence = 0.70
 	// platecheckTestTimeout bounds the configuration key test.
 	platecheckTestTimeout = 20 * time.Second
 	// endpointKeyMessage explains why a saved credential cannot move to a new destination.
 	endpointKeyMessage = "Enter an API key for this provider. The stored key is only used with the account ID or endpoint it was saved with."
 )
 
-// Settings configures startup build-plate checks.
+// Settings configures the shared startup and post-first-layer build-plate checks.
 type Settings struct {
 	// Enabled selects automatic protection; nil follows destination and key presence.
 	Enabled *bool `yaml:"enabled"`
@@ -43,9 +48,26 @@ type Settings struct {
 	Model string `yaml:"model"`
 	// StopConfidence is the strict occupied-probability cutoff.
 	StopConfidence float64 `yaml:"stop_confidence"`
+	// FirstLayer configures the post-layer-1 defect checks; it runs only
+	// when the overall plate check is enabled.
+	FirstLayer FirstLayerSettings `yaml:"first_layer"`
 }
 
-// On reports whether automatic startup checks are enabled.
+// FirstLayerSettings configures the post-layer-1 checks made on two fresh
+// snapshots. Enabled defaults to true, so a nil pointer keeps the phase on.
+type FirstLayerSettings struct {
+	// Enabled selects the post-layer-1 phase; nil follows true.
+	Enabled *bool `yaml:"enabled" json:"enabled"`
+	// PauseConfidence is the strict defect-probability cutoff for pausing.
+	PauseConfidence float64 `yaml:"pause_confidence" json:"pause_confidence"`
+}
+
+// On reports whether the post-layer-1 phase runs when the overall check is on.
+func (f FirstLayerSettings) On() bool {
+	return f.Enabled == nil || *f.Enabled
+}
+
+// On reports whether automatic plate checks are enabled in both phases.
 func (s Settings) On() bool {
 	if s.Enabled != nil {
 		return *s.Enabled
@@ -93,11 +115,23 @@ func SettingsOf(c *config.Config) (Settings, error) {
 		return Settings{}, err
 	}
 	s := v.(*Settings).normalized()
-	n := math.Round(s.StopConfidence * 100)
-	if s.StopConfidence >= 0.5 && s.StopConfidence <= 0.99 && !math.IsNaN(n) && !math.IsInf(n, 0) && math.Abs(s.StopConfidence*100-n) <= 1e-9 {
-		s.StopConfidence = n / 100
+	if n, ok := wholePercent(s.StopConfidence); ok {
+		s.StopConfidence = n
+	}
+	if n, ok := wholePercent(s.FirstLayer.PauseConfidence); ok {
+		s.FirstLayer.PauseConfidence = n
 	}
 	return s, nil
+}
+
+// wholePercent reports whether c is a finite whole percentage in the
+// accepted 0.50..0.99 range and returns its canonical value on that grid.
+// Values outside the range stay unchanged, so an explicit invalid cutoff
+// keeps failing validation instead of being silently coerced.
+func wholePercent(c float64) (float64, bool) {
+	n := math.Round(c * 100)
+	ok := !math.IsNaN(c) && !math.IsInf(c, 0) && c >= 0.5 && c <= 0.99 && math.Abs(c*100-n) <= 1e-9
+	return n / 100, ok
 }
 
 // settingsView exchanges page settings without returning the private key.
@@ -118,11 +152,19 @@ type settingsView struct {
 	Model string `json:"model"`
 	// StopConfidence is the occupied-probability cutoff.
 	StopConfidence float64 `json:"stop_confidence"`
+	// FirstLayer reports the post-layer-1 phase to the page. The page
+	// submission keeps the same shape; an absent or null member keeps the
+	// decode defaults, and the view resolves Enabled so a nil stored
+	// pointer is never serialized as null.
+	FirstLayer FirstLayerSettings `json:"first_layer"`
 }
 
 // decodeSettingsView accepts known fields and defaults an absent page section.
+// The nested first_layer default keeps the phase on with the default cutoff;
+// an explicit false or an explicit cutoff value in range survives untouched.
 func decodeSettingsView(raw json.RawMessage) (settingsView, error) {
-	in := settingsView{Provider: ProviderCloudflare, Model: "clef", StopConfidence: 0.5}
+	in := settingsView{Provider: ProviderCloudflare, Model: "clef", StopConfidence: 0.5,
+		FirstLayer: FirstLayerSettings{PauseConfidence: DefaultPauseConfidence}}
 	if len(raw) == 0 {
 		return in, nil
 	}
@@ -150,11 +192,19 @@ func validateSettings(s Settings, require bool) (Settings, error) {
 	if s.Provider != ProviderCloudflare && s.Provider != ProviderCustom {
 		return s, errors.New("The plate-check provider must be cloudflare or custom.")
 	}
-	n := math.Round(s.StopConfidence * 100)
-	if math.IsNaN(s.StopConfidence) || math.IsInf(s.StopConfidence, 0) || s.StopConfidence < 0.5 || s.StopConfidence > 0.99 || math.Abs(s.StopConfidence*100-n) > 1e-9 {
+	// Both cutoffs are validated unconditionally: an absent value keeps
+	// the applied default, an explicit one outside the whole-percentage
+	// range is an error, never a silent default.
+	stopAt, ok := wholePercent(s.StopConfidence)
+	if !ok {
 		return s, errors.New("Stop above must be a whole percentage from 50 through 99 percent.")
 	}
-	s.StopConfidence = n / 100
+	s.StopConfidence = stopAt
+	pauseAt, ok := wholePercent(s.FirstLayer.PauseConfidence)
+	if !ok {
+		return s, errors.New("Pause above must be a whole percentage from 50 through 99 percent.")
+	}
+	s.FirstLayer.PauseConfidence = pauseAt
 	if s.Provider == ProviderCloudflare {
 		if s.Endpoint != "" {
 			return s, errors.New("The Cloudflare provider builds the endpoint from the account ID. Remove the endpoint or choose the custom provider.")
@@ -193,7 +243,7 @@ func submittedSettings(in settingsView, key string) Settings {
 	if strings.TrimSpace(in.APIKey) != "" {
 		key = in.APIKey
 	}
-	s := Settings{Enabled: &in.Enabled, Provider: in.Provider, AccountID: in.AccountID, Endpoint: in.Endpoint, APIKey: key, Model: in.Model, StopConfidence: in.StopConfidence}.normalized()
+	s := Settings{Enabled: &in.Enabled, Provider: in.Provider, AccountID: in.AccountID, Endpoint: in.Endpoint, APIKey: key, Model: in.Model, StopConfidence: in.StopConfidence, FirstLayer: in.FirstLayer}.normalized()
 	if s.Provider == ProviderCustom {
 		s.AccountID = ""
 	} else {
@@ -219,7 +269,10 @@ func resolveTestSettings(in settingsView, base Settings) (Settings, error) {
 // ConfigSection owns file settings and configuration-page operations.
 var ConfigSection = config.Section{
 	Key: "platecheck",
-	New: func() any { return &Settings{Provider: ProviderCloudflare, Model: "clef", StopConfidence: 0.5} },
+	New: func() any {
+		return &Settings{Provider: ProviderCloudflare, Model: "clef", StopConfidence: 0.5,
+			FirstLayer: FirstLayerSettings{PauseConfidence: DefaultPauseConfidence}}
+	},
 	Validate: func(c *config.Config) error {
 		s, err := SettingsOf(c)
 		if err != nil {
@@ -230,7 +283,8 @@ var ConfigSection = config.Section{
 	},
 	View: func(file *config.Config) any {
 		s, _ := SettingsOf(file)
-		return settingsView{Enabled: s.On(), Provider: s.Provider, AccountID: s.AccountID, Endpoint: s.Endpoint, HasAPIKey: s.Key() != "", Model: s.Model, StopConfidence: s.StopConfidence}
+		return settingsView{Enabled: s.On(), Provider: s.Provider, AccountID: s.AccountID, Endpoint: s.Endpoint, HasAPIKey: s.Key() != "", Model: s.Model, StopConfidence: s.StopConfidence,
+			FirstLayer: FirstLayerSettings{Enabled: new(s.FirstLayer.On()), PauseConfidence: s.FirstLayer.PauseConfidence}}
 	},
 	Save: func(raw json.RawMessage, stored, out *config.Config) error {
 		in, err := decodeSettingsView(raw)
@@ -251,6 +305,7 @@ var ConfigSection = config.Section{
 			return &config.PageError{Status: 400, Message: err.Error()}
 		}
 		s.StopConfidence = checked.StopConfidence
+		s.FirstLayer.PauseConfidence = checked.FirstLayer.PauseConfidence
 		out.SetSection("platecheck", s)
 		return nil
 	},

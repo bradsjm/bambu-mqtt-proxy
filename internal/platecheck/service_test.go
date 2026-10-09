@@ -64,6 +64,9 @@ type fakeCommands struct {
 	stops, lights       []uint64
 	stopErr, lightErr   error
 	stopHook, lightHook func()
+	pauses              []uint64
+	pauseErr            error
+	pauseHook           func()
 }
 
 func (f *fakeCommands) Generation(string) uint64 { f.mu.Lock(); defer f.mu.Unlock(); return f.gen }
@@ -80,6 +83,15 @@ func (f *fakeCommands) StopPrint(_ string, g uint64) error {
 		f.stopHook()
 	}
 	return f.stopErr
+}
+func (f *fakeCommands) PausePrint(_ string, g uint64) error {
+	f.mu.Lock()
+	f.pauses = append(f.pauses, g)
+	f.mu.Unlock()
+	if f.pauseHook != nil {
+		f.pauseHook()
+	}
+	return f.pauseErr
 }
 func (f *fakeCommands) SetChamberLight(_ string, g uint64, _ bool) error {
 	f.mu.Lock()
@@ -100,11 +112,15 @@ func (f frameFunc) Capture(ctx context.Context, s string, t time.Time) (Frame, e
 }
 
 type fakeDecision struct {
-	mu     sync.Mutex
-	result Result
-	err    error
-	calls  int
-	hook   func()
+	mu          sync.Mutex
+	result      Result
+	err         error
+	calls       int
+	hook        func()
+	layerResult LayerResult
+	layerCalls  int
+	layerHook   func()
+	layerImages [][]byte
 }
 
 func (f *fakeDecision) Probe(context.Context) error { return f.err }
@@ -118,6 +134,16 @@ func (f *fakeDecision) Evaluate(context.Context, []byte, string) (Result, error)
 	result := f.result
 	result.POccupied = 1 - result.PClear
 	return result, f.err
+}
+func (f *fakeDecision) EvaluateFirstLayer(_ context.Context, frames [][]byte, _ string) (LayerResult, error) {
+	f.mu.Lock()
+	f.layerCalls++
+	f.layerImages = frames
+	f.mu.Unlock()
+	if f.layerHook != nil {
+		f.layerHook()
+	}
+	return f.layerResult, f.err
 }
 
 type fixture struct {
@@ -154,7 +180,18 @@ func newFixture(t *testing.T, state string) *fixture {
 	return &fixture{s: s, w: s.workers["01S1"], state: st, commands: commands, client: client, clock: clock, activity: events}
 }
 func (f *fixture) hint(kind string) {
-	f.s.ObserveActivity("01S1", activity.Entry{Kind: kind, Time: f.clock.now()})
+	entry := activity.Entry{Kind: kind, Time: f.clock.now()}
+	if kind == "first_layer_complete" {
+		// Intentionally valid first-layer events carry the current source
+		// evidence, exactly as firstlayer records them: a coherent
+		// Job+Session snapshot at sampling time. Deliberately invalid
+		// events must be built by hand so the rejection paths stay
+		// reachable.
+		j, _ := f.state.Job("01S1")
+		v, _ := f.state.Session("01S1")
+		entry.Observation = activity.Observation{SessionGen: v.SessionGen, Epoch: v.Epoch, StateGen: v.StateGen, ObsGen: v.ObsGen, ObsAt: v.ObsAt, JobGen: j.Generation, JobRevision: j.Revision, RunningEpoch: j.RunningEpoch}
+	}
+	f.s.ObserveActivity("01S1", entry)
 }
 func (f *fixture) step() { f.w.step(context.Background()) }
 func (f *fixture) report(state string, layer *int) {
@@ -171,10 +208,10 @@ func (f *fixture) report(state string, layer *int) {
 			}
 		}
 		j.State = state
-		j.Active = state == "PREPARE" || state == "SLICING" || state == "RUNNING" || state == "PAUSE"
+		j.Active = state == "PREPARE" || state == "SLICING" || state == "RUNNING" || state == "PAUSE" || state == "PAUSED"
 		j.ObsAt = f.clock.now()
 		v.State = state
-		v.Active = state == "RUNNING" || state == "PAUSE"
+		v.Active = state == "RUNNING" || state == "PAUSE" || state == "PAUSED"
 		v.Obs++
 		v.ObsAt = f.clock.now()
 		v.LayerNum = layer
@@ -620,9 +657,10 @@ func TestModuleDisabledBlockedAndApprovedDisplay(t *testing.T) {
 		if d.Panel.Title != "Plate check" || d.Panel.Level != 3 || d.Panel.Rows[0].Value == "" || len(d.Overlay) != 0 {
 			t.Fatalf("display %s", state)
 		}
-		want := 2
+		// Result and First layer rows always render; non-idle states add Stop above.
+		want := 3
 		if state == "idle" {
-			want = 1
+			want = 2
 		}
 		if len(d.Panel.Rows) != want {
 			t.Fatal("rows")
@@ -751,6 +789,9 @@ type evaluateFunc func(context.Context, []byte, string) (Result, error)
 func (f evaluateFunc) Probe(context.Context) error { return nil }
 func (f evaluateFunc) Evaluate(ctx context.Context, data []byte, model string) (Result, error) {
 	return f(ctx, data, model)
+}
+func (f evaluateFunc) EvaluateFirstLayer(ctx context.Context, _ [][]byte, _ string) (LayerResult, error) {
+	return LayerResult{}, ctx.Err()
 }
 
 func TestCloseCancelsOutstandingInferenceAndConcurrentReaders(t *testing.T) {

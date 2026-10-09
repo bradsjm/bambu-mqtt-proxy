@@ -86,8 +86,10 @@ log:
   level: info # debug logs per-packet routing decisions
 
 # Optional build-plate check (also editable on the /config page). One
-# fresh snapshot is uploaded per new print and `stop` is sent only when the
-# plate looks occupied. Best effort: errors let the print continue.
+# fresh snapshot is uploaded when a print starts and `stop` is sent only
+# when the plate looks occupied. The nested first-layer phase is on by
+# default: two more frames are uploaded and the proxy may pause once when
+# the first layer looks defective. Best effort: errors let the print continue.
 # platecheck:
 #   enabled: true            # default: on when the account/endpoint and api_key are set
 #   provider: cloudflare     # cloudflare or custom
@@ -96,3 +98,6 @@ log:
 #   api_key: ""              # write-only on the /config page
 #   model: clef              # cloudflare: clef or clef-flash; custom: any name
 #   stop_confidence: 0.5     # 0.50-0.99; stop above this occupied probability
+#   first_layer:             # runs whenever the plate check is on
+#     enabled: true          # false disables the first-layer phase alone
+#     pause_confidence: 0.7  # 0.50-0.99; pause above this defect probability

@@ -155,7 +155,7 @@ main input:user-invalid { border-color: var(--error); }
 .listener input[type=number] { max-width: none; }
 .listener .tls { display: inline-flex; align-items: center; gap: .4rem; font-size: .85rem; color: var(--dim); }
 .listener input[type=text]:disabled, #f-ai-key:disabled, #f-platecheck-key:disabled, #f-platecheck-provider:disabled,
-#f-platecheck-account:disabled, #f-platecheck-endpoint:disabled { opacity: .4; }
+#f-platecheck-account:disabled, #f-platecheck-endpoint:disabled, #f-platecheck-pause:disabled { opacity: .4; }
 
 /* Test status lines: muted while busy, colored once a result arrives. In a
    settings row the line wraps below its button. */
@@ -385,7 +385,7 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
 
   <section aria-labelledby="ai-h">
     <div class="sec-head"><h2 id="ai-h">AI detection</h2></div>
-    <p class="sec-lede">Optional print-failure detection through OctoEverywhere's Gadget service, and an optional build-plate check at print start through a vision model provider.</p>
+    <p class="sec-lede">Optional print-failure detection through OctoEverywhere's Gadget service, and an optional vision check at print start and after layer 1 through a vision model provider.</p>
     <div class="groups">
       <fieldset class="group">
         <legend>Gadget AI</legend>
@@ -411,8 +411,8 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
       <fieldset class="group" id="platecheck">
         <legend>Vision checks</legend>
         <div class="row">
-          <div><label for="f-platecheck">Plate check at print start</label>
-            <span class="hint" id="f-platecheck-hint">When a print starts, the proxy uploads one current camera snapshot to the selected provider. If the chamber light is off, the proxy turns it on for the snapshot. If the plate looks occupied above the cutoff, the proxy sends Stop to the printer without asking. If the check fails or the view is unclear, the print continues. This is a best-effort check at print start, not a safety interlock.</span>
+          <div><label for="f-platecheck">Plate checks</label>
+            <span class="hint" id="f-platecheck-hint">When a print starts, the proxy uploads one current camera snapshot to the selected provider. If the chamber light is off, the proxy turns it on for the snapshot. If the plate looks occupied above the stop cutoff, the proxy sends Stop to the printer without asking. After the first layer finishes, the proxy checks two fresh snapshots for visible defects and can pause the print without asking; missing print material is a warning only. If a check fails or the view is unclear, the print continues. These are best-effort checks, not a safety interlock.</span>
             <span class="env" id="platecheck-blocked" hidden></span></div>
           <div class="control"><input id="f-platecheck" class="switch" type="checkbox" role="switch" aria-describedby="f-platecheck-hint" data-field="platecheck.enabled"></div>
         </div>
@@ -456,6 +456,17 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
             <span class="hint" id="f-platecheck-threshold-hint">The proxy stops a print only when the occupied score is above this value. Higher values mean fewer stops. A score equal to this value does not stop.</span></div>
           <div class="control range"><input id="f-platecheck-threshold" type="range" min="50" max="99" step="1" value="50" aria-describedby="f-platecheck-threshold-hint" aria-valuetext="Stop above 50 percent" data-field="platecheck.stop_confidence" data-type="percent">
             <output id="f-platecheck-threshold-out" for="f-platecheck-threshold" class="mono">50%</output></div>
+        </div>
+        <div class="row">
+          <div><label for="f-platecheck-firstlayer">Recheck after layer 1</label>
+            <span class="hint" id="f-platecheck-firstlayer-hint">After the first layer finishes, the proxy uploads two fresh snapshots and checks them for a tangled print, a part detached from the plate, a blob on the nozzle, or an incomplete layer. Above the pause cutoff the proxy pauses the print without asking. Missing print material is a warning only. Turn this off to keep the startup stop check only.</span></div>
+          <div class="control"><input id="f-platecheck-firstlayer" class="switch" type="checkbox" role="switch" aria-describedby="f-platecheck-firstlayer-hint" data-field="platecheck.first_layer.enabled"></div>
+        </div>
+        <div class="row">
+          <div><label for="f-platecheck-pause">Pause above</label>
+            <span class="hint" id="f-platecheck-pause-hint">The proxy pauses a print only when a defect score is above this value. Higher values mean fewer pauses. A score equal to this value does not pause.</span></div>
+          <div class="control range"><input id="f-platecheck-pause" type="range" min="50" max="99" step="1" value="70" aria-describedby="f-platecheck-pause-hint" aria-valuetext="Pause above 70 percent" data-field="platecheck.first_layer.pause_confidence" data-type="percent">
+            <output id="f-platecheck-pause-out" for="f-platecheck-pause" class="mono">70%</output></div>
         </div>
         <div class="row">
           <div><span class="label">Test</span>
@@ -734,10 +745,16 @@ function platecheckHints() {
   const range = $("#f-platecheck-threshold"), pct = Number(range.value);
   $("#f-platecheck-threshold-out").textContent = `${pct}%`;
   range.setAttribute("aria-valuetext", `Stop above ${pct} percent`);
+  // The pause slider mirrors the Stop slider: the display reads the field
+  // value, and it is disabled while the post-layer-1 phase is off.
+  const pause = $("#f-platecheck-pause"), pausePct = Number(pause.value);
+  $("#f-platecheck-pause-out").textContent = `${pausePct}%`;
+  pause.setAttribute("aria-valuetext", `Pause above ${pausePct} percent`);
+  pause.disabled = !pc.first_layer?.enabled;
   const blocked = $("#platecheck-blocked");
   blocked.hidden = !!cfg.camera_enabled || !pc.enabled;
   if (!blocked.hidden) {
-    blocked.innerHTML = "Cameras are off, so plate check is blocked: no uploads and no automatic stops. Turn on Cameras under Web and extras.";
+    blocked.innerHTML = "Cameras are off, so plate check is blocked: no uploads and no automatic stops or pauses. Turn on Cameras under Web and extras.";
   }
 }
 

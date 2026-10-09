@@ -67,6 +67,31 @@ func TestEventSummaryPlatecheckKinds(t *testing.T) {
 	}
 }
 
+// TestEventSummaryPlatecheckLayer1Kinds pins which first-layer kinds
+// notify: the warning and pause lifecycle kinds pass the recorded message
+// through, while pass, confirmed, and skipped entries stay activity-only.
+// The message text stands in for whatever the plate-check module records.
+func TestEventSummaryPlatecheckLayer1Kinds(t *testing.T) {
+	const message = "First-layer check recorded this message."
+	for _, tc := range []struct {
+		kind string
+		want string
+	}{
+		{"platecheck_layer1_warning", message},
+		{"platecheck_layer1_pause_sent", message},
+		{"platecheck_layer1_pause_failed", message},
+		{"platecheck_layer1_pause_unconfirmed", message},
+		{"platecheck_layer1_pause_confirmed", ""},
+		{"platecheck_layer1_passed", ""},
+		{"platecheck_layer1_skipped", ""},
+	} {
+		entry := activity.Entry{Kind: tc.kind, Message: message}
+		if got := eventSummary(entry); got != tc.want {
+			t.Errorf("eventSummary(%s) = %q, want %q", tc.kind, got, tc.want)
+		}
+	}
+}
+
 // TestServiceSendsFinishedPrintWithSnapshot pins the happy path: one
 // message whose title is the printer name, whose body carries the summary
 // and the file line, and whose JPEG comes from the camera seam.

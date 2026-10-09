@@ -25,8 +25,9 @@ const (
 	Error   = "error"
 )
 
-// Entry is one recorded event. AgeSeconds is computed when the entry is read,
-// so clients can show relative times without trusting their own clock.
+// Entry is one recorded event. AgeSeconds is computed when the entry is
+// read, so clients can show relative times without trusting their own
+// clock.
 type Entry struct {
 	ID         uint64    `json:"id"`          // monotonically increases across all printers
 	Time       time.Time `json:"time"`        // UTC event timestamp
@@ -34,6 +35,32 @@ type Entry struct {
 	Severity   string    `json:"severity"`    // info, warning, or error
 	Message    string    `json:"message"`     // display-ready event text
 	AgeSeconds float64   `json:"age_seconds"` // event age when read
+
+	// Observation is the source-event evidence for generators that must pin
+	// an entry to the original job and print session that caused it:
+	// JobGen/JobRevision/RunningEpoch identify the preview-job projection
+	// at event time, SessionGen the print session, Epoch the state
+	// boundary, StateGen the last merged gcode_state report, and ObsGen
+	// the last real print report with ObsAt as its observation time. It is
+	// internal evidence only and never serialized to HTTP clients.
+	Observation Observation `json:"-"`
+}
+
+// Observation is the source-event evidence attached to entries whose
+// meaning depends on the print session that caused them. It carries the
+// telemetry identity copied from the exact coherent job+session snapshot
+// that proved the event, so consumers can reject entries recorded against
+// telemetry that has since switched to another job, session, state
+// boundary, or connection.
+type Observation struct {
+	JobGen       uint64    // Job generation at event time.
+	JobRevision  uint64    // Identity revision inside JobGen.
+	RunningEpoch uint64    // RUNNING settling boundary of that job.
+	SessionGen   uint64    // Print session that produced the event.
+	Epoch        uint64    // State boundary or identity change in that session.
+	StateGen     uint64    // Upstream generation of the last gcode_state report.
+	ObsGen       uint64    // Upstream generation of the last real print report.
+	ObsAt        time.Time // Observation time of that print report.
 }
 
 // Log holds one ring buffer per configured printer. A nil *Log is valid and
@@ -63,8 +90,16 @@ func New(printers []config.Printer) *Log {
 	return &Log{rings: rings, now: time.Now}
 }
 
-// Record appends one event for serial.
+// Record appends one event for serial. Producers that must pin the event
+// to the print session that caused it use RecordObserved instead.
 func (l *Log) Record(serial, kind, severity, message string) {
+	l.RecordObserved(serial, kind, severity, message, Observation{})
+}
+
+// RecordObserved appends one event for serial with the source-session
+// evidence Observation. It owns the shared append logic: timestamp and ID
+// generation, ring overwrite, and the unlocked observer callback.
+func (l *Log) RecordObserved(serial, kind, severity, message string, observation Observation) {
 	if l == nil {
 		return
 	}
@@ -76,11 +111,12 @@ func (l *Log) Record(serial, kind, severity, message string) {
 	}
 	l.nextID++
 	e := Entry{
-		ID:       l.nextID,
-		Time:     l.now().UTC().Round(0),
-		Kind:     kind,
-		Severity: severity,
-		Message:  message,
+		ID:          l.nextID,
+		Time:        l.now().UTC().Round(0),
+		Kind:        kind,
+		Severity:    severity,
+		Message:     message,
+		Observation: observation,
 	}
 	if len(r.buf) < Capacity {
 		r.buf = append(r.buf, e)

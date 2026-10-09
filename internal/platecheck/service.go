@@ -25,7 +25,7 @@ type StateSource interface {
 	Session(string) (telemetry.SessionView, bool)
 }
 
-// PrinterCommands supplies connection status and guarded light and stop commands.
+// PrinterCommands supplies connection status and guarded light, stop, and pause commands.
 type PrinterCommands interface {
 	// Connected reports whether the upstream MQTT connection is established.
 	Connected(string) bool
@@ -33,6 +33,8 @@ type PrinterCommands interface {
 	Generation(string) uint64
 	// StopPrint sends a generation-guarded QoS 0 stop request.
 	StopPrint(string, uint64) error
+	// PausePrint sends one generation-guarded QoS 0 pause request.
+	PausePrint(string, uint64) error
 	// SetChamberLight sends a generation-guarded light request.
 	SetChamberLight(string, uint64, bool) error
 }
@@ -46,13 +48,13 @@ var operations atomic.Uint64
 // operationOf returns the local operation identifier, or zero for an unscoped call.
 func operationOf(ctx context.Context) uint64 { v, _ := ctx.Value(operationKey{}).(uint64); return v }
 
-// Service owns independent startup workers and read-only snapshot diagnostics.
+// Service owns per-printer startup and first-layer workers plus startup-only diagnostics.
 type Service struct {
 	// printers retains configured order for diagnostics.
 	printers []config.Printer
 	// settings is the construction-time effective configuration.
 	settings Settings
-	// client evaluates automatic startup frames; nil while off.
+	// client evaluates automatic startup and first-layer frames; nil while off.
 	client DecisionClient
 	// frames supplies fresh shared camera JPEGs.
 	frames FrameSource
@@ -122,7 +124,9 @@ type boundCheck struct {
 	connection uint64
 	// prepare allows only one PREPARE-to-first-RUNNING transition.
 	prepare bool
-	// admitted is the original overall-check budget boundary.
+	// admitted is the boundary that starts the overall-check budget: step
+	// admission time for the startup phase, the event's originating evidence
+	// time for the first-layer phase (queueing never restarts it).
 	admitted time.Time
 	// captured is the exact image capture time.
 	captured time.Time
@@ -154,7 +158,7 @@ type worker struct {
 	printer config.Printer
 	// wake coalesces activity without blocking report processing.
 	wake chan struct{}
-	// mu guards startup hints, processed markers, suppression, and display status.
+	// mu guards startup and first-layer hints, processed markers, suppression, and display status.
 	mu sync.Mutex
 	// candidate is the latest observed startup hint.
 	candidate *candidate
@@ -166,6 +170,16 @@ type worker struct {
 	status ModuleState
 	// pending is owned exclusively by the worker loop.
 	pending *pendingStop
+	// layerHint binds the first-layer event's source-session provenance
+	// (job, session, running epoch, connection, and the originating evidence
+	// time) independently of startup admission.
+	layerHint *boundCheck
+	// layerProcessed prevents replay after any first-layer outcome.
+	layerProcessed uint64
+	// startupStopped remembers every generation with a startup stop attempt.
+	startupStopped uint64
+	// layerPending is owned exclusively by the worker loop.
+	layerPending *pendingPause
 }
 
 // New constructs the module without opening connections or starting goroutines.
@@ -183,7 +197,11 @@ func New(printers []config.Printer, settings Settings, client DecisionClient, fr
 	s := &Service{printers: append([]config.Printer(nil), printers...), settings: settings, client: client, frames: frames, state: state, commands: commands, log: log, workers: map[string]*worker{}, now: time.Now, kPoll: time.Second, kHint: 30 * time.Second, kRunningHint: 5 * time.Second, kFresh: 15 * time.Second, kCheck: 25 * time.Second, kConfirm: 30 * time.Second}
 	s.newClient = func(settings Settings, log *slog.Logger) DecisionClient { return NewClient(settings, log) }
 	for _, p := range printers {
-		s.workers[p.Serial] = &worker{s: s, printer: p, wake: make(chan struct{}, 1), status: ModuleState{State: "idle", Cutoff: settings.StopConfidence}}
+		layerState := "idle"
+		if !settings.FirstLayer.On() {
+			layerState = "disabled"
+		}
+		s.workers[p.Serial] = &worker{s: s, printer: p, wake: make(chan struct{}, 1), status: ModuleState{State: "idle", Cutoff: settings.StopConfidence, FirstLayer: FirstLayerState{State: layerState, Cutoff: settings.FirstLayer.PauseConfidence}}}
 	}
 	return s
 }
@@ -222,7 +240,7 @@ func (s *Service) Close() {
 	s.wg.Wait()
 }
 
-// ObserveActivity records startup hints without consuming telemetry report channels.
+// ObserveActivity records startup and first-layer hints without blocking on network work.
 func (s *Service) ObserveActivity(serial string, entry activity.Entry) {
 	if !s.settings.On() || s.blocked != "" || strings.HasPrefix(entry.Kind, "platecheck_") {
 		return
@@ -230,6 +248,38 @@ func (s *Service) ObserveActivity(serial string, entry activity.Entry) {
 	w := s.workers[serial]
 	if w == nil || s.state == nil || s.commands == nil {
 		return
+	}
+	if entry.Kind == "first_layer_complete" && s.settings.FirstLayer.On() {
+		// The event must carry the print that produced it. Provenance has
+		// to match the coherent current Job projection (generation,
+		// revision, running epoch) and Session projection (session
+		// generation, epoch, report evidence) plus the upstream
+		// connection. Session evidence alone cannot identify the print: a
+		// same-cookie replacement with a changed positive gcode_start_time
+		// advances only the Job generation, so the job fields are what
+		// separates A's event from B. Missing or mismatched evidence is
+		// rejected outright — never repaired from current telemetry, never
+		// queued, never consuming the current job — so a late event cannot
+		// act on the print that replaced it.
+		o := entry.Observation
+		if o.SessionGen == 0 || o.JobGen == 0 || o.ObsAt.IsZero() {
+			return
+		}
+		j, v, connection, ok := w.snapshot()
+		origin := s.now().Sub(o.ObsAt)
+		if ok && origin >= 0 && origin <= s.kFresh &&
+			o.JobGen == j.Generation && o.JobRevision == j.Revision && o.RunningEpoch == j.RunningEpoch &&
+			o.SessionGen == v.SessionGen && o.Epoch == v.Epoch && o.StateGen == v.StateGen && o.ObsGen == v.ObsGen &&
+			w.layerIdentityValid(j, v, connection) {
+			w.mu.Lock()
+			// Keep the first valid queued source event for the job; later
+			// hints for the same job refresh nothing, so the originating
+			// evidence time never renews.
+			if j.Generation > w.layerProcessed && (w.layerHint == nil || w.layerHint.job.Generation != j.Generation) {
+				w.layerHint = &boundCheck{job: j, session: v, connection: connection, admitted: o.ObsAt}
+			}
+			w.mu.Unlock()
+		}
 	}
 	if entry.Kind == "print_preparing" || entry.Kind == "print_started" || entry.Kind == "state_initial" {
 		job, ok := s.state.Job(serial)
@@ -265,10 +315,15 @@ func (s *Service) ObserveActivity(serial string, entry activity.Entry) {
 	}
 }
 
-// run serializes checks and pending confirmation for one printer.
+// run serializes both phases' checks and pending confirmations for one printer.
 func (w *worker) run(ctx context.Context) {
 	ticker := time.NewTicker(w.s.kPoll)
 	defer ticker.Stop()
+	defer func() {
+		if w.layerPending != nil {
+			w.unconfirmedPause()
+		}
+	}()
 	for {
 		select {
 		case <-ctx.Done():
@@ -347,8 +402,14 @@ func (w *worker) authorize(b boundCheck) (telemetry.JobView, telemetry.SessionVi
 	return j, v, v.Epoch == b.session.Epoch && v.SessionGen == b.session.SessionGen
 }
 
-// step admits one hint or revalidates one pending stop without inventing startup events.
+// step advances both phases: it confirms one pending pause or stop, then admits one startup or first-layer hint without inventing events.
 func (w *worker) step(ctx context.Context) {
+	if w.layerPending != nil {
+		w.confirmPause()
+		if w.layerPending != nil {
+			return
+		}
+	}
 	if w.pending != nil {
 		w.confirm(ctx)
 		if w.pending != nil {
@@ -364,6 +425,7 @@ func (w *worker) step(ctx context.Context) {
 	}
 	w.mu.Unlock()
 	if !have {
+		w.stepLayer(ctx)
 		return
 	}
 	j, v, connection, ok := w.snapshot()
@@ -414,6 +476,7 @@ func (w *worker) setStatus(state string, r *Result) {
 		v.PAssessable = new(r.PAssessable)
 	}
 	w.mu.Lock()
+	v.FirstLayer = w.status.FirstLayer
 	w.status = v
 	w.mu.Unlock()
 }
@@ -523,6 +586,9 @@ func (w *worker) dispatch(ctx context.Context) {
 		p.firstPrepare = j.State == "PREPARE"
 	}
 	p.obs = v.Obs
+	w.mu.Lock()
+	w.startupStopped = max(w.startupStopped, p.bound.job.Generation)
+	w.mu.Unlock()
 	// Count and record the attempt even if local publication fails.
 	err := w.s.commands.StopPrint(w.printer.Serial, p.bound.connection)
 	p.dispatched = w.s.now()

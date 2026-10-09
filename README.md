@@ -39,7 +39,7 @@ topic path.
 | **Printer outages ride out** | Capped exponential backoff with jitter, automatic reconnect and resubscribe, and a `pushall` warmup. Late joiners get full state (P1 printers otherwise send deltas only). |
 | **Cameras, two ways** | A live multi-printer dashboard wall — P1/A1 cameras natively, X1/P2S/H2-series cameras through bundled FFmpeg — and a printer-compatible raw passthrough on port 6000. |
 | **Optional AI failure detection** | With an OctoEverywhere Gadget key, snapshots from active prints are analyzed and the proxy pauses likely failures. No key, no uploads, no automatic pauses. |
-| **Optional build-plate check** | With a vision provider (Cloudflare or a custom HTTPS endpoint) and key, one fresh snapshot is checked at print startup and the proxy sends `stop` when the plate looks occupied. Runs comfortably inside Cloudflare's free daily allowance. Off without both. |
+| **Optional build-plate check** | With a vision provider (Cloudflare or a custom HTTPS endpoint) and key, one fresh snapshot is checked at print startup and the proxy sends `stop` when the plate looks occupied. A built-in first-layer phase then uploads two frames and may pause once for a tangled filament, a detached part, or a nozzle blob. Best effort, fail-open, and off without both. |
 | **MCP endpoint** | `/mcp` exposes printer state, camera snapshots, and printer controls (pause, resume, emergency stop, chamber light, speed profile, AI monitoring toggle) to AI agents. |
 | **Supervision-friendly** | `/livez`, `/readyz`, and `/status` for Docker/Kubernetes probes. |
 | **Stateless and multi-arch** | No database, no volumes required; `linux/amd64` and `linux/arm64` images. |
@@ -192,8 +192,8 @@ disabled.
 |---|---|
 | `/` | Redirects to `/config` until a printer is configured, then to `/camwall` (no redirect while cameras are disabled) |
 | `/livez`, `/readyz` | `200 ok` once serving (printer state deliberately excluded — clients stay connected while printers recover) |
-| `/status` | JSON: `{"status":"ok","upstreams":{"<serial>":true\|false}}`, plus a `detection` map per printer when AI detection is enabled and a `platecheck` state when the camera feature is on |
-| `POST /platecheck/snapshots` | Plate-check dry run used by the `/config` page: checks one fresh snapshot per online, camera-capable printer in parallel and streams the exact images and scores as NDJSON (`start`, one `result` per printer, `done`). Offline printers are skipped. Sends no printer command. Mounted when cameras are on |
+| `/status` | JSON: `{"status":"ok","upstreams":{"<serial>":true\|false}}`, plus a `detection` map per printer when AI detection is enabled and a `platecheck` state, covering the startup result and the first-layer phase, when the camera feature is on |
+| `POST /platecheck/snapshots` | Plate-check dry run used by the `/config` page: checks one fresh snapshot per online, camera-capable printer in parallel and streams the exact images and scores as NDJSON (`start`, one `result` per printer, `done`). Offline printers are skipped. Sends no printer command. Covers the startup check only, not the first-layer phase. Mounted when cameras are on |
 | `/activity`, `/activity/{serial}` | Recent per-printer events (in memory; cleared when the proxy restarts) |
 | `/camera/{serial}/snapshot` | Single JPEG frame (P1/A1 native; X1/P2S/H2-series converted server-side with FFmpeg) |
 | `/camera/{serial}/stream` | Live multipart MJPEG stream (same model support as the snapshot) |
@@ -368,21 +368,25 @@ plate when a print starts. Set `provider` (`cloudflare`, the default, or `custom
 `clef-flash`); the proxy builds the Workers AI URL. Custom needs `endpoint` (a
 full HTTPS URL that accepts the same request and answer format), `api_key`, and
 a free-text `model`. Also set `stop_confidence` (0.50 to 0.99 in 0.01 steps, default
-0.50). Without an explicit `enabled`, the check runs when the provider target and key
-are set. The key is write-only on the page, a blank value keeps the stored key, and a
-stored key is never sent to a different account or endpoint than the one it
-belongs to.
+0.50). The nested `first_layer` section controls the first-layer phase: it is on
+whenever the plate check is on, `first_layer.enabled: false` disables that phase
+alone, and `first_layer.pause_confidence` (0.50 to 0.99 in 0.01 steps, default
+0.70) is its pause cutoff. Without an explicit `enabled`, the check runs when the
+provider target and key are set. The key is write-only on the page, a blank value
+keeps the stored key, and a stored key is never sent to a different account or
+endpoint than the one it belongs to.
 
-For each new print job, the proxy waits for a fresh camera frame, may turn the
-chamber light on, uploads that one JPEG to the endpoint, and sends `stop` only
-when the model is sure the view is usable (assessable at least 0.8) and the
-occupied probability is above `stop_confidence`. It never sends another
-command. Every failure, unclear image, or missing camera lets the print
-continue. It checks only prints that start while the proxy watches; a print
-already underway when the proxy attaches is never stopped. A stop sent during
-PREPARE may be repeated once when the job first reaches RUNNING with layer 0.
+For each new print job, the startup check waits for a fresh camera frame, may
+turn the chamber light on, uploads that one JPEG to the endpoint, and sends
+`stop` only when the model is sure the view is usable (assessable at least 0.8)
+and the occupied probability is above `stop_confidence`. The startup check does
+not pause or resume prints during startup. Every failure, unclear image, or
+missing camera lets the print continue. It checks only prints that start while
+the proxy watches; a print already underway when the proxy attaches is never
+stopped. A stop sent during PREPARE may be repeated once when the job first
+reaches RUNNING with layer 0.
 
-### How a decision is made
+### Startup decision
 
 The model returns two probabilities for the snapshot, and the proxy combines
 them into one of three outcomes:
@@ -397,27 +401,79 @@ Raise `stop_confidence` to avoid false stops; lower it to catch more objects
 on the plate. Any error, timeout, or missing camera is treated like an unclear
 result: the print is never stopped on a failure.
 
+### First-layer check
+
+The first-layer phase uses the same provider, credential, and model as the
+startup check. For each print job, once the observed layer count rises from 1
+or below to 2 or above while the print is still running, the proxy uploads two
+fresh original JPEGs taken at least 2 seconds apart, in one request. The
+completion event carries the print evidence observed at that moment: the
+independent job projection (job generation, revision, and running epoch) and
+the session projection (session, epoch, connection, and its report time).
+Admission accepts it only while both projections still match the current
+job, session, and upstream connection, so a late event from a replaced
+session or a reconnect cannot check or pause the print that replaced it.
+The job fields also cover a same-identity replacement: when the printer
+replaces a print under the same cookie but a changed start time, only the
+job generation moves, the stale event is rejected, and the new print keeps
+its own first-layer check.
+Arming is equally provenance-bound: the session view exposes the observed
+layer only when `layer_num` was reported inside the current independent job
+generation, so the previous job's sticky layer can never arm the
+replacement. A same-cookie boundary hides the old layer until the new job
+re-reports its own, whether the boundary arrives as a real state report or
+as a metadata-only delta that changes only `gcode_start_time`. The model
+answers five questions:
+
+| Question | Effect |
+|---|---|
+| Is the view usable (`assessable` ≥ 0.8)? | Below 0.8 the check is inconclusive. |
+| Is the filament tangled? | Pause-capable. |
+| Is a part visibly detached? | Pause-capable. |
+| Is there a nozzle blob at millimeter scale? | Pause-capable. |
+| Is the layer incomplete or material missing? | Warning only. |
+
+With a usable view, any pause-capable probability strictly above
+`pause_confidence` sends one `pause`, then waits up to 30 seconds for the
+printer to confirm it. The proxy sends no second pause and never resumes the
+print. Otherwise, any defect probability above 0.5 records a warning, and a
+check with no such defect passes. An inconclusive view, an error, a timeout, or
+a missing camera fails open: the print continues. The phase checks each job at
+most once.
+
 ### Cloudflare free allowance
 
 Cloudflare Workers AI gives every account 10,000 neurons per day at no charge,
 reset at 00:00 UTC. At list price that allowance is worth about $0.11 a day.
-Because the proxy makes one request per print start, it is more than enough
-for a home fleet. Converted to work:
+With both phases on, one print uploads three frames in two requests: the
+startup check and one first-layer request that carries two images. The counts
+below size the allowance in single-image requests, and a two-image first-layer
+request consumes more input tokens than one of them:
 
-| Model | Free input tokens per day | Decisions per day (about 500 tokens each) |
+| Model | Free input tokens per day | Single-image requests per day (about 500 tokens each) |
 |---|---|---|
 | `clef` | about 458,000 | roughly 900 |
 | `clef-flash` | about 1.22 million | roughly 2,400 |
 
-See [Workers AI pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/)
+Even so, the daily allowance covers far more prints than a typical home printer
+starts in a day. See
+[Workers AI pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/)
 for current rates. Dry runs from the `/config` page count against the same
 allowance.
 
 This is a best-effort check, not a collision interlock. Slicers connect to the
 printer directly, so the print may already be moving when the stop arrives, and
-the printer may refuse the command. Stop requests, failures, and unconfirmed
-stops go to the activity log and, with notifications on, to Pushover. The camera
-wall shows a `Plate check` panel.
+the printer may refuse the command. Stop requests, first-layer warnings, and
+first-layer pause attempts — including failed or unconfirmed pauses — go to the
+activity log and, with notifications on, to Pushover; first-layer passes,
+confirmed pauses, and skips stay in the activity log. The camera wall shows a
+`Plate check` panel covering both phases.
+
+Chamber cameras look across the plate from one corner, so a tangle, a blob, or
+a detached part can be hidden behind the toolhead or the part itself, and small
+features sit near the resolution limit. The defect thresholds are unverified
+model calibration, not a measured specification; treat every result as
+advisory.
 
 The `/config` page has a `Test plate check` button. It checks the key and then
 uploads one current snapshot from each camera to the endpoint, showing each image
@@ -509,9 +565,12 @@ block) to send print alerts to one [Pushover](https://pushover.net/) account.
 
 - **What notifies** — a print finishing, failing, or stopping before it
   finishes; printer errors and HMS warnings; AI detection warnings and AI
-  pause attempts, including failed or unconfirmed ones; and a pause that
-  leaves an active printer alert. Starts, resumes, reconnects, and cleared
-  alerts do not notify.
+  pause attempts, including failed or unconfirmed ones; a build-plate check
+  that requests a startup stop, or a first-layer warning or pause attempt,
+  including failed or unconfirmed first-layer pauses; and a pause that leaves
+  an active printer alert. Starts, resumes, reconnects, cleared alerts, and
+  routine plate-check entries (first-layer passes, confirmed pauses, and
+  skips) do not notify.
 - **What arrives** — events within 2 seconds group into one message per
   printer: the event summaries, the running file, and each active alert with
   its error code and suggested fix. The title is the printer's name or

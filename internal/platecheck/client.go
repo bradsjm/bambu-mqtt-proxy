@@ -52,6 +52,8 @@ type DecisionClient interface {
 	Probe(context.Context) error
 	// Evaluate sends one JPEG and returns the two required probabilities.
 	Evaluate(context.Context, []byte, string) (Result, error)
+	// EvaluateFirstLayer sends two original JPEGs and returns five required scores.
+	EvaluateFirstLayer(context.Context, [][]byte, string) (LayerResult, error)
 }
 
 // Client sends bounded HTTPS requests without redirects or credential logging.
@@ -176,7 +178,7 @@ type answer struct {
 
 // responseResult accepts only expected answers and numeric usage.
 type responseResult struct {
-	// Answers contains only the three known answer identifiers.
+	// Answers contains only the fixed startup, first-layer, and probe identifiers.
 	Answers struct {
 		// Clear is the plate-clear answer.
 		Clear answer `json:"plate_clear"`
@@ -184,6 +186,14 @@ type responseResult struct {
 		Assessable answer `json:"view_assessable"`
 		// Connection is the text-only probe answer.
 		Connection answer `json:"connection_test"`
+		// Tangled is the loose filament tangle answer.
+		Tangled answer `json:"filament_tangled"`
+		// Detached is the displaced printed part answer.
+		Detached answer `json:"part_detached"`
+		// NozzleBlob is the accumulated nozzle blob answer.
+		NozzleBlob answer `json:"nozzle_blob"`
+		// Incomplete is the warning-only missing material answer.
+		Incomplete answer `json:"layer_incomplete"`
 	} `json:"answers"`
 	// Usage contains nonnegative integer counts only.
 	Usage struct {

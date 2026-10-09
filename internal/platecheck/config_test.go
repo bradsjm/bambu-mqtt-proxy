@@ -13,16 +13,24 @@ import (
 )
 
 func TestMain(m *testing.M) { config.RegisterSection(ConfigSection); os.Exit(m.Run()) }
+
+// testSettings returns valid custom-provider settings with the applied
+// defaults: an explicit startup cutoff, and the post-layer-1 phase on with
+// the default pause cutoff, expressed by a nil nested Enabled.
 func testSettings() Settings {
-	return Settings{Provider: ProviderCustom, Endpoint: "https://vision.example/check", APIKey: "private-key", Model: "clef", StopConfidence: .5}
+	return Settings{Provider: ProviderCustom, Endpoint: "https://vision.example/check", APIKey: "private-key", Model: "clef", StopConfidence: .5,
+		FirstLayer: FirstLayerSettings{PauseConfidence: DefaultPauseConfidence}}
 }
 func settingsConfig(s Settings) *config.Config {
 	c := &config.Config{}
 	c.SetSection("platecheck", s)
 	return c
 }
+
+// settingsJSON builds the page submission body for s, first_layer included.
 func settingsJSON(s Settings) []byte {
-	b, _ := json.Marshal(settingsView{Enabled: s.On(), Provider: s.Provider, AccountID: s.AccountID, Endpoint: s.Endpoint, APIKey: s.APIKey, Model: s.Model, StopConfidence: s.StopConfidence})
+	b, _ := json.Marshal(settingsView{Enabled: s.On(), Provider: s.Provider, AccountID: s.AccountID, Endpoint: s.Endpoint, APIKey: s.APIKey, Model: s.Model, StopConfidence: s.StopConfidence,
+		FirstLayer: FirstLayerSettings{Enabled: new(s.FirstLayer.On()), PauseConfidence: s.FirstLayer.PauseConfidence}})
 	return b
 }
 
@@ -30,6 +38,9 @@ func TestConfigurationDefaultsAndEnable(t *testing.T) {
 	s, err := SettingsOf(&config.Config{})
 	if err != nil || s.On() || s.Provider != ProviderCloudflare || s.Model != "clef" || s.StopConfidence != .5 {
 		t.Fatalf("default %+v %v", s, err)
+	}
+	if !s.FirstLayer.On() || s.FirstLayer.PauseConfidence != DefaultPauseConfidence || s.FirstLayer.Enabled != nil {
+		t.Fatalf("nested default %+v", s.FirstLayer)
 	}
 	for _, tc := range []struct {
 		endpoint, key string
@@ -51,6 +62,86 @@ func TestConfigurationDefaultsAndEnable(t *testing.T) {
 	s, err = SettingsOf(parsed)
 	if err != nil || s.On() || s.Key() != "012345" || s.Model != "clef-flash" || s.StopConfidence != .7 {
 		t.Fatalf("parsed %+v %v", s, err)
+	}
+	// A stored section without first_layer keeps the constructor default:
+	// the phase stays on at the default cutoff, never at zero.
+	without, err := config.Parse([]byte("platecheck:\n  enabled: true\n  provider: custom\n  api_key: 012345\n  endpoint: https://a.example/check\n  model: clef\n  stop_confidence: 0.5\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err = SettingsOf(without)
+	if err != nil || !s.FirstLayer.On() || s.FirstLayer.PauseConfidence != .7 || s.FirstLayer.Enabled != nil {
+		t.Fatalf("section without first_layer %+v %v", s.FirstLayer, err)
+	}
+	// An explicit nested disable and an explicit nested enable both persist.
+	disabled, err := config.Parse([]byte("platecheck:\n  first_layer:\n    enabled: false\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err = SettingsOf(disabled)
+	if err != nil || s.FirstLayer.On() || s.FirstLayer.PauseConfidence != .7 || s.FirstLayer.Enabled == nil || *s.FirstLayer.Enabled {
+		t.Fatalf("explicit nested disable %+v %v", s.FirstLayer, err)
+	}
+	enabled, err := config.Parse([]byte("platecheck:\n  first_layer:\n    enabled: true\n    pause_confidence: 0.85\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err = SettingsOf(enabled)
+	if err != nil || !s.FirstLayer.On() || s.FirstLayer.PauseConfidence != .85 || s.FirstLayer.Enabled == nil || !*s.FirstLayer.Enabled {
+		t.Fatalf("explicit nested enable %+v %v", s.FirstLayer, err)
+	}
+}
+
+func TestFirstLayerCutoffValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		pauseConf float64
+		valid     bool
+	}{
+		{"default", DefaultPauseConfidence, true},
+		{"low edge", .5, true},
+		{"high edge", .99, true},
+		{"near integer", .58 + 1e-12, true},
+		{"below", .49, false},
+		{"just below", math.Nextafter(.5, 0), false},
+		{"just above", math.Nextafter(.99, 1), false},
+		{"above", 1.01, false},
+		{"fractional percent", .585, false},
+		{"nan", math.NaN(), false},
+		{"inf", math.Inf(1), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := testSettings()
+			s.FirstLayer.PauseConfidence = tc.pauseConf
+			got, err := validateSettings(s, s.On())
+			if (err == nil) != tc.valid {
+				t.Fatalf("valid=%v err=%v", tc.valid, err)
+			}
+			if !tc.valid {
+				if err.Error() != "Pause above must be a whole percentage from 50 through 99 percent." {
+					t.Fatalf("unexpected message %q", err.Error())
+				}
+				// An invalid explicit value is reported, never coerced to
+				// the default.
+				if got.FirstLayer.PauseConfidence == DefaultPauseConfidence && tc.pauseConf != DefaultPauseConfidence {
+					t.Fatalf("invalid cutoff %.17g coerced to the default", tc.pauseConf)
+				}
+				return
+			}
+			// A valid value round trips onto the whole-percentage grid.
+			want := float64(int(math.Round(tc.pauseConf*100))) / 100
+			if got.FirstLayer.PauseConfidence != want {
+				t.Fatalf("normalized %.17g, want %.17g", got.FirstLayer.PauseConfidence, want)
+			}
+		})
+	}
+	// Section validation routes through the same cutoff rules.
+	for _, cutoff := range []float64{0, .49, .501, math.Nextafter(.99, 1)} {
+		conf := testSettings()
+		conf.FirstLayer.PauseConfidence = cutoff
+		if err := ConfigSection.Validate(settingsConfig(conf)); err == nil {
+			t.Fatalf("accepted pause cutoff %.17g", cutoff)
+		}
 	}
 }
 
@@ -105,7 +196,9 @@ func TestConfigViewSaveRedaction(t *testing.T) {
 	}
 	var view settingsView
 	_ = json.Unmarshal(raw, &view)
-	if !view.HasAPIKey || view.StopConfidence != .7 {
+	// The view resolves the nested default: the stored nil Enabled reads as
+	// enabled true, never as null.
+	if !view.HasAPIKey || view.StopConfidence != .7 || !view.FirstLayer.On() || view.FirstLayer.PauseConfidence != .7 || view.FirstLayer.Enabled == nil || !*view.FirstLayer.Enabled {
 		t.Fatal(string(raw))
 	}
 	submitted := s
@@ -116,7 +209,7 @@ func TestConfigViewSaveRedaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, _ := SettingsOf(out)
-	if got.Key() != s.Key() || got.StopConfidence != .58 {
+	if got.Key() != s.Key() || got.StopConfidence != .58 || got.FirstLayer.PauseConfidence != .7 || !got.FirstLayer.On() {
 		t.Fatalf("save %+v", got)
 	}
 	// Disabling keeps the stored endpoint and key pair.
@@ -132,7 +225,8 @@ func TestConfigViewSaveRedaction(t *testing.T) {
 }
 
 func TestStrictSubmittedSettings(t *testing.T) {
-	for _, raw := range []string{`null`, `[]`, `{"unknown":"hostile"}`, `{"stop_confidence":"0.5"}`, `{"enabled":true} {}`, `{"api_key":"marker",`} {
+	for _, raw := range []string{`null`, `[]`, `{"unknown":"hostile"}`, `{"stop_confidence":"0.5"}`, `{"enabled":true} {}`, `{"api_key":"marker",`,
+		`{"first_layer":{"unknown":1}}`, `{"first_layer":{"pause_confidence":"0.7"}}`, `{"first_layer":{"enabled":"yes"}}`} {
 		if _, err := decodeSettingsView([]byte(raw)); err == nil {
 			t.Fatalf("accepted %q", raw)
 		} else {
@@ -247,6 +341,64 @@ func TestConfigSaveAbsentPageSectionUsesDisabledDefaults(t *testing.T) {
 	if err != nil || got.On() || got.Model != "clef" || got.StopConfidence != .5 {
 		t.Fatalf("absent section %+v %v", got, err)
 	}
+	// The decode defaults keep the nested phase on at the default cutoff.
+	if !got.FirstLayer.On() || got.FirstLayer.PauseConfidence != DefaultPauseConfidence {
+		t.Fatalf("absent section nested defaults %+v", got.FirstLayer)
+	}
+}
+
+// TestFirstLayerViewSaveRoundtrip pins the nested page contract: the view
+// resolves a nil stored Enabled to true, a submission keeps an explicit
+// disable and a normalized cutoff, an absent first_layer member keeps the
+// on-defaults, an invalid cutoff rejects the save, and credentials survive.
+func TestFirstLayerViewSaveRoundtrip(t *testing.T) {
+	stored := testSettings()
+	stored.Enabled = new(true)
+	stored.FirstLayer.Enabled = new(false)
+	stored.FirstLayer.PauseConfidence = .82
+
+	// The view resolves the explicit disable as false. The stored fixture has
+	// a key, so has_api_key reads true while the credential itself is never
+	// returned; TestConfigViewSaveRedaction pins that redaction contract.
+	raw, _ := json.Marshal(ConfigSection.View(settingsConfig(stored)))
+	var view settingsView
+	_ = json.Unmarshal(raw, &view)
+	if view.FirstLayer.On() || view.FirstLayer.PauseConfidence != .82 || !view.HasAPIKey {
+		t.Fatalf("view of explicit disable: %s", raw)
+	}
+
+	// A re-enable submission normalizes the cutoff and keeps the key.
+	in := stored
+	in.FirstLayer.Enabled = new(true)
+	in.FirstLayer.PauseConfidence = .58 + 1e-12
+	out := &config.Config{}
+	if err := ConfigSection.Save(settingsJSON(in), settingsConfig(stored), out); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := SettingsOf(out)
+	if got.FirstLayer.Enabled == nil || !*got.FirstLayer.Enabled || got.FirstLayer.PauseConfidence != .58 || got.Key() != stored.Key() {
+		t.Fatalf("re-enable save %+v", got)
+	}
+
+	// A submission without first_layer keeps the decode defaults: on at .70.
+	out = &config.Config{}
+	legacy := []byte(`{"enabled":true,"provider":"custom","endpoint":"https://vision.example/check","api_key":"typed-key","model":"clef","stop_confidence":0.5}`)
+	if err := ConfigSection.Save(legacy, settingsConfig(stored), out); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = SettingsOf(out)
+	if got.FirstLayer.Enabled != nil || !got.FirstLayer.On() || got.FirstLayer.PauseConfidence != DefaultPauseConfidence || got.Key() != "typed-key" {
+		t.Fatalf("absent first_layer save %+v", got)
+	}
+
+	// An explicit invalid nested cutoff rejects the page save with 400.
+	out = &config.Config{}
+	zero := stored
+	zero.FirstLayer.PauseConfidence = 0
+	var page *config.PageError
+	if err := ConfigSection.Save(settingsJSON(zero), settingsConfig(stored), out); !errors.As(err, &page) || page.Status != 400 || page.Message != "Pause above must be a whole percentage from 50 through 99 percent." {
+		t.Fatalf("explicit zero pause cutoff save: %v", err)
+	}
 }
 
 func TestSaveCredentialRetentionRequiresSameEndpoint(t *testing.T) {
@@ -299,7 +451,8 @@ func TestProviderValidationMessages(t *testing.T) {
 		{"key missing", func(s *Settings) { s.APIKey = "" }, true, "No API key is configured. Enter a key."},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s := Settings{Provider: ProviderCloudflare, AccountID: "0123456789abcdef0123456789abcdef", APIKey: "private-key", Model: "clef", StopConfidence: .5}
+			s := Settings{Provider: ProviderCloudflare, AccountID: "0123456789abcdef0123456789abcdef", APIKey: "private-key", Model: "clef", StopConfidence: .5,
+				FirstLayer: FirstLayerSettings{PauseConfidence: DefaultPauseConfidence}}
 			tc.edit(&s)
 			_, err := validateSettings(s, tc.require)
 			if err == nil || err.Error() != tc.message {
@@ -325,7 +478,8 @@ func TestProviderValidationMessages(t *testing.T) {
 func TestCloudflareURLAndKeyBinding(t *testing.T) {
 	const account = "0123456789abcdef0123456789abcdef"
 	const other = "fedcba9876543210fedcba9876543210"
-	stored := Settings{Provider: ProviderCloudflare, AccountID: account, APIKey: "stored-key", Model: "clef-flash", StopConfidence: .5}
+	stored := Settings{Provider: ProviderCloudflare, AccountID: account, APIKey: "stored-key", Model: "clef-flash", StopConfidence: .5,
+		FirstLayer: FirstLayerSettings{PauseConfidence: DefaultPauseConfidence}}
 	want := "https://api.cloudflare.com/client/v4/accounts/" + account + "/ai/run/@cf/cloudflare/clef-flash"
 	if stored.URL() != want || !stored.On() {
 		t.Fatalf("URL %s, on %v", stored.URL(), stored.On())
@@ -351,10 +505,10 @@ func TestCloudflareURLAndKeyBinding(t *testing.T) {
 		t.Fatalf("changed account save %+v", saved)
 	}
 	// The stored key only follows a diagnostic submission for its own account.
-	if _, err := resolveTestSettings(settingsView{Provider: ProviderCloudflare, AccountID: other, Model: "clef", StopConfidence: .5}, stored); err == nil || err.Error() != endpointKeyMessage {
+	if _, err := resolveTestSettings(settingsView{Provider: ProviderCloudflare, AccountID: other, Model: "clef", StopConfidence: .5, FirstLayer: FirstLayerSettings{PauseConfidence: DefaultPauseConfidence}}, stored); err == nil || err.Error() != endpointKeyMessage {
 		t.Fatalf("diagnostic moved stored key: %v", err)
 	}
-	if s, err := resolveTestSettings(settingsView{Provider: ProviderCloudflare, AccountID: account, Model: "clef", StopConfidence: .5}, stored); err != nil || s.Key() != stored.Key() {
+	if s, err := resolveTestSettings(settingsView{Provider: ProviderCloudflare, AccountID: account, Model: "clef", StopConfidence: .5, FirstLayer: FirstLayerSettings{PauseConfidence: DefaultPauseConfidence}}, stored); err != nil || s.Key() != stored.Key() {
 		t.Fatalf("same account diagnostic %+v: %v", s, err)
 	}
 }
