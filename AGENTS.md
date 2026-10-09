@@ -9,7 +9,7 @@
 `cmd/bambu-mqtt-proxy/main.go` loads the YAML configuration, applies the `BMBPX_HTTP_PORT` and `BMBPX_LOG_LEVEL` overrides and defaults, validates configuration, wires services, and handles shutdown signals. MQTT reports flow from the per-printer connections through the broker to downstream subscribers. Client requests flow through broker ACL and routing hooks to the matching printer; payloads pass through unchanged.
 
 - `internal/config` owns config parsing, defaults, environment overrides, and validation.
-- `internal/broker` adapts the mochi MQTT server and its hooks. `internal/routing` resolves topic filters against configured serials.
+- `internal/broker` adapts the mochi MQTT server and its hooks. `internal/routing` resolves topic filters against configured serials and optional downstream aliases.
 - `internal/upstream` owns lazy per-printer connections, merged subscriptions, reconnects, and warmup commands.
 - `internal/telemetry` observes reports without changing forwarding. `internal/camera` owns camera capture and endpoints. `internal/health` and `internal/httpsrv` provide the shared HTTP service.
 - `internal/module` defines the module contract. Every optional capability is a module; follow the Module Pattern section below.
@@ -91,6 +91,7 @@ The upstream device is a printer with a bare-bones ESP32 MQTT broker, not a gene
 - Send one warmup batch when the upstream report subscription is established. Keep full-state requests for genuinely late subscribers; do not duplicate startup warmups.
 - Preserve byte-exact payload forwarding, one upstream socket per printer, bounded reconnects, and correct shutdown. QoS 0 does not remove MQTT subscription acknowledgements or proxy-side concurrency requirements.
 - Configure fake printer brokers for QoS 0 only. Verify that startup stays connected and reports reach downstream clients.
+- A printer's optional `alias` replaces its serial on the downstream side only; `internal/routing` maps it, and upstream topics and payloads never change.
 
 ## Key Directories
 

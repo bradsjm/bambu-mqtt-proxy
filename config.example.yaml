@@ -22,13 +22,15 @@ auth:
   mode: printer
 
 # One entry per printer. The serial routes MQTT traffic: clients talk to
-# device/{serial}/report and device/{serial}/request. The raw camera endpoint
+# device/{serial}/report and device/{serial}/request, or to
+# device/{alias}/... when an alias is set. The raw camera endpoint
 # on port 6000 instead routes by the access code, so each printer needs its
 # own code.
 printers:
   - serial: "01P00A123456789"
     name: "Garage P1S" # optional friendly label for the camera wall; never used for routing
     # model: "P1S" # optional; camera support is auto-detected from the serial prefix
+    # alias: 01P00A987654321 # optional, blank by default; downstream clients must use it instead of the real serial, which is refused
     address: "192.168.1.42:8883"
     tls: true
     insecure_skip_verify: true

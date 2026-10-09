@@ -47,7 +47,7 @@ func TestNewListenerFailureReleasesPortAndInjector(t *testing.T) {
 	inject := NewInjector(logger)
 	pool := upstream.NewPool(cfg.Printers, inject, cfg.Behavior, logger)
 	t.Cleanup(pool.Stop)
-	table := routing.NewTable([]string{cfg.Printers[0].Serial})
+	table := routing.NewTable([]string{cfg.Printers[0].Serial}, nil)
 
 	srv, err := New(cfg, table, pool, inject, logger)
 	if err == nil {
@@ -94,7 +94,7 @@ func TestCloseOnServingServerKeepsWorking(t *testing.T) {
 	pool := upstream.NewPool(cfg.Printers, inject, cfg.Behavior, logger)
 	t.Cleanup(pool.Stop)
 
-	srv, err := New(cfg, routing.NewTable([]string{cfg.Printers[0].Serial}), pool, inject, logger)
+	srv, err := New(cfg, routing.NewTable([]string{cfg.Printers[0].Serial}, nil), pool, inject, logger)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

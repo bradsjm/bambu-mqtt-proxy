@@ -241,6 +241,8 @@ dialog h2 { font-size: 1.1rem; }
 .field > label { font-weight: 550; }
 .field .hint { margin: 0; }
 .field input.serial { font: 600 1rem var(--mono); letter-spacing: .1em; text-transform: uppercase; }
+.alias-row { display: flex; gap: .5rem; }
+.alias-row input { flex: 1; min-width: 0; }
 .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
 .check { display: flex; gap: .6rem; align-items: flex-start; font-weight: 500; }
 .check input { margin-top: .2rem; }
@@ -293,7 +295,7 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
 
   <section aria-labelledby="printers-h">
     <div class="sec-head"><h2 id="printers-h">Printers</h2><span class="count" id="printer-count"></span></div>
-    <p class="sec-lede">Apps reach each printer through the proxy by its serial number. Access codes are stored in the config file and never shown here.</p>
+    <p class="sec-lede">Apps reach each printer through the proxy by its serial number, or by its alias when one is set. Access codes are stored in the config file and never shown here.</p>
     <div class="plates" id="plates"></div>
   </section>
 
@@ -542,6 +544,14 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
       <label for="p-serial">Serial number</label>
       <input id="p-serial" class="serial" type="text" required autocomplete="off" spellcheck="false" autocapitalize="characters" placeholder="01P00A123456789">
     </div>
+    <div class="field">
+      <label for="p-alias">Alias</label>
+      <div class="alias-row">
+        <input id="p-alias" class="serial" type="text" autocomplete="off" spellcheck="false" autocapitalize="characters">
+        <button class="btn" type="button" id="p-alias-gen">Generate</button>
+      </div>
+      <p class="hint">Apps connect with this serial instead of the real one; when set, the real serial is refused; leave blank to use the real serial.</p>
+    </div>
     <div class="pair">
       <div class="field">
         <label for="p-name">Name <span class="hint" style="display:inline">(optional)</span></label>
@@ -618,6 +628,7 @@ function barcode(text) {
 
 /* ---- Model and camera detection, mirroring internal/config. ---- */
 const PREFIX = [["01P", "P1P"], ["01S", "P1S"], ["030", "A1MINI"], ["039", "A1"]];
+const MODEL_PREFIX = {P1P:"01P", P1S:"01S", A1MINI:"030", A1:"039", X1C:"00M", X1:"00W", X1E:"03W", P2S:"22E", H2S:"093", H2D:"094"};
 const modelFor = p => (p.model || "").trim() || (PREFIX.find(([pre]) => p.serial.toUpperCase().startsWith(pre)) || [])[1] || "";
 const norm = m => m.toUpperCase().replace(/\s+/g, "");
 const hasCamera = p => ["P1P", "P1S", "A1", "A1MINI"].includes(norm(modelFor(p)));
@@ -652,9 +663,10 @@ function renderPlates() {
     return `<article class="plate" aria-label="Printer ${esc(p.serial)}">
       <div class="plate-top"><span>${esc(model || "Model unknown")}</span>${changed ? `<span class="tag unsaved">Unsaved</span>` : ""}</div>
       <h3 class="plate-name ${p.name ? "" : "unnamed"}">${esc(p.name || "Unnamed printer")}</h3>
-      ${barcode(p.serial)}
+      ${barcode(p.alias || p.serial)}
       <p class="sn"><span>S/N</span>${esc(p.serial)}</p>
       <dl class="specs">
+        ${p.alias ? `<dt>Alias</dt><dd class="mono">${esc(p.alias)}</dd>` : ""}
         <dt>Address</dt><dd class="mono">${esc(p.address)}</dd>
         <dt>Link</dt><dd>${link}</dd>
         <dt>Code</dt><dd>${code}</dd>
@@ -873,11 +885,11 @@ const dlg = $("#dlg");
 const printerSettingInputs = new Map();
 function openPrinter(i) {
   editing = i;
-  const p = i >= 0 ? cfg.printers[i] : { serial: "", name: "", model: "", settings: {}, address: "", tls: true, insecure_skip_verify: true, username: "bblp", has_access_code: false };
+  const p = i >= 0 ? cfg.printers[i] : { serial: "", alias: "", name: "", model: "", settings: {}, address: "", tls: true, insecure_skip_verify: true, username: "bblp", has_access_code: false };
   $("#dlg-title").textContent = i >= 0 ? `Edit ${p.name || p.serial}` : "Add printer";
   $("#dlg-ok").textContent = i >= 0 ? "Update printer" : "Add printer";
   $("#p-test").hidden = i >= 0;   // the test connects to a new destination only
-  $("#p-serial").value = p.serial; $("#p-name").value = p.name; $("#p-model").value = p.model;
+  $("#p-serial").value = p.serial; $("#p-alias").value = p.alias || ""; $("#p-name").value = p.name; $("#p-model").value = p.model;
   $("#p-address").value = p.address; $("#p-code").value = p.access_code || "";
   $("#p-settings").replaceChildren();
   printerSettingInputs.clear();
@@ -912,6 +924,7 @@ function openPrinter(i) {
   $("#dlg-error").hidden = true;
   printerTest.invalidate();
   codeHint();
+  aliasGenState();
   dlg.showModal();
   $(i >= 0 ? "#p-name" : "#p-serial").focus();
 }
@@ -934,19 +947,60 @@ function codeHint() {
     : "Shown on the printer's screen with LAN mode.";
 }
 
+/* Generates a random printer-shaped alias from the dialog serial and model.
+   The prefix follows the model when it names a known printer, else the
+   serial; each later character keeps the template's digit-or-letter shape
+   with fresh randomness from crypto.getRandomValues. A result that collides
+   with the dialog serial or another printer's serial or alias is
+   regenerated. The result lands in the alias field, where the user can still
+   edit it. */
+function generateAlias() {
+  const serial = $("#p-serial").value.trim().toUpperCase();
+  const template = serial.length >= 4 ? serial : "01P00A000000000";
+  const prefix = MODEL_PREFIX[norm($("#p-model").value.trim())] || template.slice(0, 3);
+  const shape = template.slice(3);
+  const taken = new Set([serial]);
+  cfg.printers.forEach((p, i) => {
+    if (i === editing) return;
+    taken.add((p.serial || "").toUpperCase());
+    if (p.alias) taken.add(p.alias.toUpperCase());
+  });
+  for (let tries = 0; tries < 100; tries++) {
+    const rand = new Uint32Array(shape.length);
+    crypto.getRandomValues(rand);
+    let out = prefix;
+    for (let i = 0; i < shape.length; i++) {
+      out += /\d/.test(shape[i]) ? String(rand[i] % 10) : String.fromCharCode(65 + (rand[i] % 26));
+    }
+    if (!taken.has(out)) {
+      $("#p-alias").value = out;
+      return;
+    }
+  }
+}
+
+/* Enables the Generate button once the dialog holds a serial or a model. */
+function aliasGenState() {
+  $("#p-alias-gen").disabled = !$("#p-serial").value.trim() && !$("#p-model").value.trim();
+}
+
 function submitPrinter(e) {
   e.preventDefault();
   const fail = (msg, el) => { $("#dlg-error").textContent = msg; $("#dlg-error").hidden = false; el.focus(); };
   const serial = $("#p-serial").value.trim().toUpperCase();
+  const alias = $("#p-alias").value.trim().toUpperCase();
   const address = $("#p-address").value.trim();
   const code = $("#p-code").value;
   if (!serial) return fail("Enter the printer's serial number.", $("#p-serial"));
   if (cfg.printers.some((p, i) => i !== editing && p.serial === serial)) return fail(`Printer ${serial} is already on the list.`, $("#p-serial"));
+  if (!/^[0-9A-Z]*$/.test(alias)) return fail("The alias can only use digits and capital letters A-Z.", $("#p-alias"));
+  if (alias === serial) return fail("The alias must differ from the printer's own serial number.", $("#p-alias"));
+  if (alias && cfg.printers.some((p, i) => i !== editing && ((p.serial || "").toUpperCase() === alias || (p.alias || "").toUpperCase() === alias))) return fail(`Alias ${alias} is already used by another printer.`, $("#p-alias"));
   if (!address) return fail("Enter the printer's IP address or host name, for example 192.168.1.42.", $("#p-address"));
   if (!code && codeNeeded()) return fail("Enter the printer's access code.", $("#p-code"));
   const prev = editing >= 0 ? cfg.printers[editing] : {};
   const p = {
-    serial, name: $("#p-name").value.trim(), model: $("#p-model").value.trim(), address,
+    serial, alias, name: $("#p-name").value.trim(), model: $("#p-model").value.trim(), address,
     settings: {},
     tls: $("#p-tls").checked, insecure_skip_verify: $("#p-skip").checked,
     username: $("#p-user").value.trim() || "bblp",
@@ -978,6 +1032,8 @@ $("#plates").addEventListener("click", e => {
 $("#dlg-form").addEventListener("submit", submitPrinter);
 $("#dlg-cancel").addEventListener("click", () => dlg.close());
 $("#p-address").addEventListener("input", codeHint);
+$("#p-alias-gen").addEventListener("click", generateAlias);
+for (const id of ["p-serial", "p-model"]) $("#" + id).addEventListener("input", aliasGenState);
 
 /* ---- Test controls. Every Test button on this page uses one runner: a run
    sequence, an AbortController, a disabled button while running, and one

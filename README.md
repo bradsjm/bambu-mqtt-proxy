@@ -92,7 +92,8 @@ printers:
     password: "12345678"
 ```
 
-MQTT always routes by serial; the `name` label only decorates the camera wall.
+MQTT always routes by serial, or by the optional `alias` when one is set (see
+[Configuration](#configuration)); the `name` label only decorates the camera wall.
 
 **Docker Compose**
 
@@ -116,10 +117,11 @@ go build -o bambu-mqtt-proxy ./cmd/bambu-mqtt-proxy
 | MQTT clients — Bambu Studio, Home Assistant, xtouch, OctoPrint plugins | `<proxy-host>:8883` | `bblp` | any configured printer's access code |
 | Camera apps speaking the printer camera protocol | `<proxy-host>:6000` | `bblp` | the target printer's access code |
 
-MQTT traffic carries the serial in its topics, so one endpoint serves every
-configured printer. Camera connections carry no serial: the access code
-selects the printer, so give each printer a unique access code (the proxy does
-not reject duplicates, and MQTT routing is unaffected).
+MQTT traffic carries the serial (or the printer's alias, when set) in its
+topics, so one endpoint serves every configured printer. Camera connections
+carry no serial: the access code selects the printer, so give each printer a
+unique access code (the proxy does not reject duplicates, and MQTT routing is
+unaffected).
 
 ## Configuration
 
@@ -178,6 +180,19 @@ log:
 |---|---|---|
 | `BMBPX_LOG_LEVEL` | *(unset)* | A non-empty value overrides `log.level`: `info` logs client and upstream state, subscriptions, retries, and backoff delays; `debug` adds per-packet request routing |
 | `BMBPX_HTTP_PORT` | *(unset)* | A value from 0 to 65535 overrides `http.port`: the shared health, camera, and MCP HTTP port; `0` disables HTTP (the raw camera listener on 6000 keeps serving while cameras are enabled) |
+
+An optional per-printer `alias` is a replacement serial seen only by
+downstream MQTT clients, so a printer can be swapped without reconfiguring
+downstream apps. Either generate an alias in advance and point apps at it
+once, or after a swap set `serial` to the new printer and `alias` to the old
+serial so existing apps keep working. The `/config` page offers a Generate
+button that makes a serial-shaped value with the printer model's prefix; the
+value stays editable. Aliases allow uppercase letters and digits only and
+must be unique across all configured serials and aliases. Only the serial is
+replaced: the new printer's access code still applies, and some report
+payloads still carry the real serial because payloads are forwarded
+unchanged. Camera endpoints, `/status`, `/activity`, and MCP keep using the
+real serial.
 
 ## HTTP endpoints
 
@@ -352,6 +367,8 @@ On by default; disable with `mcp.enabled: false`. MCP protocol
   already in use), the previous file is restored and the page shows the error.
 - Never displays or returns access codes: a blank code keeps the stored one,
   and changing a printer's address requires entering its code again.
+- Edits each printer's optional `alias`. A Generate button fills a
+  serial-shaped value using the model's prefix; you can edit it before saving.
 - Marks the HTTP port and the log level when `BMBPX_HTTP_PORT` or
   `BMBPX_LOG_LEVEL` is set; those variables still win. Saving rewrites the
   file, so comments in it are not kept.

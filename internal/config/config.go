@@ -83,6 +83,10 @@ type Printer struct {
 	// Name is an optional friendly label shown on the camera wall. It never
 	// affects routing, which is keyed by Serial.
 	Name string `yaml:"name,omitempty"`
+	// Alias is an optional downstream serial. When set, downstream MQTT
+	// clients must address this printer as device/{Alias}/... and the real
+	// Serial is rejected downstream; upstream traffic always uses Serial.
+	Alias string `yaml:"alias,omitempty"`
 	// Model is the optional printer model, free-form (P1S, A1MINI,
 	// X1C, ...). Camera capture requires one of P1P, P1S, A1, A1MINI; see
 	// CameraSupported. Any other model still proxies MQTT.
@@ -395,6 +399,22 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
+	used := make(map[string]bool, 2*len(c.Printers))
+	for serial := range seen {
+		used[serial] = true
+	}
+	for i, p := range c.Printers {
+		if p.Alias == "" {
+			continue
+		}
+		if !validAlias(p.Alias) {
+			return fmt.Errorf("printers[%d] (%s): alias %q must contain only uppercase letters and digits", i, p.Serial, p.Alias)
+		}
+		if used[p.Alias] {
+			return fmt.Errorf("printers[%d] (%s): alias %q duplicates a configured serial or alias", i, p.Serial, p.Alias)
+		}
+		used[p.Alias] = true
+	}
 	if c.Behavior.UpstreamKeepaliveSeconds <= 0 ||
 		c.Behavior.UpstreamConnectTimeoutSeconds <= 0 ||
 		c.Behavior.UpstreamBackoffInitialSeconds <= 0 ||
@@ -406,6 +426,17 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("http: port %d out of range (0 disables)", c.HTTP.Port)
 	}
 	return nil
+}
+
+// validAlias reports whether an alias matches the downstream ID grammar:
+// one or more uppercase letters and digits.
+func validAlias(alias string) bool {
+	for _, c := range alias {
+		if (c < '0' || c > '9') && (c < 'A' || c > 'Z') {
+			return false
+		}
+	}
+	return alias != ""
 }
 
 // DisplayModel names a printer model: explicit model configuration first,

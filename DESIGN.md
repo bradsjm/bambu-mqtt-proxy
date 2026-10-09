@@ -477,7 +477,14 @@ The `platecheck` module (`internal/platecheck`) evaluates fresh camera frames ag
 
 ## 7. Routing model (core)
 
-Topic grammar: `device/{serial}/report` and `device/{serial}/request`. The serial is the second level. Any other topic shape is denied/dropped and logged. This routing model covers MQTT only: the raw camera endpoint (§6) carries no topics and routes by the access code instead.
+Topic grammar: `device/{id}/report` and `device/{id}/request`, where `{id}` is the printer's downstream ID (its alias when set, otherwise its serial). The ID is the second level. Any other topic shape is denied/dropped and logged. This routing model covers MQTT only: the raw camera endpoint (§6) carries no topics and routes by the access code instead.
+
+Each printer has one downstream ID: its `alias` when set, otherwise its
+`serial`. The bridge rewrites the request topic's serial level to the real
+serial upstream, and the injector rewrites the report topic's serial level
+to the downstream ID; payloads pass through unchanged. While an alias is
+set, the real serial is refused downstream. Wildcard subscribers receive
+each report once, on the downstream-ID topic.
 
 ### 7.1 Subscribe path (downstream → upstream)
 
@@ -567,6 +574,7 @@ printers:
   - serial: "01P00A123456789"
     # name: "Garage P1S"      # optional; camera wall label, never used for routing
     # model: "P1S"            # optional; camera support is inferred from the serial prefix
+    # alias: "01P00A000000001" # optional downstream serial: clients must use it and the real serial is refused; uppercase letters and digits, unique across serials and aliases
     address: "192.168.1.42:8883"
     tls: true
     insecure_skip_verify: true
@@ -632,7 +640,7 @@ internal/broker/server.go      mochi server, TLS listeners, cert bootstrap
 internal/broker/bridge.go      routing hooks + per-client filter tracking + refcounts
 internal/upstream/pool.go      serial → connection table, lazy connect, reconnect/resubscribe
 internal/upstream/conn.go      paho client wrapper (connect, publish, merged subscribe)
-internal/routing/topic.go      serial extraction, wildcard expansion, filter↔serial sets
+internal/routing/topic.go      serial and alias extraction, wildcard expansion, downstream-ID↔serial mapping and topic rewrite
 internal/telemetry/            delta-merging display-state cache fed by upstream reports
 internal/camera/               P1/A1 chamber-image capture, X1/P2S/H2-series RTSPS capture via FFmpeg, raw TLS camera endpoint, snapshot/stream/camera wall handlers
 internal/mcpserver/            MCP endpoint (core tools, state resource, subscriptions, shared sampler)

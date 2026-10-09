@@ -156,8 +156,11 @@ type PrinterSettingView struct {
 // returned; PreviousSerial names the stored printer an edit started from.
 type PrinterView struct {
 	Serial string `json:"serial"`
-	Name   string `json:"name"`
-	Model  string `json:"model"`
+	// Alias is the optional downstream serial. Apps address the printer
+	// by the alias when it is set; a blank alias uses the serial.
+	Alias string `json:"alias"`
+	Name  string `json:"name"`
+	Model string `json:"model"`
 	// Settings holds optional module values returned by the API.
 	// A blank submitted value clears a setting.
 	Settings           map[string]string `json:"settings"`
@@ -514,6 +517,7 @@ func toView(c *config.Config) View {
 		}
 		v.Printers = append(v.Printers, PrinterView{
 			Serial:             p.Serial,
+			Alias:              p.Alias,
 			Name:               p.Name,
 			Model:              p.Model,
 			Settings:           settings,
@@ -575,6 +579,7 @@ func (v View) toConfig(stored *config.Config) (*config.Config, error) {
 	for _, p := range v.Printers {
 		out := config.Printer{
 			Serial:             strings.TrimSpace(p.Serial),
+			Alias:              strings.TrimSpace(p.Alias),
 			Name:               strings.TrimSpace(p.Name),
 			Model:              strings.TrimSpace(p.Model),
 			Address:            strings.TrimSpace(p.Address),

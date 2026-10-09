@@ -102,10 +102,14 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	}
 
 	serials := make([]string, 0, len(cfg.Printers))
+	aliases := make(map[string]string, len(cfg.Printers))
 	for _, p := range cfg.Printers {
 		serials = append(serials, p.Serial)
+		if p.Alias != "" {
+			aliases[p.Serial] = p.Alias
+		}
 	}
-	table := routing.NewTable(serials)
+	table := routing.NewTable(serials, aliases)
 	inject := broker.NewInjector(logger)
 	pool := upstream.NewPool(cfg.Printers, inject, cfg.Behavior, logger)
 	activities := activity.New(cfg.Printers)

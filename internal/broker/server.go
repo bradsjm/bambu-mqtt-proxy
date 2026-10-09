@@ -18,8 +18,9 @@ import (
 // server is attached after construction to break the pool/server dependency
 // cycle.
 type Injector struct {
-	srv *mqtt.Server
-	log *slog.Logger
+	srv   *mqtt.Server
+	table *routing.Table
+	log   *slog.Logger
 }
 
 // NewInjector creates an unattached injector.
@@ -33,6 +34,9 @@ func NewInjector(log *slog.Logger) *Injector {
 func (i *Injector) PublishDownstream(topic string, payload []byte) {
 	if i.srv == nil {
 		return
+	}
+	if i.table != nil {
+		topic = i.table.Downstream(topic)
 	}
 	if err := i.srv.Publish(topic, payload, false, 0); err != nil {
 		i.log.Warn("downstream inject failed", "topic", topic, "error", err)
@@ -88,9 +92,11 @@ func New(cfg *config.Config, table *routing.Table, pool *upstream.Pool, inject *
 			return fail(fmt.Errorf("add listener %d: %w", i, err))
 		}
 	}
-	// Every listener is bound. Publishing the server into the injector is
-	// the last step, so a failed construction never leaves a live target.
+	// Every listener is bound. Publishing the server and the routing table
+	// into the injector is the last step, so a failed construction never
+	// leaves a live target.
 	inject.srv = srv
+	inject.table = table
 	return s, nil
 }
 

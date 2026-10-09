@@ -314,7 +314,7 @@ func (b *Bridge) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, 
 	if len(serials) == 0 {
 		return pk, packets.CodeSuccessIgnore
 	}
-	b.pool.PublishWithContext(serials[0], pk.TopicName, pk.Payload, upstream.PublishContext{
+	b.pool.PublishWithContext(serials[0], b.table.Upstream(pk.TopicName), pk.Payload, upstream.PublishContext{
 		Origin:       "client",
 		Action:       "request",
 		ClientID:     cl.ID,

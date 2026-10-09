@@ -17,8 +17,9 @@ import (
 
 // fakePool records the reference operations the bridge performs upstream.
 type fakePool struct {
-	mu  sync.Mutex
-	ops []refOp
+	mu   sync.Mutex
+	ops  []refOp
+	pubs []pubOp
 	// settled, when set, runs inside every upstream completion.
 	settled func()
 }
@@ -28,6 +29,13 @@ type refOp struct {
 	kind   string // subscribe | unsubscribe
 	serial string
 	filter string
+}
+
+// pubOp is one recorded upstream publish.
+type pubOp struct {
+	serial  string
+	topic   string
+	payload string
 }
 
 func (f *fakePool) EnsureConnected(string, time.Duration) bool { return true }
@@ -52,9 +60,12 @@ func (f *fakePool) RecordUnsubscribe(serial, filter string) func() {
 	return f.record(refOp{"unsubscribe", serial, filter})
 }
 
-func (f *fakePool) PublishWithContext(string, string, []byte, upstream.PublishContext) {}
+func (f *fakePool) PublishWithContext(serial, topic string, payload []byte, _ upstream.PublishContext) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pubs = append(f.pubs, pubOp{serial: serial, topic: topic, payload: string(payload)})
+}
 
-// count reports how many ops of a kind hit serial+filter.
 func (f *fakePool) count(kind, serial, filter string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -86,7 +97,7 @@ func newTestBridge() (*Bridge, *fakePool) {
 		Behavior: config.Behavior{UpstreamConnectTimeoutSeconds: 1},
 	}
 	pool := &fakePool{}
-	return newBridge(cfg, routing.NewTable([]string{"S1", "S2"}), pool, slog.New(slog.NewTextHandler(io.Discard, nil))), pool
+	return newBridge(cfg, routing.NewTable([]string{"S1", "S2"}, nil), pool, slog.New(slog.NewTextHandler(io.Discard, nil))), pool
 }
 
 // mkClient builds an unattached mochi client. subs seeds the session state
@@ -330,5 +341,34 @@ func TestUpstreamCompletionsRunOutsideOwnershipLock(t *testing.T) {
 	b.OnDisconnect(persistent, nil, true)
 	if runs != 4 {
 		t.Fatalf("completions run = %d, want 4 (subscribe, unsubscribe, inherit, expire)", runs)
+	}
+}
+
+func TestOnPublishAliasRewritesToSerial(t *testing.T) {
+	cfg := &config.Config{
+		Auth:     config.Auth{Mode: config.AuthModeAcceptAll},
+		Printers: []config.Printer{{Serial: "S1", Password: "pw"}},
+		Behavior: config.Behavior{UpstreamConnectTimeoutSeconds: 1},
+	}
+	pool := &fakePool{}
+	table := routing.NewTable([]string{"S1"}, map[string]string{"S1": "ALIAS1"})
+	b := newBridge(cfg, table, pool, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	cl := mkClient("c1", false, nil)
+	payload := []byte(`{"print":{"command":"pause"}}`)
+	pk := packets.Packet{TopicName: "device/ALIAS1/request", Payload: payload}
+	if _, err := b.OnPublish(cl, pk); err != packets.CodeSuccessIgnore {
+		t.Fatalf("OnPublish alias err = %v, want CodeSuccessIgnore", err)
+	}
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if len(pool.pubs) != 1 {
+		t.Fatalf("upstream publishes = %d, want 1", len(pool.pubs))
+	}
+	got := pool.pubs[0]
+	if got.serial != "S1" || got.topic != "device/S1/request" {
+		t.Fatalf("upstream publish = %s %s, want S1 device/S1/request", got.serial, got.topic)
+	}
+	if got.payload != string(payload) {
+		t.Fatalf("upstream payload = %q, want %q", got.payload, payload)
 	}
 }

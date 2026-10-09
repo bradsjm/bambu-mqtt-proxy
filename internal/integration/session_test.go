@@ -47,10 +47,14 @@ func startProxyAuth(t *testing.T, mode string, printers []config.Printer) *proxy
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	serials := make([]string, 0, len(printers))
+	aliases := make(map[string]string, len(printers))
 	for _, p := range printers {
 		serials = append(serials, p.Serial)
+		if p.Alias != "" {
+			aliases[p.Serial] = p.Alias
+		}
 	}
-	table := routing.NewTable(serials)
+	table := routing.NewTable(serials, aliases)
 	inject := broker.NewInjector(logger)
 	pool := upstream.NewPool(printers, inject, cfg.Behavior, logger)
 	srv, err := broker.New(cfg, table, pool, inject, logger)
