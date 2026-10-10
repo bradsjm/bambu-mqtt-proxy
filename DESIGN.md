@@ -135,8 +135,11 @@ MCP follows the same ownership. A module's per-printer data reaches agents only 
 | `detection` | A Gadget key (or explicit enable) is configured (§6.1) | `Start`/`Stop`, `NeedsReports`, `State`, `FleetValues`, `StatusValue`, `Routes`, `MCP` | Tile `detection`, fleet `detection_suspended`/`detection_message`, `/status` `detection`, `PUT /detection/{serial}`, `state.modules.detection`, `set_ai_monitoring` |
 | `platecheck` | Cameras on and HTTP on (diagnostics), or endpoint and key set (§6.2) | `Start`/`Stop`, `NeedsReports`, `ObserveActivity`, `State`, `Display`, `StatusValue`, `Routes` | Tile `platecheck` and panel (startup and first-layer), `/status` `platecheck`, `POST /platecheck/snapshots` (startup only), `state.modules.platecheck` |
 | `firstlayer` | Always | `Start`/`Stop` | The `first_layer_complete` activity entry |
+| `safety` | `safety.enabled` (a `config.Section` owned by the module; requires the `notifications` Pushover credentials) | `Start`/`Stop`, `NeedsReports` | The `safety_overtemp` and `safety_power_off` activity entries, one guarded `stop` to every printer, one Panda PWR power-off, one Pushover emergency alert |
 
-Two kinds of module-specific markup remain in the embedded pages, because the generic hooks cannot express them: the interactive detection controls in `camwall.html` and the section forms in `config.html`. The notification module's summaries for other modules' activity kinds (`ai_*`, `platecheck_*`, `first_layer_complete`) are accepted module-to-module knowledge.
+Two kinds of module-specific markup remain in the embedded pages, because the generic hooks cannot express them: the interactive detection controls in `camwall.html` and the section forms in `config.html`. The notification module's summaries for other modules' activity kinds (`ai_*`, `platecheck_*`, `first_layer_complete`) are accepted module-to-module knowledge. The safety module calls `notification.SendEmergency` and `pandapwr.PowerOff` directly; that is accepted module-to-module knowledge too.
+
+Safety is a best-effort backup to the printer firmware's thermal protection. Once per second it compares the cached nozzle, bed, and chamber readings of each printer that has reported on its current upstream connection with a per-model limit table (the rated maximum plus a margin). The latch holds through disconnects and clears only when a connected printer's readings are all below the limits, so a value cached before a disconnect trips only if the printer reported it over the limit and no check saw it before the drop. The chamber is the native sensor, or the latest accessory reading on models without one; a stale accessory value keeps its last reading, so losing the device never re-arms a tripped printer. On a trip it records `safety_overtemp` and sends one guarded `stop` to every printer, one `POST /set power=0` to the impacted printer's Panda PWR, and one Pushover emergency alert. Each action is a single attempt. The `/config` page has no safety form, so its `Save` hook copies the stored YAML section.
 
 Panda Breath shows a wall panel (full detail level) with the device link (connected, connected with no readings, or offline), the device's own chamber reading while fresh, and a trend over up to three minutes of spaced samples; a "Chamber warming" badge appears on the camera image only while the chamber rises by at least 2 °C over at least two minutes. Everything derives from the live `warehouse_temper` stream: the device sends its settings only once per connection, so the module shows no settings and opens no extra connections. One locked snapshot backs both the panel and the `State` value (`link`, `chamber_c` while fresh, `trend`, and the signed `rate_c_per_min`); its `StableKey` keeps only the link and trend, so temperature steps do not wake `watch_printer`.
 
@@ -636,6 +639,7 @@ internal/pandabreath/          module: Panda Breath accessory link, chamber read
 internal/pandapwr/             module: Panda PWR smart plug power draw over HTTP
 internal/detection/            module: Gadget AI failure detection, its config section, set_ai_monitoring
 internal/firstlayer/           module: first-layer completion activity entry
+internal/safety/               module: over-temperature stop, Panda PWR power-off, Pushover emergency alert
 internal/httpsrv/              shared health + camera HTTP listener
 internal/tlsutil/              self-signed certificate generation and persistence
 ```
@@ -675,6 +679,7 @@ Dependencies: `github.com/mochi-mqtt/server/v2`, `github.com/eclipse/paho.mqtt.g
 | Notification queue full (activity burst) | The observer drops the new event and logs `notification dropped` | That event never notifies; forwarding and printing are unaffected |
 | Pushover unreachable, slow, or rejecting | One send attempt per message (15 s client timeout inside a 20 s context), no retry; the failure is logged with a credential-safe error | The message is lost; every other service is unaffected |
 | Camera unavailable when a notification sends | The message goes out text-only | The alert still arrives without the image |
+| Over-temperature trip (safety module) | One `stop` per printer, one Panda PWR power-off, one Pushover emergency alert; no retry or confirmation; failures are logged and listed in the alert | A disconnected printer misses the stop; a busy Panda PWR can reject the power-off; a printer that stops reporting cannot trip |
 
 ## 12. Alternatives considered
 

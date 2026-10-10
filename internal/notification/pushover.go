@@ -37,6 +37,19 @@ var pushoverClient = &http.Client{Timeout: 15 * time.Second}
 // snapshot. Errors are safe: they never contain credentials or the
 // response body.
 func Send(ctx context.Context, cfg Settings, title, body string, jpeg []byte) error {
+	return post(ctx, cfg, title, body, jpeg, nil)
+}
+
+// SendEmergency delivers one Pushover emergency-priority message. Pushover
+// repeats it every 30 seconds for up to one hour until the user
+// acknowledges it. Errors follow the Send rules.
+func SendEmergency(ctx context.Context, cfg Settings, title, body string) error {
+	return post(ctx, cfg, title, body, nil, [][2]string{{"priority", "2"}, {"retry", "30"}, {"expire", "3600"}})
+}
+
+// post builds and sends one Pushover message with optional extra form
+// fields, such as the emergency priority parameters.
+func post(ctx context.Context, cfg Settings, title, body string, jpeg []byte, extra [][2]string) error {
 	switch cfg.Provider {
 	case "", "pushover":
 	default:
@@ -45,13 +58,14 @@ func Send(ctx context.Context, cfg Settings, title, body string, jpeg []byte) er
 
 	buf := &bytes.Buffer{}
 	form := multipart.NewWriter(buf)
-	for _, f := range []struct{ name, value string }{
+	fields := [][2]string{
 		{"token", strings.TrimSpace(cfg.Pushover.AppToken)},
 		{"user", strings.TrimSpace(cfg.Pushover.UserKey)},
 		{"title", truncateRunes(title, maxTitleRunes)},
 		{"message", truncateRunes(body, maxMessageRunes)},
-	} {
-		if err := form.WriteField(f.name, f.value); err != nil {
+	}
+	for _, f := range append(fields, extra...) {
+		if err := form.WriteField(f[0], f[1]); err != nil {
 			return fmt.Errorf("build pushover form: %w", err)
 		}
 	}

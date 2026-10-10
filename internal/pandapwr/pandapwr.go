@@ -18,12 +18,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math"
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -241,6 +243,32 @@ func (s *Store) poll(ctx context.Context, t target) (ok bool, reason string) {
 	s.readings[t.serial] = r
 	s.mu.Unlock()
 	return true, ""
+}
+
+// PowerOff switches the Panda PWR relay at the configured address off with
+// one POST /set power=0 request. It does not retry or confirm the switch.
+// The device serves one request at a time, so a concurrent poll can make
+// the request fail.
+func PowerOff(ctx context.Context, address string) error {
+	host, err := config.HostOnly(address)
+	if err != nil {
+		return fmt.Errorf("panda pwr power off %q: %w", address, err)
+	}
+	url := "http://" + host + "/set"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader("power=0"))
+	if err != nil {
+		return fmt.Errorf("panda pwr power off: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("panda pwr power off: %w", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("panda pwr power off %s: HTTP %s", url, resp.Status)
+	}
+	return nil
 }
 
 // failReason classifies a request failure into a bounded, payload-free

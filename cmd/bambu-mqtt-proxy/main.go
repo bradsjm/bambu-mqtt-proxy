@@ -34,6 +34,7 @@ import (
 	"bambu-mqtt-proxy/internal/pandapwr"
 	"bambu-mqtt-proxy/internal/platecheck"
 	"bambu-mqtt-proxy/internal/routing"
+	"bambu-mqtt-proxy/internal/safety"
 	"bambu-mqtt-proxy/internal/telemetry"
 	"bambu-mqtt-proxy/internal/upstream"
 )
@@ -239,10 +240,22 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		notifier = notification.New(notificationSettings, state, cameras, logger)
 	}
 
+	// Optional over-temperature safety stop: the YAML safety section. It
+	// uses the notification section's Pushover credentials even while
+	// ordinary notifications are disabled.
+	var safe *safety.Service
+	safetySettings, err := safety.SettingsOf(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("safety settings: %w", err)
+	}
+	if safetySettings.Enabled {
+		safe = safety.New(cfg.Printers, state, pool, activities, notificationSettings, logger)
+	}
+
 	// Optional modules start in order: notifications, job preview, Panda
-	// Breath, Panda PWR, detection, plate check, first-layer completion.
-	// Wire their shared hooks before the broker can record activity or
-	// deliver reports.
+	// Breath, Panda PWR, detection, plate check, first-layer completion,
+	// safety. Wire their shared hooks before the broker can record
+	// activity or deliver reports.
 	var mods []module.Module
 	if notifier != nil {
 		mods = append(mods, notifier.Module())
@@ -263,6 +276,9 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		mods = append(mods, plates.Module())
 	}
 	mods = append(mods, firstLayers.Module())
+	if safe != nil {
+		mods = append(mods, safe.Module())
+	}
 	if err := module.Check(mods); err != nil {
 		return nil, fmt.Errorf("modules: %w", err)
 	}
@@ -329,10 +345,10 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	// The broker is up. Install the single teardown before starting the raw
 	// camera listener or modules, so later bind failures use the same path.
 	// MCP and HTTP stop first, then started modules stop in reverse order:
-	// first-layer completion, plate check, detection, Panda Breath, job preview,
-	// notifications. Their consumers end before the modules and the cameras
-	// and pool they read. The raw listener stops next, before camera
-	// captures, the pool, and the broker.
+	// safety, first-layer completion, plate check, detection, Panda PWR,
+	// Panda Breath, job preview, notifications. Their consumers end before
+	// the modules and the cameras and pool they read. The raw listener
+	// stops next, before camera captures, the pool, and the broker.
 	// Modules whose Start never ran must not receive Stop.
 	var httpSrv *httpsrv.Server
 	var raw *camera.RawServer

@@ -76,6 +76,15 @@ notifications:
   #   app_token: "your-pushover-app-token"
   #   user_key: "your-pushover-user-key"
 
+safety:
+  # Optional over-temperature stop, a best-effort backup to the printer's own
+  # thermal protection. When a printer's nozzle, bed, or chamber reaches its
+  # model's safety limit, the proxy stops every printer, switches that
+  # printer's Panda PWR off when panda_pwr is set, and sends one Pushover
+  # emergency alert. Requires the Pushover credentials above, even while
+  # notifications are disabled. YAML only; /config saves keep this section.
+  # enabled: true
+
 behavior:
   warmup_commands:
     - '{"pushing":{"sequence_id":"0","command":"pushall"}}'

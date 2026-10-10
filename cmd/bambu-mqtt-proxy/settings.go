@@ -7,6 +7,7 @@ import (
 	"bambu-mqtt-proxy/internal/pandabreath"
 	"bambu-mqtt-proxy/internal/pandapwr"
 	"bambu-mqtt-proxy/internal/platecheck"
+	"bambu-mqtt-proxy/internal/safety"
 )
 
 // init registers module printer settings and global sections before config loading.
@@ -16,4 +17,5 @@ func init() {
 	config.RegisterSection(detection.ConfigSection)
 	config.RegisterSection(platecheck.ConfigSection)
 	config.RegisterSection(notification.ConfigSection)
+	config.RegisterSection(safety.ConfigSection)
 }
