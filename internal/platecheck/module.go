@@ -12,6 +12,8 @@ import (
 type ModuleState struct {
 	// State is the fixed check or stop-lifecycle state.
 	State string `json:"state"`
+	// Reason is the skip or failure code behind State, empty otherwise.
+	Reason string `json:"reason,omitempty"`
 	// Cutoff is the configured strict occupied-probability threshold.
 	Cutoff float64 `json:"cutoff"`
 	// PClear is nil unless the last check returned a valid score.
@@ -28,6 +30,8 @@ type ModuleState struct {
 type FirstLayerState struct {
 	// State is the fixed first-layer outcome, independent of startup state.
 	State string `json:"state"`
+	// Reason is the skip or failure code behind State, empty otherwise.
+	Reason string `json:"reason,omitempty"`
 	// Pause is pending, confirmed, failed, or unconfirmed after a pause verdict.
 	Pause string `json:"pause,omitempty"`
 	// Cutoff is the configured strict pause-capable defect threshold.
@@ -124,89 +128,152 @@ func (s *Service) Display(serial string) *module.Display {
 		return nil
 	}
 	v := value.(ModuleState)
-	row := module.Row{Label: "Result"}
+	var rows []module.Row
+	rows = append(rows, plateRow(v))
+	rows = append(rows, module.Row{
+		Label:   "Rule",
+		Value:   fmt.Sprintf("Stops the print if the plate looks occupied (over %.0f%%)", math.Round(v.Cutoff*100)),
+		Section: "Before printing",
+	})
+	if v.POccupied != nil {
+		rows = append(rows, module.Row{
+			Label:   "Scores",
+			Value:   fmt.Sprintf("Occupied %.0f%% · view clarity %.0f%%", math.Round(*v.POccupied*100), clarity(v.PAssessable)),
+			Section: "Before printing",
+		})
+	}
+	rows = append(rows, firstLayerRow(v.FirstLayer))
+	if v.FirstLayer.State != "disabled" {
+		rows = append(rows, module.Row{
+			Label:   "Rule",
+			Value:   fmt.Sprintf("Pauses the print if tangle, detachment, or nozzle blob is over %.0f%%", math.Round(v.FirstLayer.Cutoff*100)),
+			Section: "After layer 1",
+		})
+	}
+	if v.FirstLayer.PAssessable != nil {
+		tone := ""
+		if *v.FirstLayer.PAssessable < 0.8 {
+			tone = "warn"
+		}
+		rows = append(rows, module.Row{
+			Label:   "View clarity",
+			Value:   fmt.Sprintf("%.0f%% (needs 80%%)", math.Round(*v.FirstLayer.PAssessable*100)),
+			Tone:    tone,
+			Section: "After layer 1",
+		})
+	}
+	if v.FirstLayer.PTangled != nil && v.FirstLayer.PDetached != nil && v.FirstLayer.PNozzleBlob != nil && v.FirstLayer.PIncomplete != nil {
+		row := module.Row{
+			Label:   "Findings",
+			Value:   fmt.Sprintf("Tangle %.0f%% · detached %.0f%% · nozzle blob %.0f%% · missing material %.0f%% (warning only)", math.Round(*v.FirstLayer.PTangled*100), math.Round(*v.FirstLayer.PDetached*100), math.Round(*v.FirstLayer.PNozzleBlob*100), math.Round(*v.FirstLayer.PIncomplete*100)),
+			Section: "After layer 1",
+		}
+		if v.FirstLayer.State == "inconclusive" {
+			row.Note = "Low confidence: camera view too unclear"
+		}
+		rows = append(rows, row)
+	}
+	return &module.Display{Panel: &module.Panel{Title: "Print checks", Level: 3, Rows: rows}}
+}
+
+// clarity renders a nil-safe view-clarity percentage.
+func clarity(p *float64) float64 {
+	if p == nil {
+		return 0
+	}
+	return math.Round(*p * 100)
+}
+
+// plateRow renders the Before printing Plate row for one startup state.
+func plateRow(v ModuleState) module.Row {
+	row := module.Row{Label: "Plate", Section: "Before printing"}
 	switch v.State {
 	case "idle":
-		row.Value = "No check yet"
+		row.Value = "Not checked yet"
+		row.Note = "Checks the plate when a print starts"
 	case "checking":
 		row.Value, row.Tone = "Checking", "info"
-	case "blocked":
-		row.Value, row.Tone = "Camera unavailable · print continued", "warn"
 	case "clear":
 		row.Value, row.Tone = "Clear", "calm"
 	case "below_threshold":
-		row.Value, row.Tone = "Below cutoff · print continued", "info"
+		row.Value, row.Tone = "Possibly occupied, below the stop threshold", "info"
+		row.Note = "Printing continued"
 	case "inconclusive":
-		row.Value = "Inconclusive · print continued"
+		row.Value = "Inconclusive"
+		row.Note = "Camera view too unclear to judge; printing continued"
 	case "error":
-		row.Value, row.Tone = "Check failed · print continued", "warn"
+		row.Value, row.Tone = "Check failed", "warn"
+		row.Note = reasonNote("Plate check", v.Reason)
 	case "skipped":
-		row.Value = "Check skipped · print continued"
+		row.Value = "Not checked"
+		row.Note = reasonNote("Plate check", v.Reason)
+	case "blocked":
+		row.Value, row.Tone = "Unavailable", "warn"
+		row.Note = reasonNote("Plate check", "camera_disabled")
 	case "stop_requested":
 		row.Value, row.Tone = "Stop requested", "error"
+		row.Note = "Waiting for the printer to confirm"
 	case "stopped":
 		row.Value, row.Tone = "Print ended after stop request", "error"
+		row.Note = "Clear the plate before sending the print again"
 	case "stop_failed":
-		row.Value, row.Tone = "Stop command failed · check printer", "error"
+		row.Value, row.Tone = "Stop command failed", "error"
+		row.Note = "Check the printer now"
 	case "stop_unconfirmed":
-		row.Value, row.Tone = "Stop unconfirmed · check printer", "error"
+		row.Value, row.Tone = "Stop not confirmed", "error"
+		row.Note = "Check the printer now"
 	default:
-		row.Value = "No check yet"
+		row.Value = "Not checked yet"
+		row.Note = "Checks the plate when a print starts"
 	}
-	rows := []module.Row{row}
-	if v.State != "idle" {
-		rows = append(rows, module.Row{Label: "Stop above", Value: fmt.Sprintf("%.0f%%", math.Round(v.Cutoff*100))})
-	}
-	if v.POccupied != nil {
-		rows = append(rows, module.Row{Label: "P(occupied)", Value: fmt.Sprintf("%.1f%%", *v.POccupied*100)})
-	}
-	layer := module.Row{Label: "First layer"}
-	switch v.FirstLayer.State {
+	return row
+}
+
+// firstLayerRow renders the After layer 1 First layer row for one phase outcome.
+func firstLayerRow(v FirstLayerState) module.Row {
+	row := module.Row{Label: "First layer", Section: "After layer 1"}
+	switch v.State {
 	case "disabled":
-		layer.Value = "Disabled"
+		row.Value = "Off"
+	case "idle":
+		row.Value = "Not checked yet"
+		row.Note = "Checks after the first layer is printed"
 	case "checking":
-		layer.Value, layer.Tone = "Checking two views", "info"
+		row.Value, row.Tone = "Checking", "info"
 	case "passed":
-		layer.Value, layer.Tone = "Passed", "calm"
+		row.Value, row.Tone = "Looks good", "calm"
 	case "warning":
-		layer.Value, layer.Tone = "Possible defect · print continued", "warn"
+		row.Value, row.Tone = "Possible problem", "warn"
+		row.Note = "Printing continued; check the printer"
 	case "inconclusive":
-		layer.Value = "Inconclusive · print continued"
-	case "blocked", "error", "skipped":
-		layer.Value = "Check unavailable · print continued"
+		row.Value = "Inconclusive"
+		row.Note = "Camera view too unclear to judge; printing continued"
+	case "blocked":
+		row.Value, row.Tone = "Unavailable", "warn"
+		row.Note = reasonNote("First-layer check", "camera_disabled")
+	case "error", "skipped":
+		row.Value = "Not checked"
+		row.Note = reasonNote("First-layer check", v.Reason)
 	case "pause":
-		switch v.FirstLayer.Pause {
+		switch v.Pause {
 		case "pending":
-			layer.Value, layer.Tone = "Pause sent · awaiting confirmation", "error"
+			row.Value, row.Tone = "Pause sent", "error"
+			row.Note = "Waiting for the printer to confirm"
 		case "confirmed":
-			layer.Value, layer.Tone = "Pause confirmed · check print", "warn"
+			row.Value, row.Tone = "Printer reports paused", "warn"
+			row.Note = "Check the first layer before resuming"
 		case "failed":
-			layer.Value, layer.Tone = "Pause command failed · check printer", "error"
+			row.Value, row.Tone = "Pause command failed", "error"
+			row.Note = "Check the printer now"
 		case "unconfirmed":
-			layer.Value, layer.Tone = "Pause unconfirmed · check printer", "error"
+			row.Value, row.Tone = "Pause not confirmed", "error"
+			row.Note = "Check the printer now"
 		default:
-			layer.Value, layer.Tone = "Possible failure", "warn"
+			row.Value, row.Tone = "Possible failure", "warn"
 		}
 	default:
-		layer.Value = "No check yet"
+		row.Value = "Not checked yet"
+		row.Note = "Checks after the first layer is printed"
 	}
-	rows = append(rows, layer)
-	if v.FirstLayer.State != "idle" && v.FirstLayer.State != "disabled" {
-		rows = append(rows, module.Row{Label: "Pause above", Value: fmt.Sprintf("%.0f%%", math.Round(v.FirstLayer.Cutoff*100))})
-	}
-	for _, score := range []struct {
-		label string
-		value *float64
-	}{
-		{"P(layer assessable)", v.FirstLayer.PAssessable},
-		{"P(tangled)", v.FirstLayer.PTangled},
-		{"P(detached)", v.FirstLayer.PDetached},
-		{"P(nozzle blob)", v.FirstLayer.PNozzleBlob},
-		{"P(incomplete) · warning only", v.FirstLayer.PIncomplete},
-	} {
-		if score.value != nil {
-			rows = append(rows, module.Row{Label: score.label, Value: fmt.Sprintf("%.1f%%", *score.value*100)})
-		}
-	}
-	return &module.Display{Panel: &module.Panel{Title: "Plate check", Level: 3, Rows: rows}}
+	return row
 }

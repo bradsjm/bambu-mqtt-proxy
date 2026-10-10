@@ -214,12 +214,12 @@ func eventSummary(e activity.Entry) string {
 	case "first_layer_complete":
 		return "First layer complete"
 	case "print_failed":
-		return "Print failed or was cancelled"
+		return "Print failed"
+	case "print_cancelled":
+		return "Print cancelled"
 	case "print_stopped":
 		return "Print stopped before finishing"
-	case "print_error":
-		return "Printer error"
-	case "hms_alert":
+	case "print_error", "hms_alert":
 		switch e.Severity {
 		case activity.Warning:
 			return "Printer warning"

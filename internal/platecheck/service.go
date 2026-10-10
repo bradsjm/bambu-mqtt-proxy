@@ -17,12 +17,10 @@ import (
 // ReasonCameraDisabled explains why automatic protection is blocked.
 const ReasonCameraDisabled = "camera_disabled"
 
-// StateSource supplies current job identity and session-scoped action evidence.
+// StateSource supplies the current job and session views in one coherent read.
 type StateSource interface {
-	// Job returns coherent job-generation and real-report evidence.
-	Job(string) (telemetry.JobView, bool)
-	// Session returns connection-scoped layer and state evidence.
-	Session(string) (telemetry.SessionView, bool)
+	// Print returns the preview-job and session projections for one serial.
+	Print(string) (telemetry.JobView, telemetry.SessionView, bool)
 }
 
 // PrinterCommands supplies connection status and guarded light, stop, and pause commands.
@@ -76,12 +74,8 @@ type Service struct {
 	now func() time.Time
 	// kPoll bounds pending revalidation intervals.
 	kPoll time.Duration
-	// kHint bounds SLICING startup hints.
+	// kHint bounds layer and connectivity waits during admission.
 	kHint time.Duration
-	// kRunningHint bounds direct RUNNING admission.
-	kRunningHint time.Duration
-	// kFresh bounds real-report freshness.
-	kFresh time.Duration
 	// kCheck bounds capture plus evaluation and result age.
 	kCheck time.Duration
 	// kConfirm bounds stop confirmation.
@@ -98,35 +92,35 @@ type Service struct {
 	wg sync.WaitGroup
 }
 
-// candidate binds an observed startup hint to its original identity and connection.
+// candidate is an observed startup hint waiting for admission. The wait
+// fields track one expiring wait condition; waitExpired owns them.
 type candidate struct {
 	// generation is the hinted job generation.
 	generation uint64
-	// revision is the hinted identity revision.
-	revision uint64
-	// connection is the hinted upstream transport generation.
-	connection uint64
-	// at is the original activity time.
-	at time.Time
-	// startedAt is the first print_started hint, independent of the SLICING boundary.
-	startedAt time.Time
-	// kind distinguishes PREPARE from direct RUNNING permission.
-	kind string
+	// waitReason names the current wait condition.
+	waitReason string
+	// waitSince is when the current wait condition started.
+	waitSince time.Time
+}
+
+// layerHint is an observed first-layer hint waiting for admission.
+type layerHint struct {
+	// generation is the hinted job generation.
+	generation uint64
+	// waitReason names the current wait condition.
+	waitReason string
+	// waitSince is when the current wait condition started.
+	waitSince time.Time
 }
 
 // boundCheck retains admission evidence through evaluation and both stop attempts.
 type boundCheck struct {
-	// job is the admitted job identity and running epoch.
-	job telemetry.JobView
-	// session is the admitted session epoch.
-	session telemetry.SessionView
-	// connection is the admitted upstream generation.
-	connection uint64
+	// generation is the admitted job generation.
+	generation uint64
 	// prepare allows only one PREPARE-to-first-RUNNING transition.
 	prepare bool
-	// admitted is the boundary that starts the overall-check budget: step
-	// admission time for the startup phase, the event's originating evidence
-	// time for the first-layer phase (queueing never restarts it).
+	// admitted is the step admission time, the boundary that starts the
+	// overall-check budget.
 	admitted time.Time
 	// captured is the exact image capture time.
 	captured time.Time
@@ -144,8 +138,6 @@ type pendingStop struct {
 	firstPrepare bool
 	// dispatched is the last dispatch-completion time.
 	dispatched time.Time
-	// obs is the pre-dispatch real observation counter.
-	obs uint64
 	// deadline bounds confirmation after the last permitted dispatch.
 	deadline time.Time
 }
@@ -158,22 +150,19 @@ type worker struct {
 	printer config.Printer
 	// wake coalesces activity without blocking report processing.
 	wake chan struct{}
-	// mu guards startup and first-layer hints, processed markers, suppression, and display status.
+	// mu guards startup and first-layer hints, processed markers, and display status.
 	mu sync.Mutex
 	// candidate is the latest observed startup hint.
 	candidate *candidate
 	// processed prevents repeated checks for a generation.
 	processed uint64
-	// suppressed revokes initial attachment permission, including in-flight work.
-	suppressed uint64
 	// status is the last automatic status, never diagnostic state.
 	status ModuleState
 	// pending is owned exclusively by the worker loop.
 	pending *pendingStop
-	// layerHint binds the first-layer event's source-session provenance
-	// (job, session, running epoch, connection, and the originating evidence
-	// time) independently of startup admission.
-	layerHint *boundCheck
+	// layerHint is the latest observed first-layer hint, independent of
+	// startup admission.
+	layerHint *layerHint
 	// layerProcessed prevents replay after any first-layer outcome.
 	layerProcessed uint64
 	// startupStopped remembers every generation with a startup stop attempt.
@@ -194,7 +183,7 @@ func New(printers []config.Printer, settings Settings, client DecisionClient, fr
 	if settings.On() && client == nil {
 		client = NewClient(settings, log.With("component", "vision_client"))
 	}
-	s := &Service{printers: append([]config.Printer(nil), printers...), settings: settings, client: client, frames: frames, state: state, commands: commands, log: log, workers: map[string]*worker{}, now: time.Now, kPoll: time.Second, kHint: 30 * time.Second, kRunningHint: 5 * time.Second, kFresh: 15 * time.Second, kCheck: 25 * time.Second, kConfirm: 30 * time.Second}
+	s := &Service{printers: append([]config.Printer(nil), printers...), settings: settings, client: client, frames: frames, state: state, commands: commands, log: log, workers: map[string]*worker{}, now: time.Now, kPoll: time.Second, kHint: 30 * time.Second, kCheck: 25 * time.Second, kConfirm: 30 * time.Second}
 	s.newClient = func(settings Settings, log *slog.Logger) DecisionClient { return NewClient(settings, log) }
 	for _, p := range printers {
 		layerState := "idle"
@@ -250,63 +239,44 @@ func (s *Service) ObserveActivity(serial string, entry activity.Entry) {
 		return
 	}
 	if entry.Kind == "first_layer_complete" && s.settings.FirstLayer.On() {
-		// The event must carry the print that produced it. Provenance has
-		// to match the coherent current Job projection (generation,
-		// revision, running epoch) and Session projection (session
-		// generation, epoch, report evidence) plus the upstream
-		// connection. Session evidence alone cannot identify the print: a
-		// same-cookie replacement with a changed positive gcode_start_time
-		// advances only the Job generation, so the job fields are what
-		// separates A's event from B. Missing or mismatched evidence is
-		// rejected outright — never repaired from current telemetry, never
-		// queued, never consuming the current job — so a late event cannot
-		// act on the print that replaced it.
-		o := entry.Observation
-		if o.SessionGen == 0 || o.JobGen == 0 || o.ObsAt.IsZero() {
-			return
-		}
-		j, v, connection, ok := w.snapshot()
-		origin := s.now().Sub(o.ObsAt)
-		if ok && origin >= 0 && origin <= s.kFresh &&
-			o.JobGen == j.Generation && o.JobRevision == j.Revision && o.RunningEpoch == j.RunningEpoch &&
-			o.SessionGen == v.SessionGen && o.Epoch == v.Epoch && o.StateGen == v.StateGen && o.ObsGen == v.ObsGen &&
-			w.layerIdentityValid(j, v, connection) {
+		// The event must carry the print that produced it: its JobGen
+		// must name the current active job. Missing or mismatched
+		// evidence is rejected outright — never repaired from current
+		// telemetry, never queued, never consuming the current job — so
+		// a late event cannot act on the print that replaced it.
+		j, _, ok := s.state.Print(serial)
+		if ok && j.Active && entry.Observation.JobGen != 0 && entry.Observation.JobGen == j.Generation {
 			w.mu.Lock()
-			// Keep the first valid queued source event for the job; later
-			// hints for the same job refresh nothing, so the originating
-			// evidence time never renews.
-			if j.Generation > w.layerProcessed && (w.layerHint == nil || w.layerHint.job.Generation != j.Generation) {
-				w.layerHint = &boundCheck{job: j, session: v, connection: connection, admitted: o.ObsAt}
+			if j.Generation > w.layerProcessed && (w.layerHint == nil || w.layerHint.generation != j.Generation) {
+				w.layerHint = &layerHint{generation: j.Generation}
 			}
 			w.mu.Unlock()
 		}
 	}
 	if entry.Kind == "print_preparing" || entry.Kind == "print_started" || entry.Kind == "state_initial" {
-		job, ok := s.state.Job(serial)
-		if ok && job.Active && job.Generation != 0 {
-			connection := s.commands.Generation(serial)
-			w.mu.Lock()
-			if entry.Kind == "state_initial" {
-				w.processed = max(w.processed, job.Generation)
-				w.suppressed = job.Generation
+		j, _, ok := s.state.Print(serial)
+		if !ok {
+			return
+		}
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		if entry.Kind == "state_initial" {
+			// Mid-print attach: the proxy never saw this print begin, so
+			// there is no startup to check. Mark it processed without a
+			// check and without recording activity.
+			if j.Active && !j.StartObserved {
+				w.processed = max(w.processed, j.Generation)
 				w.candidate = nil
-			} else if job.Generation > w.processed {
-				at := entry.Time
-				if at.IsZero() {
-					at = s.now()
-				}
-				// Repeated hints preserve the earliest boundary instead of extending its lifetime.
-				if w.candidate == nil || w.candidate.generation != job.Generation {
-					w.candidate = &candidate{generation: job.Generation, revision: job.Revision, connection: connection, at: at, kind: entry.Kind}
-					if entry.Kind == "print_started" {
-						w.candidate.startedAt = at
-					}
-				} else if entry.Kind == "print_started" && w.candidate.startedAt.IsZero() {
-					w.candidate.kind = entry.Kind
-					w.candidate.startedAt = at
-				}
+				w.setStatusLocked("skipped", nil, "start_not_observed")
 			}
-			w.mu.Unlock()
+			return
+		}
+		// A start hint binds only when the entry's job is still the
+		// current active job and this proxy saw it begin. Delayed
+		// delivery of an older generation's hint creates no candidate.
+		if j.Active && j.StartObserved && entry.Observation.JobGen == j.Generation && j.Generation > w.processed &&
+			(w.candidate == nil || w.candidate.generation != j.Generation) {
+			w.candidate = &candidate{generation: j.Generation}
 		}
 	}
 	select {
@@ -323,6 +293,9 @@ func (w *worker) run(ctx context.Context) {
 		if w.layerPending != nil {
 			w.unconfirmedPause()
 		}
+		if w.pending != nil {
+			w.unconfirmed()
+		}
 	}()
 	for {
 		select {
@@ -338,68 +311,63 @@ func (w *worker) run(ctx context.Context) {
 	}
 }
 
-// snapshot retries bounded coherent job and session reads before action authorization.
-func (w *worker) snapshot() (telemetry.JobView, telemetry.SessionView, uint64, bool) {
-	s := w.s
-	if s.state == nil || s.commands == nil {
-		return telemetry.JobView{}, telemetry.SessionView{}, 0, false
+// waitExpired tracks one expiring wait condition on a stored candidate or
+// layer hint. Call it with w.mu held, on the stored fields, never on a
+// copy. When the reason changes it stamps the new wait and returns false;
+// otherwise it returns whether the wait has reached kHint.
+func (w *worker) waitExpired(reason string, now time.Time, hint *string, since *time.Time) bool {
+	if *hint != reason {
+		*hint = reason
+		*since = now
+		return false
 	}
-	var j telemetry.JobView
-	var v telemetry.SessionView
-	var connection uint64
-	for range 3 {
-		connection = s.commands.Generation(w.printer.Serial)
-		first, ok := s.state.Job(w.printer.Serial)
-		if !ok {
-			return first, v, connection, false
-		}
-		v, ok = s.state.Session(w.printer.Serial)
-		if !ok {
-			return first, v, connection, false
-		}
-		j, ok = s.state.Job(w.printer.Serial)
-		if !ok {
-			return j, v, connection, false
-		}
-		// Session and Job use separate clocks, so compare each projection with itself.
-		lastSession, ok := s.state.Session(w.printer.Serial)
-		if !ok {
-			return j, v, connection, false
-		}
-		jobStable := first.Generation == j.Generation && first.Revision == j.Revision && first.State == j.State && first.Active == j.Active && first.RunningEpoch == j.RunningEpoch && first.StateGen == j.StateGen && first.ObsGen == j.ObsGen && first.ObsAt.Equal(j.ObsAt)
-		sessionStable := v.Obs == lastSession.Obs && v.ObsAt.Equal(lastSession.ObsAt) && v.ObsGen == lastSession.ObsGen && v.StateGen == lastSession.StateGen && v.Epoch == lastSession.Epoch && v.SessionGen == lastSession.SessionGen && v.State == lastSession.State && v.Active == lastSession.Active && (v.LayerNum == nil) == (lastSession.LayerNum == nil)
-		if sessionStable && v.LayerNum != nil {
-			sessionStable = *v.LayerNum == *lastSession.LayerNum
-		}
-		if !jobStable || !sessionStable {
-			continue
-		}
-		age := s.now().Sub(j.ObsAt)
-		valid := connection != 0 && s.commands.Generation(w.printer.Serial) == connection && j.StateGen == connection && j.ObsGen == connection && !j.ObsAt.IsZero() && age >= 0 && age <= s.kFresh && v.State == j.State && v.StateGen == connection && v.ObsGen == connection
-		return j, v, connection, valid
-	}
-	return j, v, connection, false
+	return now.Sub(*since) >= w.s.kHint
 }
 
-// authorize preserves original identity, connection, and transition budget for every action.
-func (w *worker) authorize(b boundCheck) (telemetry.JobView, telemetry.SessionView, bool) {
-	j, v, connection, ok := w.snapshot()
-	w.mu.Lock()
-	suppressed := w.suppressed == b.job.Generation
-	w.mu.Unlock()
-	if !ok || suppressed || !j.Active || j.Generation != b.job.Generation || j.Revision != b.job.Revision || connection != b.connection || j.RunningEpoch != b.job.RunningEpoch {
-		return j, v, false
+// authorize rereads the current print and reports whether the bound startup
+// check may proceed. It returns the coherent job and session views plus a
+// failure reason, or an empty reason when authorized.
+func (w *worker) authorize(b boundCheck) (telemetry.JobView, telemetry.SessionView, string) {
+	j, v, ok := w.s.state.Print(w.printer.Serial)
+	if !ok || j.Generation != b.generation || !j.Active {
+		return j, v, "print_ended"
 	}
-	if j.State == "PREPARE" {
-		return j, v, b.prepare && v.Epoch == b.session.Epoch && v.SessionGen == b.session.SessionGen
+	if !w.s.commands.Connected(w.printer.Serial) {
+		return j, v, "printer_offline"
 	}
-	if j.State != "RUNNING" || !v.Active || v.LayerNum == nil || *v.LayerNum != 0 {
-		return j, v, false
+	layer := v.CurrentLayer()
+	if layer != nil && *layer > 0 {
+		return j, v, "print_past_start"
 	}
-	if b.prepare {
-		return j, v, v.Epoch == b.session.Epoch+1 && v.SessionGen == b.session.SessionGen+1
+	if j.State == "PREPARE" || j.State == "SLICING" {
+		return j, v, ""
 	}
-	return j, v, v.Epoch == b.session.Epoch && v.SessionGen == b.session.SessionGen
+	if j.State == "RUNNING" {
+		if layer == nil {
+			return j, v, "layer_not_reported"
+		}
+		return j, v, ""
+	}
+	return j, v, "print_paused"
+}
+
+// commandGate reads the upstream connection generation first, then
+// authorizes the bound check. Every command sends with the returned
+// generation immediately: the generation is never re-read after
+// authorization, and the pool rejects the command if the connection
+// changed after that read.
+func (w *worker) commandGate(b boundCheck) (uint64, telemetry.SessionView, string) {
+	gen, _, v, reason := w.commandGateFull(b)
+	return gen, v, reason
+}
+
+// commandGateFull is commandGate with the authorized job view attached,
+// so dispatch can read the PREPARE state from the same coherent read
+// that authorized the stop instead of racing it with a second read.
+func (w *worker) commandGateFull(b boundCheck) (uint64, telemetry.JobView, telemetry.SessionView, string) {
+	gen := w.s.commands.Generation(w.printer.Serial)
+	j, v, reason := w.authorize(b)
+	return gen, j, v, reason
 }
 
 // step advances both phases: it confirms one pending pause or stop, then admits one startup or first-layer hint without inventing events.
@@ -417,75 +385,116 @@ func (w *worker) step(ctx context.Context) {
 		}
 	}
 	w.mu.Lock()
-	var hint candidate
-	have := w.candidate != nil
-	if have {
-		hint = *w.candidate
-		have = hint.generation > w.processed
-	}
-	w.mu.Unlock()
-	if !have {
+	c := w.candidate
+	if c == nil || c.generation <= w.processed {
+		w.mu.Unlock()
 		w.stepLayer(ctx)
 		return
 	}
-	j, v, connection, ok := w.snapshot()
-	if j.Generation != hint.generation || j.Revision != hint.revision || connection != hint.connection || !j.Active || w.s.now().Sub(hint.at) < 0 || w.s.now().Sub(hint.at) > w.s.kHint {
-		w.consume(hint.generation)
-		w.skip("skipped", "startup_changed", 0)
-		return
-	}
+	now := w.s.now()
+	j, v, ok := w.s.state.Print(w.printer.Serial)
 	if !ok {
+		w.mu.Unlock()
 		return
 	}
-	if j.State == "SLICING" {
+	layer := v.CurrentLayer()
+	switch {
+	case j.Generation != c.generation || !j.Active:
+		w.consumeLocked(c.generation)
+		w.mu.Unlock()
+		w.skip("skipped", "print_ended", 0)
+		return
+	case layer != nil && *layer > 0:
+		w.consumeLocked(c.generation)
+		w.mu.Unlock()
+		w.skip("skipped", "print_past_start", 0)
+		return
+	case j.State == "SLICING" || j.State == "PAUSE" || j.State == "PAUSED":
+		c.waitReason = ""
+		w.mu.Unlock()
+		return
+	case !w.s.commands.Connected(w.printer.Serial):
+		if w.waitExpired("printer_offline", now, &c.waitReason, &c.waitSince) {
+			w.consumeLocked(c.generation)
+			w.mu.Unlock()
+			w.skip("skipped", "printer_offline", 0)
+			return
+		}
+		w.mu.Unlock()
+		return
+	case j.State == "PREPARE":
+		w.consumeLocked(c.generation)
+		w.mu.Unlock()
+		w.check(ctx, boundCheck{generation: c.generation, prepare: true, admitted: now, operation: operations.Add(1)})
+		return
+	case j.State == "RUNNING" && layer == nil:
+		if w.waitExpired("layer_not_reported", now, &c.waitReason, &c.waitSince) {
+			w.consumeLocked(c.generation)
+			w.mu.Unlock()
+			w.skip("skipped", "layer_not_reported", 0)
+			return
+		}
+		w.mu.Unlock()
+		return
+	case j.State == "RUNNING":
+		w.consumeLocked(c.generation)
+		w.mu.Unlock()
+		w.check(ctx, boundCheck{generation: c.generation, admitted: now, operation: operations.Add(1)})
+		return
+	default:
+		w.mu.Unlock()
 		return
 	}
-	prepare := j.State == "PREPARE"
-	if !prepare && (j.State != "RUNNING" || hint.kind != "print_started" || hint.startedAt.IsZero() || w.s.now().Sub(hint.startedAt) < 0 || w.s.now().Sub(hint.startedAt) > w.s.kRunningHint || !v.Active || v.LayerNum == nil || *v.LayerNum != 0) {
-		w.consume(hint.generation)
-		w.skip("skipped", "startup_changed", 0)
-		return
-	}
-	if !w.consume(hint.generation) {
-		return
-	}
-	b := boundCheck{job: j, session: v, connection: connection, prepare: prepare, admitted: w.s.now(), operation: operations.Add(1)}
-	w.check(ctx, b)
 }
 
-// consume marks a generation processed before camera or provider work starts.
-func (w *worker) consume(generation uint64) bool {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+// consumeLocked marks a generation processed before camera or provider work
+// starts. The caller holds w.mu.
+func (w *worker) consumeLocked(generation uint64) {
 	if generation <= w.processed {
-		return false
+		return
 	}
 	w.processed = generation
 	if w.candidate != nil && w.candidate.generation == generation {
 		w.candidate = nil
 	}
-	return true
 }
 
 // setStatus publishes immutable numeric values without retaining images.
+// Every other status change clears the skip reason; skip sets it.
 func (w *worker) setStatus(state string, r *Result) {
-	v := ModuleState{State: state, Cutoff: w.s.settings.StopConfidence}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.setStatusLocked(state, r, "")
+}
+
+// setStatusLocked publishes the status and reason. The caller holds w.mu.
+func (w *worker) setStatusLocked(state string, r *Result, reason string) {
+	v := ModuleState{State: state, Cutoff: w.s.settings.StopConfidence, Reason: reason}
 	if r != nil {
 		v.PClear = new(r.PClear)
 		v.POccupied = new(r.POccupied)
 		v.PAssessable = new(r.PAssessable)
 	}
-	w.mu.Lock()
 	v.FirstLayer = w.status.FirstLayer
 	w.status = v
-	w.mu.Unlock()
 }
 
-// skip records a fixed fail-open reason and clears any previous scores.
+// skip records a cataloged fail-open reason and clears any previous scores.
 func (w *worker) skip(state, reason string, operation uint64) {
-	w.setStatus(state, nil)
+	w.setStatusWithReason(state, nil, reason)
 	w.s.log.Info("Plate check skipped", "operation", operation, "serial", w.printer.Serial, "state", state, "error_code", reason)
-	w.s.activity.Record(w.printer.Serial, "platecheck_skipped", activity.Info, fixedSentence(reason))
+	kind, severity := "platecheck_skipped", activity.Info
+	if state == "error" {
+		kind, severity = "platecheck_failed", activity.Warning
+	}
+	w.s.activity.Record(w.printer.Serial, kind, severity, activitySentence("Plate check", state, reason))
+}
+
+// setStatusWithReason publishes the status with a skip reason.
+func (w *worker) setStatusWithReason(state string, r *Result, reason string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.setStatusLocked(state, r, reason)
 }
 
 // check captures and evaluates once within the overall startup budget.
@@ -495,18 +504,20 @@ func (w *worker) check(parent context.Context, b boundCheck) {
 	w.setStatus("checking", nil)
 	w.s.log.InfoContext(ctx, "Plate check started", "operation", b.operation, "serial", w.printer.Serial)
 	boundary := w.s.now()
-	_, v, valid := w.authorize(b)
-	if !valid || ctx.Err() != nil {
-		w.skip("skipped", "startup_changed", b.operation)
+	if _, _, reason := w.authorize(b); reason != "" {
+		w.skip("skipped", reason, b.operation)
+		return
+	} else if ctx.Err() != nil {
+		w.skip("skipped", w.contextReason(ctx), b.operation)
 		return
 	}
-	if v.ChamberLight == "off" {
-		// The final local guard cannot eliminate printer-side replacement after dispatch.
-		if _, _, valid = w.authorize(b); !valid {
-			w.skip("skipped", "startup_changed", b.operation)
+	if gen, v, reason := w.commandGate(b); v.ChamberLight == "off" {
+		// The final local guard cannot eliminate a printer-side change after dispatch.
+		if reason != "" {
+			w.skip("skipped", reason, b.operation)
 			return
 		}
-		if err := w.s.commands.SetChamberLight(w.printer.Serial, b.connection, true); err == nil {
+		if err := w.s.commands.SetChamberLight(w.printer.Serial, gen, true); err == nil {
 			boundary = w.s.now()
 		} else {
 			w.s.log.DebugContext(ctx, "Plate-check light command failed", "operation", b.operation, "serial", w.printer.Serial, "error_code", "command_failed")
@@ -519,15 +530,18 @@ func (w *worker) check(parent context.Context, b boundCheck) {
 	}
 	b.captured = frame.Captured
 	if !frame.Captured.After(boundary) || frame.Captured.After(w.s.now()) {
-		w.skip("skipped", "startup_changed", b.operation)
+		w.skip("skipped", "capture_timeout", b.operation)
 		return
 	}
-	if _, _, valid = w.authorize(b); !valid || ctx.Err() != nil || w.s.now().Sub(b.admitted) > w.s.kCheck {
-		w.skip("skipped", "startup_changed", b.operation)
+	if _, _, reason := w.authorize(b); reason != "" {
+		w.skip("skipped", reason, b.operation)
+		return
+	} else if ctx.Err() != nil || w.s.now().Sub(b.admitted) > w.s.kCheck {
+		w.skip("skipped", w.budgetReason(ctx), b.operation)
 		return
 	}
 	if w.s.log.Enabled(ctx, slog.LevelDebug) {
-		w.s.log.DebugContext(ctx, "Plate-check frame captured", "operation", b.operation, "serial", w.printer.Serial, "model", w.s.settings.Model, "frame_sequence", frame.Seq, "captured_at", frame.Captured.UTC(), "width", frame.Width, "height", frame.Height, "image_bytes", len(frame.JPEG), "job_generation", b.job.Generation, "job_revision", b.job.Revision, "connection_generation", b.connection)
+		w.s.log.DebugContext(ctx, "Plate-check frame captured", "operation", b.operation, "serial", w.printer.Serial, "model", w.s.settings.Model, "frame_sequence", frame.Seq, "captured_at", frame.Captured.UTC(), "width", frame.Width, "height", frame.Height, "image_bytes", len(frame.JPEG), "job_generation", b.generation)
 	}
 	result, err := w.s.client.Evaluate(ctx, frame.JPEG, config.DisplayModel(w.printer.Model, w.printer.Serial))
 	if err != nil {
@@ -538,8 +552,11 @@ func (w *worker) check(parent context.Context, b boundCheck) {
 		w.skip("error", "bad_response", b.operation)
 		return
 	}
-	if _, _, valid = w.authorize(b); !valid || ctx.Err() != nil || w.s.now().Sub(b.admitted) > w.s.kCheck || w.s.now().Sub(frame.Captured) > w.s.kCheck {
-		w.skip("skipped", "startup_changed", b.operation)
+	if _, _, reason := w.authorize(b); reason != "" {
+		w.skip("skipped", reason, b.operation)
+		return
+	} else if ctx.Err() != nil || w.s.now().Sub(b.admitted) > w.s.kCheck || w.s.now().Sub(frame.Captured) > w.s.kCheck {
+		w.skip("skipped", w.budgetReason(ctx), b.operation)
 		return
 	}
 	decision := classify(result, w.s.settings.StopConfidence)
@@ -552,15 +569,40 @@ func (w *worker) check(parent context.Context, b boundCheck) {
 		state = "checking"
 	}
 	w.setStatus(state, &result)
-	if decision == "inconclusive" {
-		w.s.activity.Record(w.printer.Serial, "platecheck_skipped", activity.Info, "The build-plate view was inconclusive. The print continued.")
+	switch decision {
+	case "inconclusive":
+		w.s.activity.Record(w.printer.Serial, "platecheck_skipped", activity.Info, "Plate view inconclusive, continuing print")
 		return
-	}
-	if decision != "would_stop" {
+	case "clear":
+		w.s.activity.Record(w.printer.Serial, "platecheck_passed", activity.Info, "Plate check passed, plate clear")
 		return
+	case "below_threshold":
+		w.s.activity.Record(w.printer.Serial, "platecheck_passed", activity.Info, "Plate check passed, plate may not be empty but is below the stop threshold")
+		return
+	case "would_stop":
+		w.pending = &pendingStop{bound: b}
+		w.dispatch(ctx)
 	}
-	w.pending = &pendingStop{bound: b}
-	w.dispatch(ctx)
+}
+
+// contextReason maps a failed check context to its skip code: Close
+// cancellation gives "canceled", and a passed deadline gives
+// "check_timeout".
+func (w *worker) contextReason(ctx context.Context) string {
+	if ctx.Err() == context.Canceled {
+		return "canceled"
+	}
+	return "check_timeout"
+}
+
+// budgetReason maps a failed budget recheck to its skip code: Close
+// cancellation gives "canceled", and any other failure gives
+// "check_timeout".
+func (w *worker) budgetReason(ctx context.Context) string {
+	if ctx.Err() == context.Canceled {
+		return "canceled"
+	}
+	return "check_timeout"
 }
 
 // validResult rejects invalid fake or implementation-boundary probabilities.
@@ -571,11 +613,11 @@ func validResult(r Result) bool {
 // dispatch revalidates the original evidence immediately before each stop attempt.
 func (w *worker) dispatch(ctx context.Context) {
 	p := w.pending
-	j, v, ok := w.authorize(p.bound)
-	if !ok || ctx.Err() != nil || w.s.now().Sub(p.bound.captured) > w.s.kCheck {
+	gen, j, _, reason := w.commandGateFull(p.bound)
+	if reason != "" {
 		if p.attempts == 0 {
 			w.pending = nil
-			w.skip("skipped", "startup_changed", p.bound.operation)
+			w.skip("skipped", reason, p.bound.operation)
 		} else {
 			w.unconfirmed()
 		}
@@ -585,20 +627,19 @@ func (w *worker) dispatch(ctx context.Context) {
 	if p.attempts == 1 {
 		p.firstPrepare = j.State == "PREPARE"
 	}
-	p.obs = v.Obs
 	w.mu.Lock()
-	w.startupStopped = max(w.startupStopped, p.bound.job.Generation)
+	w.startupStopped = max(w.startupStopped, p.bound.generation)
 	w.mu.Unlock()
 	// Count and record the attempt even if local publication fails.
-	err := w.s.commands.StopPrint(w.printer.Serial, p.bound.connection)
+	err := w.s.commands.StopPrint(w.printer.Serial, gen)
 	p.dispatched = w.s.now()
 	p.deadline = p.dispatched.Add(w.s.kConfirm)
 	w.setStatusKeepingScores("stop_requested")
-	w.s.activity.Record(w.printer.Serial, "platecheck_stop_requested", activity.Warning, "Build plate may be occupied; stop requested. Check the printer and clear the plate before sending the print again.")
+	w.s.activity.Record(w.printer.Serial, "platecheck_stop_requested", activity.Warning, "Plate looks occupied, stopping print")
 	w.s.log.WarnContext(ctx, "Plate-check stop requested", "operation", p.bound.operation, "serial", w.printer.Serial, "attempt", p.attempts)
 	if err != nil {
 		w.setStatusKeepingScores("stop_failed")
-		w.s.activity.Record(w.printer.Serial, "platecheck_stop_failed", activity.Error, "Plate-check stop command failed. Check the printer now.")
+		w.s.activity.Record(w.printer.Serial, "platecheck_stop_failed", activity.Error, "Plate-check stop command failed, check the printer")
 		w.s.log.ErrorContext(ctx, "Plate-check stop command failed", "operation", p.bound.operation, "serial", w.printer.Serial, "error_code", "command_failed")
 	}
 }
@@ -607,43 +648,35 @@ func (w *worker) dispatch(ctx context.Context) {
 func (w *worker) setStatusKeepingScores(state string) {
 	w.mu.Lock()
 	w.status.State = state
+	w.status.Reason = ""
 	w.mu.Unlock()
 }
 
-// confirm requires a fresh same-job real terminal observation after dispatch.
+// confirm waits for the printer to report the job ended after dispatch.
 func (w *worker) confirm(ctx context.Context) {
 	p := w.pending
-	j, v, connection, fresh := w.snapshot()
-	same := j.Generation == p.bound.job.Generation && j.Revision == p.bound.job.Revision && connection == p.bound.connection
-	if !same {
+	now := w.s.now()
+	if !now.Before(p.deadline) {
 		w.unconfirmed()
 		return
 	}
-	if fresh && !j.Active && v.Obs > p.obs && j.ObsAt.After(p.dispatched) && j.ObsAt.Before(p.deadline) {
-		if j.State == "IDLE" || j.State == "FAILED" {
-			w.setStatusKeepingScores("stopped")
-			w.s.activity.Record(w.printer.Serial, "platecheck_stopped", activity.Info, "Printer reports the job ended after the plate-check stop request.")
-			w.s.log.InfoContext(ctx, "Printer reports plate-check job ended", "operation", p.bound.operation, "serial", w.printer.Serial)
-			w.pending = nil
-			return
-		}
-		if j.State == "FINISH" {
-			w.unconfirmed()
-			return
-		}
+	j, _, ok := w.s.state.Print(w.printer.Serial)
+	if !ok {
+		return
 	}
-	if !w.s.now().Before(p.deadline) {
+	if j.Generation != p.bound.generation {
 		w.unconfirmed()
 		return
 	}
 	if !j.Active {
-		return
-	}
-	if _, _, valid := w.authorize(p.bound); !valid {
-		// Stale reports may recover inside the window; identity and epoch changes cannot.
-		if j.RunningEpoch != p.bound.job.RunningEpoch || j.State == "PAUSE" || j.State == "PAUSED" || (fresh && j.State == "RUNNING") {
-			w.unconfirmed()
+		if j.State == "IDLE" || j.State == "FAILED" {
+			w.setStatusKeepingScores("stopped")
+			w.s.activity.Record(w.printer.Serial, "platecheck_stopped", activity.Info, "Print ended after plate-check stop request, clear the plate before resending")
+			w.s.log.InfoContext(ctx, "Printer reports plate-check job ended", "operation", p.bound.operation, "serial", w.printer.Serial)
+			w.pending = nil
+			return
 		}
+		w.unconfirmed()
 		return
 	}
 	if p.firstPrepare && p.attempts == 1 && j.State == "RUNNING" {
@@ -658,7 +691,7 @@ func (w *worker) unconfirmed() {
 		return
 	}
 	w.setStatusKeepingScores("stop_unconfirmed")
-	w.s.activity.Record(w.printer.Serial, "platecheck_stop_unconfirmed", activity.Error, "Plate-check stop is unconfirmed. Check the printer now.")
+	w.s.activity.Record(w.printer.Serial, "platecheck_stop_unconfirmed", activity.Error, "Plate-check stop not confirmed, check the printer")
 	w.s.log.Error("Plate-check stop unconfirmed", "operation", p.bound.operation, "serial", w.printer.Serial)
 	w.pending = nil
 }

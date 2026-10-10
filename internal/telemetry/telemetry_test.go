@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"reflect"
 	"testing"
 
 	"bambu-mqtt-proxy/internal/activity"
@@ -34,7 +35,7 @@ func TestObserveReportRecordsPrintAndAlertTransitions(t *testing.T) {
 	}
 	want := []string{
 		"state_initial", "print_paused", "print_resumed", "print_finished",
-		"hms_alert", "print_error", "hms_cleared", "print_error_cleared",
+		"hms_alert", "print_error", "alerts_cleared",
 	}
 	if len(kinds) != len(want) {
 		t.Fatalf("event kinds = %v, want %v", kinds, want)
@@ -93,9 +94,9 @@ func TestSessionEpochTracksStateBoundaries(t *testing.T) {
 	}
 	c.ObserveReport("S1", 4, 5, report("RUNNING", "9", "8", "b.gcode"))
 	v, _ = c.Session("S1")
-	// The restart bumps twice by design: the state boundary and the new
-	// identity while a complete cookie was still set.
-	if !v.Active || v.Epoch != 4 || v.Cookie != "9-8-b.gcode" {
+	// The restart bumps once by design: the state boundary opens the new
+	// session, and the same report's new identity does not bump again.
+	if !v.Active || v.Epoch != 3 || v.Cookie != "9-8-b.gcode" {
 		t.Fatalf("after restart: active/epoch/cookie = %v/%d/%q", v.Active, v.Epoch, v.Cookie)
 	}
 }
@@ -150,7 +151,7 @@ func TestObserveReportDropsStragglers(t *testing.T) {
 	}
 }
 
-func TestSessionLayerRequiresCurrentSessionAndConnection(t *testing.T) {
+func TestSessionLayerKeepsLastReportedValue(t *testing.T) {
 	c := NewCache([]config.Printer{{Serial: "S1", Name: "Shop"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	report := func(seq, gen uint64, payload string) {
 		t.Helper()
@@ -159,38 +160,51 @@ func TestSessionLayerRequiresCurrentSessionAndConnection(t *testing.T) {
 	report(1, 4, `{"print":{"gcode_state":"RUNNING","subtask_name":"a.3mf","layer_num":7}}`)
 	v, _ := c.Session("S1")
 	if v.LayerNum == nil || *v.LayerNum != 7 {
-		t.Fatalf("layer = %v, want the current print's layer 7", v.LayerNum)
+		t.Fatalf("layer = %v, want the reported layer 7", v.LayerNum)
+	}
+	if layer := v.CurrentLayer(); layer == nil || *layer != 7 {
+		t.Fatalf("CurrentLayer = %v, want 7 inside the reporting job", layer)
 	}
 
-	// A mid-print report that omits layer_num preserves the layer: the
-	// connection and the print session cannot have moved.
+	// A mid-print report that omits layer_num preserves the layer.
 	report(2, 4, `{"print":{"gcode_state":"RUNNING","mc_percent":42.5}}`)
 	v, _ = c.Session("S1")
 	if v.LayerNum == nil || *v.LayerNum != 7 {
 		t.Fatalf("layer = %v, want layer 7 preserved without a restamp", v.LayerNum)
 	}
 
-	// A new print on the same connection starts a new session: the previous
-	// job's layer must not leak into the detection view.
+	// A new print on the same connection keeps the last reported value in
+	// the view, while CurrentLayer hides the previous job's positive layer
+	// from decisions about the new print.
 	report(3, 4, `{"print":{"gcode_state":"FINISH"}}`)
 	report(4, 4, `{"print":{"gcode_state":"RUNNING","task_id":12,"subtask_name":"b.3mf"}}`)
 	v, _ = c.Session("S1")
-	if v.LayerNum != nil {
-		t.Fatalf("layer = %v, want nil for the new print before its own layer report", v.LayerNum)
+	if v.LayerNum == nil || *v.LayerNum != 7 {
+		t.Fatalf("layer = %v, want the last reported 7 kept for the new print", v.LayerNum)
+	}
+	if v.LayerThisJob || v.CurrentLayer() != nil {
+		t.Fatalf("previous job's layer stayed current for the new print: %+v", v)
 	}
 
-	// The new print's first layer report becomes current immediately.
+	// The new print's first layer report becomes decision evidence.
 	report(5, 4, `{"print":{"gcode_state":"RUNNING","layer_num":1}}`)
 	v, _ = c.Session("S1")
-	if v.LayerNum == nil || *v.LayerNum != 1 {
-		t.Fatalf("layer = %v, want the new print's layer 1", v.LayerNum)
+	if v.LayerNum == nil || *v.LayerNum != 1 || !v.LayerThisJob {
+		t.Fatalf("layer = %v thisJob=%v, want the new print's layer 1", v.LayerNum, v.LayerThisJob)
+	}
+	if layer := v.CurrentLayer(); layer == nil || *layer != 1 {
+		t.Fatalf("CurrentLayer = %v, want 1", layer)
 	}
 
-	// A reconnected printer must re-report the layer on the new connection.
+	// A reconnect delta without a layer keeps the last reported value,
+	// and it stays decision evidence: the job never changed.
 	report(6, 5, `{"print":{"gcode_state":"RUNNING"}}`)
 	v, _ = c.Session("S1")
-	if v.LayerNum != nil {
-		t.Fatalf("layer = %v, want nil on the new connection before a fresh layer report", v.LayerNum)
+	if v.LayerNum == nil || *v.LayerNum != 1 {
+		t.Fatalf("layer = %v, want layer 1 kept across the reconnect", v.LayerNum)
+	}
+	if layer := v.CurrentLayer(); layer == nil || *layer != 1 {
+		t.Fatalf("CurrentLayer = %v, want 1 across the reconnect", layer)
 	}
 	report(7, 5, `{"print":{"gcode_state":"RUNNING","layer_num":2}}`)
 	v, _ = c.Session("S1")
@@ -198,20 +212,19 @@ func TestSessionLayerRequiresCurrentSessionAndConnection(t *testing.T) {
 		t.Fatalf("layer = %v, want layer 2 re-reported on the new connection", v.LayerNum)
 	}
 
-	// A present but unparseable layer_num contradicts the last valid layer:
-	// the detection view must drop it instead of leaving it current, while
-	// the display keeps the sticky value.
+	// A present but unparseable layer_num contradicts the last valid
+	// layer: the public field is cleared, and so is the display value.
 	report(8, 5, `{"print":{"gcode_state":"RUNNING","layer_num":"bad"}}`)
 	v, _ = c.Session("S1")
-	if v.LayerNum != nil {
+	if v.LayerNum != nil || v.CurrentLayer() != nil {
 		t.Fatalf("layer = %v, want nil after an invalid layer report", v.LayerNum)
 	}
 	st, _ := c.State("S1")
-	if st.LayerNum == nil || *st.LayerNum != 2 {
-		t.Fatalf("display layer = %v, want the sticky value kept after the invalid report", st.LayerNum)
+	if st.LayerNum != nil {
+		t.Fatalf("display layer = %v, want nil after the invalid report", st.LayerNum)
 	}
 
-	// The next valid layer report restores the current evidence.
+	// The next valid layer report restores the value.
 	report(9, 5, `{"print":{"gcode_state":"RUNNING","layer_num":3}}`)
 	v, _ = c.Session("S1")
 	if v.LayerNum == nil || *v.LayerNum != 3 {
@@ -225,31 +238,35 @@ func TestSessionLayerRequiresCurrentSessionAndConnection(t *testing.T) {
 	}
 }
 
-// TestSessionLayerRequiresCurrentJobGeneration is a regression for the
+// TestSessionLayerHidesPreviousJobFromCurrentLayer is a regression for the
 // layer-provenance finding: a preview-job boundary that no session or
-// connection evidence catches must invalidate an un-re-reported layer. A
-// changed positive gcode_start_time on the same cookie, session and upstream
-// connection starts a new print job at layer 1, so the previous job's sticky
-// layer must not stay current and re-arm a consumer against the new job.
-func TestSessionLayerRequiresCurrentJobGeneration(t *testing.T) {
+// connection evidence catches must hide an un-re-reported layer from
+// CurrentLayer. A changed positive gcode_start_time on the same cookie,
+// session and upstream connection starts a new print job at layer 1, so
+// the previous job's layer must not stay decision evidence, while the
+// session view keeps it as the last reported value.
+func TestSessionLayerHidesPreviousJobFromCurrentLayer(t *testing.T) {
 	c := NewCache([]config.Printer{{Serial: "S1", Name: "Shop"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	report := func(seq uint64, payload string) {
 		t.Helper()
 		c.ObserveReport("S1", seq, 4, []byte(payload))
 	}
 
-	// Job A runs at layer 1 and its report is current evidence.
+	// Job A runs at layer 1 and its report is decision evidence.
 	report(1, `{"print":{"gcode_state":"RUNNING","project_id":1,"task_id":2,"subtask_name":"a.3mf","gcode_start_time":1000,"layer_num":1}}`)
 	v, _ := c.Session("S1")
 	if v.LayerNum == nil || *v.LayerNum != 1 {
 		t.Fatalf("layer = %v, want job A's layer 1", v.LayerNum)
 	}
+	if layer := v.CurrentLayer(); layer == nil || *layer != 1 {
+		t.Fatalf("CurrentLayer = %v, want job A's layer 1", layer)
+	}
 
 	// A real report restamps the same identity with a different positive
 	// start time and omits layer_num: the job generation advances while the
 	// cookie, session generation, epoch and upstream connection stay put,
-	// and job B starts at layer 1, so job A's sticky layer must not stay
-	// current in the session view while the display keeps it.
+	// and job B starts at layer 1, so job A's layer must leave
+	// CurrentLayer while the view keeps it as the last reported value.
 	report(2, `{"print":{"gcode_start_time":2000,"mc_percent":1}}`)
 	jobB, _ := c.Job("S1")
 	v, _ = c.Session("S1")
@@ -259,18 +276,24 @@ func TestSessionLayerRequiresCurrentJobGeneration(t *testing.T) {
 	if v.SessionGen != 1 || v.Epoch != 0 || v.Cookie != "1-2-a.3mf" {
 		t.Fatalf("session evidence moved with the job boundary: %+v", v)
 	}
-	if v.LayerNum != nil {
-		t.Fatalf("layer = %v, want nil after the start time started a new job", v.LayerNum)
+	if v.LayerNum == nil || *v.LayerNum != 1 {
+		t.Fatalf("layer = %v, want the last reported 1 kept", v.LayerNum)
+	}
+	if v.LayerThisJob || v.CurrentLayer() != nil {
+		t.Fatalf("job A's layer stayed decision evidence for job B: %+v", v)
 	}
 	if st, _ := c.State("S1"); st.LayerNum == nil || *st.LayerNum != 1 {
 		t.Fatalf("display layer = %v, want the sticky display value kept", st.LayerNum)
 	}
 
-	// Job B's own layer report restores the current evidence.
+	// Job B's own layer report restores the decision evidence.
 	report(3, `{"print":{"gcode_state":"RUNNING","layer_num":3}}`)
 	v, _ = c.Session("S1")
 	if v.LayerNum == nil || *v.LayerNum != 3 {
 		t.Fatalf("layer = %v, want job B's layer 3", v.LayerNum)
+	}
+	if layer := v.CurrentLayer(); layer == nil || *layer != 3 {
+		t.Fatalf("CurrentLayer = %v, want job B's layer 3", layer)
 	}
 
 	// A later report of the same job that omits layer_num keeps it current:
@@ -282,16 +305,19 @@ func TestSessionLayerRequiresCurrentJobGeneration(t *testing.T) {
 	}
 
 	// A metadata-only delta that changes the start time starts job C
-	// without refreshing the detection evidence: the layer must drop even
-	// though the session and connection evidence still match.
+	// without touching the session counters: job B's layer must leave
+	// CurrentLayer even though the session evidence still matches.
 	before := v
 	report(5, `{"print":{"gcode_start_time":3000}}`)
 	v, _ = c.Session("S1")
-	if v.LayerNum != nil {
-		t.Fatalf("layer = %v, want nil after a metadata-only job boundary", v.LayerNum)
+	if v.LayerNum == nil || *v.LayerNum != 3 {
+		t.Fatalf("layer = %v, want the last reported 3 kept", v.LayerNum)
+	}
+	if v.LayerThisJob || v.CurrentLayer() != nil {
+		t.Fatalf("job B's layer stayed decision evidence for job C: %+v", v)
 	}
 	if v.Obs != before.Obs || v.SessionGen != before.SessionGen || v.ObsGen != before.ObsGen {
-		t.Fatalf("metadata-only delta moved detection evidence: %+v -> %+v", before, v)
+		t.Fatalf("metadata-only delta moved session evidence: %+v -> %+v", before, v)
 	}
 	if st, _ := c.State("S1"); st.LayerNum == nil || *st.LayerNum != 3 {
 		t.Fatalf("display layer = %v, want the sticky display value kept", st.LayerNum)
@@ -778,5 +804,274 @@ func TestNonfiniteFieldsLeavePriorValuesAndValidJSON(t *testing.T) {
 	// Fleet status JSON must stay serializable after nonfinite input.
 	if _, err := json.Marshal(c.Snapshot()); err != nil {
 		t.Fatalf("snapshot JSON: %v", err)
+	}
+}
+
+// TestPrintMatchesJobAndSession pins that Print is Job plus Session.
+func TestPrintMatchesJobAndSession(t *testing.T) {
+	c := NewCache([]config.Printer{{Serial: "S1", Name: "Shop"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	c.ObserveReport("S1", 1, 4, []byte(`{"print":{"gcode_state":"RUNNING","subtask_name":"a.3mf","layer_num":2}}`))
+	j, s, ok := c.Print("S1")
+	wj, _ := c.Job("S1")
+	ws, _ := c.Session("S1")
+	if !ok || !reflect.DeepEqual(j, wj) || !reflect.DeepEqual(s, ws) {
+		t.Fatalf("Print = %+v %+v %v; want %+v %+v", j, s, ok, wj, ws)
+	}
+	if _, _, ok := c.Print("NOPE"); ok {
+		t.Fatal("unknown serial reported ok")
+	}
+}
+
+// TestCurrentLayerRejectsEarlierJobsPositiveLayer pins CurrentLayer.
+func TestCurrentLayerRejectsEarlierJobsPositiveLayer(t *testing.T) {
+	n := func(v int) *int { return &v }
+	cases := []struct {
+		name string
+		v    SessionView
+		want *int
+	}{
+		{"nil", SessionView{}, nil},
+		{"positive older job", SessionView{LayerNum: n(300)}, nil},
+		{"positive this job", SessionView{LayerNum: n(3), LayerThisJob: true}, n(3)},
+		{"zero older job", SessionView{LayerNum: n(0)}, n(0)},
+	}
+	for _, tc := range cases {
+		got := tc.v.CurrentLayer()
+		if (got == nil) != (tc.want == nil) || (got != nil && *got != *tc.want) {
+			t.Errorf("%s: got %v want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestStartEventsCarryTheirJob pins that state_initial, print_started, and
+// print_preparing carry the job generation that proved them, so consumers
+// can reject entries recorded against a print that has since been
+// replaced. A same-cookie start-time boundary and a same-cookie name-only
+// boundary each emit exactly one print_started with the new JobGen.
+func TestStartEventsCarryTheirJob(t *testing.T) {
+	printers := []config.Printer{{Serial: "S1", Name: "Shop"}}
+	c := NewCache(printers, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	log := activity.New(printers)
+	c.SetActivity(log)
+	seq := uint64(0)
+	report := func(payload string) {
+		t.Helper()
+		seq++
+		c.ObserveReport("S1", seq, 1, []byte(payload))
+	}
+	kinds := func() []activity.Entry {
+		events := log.Recent("S1")
+		out := make([]activity.Entry, len(events))
+		for i, event := range events {
+			out[len(events)-1-i] = event
+		}
+		return out
+	}
+
+	// The first report is already RUNNING: state_initial carries job 1.
+	report(`{"print":{"gcode_state":"RUNNING","project_id":1,"task_id":2,"subtask_name":"a.3mf","gcode_start_time":1000}}`)
+	got := kinds()
+	if len(got) != 1 || got[0].Kind != "state_initial" || got[0].Observation.JobGen != 1 {
+		t.Fatalf("first events = %+v, want one state_initial with JobGen 1", got)
+	}
+
+	// A same-cookie start-time-only boundary starts job 2 while the
+	// session stays put: exactly one print_started with JobGen 2.
+	report(`{"print":{"gcode_start_time":2000,"mc_percent":6}}`)
+	got = kinds()
+	if len(got) != 2 || got[1].Kind != "print_started" || got[1].Observation.JobGen != 2 {
+		t.Fatalf("after start-time boundary = %+v, want print_started with JobGen 2", got)
+	}
+
+	// A same-cookie name-only boundary starts job 3: exactly one
+	// print_started with JobGen 3, naming the new print.
+	report(`{"print":{"subtask_name":"b.3mf","mc_percent":7}}`)
+	got = kinds()
+	if len(got) != 3 || got[2].Kind != "print_started" || got[2].Observation.JobGen != 3 {
+		t.Fatalf("after name boundary = %+v, want print_started with JobGen 3", got)
+	}
+
+	// A PREPARE entry after FINISH emits print_preparing with the new JobGen.
+	report(`{"print":{"gcode_state":"FINISH"}}`)
+	report(`{"print":{"gcode_state":"PREPARE","project_id":1,"task_id":2,"subtask_name":"c.3mf"}}`)
+	got = kinds()
+	last := got[len(got)-1]
+	j, _, _ := c.Print("S1")
+	if last.Kind != "print_preparing" || last.Observation.JobGen != j.Generation || j.Generation != 4 {
+		t.Fatalf("last = %+v job=%+v, want print_preparing with JobGen 4", last, j)
+	}
+}
+
+// TestCollectActivityEventsCatalog pins every telemetry catalog row against
+// the real hmscodes dataset: cancellation markers suppress their own
+// print_error entry, dataset severities map info to Info and warning to
+// Warning, and the cleared line names titles where the dataset knows them.
+func TestCollectActivityEventsCatalog(t *testing.T) {
+	type want struct {
+		kind, severity, message, url string
+	}
+	cases := []struct {
+		name    string
+		reports []string
+		last    []want
+	}{
+		{
+			name: "state initial lowercases the state",
+			reports: []string{
+				`{"print":{"gcode_state":"IDLE","subtask_name":"a.3mf"}}`,
+			},
+			last: []want{{"state_initial", "info", "Printer idle · a.3mf", ""}},
+		},
+		{
+			name: "failed without an error reports failure",
+			reports: []string{
+				`{"print":{"gcode_state":"IDLE"}}`,
+				`{"print":{"gcode_state":"RUNNING","subtask_name":"a.3mf"}}`,
+				`{"print":{"gcode_state":"FAILED","print_error":0}}`,
+			},
+			last: []want{{"print_failed", "error", "Print failed · a.3mf", ""}},
+		},
+		{
+			name: "failed with an unknown error reports the code",
+			reports: []string{
+				`{"print":{"gcode_state":"IDLE"}}`,
+				`{"print":{"gcode_state":"RUNNING","subtask_name":"a.3mf"}}`,
+				`{"print":{"gcode_state":"FAILED","print_error":3735928559}}`,
+			},
+			last: []want{
+				{"print_failed", "error", "Print failed · a.3mf", ""},
+				{"print_error", "error", "Printer error DEAD-BEEF, no description available", "https://printara3d.com/tools/bambu-error-codes/?code=DEAD-BEEF"},
+			},
+		},
+		{
+			name: "failed with a known error carries title and link",
+			reports: []string{
+				`{"print":{"gcode_state":"IDLE"}}`,
+				`{"print":{"gcode_state":"RUNNING","subtask_name":"a.3mf"}}`,
+				`{"print":{"gcode_state":"FAILED","print_error":50364425}}`,
+			},
+			last: []want{
+				{"print_failed", "error", "Print failed · a.3mf", ""},
+				{"print_error", "error", "Printer error: Heated Bed Temperature Malfunction (0300-8009)", "https://printara3d.com/tools/bambu-error-codes/hms-0300-8009/"},
+			},
+		},
+		{
+			name: "info-severity error notifies at info",
+			reports: []string{
+				`{"print":{"gcode_state":"IDLE"}}`,
+				`{"print":{"gcode_state":"RUNNING","subtask_name":"a.3mf"}}`,
+				`{"print":{"gcode_state":"FAILED","print_error":50364417}}`,
+			},
+			last: []want{
+				{"print_failed", "error", "Print failed · a.3mf", ""},
+				{"print_error", "info", "Printer error: Print Paused by User (0300-8001)", "https://printara3d.com/tools/bambu-error-codes/hms-0300-8001/"},
+			},
+		},
+		{
+			name: "warning-severity error notifies at warning",
+			reports: []string{
+				`{"print":{"gcode_state":"IDLE"}}`,
+				`{"print":{"gcode_state":"RUNNING","subtask_name":"a.3mf"}}`,
+				`{"print":{"gcode_state":"RUNNING","print_error":50364416}}`,
+			},
+			last: []want{
+				{"print_error", "warning", "Printer error: Print Paused Without Reason (0300-8000)", "https://printara3d.com/tools/bambu-error-codes/hms-0300-8000/"},
+			},
+		},
+		{
+			name: "cancel marker records cancelled and suppresses its error",
+			reports: []string{
+				`{"print":{"gcode_state":"IDLE"}}`,
+				`{"print":{"gcode_state":"RUNNING","subtask_name":"a.3mf"}}`,
+				`{"print":{"gcode_state":"FAILED","print_error":50348044}}`,
+			},
+			last: []want{{"print_cancelled", "warning", "Print cancelled · a.3mf", ""}},
+		},
+		{
+			name: "cloud cancel marker records cancelled",
+			reports: []string{
+				`{"print":{"gcode_state":"IDLE"}}`,
+				`{"print":{"gcode_state":"RUNNING","subtask_name":"a.3mf"}}`,
+				`{"print":{"gcode_state":"FAILED","print_error":83902478}}`,
+			},
+			last: []want{{"print_cancelled", "warning", "Print cancelled · a.3mf", ""}},
+		},
+		{
+			name: "known hms alert carries title and link",
+			reports: []string{
+				`{"print":{"gcode_state":"RUNNING","subtask_name":"a.3mf"}}`,
+				`{"print":{"hms":[{"attr":117473296,"code":65543}]}}`,
+			},
+			last: []want{
+				{"hms_alert", "error", "Printer alert: AMS Motor Overload (HMS_0700_8010_0001_0007)", "https://printara3d.com/tools/bambu-error-codes/hms-0700-8010/"},
+			},
+		},
+		{
+			name: "unknown hms alert keeps its lookup link",
+			reports: []string{
+				`{"print":{"gcode_state":"RUNNING","subtask_name":"a.3mf"}}`,
+				`{"print":{"hms":[{"attr":50331904,"code":65544}]}}`,
+			},
+			last: []want{
+				{"hms_alert", "error", "Printer alert HMS_0300_0100_0001_0008, no description available", "https://printara3d.com/tools/bambu-error-codes/?code=0300-0100"},
+			},
+		},
+		{
+			name: "one clear names titles and ids",
+			reports: []string{
+				`{"print":{"gcode_state":"RUNNING","subtask_name":"a.3mf","print_error":50364425,"hms":[{"attr":50331904,"code":65544}]}}`,
+				`{"print":{"print_error":0,"hms":[]}}`,
+			},
+			last: []want{
+				{"alerts_cleared", "info", "Printer alerts cleared: HMS_0300_0100_0001_0008, Heated Bed Temperature Malfunction", ""},
+			},
+		},
+		{
+			name: "suppressed cancel marker clears the announced error",
+			reports: []string{
+				`{"print":{"gcode_state":"IDLE"}}`,
+				`{"print":{"gcode_state":"RUNNING","subtask_name":"a.3mf"}}`,
+				`{"print":{"gcode_state":"PAUSE","print_error":50364425}}`,
+				`{"print":{"gcode_state":"FAILED","print_error":50348044}}`,
+				`{"print":{"print_error":0}}`,
+			},
+			last: []want{
+				{"alerts_cleared", "info", "Printer alerts cleared: Heated Bed Temperature Malfunction", ""},
+			},
+		},
+		{
+			name: "stopped keeps its sentence",
+			reports: []string{
+				`{"print":{"gcode_state":"IDLE"}}`,
+				`{"print":{"gcode_state":"RUNNING","subtask_name":"a.3mf"}}`,
+				`{"print":{"gcode_state":"IDLE"}}`,
+			},
+			last: []want{{"print_stopped", "warning", "Print stopped before finishing · a.3mf", ""}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			printers := []config.Printer{{Serial: "S1", Name: "Shop"}}
+			c := NewCache(printers, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			log := activity.New(printers)
+			c.SetActivity(log)
+			before := 0
+			for i, payload := range tc.reports {
+				before = len(log.Recent("S1"))
+				c.ObserveReport("S1", uint64(i+1), 1, []byte(payload))
+			}
+			got := log.Recent("S1")
+			// Recent returns newest first: take the tail this last report added.
+			added := got[:len(got)-before]
+			if len(added) != len(tc.last) {
+				t.Fatalf("last report events = %+v, want %d entries", added, len(tc.last))
+			}
+			for i, w := range tc.last {
+				e := added[len(added)-1-i]
+				if e.Kind != w.kind || e.Severity != w.severity || e.Message != w.message || e.URL != w.url {
+					t.Fatalf("event %d = %+v, want kind=%q severity=%q message=%q url=%q", i, e, w.kind, w.severity, w.message, w.url)
+				}
+			}
+		})
 	}
 }

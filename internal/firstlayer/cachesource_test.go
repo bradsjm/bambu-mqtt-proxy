@@ -55,8 +55,8 @@ func TestCacheSourceJobGenerationAdvancesWithoutNewSession(t *testing.T) {
 	}))
 	jobA, _ := cache.Job("S1")
 	sessionA, _ := cache.Session("S1")
-	if jobA.Generation != 1 || jobA.Revision != 1 {
-		t.Fatalf("job A after start = gen %d rev %d, want 1/1", jobA.Generation, jobA.Revision)
+	if jobA.Generation != 1 {
+		t.Fatalf("job A after start = gen %d, want 1", jobA.Generation)
 	}
 	if !sessionA.Active || sessionA.SessionGen != 1 || sessionA.Epoch != 0 ||
 		sessionA.Cookie != "1-2-a.3mf" || sessionA.LayerNum == nil || *sessionA.LayerNum != 1 {
@@ -77,12 +77,7 @@ func TestCacheSourceJobGenerationAdvancesWithoutNewSession(t *testing.T) {
 	if !ok {
 		t.Fatal("armed job A at layer 2 returned no evidence")
 	}
-	wantA := activity.Observation{JobGen: 1, JobRevision: 1, RunningEpoch: 0,
-		SessionGen: 1, Epoch: 0, StateGen: 5, ObsGen: 5}
-	// ObsAt is the observation time of the session view read that proved
-	// layer 2, not of the earlier read above.
-	sessionNow, _ := cache.Session("S1")
-	wantA.ObsAt = sessionNow.ObsAt
+	wantA := activity.Observation{JobGen: 1}
 	if obsA != wantA {
 		t.Fatalf("job A evidence = %+v, want %+v", obsA, wantA)
 	}
@@ -98,16 +93,13 @@ func TestCacheSourceJobGenerationAdvancesWithoutNewSession(t *testing.T) {
 	if jobB.Generation != 2 {
 		t.Fatalf("changed gcode_start_time did not advance job: gen=%d", jobB.Generation)
 	}
-	if jobB.Revision == 0 {
-		t.Fatal("new job generation carries no revision")
-	}
 	if sessionB.SessionGen != 1 || sessionB.Epoch != 0 || sessionB.Cookie != "1-2-a.3mf" {
 		t.Fatalf("session identity moved with the job start time: %+v", sessionB)
 	}
 	if _, ok := svc.sample("S1", &session); ok {
 		t.Fatal("job B already past layer 1 at first sight returned evidence")
 	}
-	if session.jobGen != 2 || session.sessionGen != 1 || session.armed || session.recorded {
+	if session.jobGen != 2 || session.armed || session.recorded {
 		t.Fatalf("job B inherited or reset state wrongly: %+v", session)
 	}
 
@@ -138,8 +130,7 @@ func TestCacheSourceJobGenerationAdvancesWithoutNewSession(t *testing.T) {
 		t.Fatal("armed job B at layer 2 returned no evidence")
 	}
 	sessionB, _ = cache.Session("S1")
-	wantB := activity.Observation{JobGen: 2, JobRevision: 1, RunningEpoch: 0,
-		SessionGen: 1, Epoch: 0, StateGen: 5, ObsGen: 5, ObsAt: sessionB.ObsAt}
+	wantB := activity.Observation{JobGen: 2}
 	if obsB != wantB {
 		t.Fatalf("job B evidence = %+v, want %+v", obsB, wantB)
 	}
@@ -159,21 +150,23 @@ func TestCacheSourceJobGenerationAdvancesWithoutNewSession(t *testing.T) {
 }
 
 // TestCacheSourceStickyLayerCannotArmReplacementJob is a regression for the
-// layer-provenance finding, run against a real telemetry.Cache: the session
-// view exposes LayerNum only when layer_num was reported inside the current
-// job generation, so a same-cookie job replacement cannot arm from the
-// previous job's sticky layer. The scenario:
+// layer-provenance finding, run against a real telemetry.Cache: CurrentLayer
+// hides a positive layer reported inside an older job generation, so a
+// same-cookie job replacement cannot arm from the previous job's sticky
+// layer. The session view still exposes that last reported layer; the
+// decision helper is what excludes it. The scenario:
 //
 //  1. Job A reports RUNNING at layer 1 (gcode_start_time 1000) and the
 //     service arms on the A pair (job 1, session 1).
 //  2. A same-cookie report changes gcode_start_time to 2000 and carries
 //     mc_percent but NO layer_num: Job.Generation advances to 2 while
-//     SessionGen and Epoch stay put. A's sticky layer 1 leaves the session
-//     view (the display value stays put), so the sample resets to job 2
-//     and remains UNARMED instead of arming from A's layer.
+//     SessionGen and Epoch stay put. The session view keeps the last
+//     reported layer 1 stamped with job A, and CurrentLayer hides it
+//     from decisions about job B, so the sample resets to job 2 and
+//     remains UNARMED instead of arming from A's layer.
 //  3. Job B reports RUNNING at layer 3 without ever observing layer 1.
-//     Layer 3 is B's own evidence, reported inside B's generation, so the
-//     session view exposes it again — but B was never armed, so no
+//     Layer 3 is B's own evidence, reported inside B's generation, so
+//     CurrentLayer exposes it — but B was never armed, so no
 //     completion event can be invented for it.
 func TestCacheSourceStickyLayerCannotArmReplacementJob(t *testing.T) {
 	cache := telemetry.NewCache([]config.Printer{{Serial: "S1", Name: "Shop"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -188,8 +181,8 @@ func TestCacheSourceStickyLayerCannotArmReplacementJob(t *testing.T) {
 	}))
 	jobA, _ := cache.Job("S1")
 	sessionA, _ := cache.Session("S1")
-	if jobA.Generation != 1 || jobA.Revision != 1 {
-		t.Fatalf("job A after start = gen %d rev %d, want 1/1", jobA.Generation, jobA.Revision)
+	if jobA.Generation != 1 {
+		t.Fatalf("job A after start = gen %d, want 1", jobA.Generation)
 	}
 	if !sessionA.Active || sessionA.SessionGen != 1 || sessionA.Epoch != 0 ||
 		sessionA.Cookie != "1-2-a.3mf" || sessionA.LayerNum == nil || *sessionA.LayerNum != 1 {
@@ -209,16 +202,20 @@ func TestCacheSourceStickyLayerCannotArmReplacementJob(t *testing.T) {
 	}))
 	jobB, _ := cache.Job("S1")
 	sessionB, _ := cache.Session("S1")
-	if jobB.Generation != 2 || jobB.Revision != 1 {
-		t.Fatalf("changed gcode_start_time did not advance the job: gen=%d rev=%d, want 2/1",
-			jobB.Generation, jobB.Revision)
+	if jobB.Generation != 2 {
+		t.Fatalf("changed gcode_start_time did not advance the job: gen=%d, want 2", jobB.Generation)
 	}
 	if sessionB.SessionGen != 1 || sessionB.Epoch != 0 || sessionB.Cookie != "1-2-a.3mf" {
 		t.Fatalf("session identity moved with the job start time: %+v", sessionB)
 	}
-	if sessionB.LayerNum != nil {
-		t.Fatalf("session view exposed job A's sticky layer %d across the job boundary, want nil",
-			*sessionB.LayerNum)
+	// The session view keeps the last reported layer, so it still shows
+	// job A's layer 1, but stamped with job A's generation:
+	// CurrentLayer hides it from decisions about job B.
+	if sessionB.LayerNum == nil || *sessionB.LayerNum != 1 {
+		t.Fatalf("session view lost job A's last reported layer: %+v", sessionB.LayerNum)
+	}
+	if sessionB.LayerThisJob || sessionB.CurrentLayer() != nil {
+		t.Fatalf("job A's sticky layer stayed current for job B: %+v", sessionB)
 	}
 	if display, _ := cache.State("S1"); display.LayerNum == nil || *display.LayerNum != 1 {
 		t.Fatalf("sticky display layer disturbed by the job boundary: %+v", display.LayerNum)
@@ -226,7 +223,7 @@ func TestCacheSourceStickyLayerCannotArmReplacementJob(t *testing.T) {
 	if _, ok := svc.sample("S1", &session); ok {
 		t.Fatal("job B sampled without its own layer evidence returned evidence")
 	}
-	if session.jobGen != 2 || session.sessionGen != 1 || session.armed || session.recorded {
+	if session.jobGen != 2 || session.armed || session.recorded {
 		t.Fatalf("job B inherited or reset state wrongly: %+v", session)
 	}
 
@@ -259,7 +256,8 @@ func TestCacheSourceStickyLayerCannotArmReplacementJob(t *testing.T) {
 // here arrives as a metadata-only delta — a report whose print object
 // carries only gcode_start_time, no real print state marker — which starts
 // the new job generation without touching session identity or session
-// freshness, and still hides the previous job's sticky layer.
+// freshness, while the previous job's sticky layer stays exposed as the
+// last reported value but hidden from CurrentLayer.
 func TestCacheSourceReplacementJobRereportsOwnLayerAndCompletes(t *testing.T) {
 	cache := telemetry.NewCache([]config.Printer{{Serial: "S1", Name: "Shop"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	log := newObservableLog()
@@ -282,9 +280,8 @@ func TestCacheSourceReplacementJobRereportsOwnLayerAndCompletes(t *testing.T) {
 	}))
 	jobB, _ := cache.Job("S1")
 	sessionB, _ := cache.Session("S1")
-	if jobB.Generation != 2 || jobB.Revision != 1 {
-		t.Fatalf("metadata-only boundary did not advance the job: gen=%d rev=%d, want 2/1",
-			jobB.Generation, jobB.Revision)
+	if jobB.Generation != 2 {
+		t.Fatalf("metadata-only boundary did not advance the job: gen=%d, want 2", jobB.Generation)
 	}
 	if sessionB.SessionGen != 1 || sessionB.Epoch != 0 || sessionB.Cookie != "1-2-a.3mf" {
 		t.Fatalf("session identity moved with the metadata-only boundary: %+v", sessionB)
@@ -292,14 +289,19 @@ func TestCacheSourceReplacementJobRereportsOwnLayerAndCompletes(t *testing.T) {
 	if sessionB.Obs != sessionA.Obs || !sessionB.ObsAt.Equal(sessionA.ObsAt) {
 		t.Fatalf("metadata-only boundary refreshed session freshness: %+v", sessionB)
 	}
-	if sessionB.LayerNum != nil {
-		t.Fatalf("session view exposed job A's sticky layer %d across the metadata-only boundary, want nil",
-			*sessionB.LayerNum)
+	// The session view keeps the last reported layer, so it still shows
+	// job A's layer 1, but stamped with job A's generation:
+	// CurrentLayer hides it from decisions about job B.
+	if sessionB.LayerNum == nil || *sessionB.LayerNum != 1 {
+		t.Fatalf("session view lost job A's last reported layer: %+v", sessionB.LayerNum)
+	}
+	if sessionB.LayerThisJob || sessionB.CurrentLayer() != nil {
+		t.Fatalf("job A's sticky layer stayed current for job B: %+v", sessionB)
 	}
 	if _, ok := svc.sample("S1", &session); ok {
 		t.Fatal("job B sampled without its own layer evidence returned evidence")
 	}
-	if session.jobGen != 2 || session.sessionGen != 1 || session.armed || session.recorded {
+	if session.jobGen != 2 || session.armed || session.recorded {
 		t.Fatalf("job B inherited or reset state wrongly: %+v", session)
 	}
 
@@ -326,9 +328,7 @@ func TestCacheSourceReplacementJobRereportsOwnLayerAndCompletes(t *testing.T) {
 	if !ok {
 		t.Fatal("armed job B at layer 2 returned no evidence")
 	}
-	sessionNow, _ := cache.Session("S1")
-	wantB := activity.Observation{JobGen: 2, JobRevision: 1, RunningEpoch: 0,
-		SessionGen: 1, Epoch: 0, StateGen: 5, ObsGen: 5, ObsAt: sessionNow.ObsAt}
+	wantB := activity.Observation{JobGen: 2}
 	if obsB != wantB {
 		t.Fatalf("job B evidence = %+v, want %+v", obsB, wantB)
 	}

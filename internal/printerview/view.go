@@ -13,9 +13,9 @@ import (
 	"bambu-mqtt-proxy/internal/telemetry"
 )
 
-// FreshnessWindow bounds how long since the last real report a printer is
-// still called fresh. It matches the detection engine's reportFreshMax so
-// every consumer shares one staleness semantic.
+// FreshnessWindow bounds how long an accessory chamber reading stays valid.
+// It no longer gates printer liveness, which is the upstream connection
+// state; it only bounds the accessory fallback in Build and the pandabreath link state.
 const FreshnessWindow = 15 * time.Second
 
 // View is the shared printer projection.
@@ -88,11 +88,10 @@ type Alert struct {
 	URL      string `json:"url,omitempty"`
 }
 
-// Freshness describes real-report evidence for one printer. A report only
-// counts when it carried print state; command ACKs never refresh it.
+// Freshness describes liveness evidence for one printer. Fresh is the upstream
+// connection state; the age and generation are diagnostics that never gate liveness.
 type Freshness struct {
-	// Fresh is true when a real report arrived within the freshness window
-	// on the upstream connection that is still current.
+	// Fresh is true when the upstream connection is live.
 	Fresh bool `json:"fresh"`
 	// LastReportAgeSeconds is the age of the last real report; null when no
 	// real report was ever observed.
@@ -106,9 +105,10 @@ type Freshness struct {
 // speedProfiles names Bambu spd_lvl values 1..4.
 var speedProfiles = [...]string{"silent", "standard", "sport", "ludicrous"}
 
-// Build projects one printer. currentGen is the live upstream connection
-// generation; now is injected so tests can freeze time.
-func Build(st telemetry.State, sv telemetry.SessionView, connected bool, currentGen uint64, now time.Time) View {
+// Build projects one printer. Live is the upstream connection state; now is
+// injected so tests can freeze time. currentGen is kept for diagnostic
+// callers and no longer gates liveness.
+func Build(st telemetry.State, sv telemetry.SessionView, connected bool, _ uint64, now time.Time) View {
 	v := View{
 		Serial:               st.Serial,
 		Name:                 st.Name,
@@ -185,14 +185,12 @@ func Build(st telemetry.State, sv telemetry.SessionView, connected bool, current
 		}
 		v.HMS = append(v.HMS, a)
 	}
+	v.Freshness.Fresh = connected
 	if !sv.ObsAt.IsZero() {
 		age := now.Sub(sv.ObsAt).Seconds()
 		gen := sv.ObsGen
-		v.Freshness = Freshness{
-			Fresh:                age <= FreshnessWindow.Seconds() && currentGen == sv.ObsGen,
-			LastReportAgeSeconds: &age,
-			UpstreamGeneration:   &gen,
-		}
+		v.Freshness.LastReportAgeSeconds = &age
+		v.Freshness.UpstreamGeneration = &gen
 	}
 	return v
 }

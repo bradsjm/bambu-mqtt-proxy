@@ -54,15 +54,18 @@ import (
 
 // ftpsShortenTiming replaces the fixed production timing seams with test
 // values: a three-second attempt deadline backstop, a 750 millisecond
-// control bound, and a 64 KiB archive cap so cap enforcement stays cheap.
+// control bound, a three-second idle stall limit (restored equally, so the
+// absolute cap still owns full stalls), and a 64 KiB archive cap so cap
+// enforcement stays cheap.
 func ftpsShortenTiming(t *testing.T) {
 	t.Helper()
-	prevAttempt, prevControl, prevMax := ftpsAttemptTimeout, ftpsControlBound, ftpsArchiveMax
+	prevAttempt, prevControl, prevIdle, prevMax := ftpsAttemptTimeout, ftpsControlBound, ftpsIdleTimeout, ftpsArchiveMax
 	ftpsAttemptTimeout = 3 * time.Second
 	ftpsControlBound = 750 * time.Millisecond
+	ftpsIdleTimeout = 3 * time.Second
 	ftpsArchiveMax = 64 << 10
 	t.Cleanup(func() {
-		ftpsAttemptTimeout, ftpsControlBound, ftpsArchiveMax = prevAttempt, prevControl, prevMax
+		ftpsAttemptTimeout, ftpsControlBound, ftpsIdleTimeout, ftpsArchiveMax = prevAttempt, prevControl, prevIdle, prevMax
 	})
 }
 
@@ -88,13 +91,11 @@ func ftpsPrinter(addr string) config.Printer {
 
 func ftpsJob(name, gcodeFile string) telemetry.JobView {
 	return telemetry.JobView{
-		Generation:   3,
-		Revision:     1,
-		RunningEpoch: 1,
-		Active:       true,
-		State:        "RUNNING",
-		Name:         name,
-		GCodeFile:    gcodeFile,
+		Generation: 3,
+		Active:     true,
+		State:      "RUNNING",
+		Name:       name,
+		GCodeFile:  gcodeFile,
 	}
 }
 
@@ -278,6 +279,8 @@ type fakeFTPSConf struct {
 	file          []byte            // archive bytes served by RETR
 	extraData     int               // bytes streamed beyond file (lied stream)
 	stallAfter    int               // stall mid-stream after this many bytes
+	chunkSize     int               // paced RETR chunk size; 0 writes at once
+	chunkDelay    time.Duration     // pause between paced RETR chunks
 	serve         map[string]bool   // remote paths that exist
 	sizeReplies   map[string]string // exact-path SIZE replies, full reply without CRLF
 }
@@ -488,6 +491,17 @@ func (s *fakeFTPS) command(tc *tls.Conn, line string) bool {
 		s.retrs = append(s.retrs, arg)
 		s.mu.Unlock()
 		writeFTPSLine(tc, "150 opening data connection")
+		if s.conf.stallAfter > 0 {
+			// Stall scenarios never complete the transfer: run it
+			// detached so the 150 reply is delivered and the data
+			// read, not the control read, observes the stall.
+			s.wg.Add(1)
+			go func() {
+				defer s.wg.Done()
+				s.transfer()
+			}()
+			break
+		}
 		s.transfer()
 		writeFTPSLine(tc, "226 transfer complete")
 	case "QUIT":
@@ -547,6 +561,25 @@ func (s *fakeFTPS) transfer() {
 		case <-s.done:
 		}
 		return // never complete: the client must cancel or time out
+	}
+	if s.conf.chunkSize > 0 && s.conf.chunkDelay > 0 {
+		for off := 0; off < len(payload); off += s.conf.chunkSize {
+			end := off + s.conf.chunkSize
+			if end > len(payload) {
+				end = len(payload)
+			}
+			if _, err := dt.Write(payload[off:end]); err != nil {
+				return
+			}
+			if end < len(payload) {
+				select {
+				case <-time.After(s.conf.chunkDelay):
+				case <-s.done:
+					return
+				}
+			}
+		}
+		return
 	}
 	if len(payload) > 0 {
 		_, _ = dt.Write(payload)
@@ -1470,6 +1503,103 @@ func TestFetch3MFAttemptTimeout(t *testing.T) {
 	if len(retrs) != 1 {
 		t.Fatalf("RETR = %q, want the one timed-out transfer", retrs)
 	}
+	ftpsNoTempFiles(t)
+}
+
+// TestFetch3MFPacedProgressSucceeds proves steady progress beats the idle
+// stall limit: chunks spaced at half the idle interval, finishing before
+// the absolute cap, download and parse cleanly.
+func TestFetch3MFPacedProgressSucceeds(t *testing.T) {
+	ftpsShortenTiming(t)
+	prevIdle, prevAttempt, prevMax := ftpsIdleTimeout, ftpsAttemptTimeout, ftpsArchiveMax
+	ftpsIdleTimeout = 400 * time.Millisecond
+	ftpsAttemptTimeout = 30 * time.Second
+	render := ftpsTestPNG(t, 8, 8)
+	archive := ftpsTestPlate3MF(t, "Paced Preview", render)
+	ftpsArchiveMax = int64(len(archive)) + 1024
+	t.Cleanup(func() {
+		ftpsIdleTimeout, ftpsAttemptTimeout, ftpsArchiveMax = prevIdle, prevAttempt, prevMax
+	})
+	srv := newFakeFTPS(t, fakeFTPSConf{
+		user:       "bblp",
+		pass:       "12345678",
+		file:       archive,
+		chunkSize:  64,
+		chunkDelay: 200 * time.Millisecond, // half the idle interval
+		serve:      map[string]bool{"/cache/BoxTower.gcode.3mf": true},
+	})
+	ftpsPointControlAt(t, srv.ctrl.Addr().String())
+	res, err := fetch(ftpsFetchCtx(t), ftpsPrinter(srv.ctrl.Addr().String()),
+		ftpsPlateJob("", "/cache/BoxTower.gcode.3mf", 1))
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if res.Preview.Status != StatusReady || !bytes.Equal(res.PNG, render) {
+		t.Fatalf("paced download = %+v, want the ready plate render", res.Preview)
+	}
+	srv.assertClean(t, 1)
+	ftpsNoTempFiles(t)
+}
+
+// TestFetch3MFIdleStallTimeout proves a mid-transfer stall longer than the
+// idle interval fails fast with a timeout, well before the absolute cap.
+func TestFetch3MFIdleStallTimeout(t *testing.T) {
+	ftpsShortenTiming(t)
+	prevIdle, prevAttempt, prevMax := ftpsIdleTimeout, ftpsAttemptTimeout, ftpsArchiveMax
+	ftpsIdleTimeout = 400 * time.Millisecond
+	ftpsAttemptTimeout = 30 * time.Second
+	ftpsArchiveMax = 64 << 10
+	t.Cleanup(func() {
+		ftpsIdleTimeout, ftpsAttemptTimeout, ftpsArchiveMax = prevIdle, prevAttempt, prevMax
+	})
+	srv := newFakeFTPS(t, fakeFTPSConf{
+		user:       "bblp",
+		pass:       "12345678",
+		file:       bytes.Repeat([]byte{0x42}, 200),
+		stallAfter: 10,
+		serve:      map[string]bool{"/cache/BoxTower.gcode.3mf": true},
+	})
+	ftpsPointControlAt(t, srv.ctrl.Addr().String())
+	start := time.Now()
+	_, err := fetch(ftpsFetchCtx(t), ftpsPrinter(srv.ctrl.Addr().String()),
+		ftpsJob("", "/cache/BoxTower.gcode.3mf"))
+	ftpsRequireCategory(t, err, catTimeout)
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("stall returned after %v, want the idle limit to fire fast", elapsed)
+	}
+	_, _, _, _, retrs, _ := srv.snapshot()
+	if len(retrs) != 1 {
+		t.Fatalf("RETR = %q, want the one stalled transfer", retrs)
+	}
+	ftpsNoTempFiles(t)
+}
+
+// TestFetch3MFAbsoluteCapBeatsProgress proves the absolute cap still owns
+// slow transfers: continuous progress that exceeds it fails with a
+// timeout even though no single read stalls.
+func TestFetch3MFAbsoluteCapBeatsProgress(t *testing.T) {
+	ftpsShortenTiming(t)
+	prevIdle, prevAttempt, prevMax := ftpsIdleTimeout, ftpsAttemptTimeout, ftpsArchiveMax
+	ftpsIdleTimeout = 30 * time.Second
+	ftpsAttemptTimeout = 800 * time.Millisecond
+	render := ftpsTestPNG(t, 8, 8)
+	archive := ftpsTestPlate3MF(t, "Slow Preview", render)
+	ftpsArchiveMax = int64(len(archive)) + 1024
+	t.Cleanup(func() {
+		ftpsIdleTimeout, ftpsAttemptTimeout, ftpsArchiveMax = prevIdle, prevAttempt, prevMax
+	})
+	srv := newFakeFTPS(t, fakeFTPSConf{
+		user:       "bblp",
+		pass:       "12345678",
+		file:       archive,
+		chunkSize:  16,
+		chunkDelay: 200 * time.Millisecond, // progress every 200ms, total past the cap
+		serve:      map[string]bool{"/cache/BoxTower.gcode.3mf": true},
+	})
+	ftpsPointControlAt(t, srv.ctrl.Addr().String())
+	_, err := fetch(ftpsFetchCtx(t), ftpsPrinter(srv.ctrl.Addr().String()),
+		ftpsPlateJob("", "/cache/BoxTower.gcode.3mf", 1))
+	ftpsRequireCategory(t, err, catTimeout)
 	ftpsNoTempFiles(t)
 }
 

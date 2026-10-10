@@ -73,3 +73,18 @@ func TestRegisterActivityEndpoints(t *testing.T) {
 		t.Fatalf("unknown serial status = %d, want 404", missing.Code)
 	}
 }
+
+// TestRecordLinkSerializesURL pins that /activity/{serial} exposes url.
+func TestRecordLinkSerializesURL(t *testing.T) {
+	log := New([]config.Printer{{Serial: "S1"}})
+	log.RecordLink("S1", "hms_alert", Warning, "Printer alert", "https://example.test/?code=1")
+	log.Record("S1", "x", Info, "plain")
+	mux := http.NewServeMux()
+	log.Register(mux)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/activity/S1", nil))
+	body := rec.Body.String()
+	if !strings.Contains(body, `"url":"https://example.test/?code=1"`) || strings.Count(body, `"url"`) != 1 {
+		t.Fatalf("body = %s", body)
+	}
+}

@@ -1,8 +1,6 @@
 // Scheduler and cache tests. Timing is driven by step(now) with injected
 // clocks and job readers; fetch calls synchronize through channels and the
-// service WaitGroup, so no test sleeps for settle timing. Freshness stays
-// meaningful: jobs built on the real telemetry cache use real report
-// timestamps and real step times.
+// service WaitGroup, so no test sleeps for retry timing.
 package jobpreview
 
 import (
@@ -22,8 +20,8 @@ import (
 	"testing"
 	"time"
 
+	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/config"
-	"bambu-mqtt-proxy/internal/printerview"
 	"bambu-mqtt-proxy/internal/telemetry"
 	"bambu-mqtt-proxy/internal/upstream"
 )
@@ -55,19 +53,16 @@ func (c *testClock) Set(now time.Time) {
 	c.mu.Unlock()
 }
 
-// fakeConn is an injectable Connectivity source. Generations default to 4,
-// matching settledJob's StateGen/ObsGen so fixtures stay eligible.
+// fakeConn is an injectable Connectivity source. Printers start connected.
 type fakeConn struct {
 	mu     sync.Mutex
 	status map[string]bool
-	gens   map[string]uint64
 }
 
 func newFakeConn(serials ...string) *fakeConn {
-	c := &fakeConn{status: make(map[string]bool), gens: make(map[string]uint64)}
+	c := &fakeConn{status: make(map[string]bool)}
 	for _, s := range serials {
 		c.status[s] = true
-		c.gens[s] = 4
 	}
 	return c
 }
@@ -82,21 +77,9 @@ func (c *fakeConn) Status() map[string]bool {
 	return out
 }
 
-func (c *fakeConn) Generation(serial string) uint64 {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.gens[serial]
-}
-
 func (c *fakeConn) setConnected(serial string, up bool) {
 	c.mu.Lock()
 	c.status[serial] = up
-	c.mu.Unlock()
-}
-
-func (c *fakeConn) bump(serial string) {
-	c.mu.Lock()
-	c.gens[serial]++
 	c.mu.Unlock()
 }
 
@@ -176,25 +159,47 @@ func await(t *testing.T, ch <-chan struct{}) {
 	}
 }
 
-// settledJob returns a RUNNING view settled well past the delay, freshly
-// observed relative to now, on upstream generation 4.
-func settledJob(now time.Time, gen uint64) telemetry.JobView {
+// runningJob returns an active RUNNING view admitted on its first tick.
+func runningJob(gen uint64) telemetry.JobView {
 	return telemetry.JobView{
-		Generation:   gen,
-		Revision:     1,
-		RunningEpoch: 2,
-		Active:       true,
-		State:        "RUNNING",
-		Name:         "Benchy",
-		GCodeFile:    "benchy_plate_3.3mf",
-		ProjectID:    "0",
-		TaskID:       "12345",
-		PlateIndex:   intPtr(3),
-		StateGen:     4,
-		ObsGen:       4,
-		ObsAt:        now.Add(-2 * time.Second),
-		RunningSince: now.Add(-90 * time.Second),
+		Generation: gen,
+		Active:     true,
+		State:      "RUNNING",
+		Name:       "a.3mf",
+		GCodeFile:  "a_plate_1.3mf",
+		PlateIndex: intPtr(1),
 	}
+}
+
+// testAdmission builds one admission for serial from the job snapshot.
+func testAdmission(serial string, job telemetry.JobView) *admission {
+	return &admission{
+		printer: config.Printer{Serial: serial},
+		job:     job,
+		gen:     job.Generation,
+	}
+}
+
+// beginAttempt reserves the slot and records one attempt for the job.
+func beginAttempt(t *testing.T, svc *Service, serial string, job telemetry.JobView) *admission {
+	t.Helper()
+	reserveSlot(svc)
+	adm := testAdmission(serial, job)
+	if !svc.begin(serial, adm) {
+		t.Fatal("begin refused a fresh attempt")
+	}
+	return adm
+}
+
+// attemptRecord copies the serial's attempt record for assertions.
+func attemptRecord(svc *Service, serial string) (attempt, bool) {
+	svc.mu.Lock()
+	defer svc.mu.Unlock()
+	rec := svc.attempts[serial]
+	if rec == nil {
+		return attempt{}, false
+	}
+	return *rec, true
 }
 
 // newTestService builds a service over injected readers, clock and
@@ -228,87 +233,76 @@ func TestUpstreamPoolSatisfiesConnectivity(t *testing.T) {
 }
 
 func TestEligibleBoundaries(t *testing.T) {
-	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
-	mk := func(settle, obsAge time.Duration) telemetry.JobView {
-		j := settledJob(base, 7)
-		j.RunningSince = base.Add(-settle)
-		j.ObsAt = base.Add(-obsAge)
-		return j
-	}
+	mk := func() telemetry.JobView { return runningJob(7) }
 	cases := []struct {
 		name      string
 		job       telemetry.JobView
 		connected bool
-		upstream  uint64
 		want      bool
 	}{
-		{"settled exactly at delay, fresh exactly at window", mk(settleDelay, printerview.FreshnessWindow), true, 4, true},
-		{"one second short of settle", mk(settleDelay-time.Second, time.Second), true, 4, false},
-		{"zero running since", func() telemetry.JobView { j := mk(time.Hour, time.Second); j.RunningSince = time.Time{}; return j }(), true, 4, false},
-		{"obs one nanosecond past window", mk(time.Hour, printerview.FreshnessWindow+time.Nanosecond), true, 4, false},
-		{"zero obs", func() telemetry.JobView { j := mk(time.Hour, time.Second); j.ObsAt = time.Time{}; return j }(), true, 4, false},
-		{"disconnected", mk(time.Hour, time.Second), false, 4, false},
-		{"state gen behind upstream", mk(time.Hour, time.Second), true, 5, false},
-		{"obs gen behind upstream", func() telemetry.JobView { j := mk(time.Hour, time.Second); j.ObsGen = 3; return j }(), true, 4, false},
-		{"paused state", func() telemetry.JobView { j := mk(time.Hour, time.Second); j.State = "PAUSE"; return j }(), true, 4, false},
-		{"inactive", func() telemetry.JobView { j := mk(time.Hour, time.Second); j.Active = false; return j }(), true, 4, false},
-		{"name only", func() telemetry.JobView { j := mk(time.Hour, time.Second); j.GCodeFile = ""; return j }(), true, 4, true},
-		{"gcode basename only", func() telemetry.JobView { j := mk(time.Hour, time.Second); j.Name = ""; return j }(), true, 4, true},
+		{"running connected", mk(), true, true},
+		{"pause state", func() telemetry.JobView { j := mk(); j.State = "PAUSE"; return j }(), true, true},
+		{"paused state", func() telemetry.JobView { j := mk(); j.State = "PAUSED"; return j }(), true, true},
+		{"prepare state", func() telemetry.JobView { j := mk(); j.State = "PREPARE"; return j }(), true, false},
+		{"slicing state", func() telemetry.JobView { j := mk(); j.State = "SLICING"; return j }(), true, false},
+		{"disconnected", mk(), false, false},
+		{"inactive", func() telemetry.JobView { j := mk(); j.Active = false; return j }(), true, false},
+		{"name only", func() telemetry.JobView { j := mk(); j.GCodeFile = ""; return j }(), true, true},
+		{"gcode basename only", func() telemetry.JobView { j := mk(); j.Name = ""; return j }(), true, true},
 		{"gcode with directories", func() telemetry.JobView {
-			j := mk(time.Hour, time.Second)
+			j := mk()
 			j.Name = ""
 			j.GCodeFile = "/cache/job.3mf"
 			return j
-		}(), true, 4, true},
+		}(), true, true},
 		{"uppercase extension", func() telemetry.JobView {
-			j := mk(time.Hour, time.Second)
+			j := mk()
 			j.Name = ""
 			j.GCodeFile = "JOB.3MF"
 			return j
-		}(), true, 4, true},
-		{"no identity at all", func() telemetry.JobView { j := mk(time.Hour, time.Second); j.Name = ""; j.GCodeFile = ""; return j }(), true, 4, false},
+		}(), true, true},
+		{"no identity at all", func() telemetry.JobView { j := mk(); j.Name = ""; j.GCodeFile = ""; return j }(), true, false},
 		{"gcode not 3mf", func() telemetry.JobView {
-			j := mk(time.Hour, time.Second)
+			j := mk()
 			j.Name = ""
 			j.GCodeFile = "job.gcode"
 			return j
-		}(), true, 4, false},
+		}(), true, false},
 		{"gcode traversal segment", func() telemetry.JobView {
-			j := mk(time.Hour, time.Second)
+			j := mk()
 			j.Name = ""
 			j.GCodeFile = "a/../b.3mf"
 			return j
-		}(), true, 4, false},
+		}(), true, false},
 		{"gcode dot segment", func() telemetry.JobView {
-			j := mk(time.Hour, time.Second)
+			j := mk()
 			j.Name = ""
 			j.GCodeFile = "./b.3mf"
 			return j
-		}(), true, 4, false},
+		}(), true, false},
 		{"gcode control character", func() telemetry.JobView {
-			j := mk(time.Hour, time.Second)
+			j := mk()
 			j.Name = ""
 			j.GCodeFile = "job\x01.3mf"
 			return j
-		}(), true, 4, false},
-		{"only separators", func() telemetry.JobView { j := mk(time.Hour, time.Second); j.Name = ""; j.GCodeFile = `/\`; return j }(), true, 4, false},
+		}(), true, false},
+		{"only separators", func() telemetry.JobView { j := mk(); j.Name = ""; j.GCodeFile = `/\`; return j }(), true, false},
 	}
 	for _, tc := range cases {
-		if got := eligible(tc.job, tc.connected, tc.upstream, base); got != tc.want {
+		if got := eligible(tc.job, tc.connected); got != tc.want {
 			t.Errorf("%s: eligible = %v, want %v", tc.name, got, tc.want)
 		}
 	}
 }
 
-// TestStepSettleSweep pins the settle boundary through the scheduler: no
-// fetch through 59 seconds of fresh RUNNING, exactly one at 60, and no
-// second attempt for the consumed generation afterwards.
-func TestStepSettleSweep(t *testing.T) {
+// TestStepAdmitsOnFirstRunningTick pins immediate admission: the first
+// RUNNING tick starts one attempt, and the generation's retry backoff
+// holds further ticks until the retry time.
+func TestStepAdmitsOnFirstRunningTick(t *testing.T) {
 	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
-	runStart := base
 	clk := &testClock{now: base}
 	conn := newFakeConn("S1")
-	rd := newJobReader("S1", settledJob(base, 7))
+	rd := newJobReader("S1", runningJob(7))
 	svc := newTestService(t, conn, rd, clk, "S1")
 
 	counts := &fetchCounter{}
@@ -319,69 +313,67 @@ func TestStepSettleSweep(t *testing.T) {
 		return Result{}, &testError{cat: catTransport}
 	}
 
-	// Fresh reports keep arriving beside every step, so the 15s freshness
-	// window holds while the 60s settle window runs out.
-	stepAt := func(offset time.Duration) {
-		at := runStart.Add(offset)
-		j := settledJob(at, 7)
-		j.RunningSince = runStart
-		rd.set("S1", j)
-		clk.Set(at)
-		svc.step(at)
-	}
-	stepAt(59 * time.Second)
-	select {
-	case <-started:
-		t.Fatal("fetch admitted before 60 seconds of settled RUNNING")
-	default:
-	}
-	if counts.count() != 0 {
-		t.Fatalf("calls = %d, want 0 before settle", counts.count())
-	}
-
-	stepAt(60 * time.Second)
+	clk.Set(base)
+	svc.step(base)
 	await(t, started)
 	svc.wg.Wait() // join the transfer goroutine: outcome settled, slot released
 	if got := counts.count(); got != 1 {
-		t.Fatalf("calls = %d, want exactly 1 at settle", got)
+		t.Fatalf("calls = %d, want exactly 1 on the first RUNNING tick", got)
 	}
 
-	stepAt(61 * time.Second)
-	stepAt(62 * time.Second)
+	// The transient failure backs off: ticks before the retry time start
+	// nothing, and the reason names the wait.
+	svc.step(base.Add(time.Second))
 	if got := counts.count(); got != 1 {
-		t.Fatalf("calls = %d after consumed generation, want 1", got)
+		t.Fatalf("calls = %d during backoff, want 1", got)
+	}
+	res, _ := svc.Lookup("S1", true)
+	if res.Preview.Status != StatusPending || res.Preview.Reason != reasonRetryWait {
+		t.Fatalf("projection = %+v, want pending retry_wait", res.Preview)
 	}
 }
 
-func TestFinishBeforeSettleZeroCalls(t *testing.T) {
+// TestIneligibleStatesNeverAdmit pins the eligibility floor through the
+// scheduler: preparing, idle, and disconnected jobs never start a fetch.
+func TestIneligibleStatesNeverAdmit(t *testing.T) {
 	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
-	clk := &testClock{now: base}
-	conn := newFakeConn("S1")
-	job := settledJob(base, 7)
-	job.RunningSince = base.Add(-30 * time.Second) // settling, not settled
-	rd := newJobReader("S1", job)
-	svc := newTestService(t, conn, rd, clk, "S1")
-	counts := &fetchCounter{}
-	started := make(chan struct{}, 4)
-	svc.fetch = func(ctx context.Context, p config.Printer, j telemetry.JobView) (Result, error) {
-		counts.add(p.Serial)
-		started <- struct{}{}
-		return Result{}, nil
+	cases := []struct {
+		name      string
+		job       telemetry.JobView
+		connected bool
+	}{
+		{"prepare", func() telemetry.JobView { j := runningJob(7); j.State = "PREPARE"; return j }(), true},
+		{"slicing", func() telemetry.JobView { j := runningJob(7); j.State = "SLICING"; return j }(), true},
+		{"inactive", func() telemetry.JobView { j := runningJob(7); j.Active = false; return j }(), true},
+		{"disconnected", runningJob(7), false},
+		{"no identity", func() telemetry.JobView { j := runningJob(7); j.Name = ""; j.GCodeFile = ""; return j }(), true},
 	}
-	for i := range 5 {
-		at := base.Add(time.Duration(i) * time.Second)
-		j := job
-		j.ObsAt = at.Add(-time.Second)
-		rd.set("S1", j)
-		svc.step(at)
-	}
-	select {
-	case <-started:
-		t.Fatal("fetch admitted while still settling")
-	default:
-	}
-	if counts.count() != 0 {
-		t.Fatalf("calls = %d, want 0", counts.count())
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clk := &testClock{now: base}
+			conn := newFakeConn("S1")
+			conn.setConnected("S1", tc.connected)
+			rd := newJobReader("S1", tc.job)
+			svc := newTestService(t, conn, rd, clk, "S1")
+			counts := &fetchCounter{}
+			started := make(chan struct{}, 4)
+			svc.fetch = func(ctx context.Context, p config.Printer, j telemetry.JobView) (Result, error) {
+				counts.add(p.Serial)
+				started <- struct{}{}
+				return Result{}, nil
+			}
+			for i := range 5 {
+				svc.step(base.Add(time.Duration(i) * time.Second))
+			}
+			select {
+			case <-started:
+				t.Fatal("fetch admitted for an ineligible job")
+			default:
+			}
+			if counts.count() != 0 {
+				t.Fatalf("calls = %d, want 0", counts.count())
+			}
+		})
 	}
 }
 
@@ -393,8 +385,8 @@ func TestSortedAdmissionNeverOverlaps(t *testing.T) {
 	clk := &testClock{now: base}
 	conn := newFakeConn("S2", "S1") // inserted out of order on purpose
 	rd := &jobReader{jobs: map[string]telemetry.JobView{
-		"S1": settledJob(base, 7),
-		"S2": settledJob(base, 9),
+		"S1": runningJob(7),
+		"S2": runningJob(9),
 	}}
 	svc := newTestService(t, conn, rd, clk, "S2", "S1")
 
@@ -432,121 +424,122 @@ func TestSortedAdmissionNeverOverlaps(t *testing.T) {
 	}
 }
 
-// TestFailureThenReconnectAndRevisionNeverRetry pins attempt consumption:
-// a failed attempt survives reconnects and revisions; only a new
-// generation grants exactly one more attempt.
-func TestFailureThenReconnectAndRevisionNeverRetry(t *testing.T) {
+// TestTransientFailuresRetryThenFinal pins the retry schedule: a transport
+// failure retries at +30 s and +60 s, the third failure marks the
+// generation final, and exactly one job_preview_unavailable entry is
+// recorded. A new generation starts a fresh budget.
+func TestTransientFailuresRetryThenFinal(t *testing.T) {
 	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
 	clk := &testClock{now: base}
 	conn := newFakeConn("S1")
-	rd := newJobReader("S1", settledJob(base, 7))
+	rd := newJobReader("S1", runningJob(7))
 	svc := newTestService(t, conn, rd, clk, "S1")
+	log := activity.New([]config.Printer{{Serial: "S1"}})
+	svc.SetActivity(log)
 
 	counts := &fetchCounter{}
 	started := make(chan struct{}, 8)
 	svc.fetch = func(ctx context.Context, p config.Printer, j telemetry.JobView) (Result, error) {
 		counts.add(p.Serial)
 		started <- struct{}{}
-		return Result{}, &testError{cat: catNotFound}
+		return Result{}, &testError{cat: catTransport}
 	}
-	upstreamGen := func() uint64 { return conn.Generation("S1") }
-
-	// Step with a fresh settled view of the given generation, aligned to
-	// the current upstream generation.
-	stepSettled := func(gen uint64) {
-		at := clk.Now().Add(time.Second)
-		j := settledJob(at, gen)
-		j.StateGen = upstreamGen()
-		j.ObsGen = upstreamGen()
-		rd.set("S1", j)
-		clk.Advance(time.Second)
+	stepAndJoin := func(at time.Time) {
+		clk.Set(at)
 		svc.step(at)
 		await(t, started)
 		svc.wg.Wait()
 	}
 
-	stepSettled(7)
+	stepAndJoin(base)
 	if got := counts.count(); got != 1 {
 		t.Fatalf("calls = %d after first attempt, want 1", got)
 	}
+	if rec, ok := attemptRecord(svc, "S1"); !ok || rec.count != 1 || rec.final || !rec.nextAt.Equal(base.Add(30*time.Second)) {
+		t.Fatalf("record = %+v, %v; want count 1 backing off to +30s", rec, ok)
+	}
 
-	// Reconnect: upstream generation moves and the job reports fresh state
-	// on the new connection, same preview generation. No second attempt.
-	conn.bump("S1")
-	at := clk.Now().Add(time.Second)
-	j := settledJob(at, 7)
-	j.StateGen = upstreamGen()
-	j.ObsGen = upstreamGen()
-	rd.set("S1", j)
-	clk.Advance(time.Second)
-	svc.step(at)
+	// Before the retry time: no attempt.
+	clk.Set(base.Add(29 * time.Second))
+	svc.step(base.Add(29 * time.Second))
 	if got := counts.count(); got != 1 {
-		t.Fatalf("calls = %d after reconnect, want 1", got)
+		t.Fatalf("calls = %d before retry time, want 1", got)
 	}
 
-	// Revision bump inside the same generation: no second attempt.
-	at = clk.Now().Add(time.Second)
-	j = settledJob(at, 7)
-	j.Revision = 2
-	j.StateGen = upstreamGen()
-	j.ObsGen = upstreamGen()
-	rd.set("S1", j)
-	clk.Advance(time.Second)
-	svc.step(at)
-	if got := counts.count(); got != 1 {
-		t.Fatalf("calls = %d after revision, want 1", got)
+	stepAndJoin(base.Add(30 * time.Second))
+	if got := counts.count(); got != 2 {
+		t.Fatalf("calls = %d after +30s retry, want 2", got)
+	}
+	if rec, _ := attemptRecord(svc, "S1"); rec.count != 2 || !rec.nextAt.Equal(base.Add(90*time.Second)) {
+		t.Fatalf("record = %+v, want count 2 backing off to +90s", rec)
 	}
 
-	// New generation: exactly one more attempt, then never again.
-	stepSettled(8)
-	if got := counts.count(); got != 2 {
-		t.Fatalf("calls = %d after new generation, want 2", got)
+	stepAndJoin(base.Add(90 * time.Second))
+	if got := counts.count(); got != 3 {
+		t.Fatalf("calls = %d after +60s retry, want 3", got)
 	}
-	at = clk.Now().Add(time.Second)
-	j = settledJob(at, 8)
-	j.StateGen = upstreamGen()
-	j.ObsGen = upstreamGen()
-	rd.set("S1", j)
-	clk.Advance(time.Second)
-	svc.step(at)
-	if got := counts.count(); got != 2 {
-		t.Fatalf("calls = %d after consumed new generation, want 2", got)
+	rec, _ := attemptRecord(svc, "S1")
+	if !rec.final || rec.reason != catTransport {
+		t.Fatalf("record = %+v, want final transport", rec)
+	}
+	res, _ := svc.Lookup("S1", true)
+	if res.Preview.Status != StatusUnavailable || res.Preview.Reason != catTransport {
+		t.Fatalf("projection = %+v, want unavailable transport", res.Preview)
+	}
+	events := log.Recent("S1")
+	if len(events) != 1 || events[0].Kind != "job_preview_unavailable" || events[0].Severity != activity.Info {
+		t.Fatalf("activity = %+v, want one info job_preview_unavailable", events)
+	}
+	wantMsg := "Print details unavailable, " + strings.ToLower(reasonText(catTransport)[:1]) + reasonText(catTransport)[1:]
+	if events[0].Message != wantMsg {
+		t.Fatalf("message = %q, want %q", events[0].Message, wantMsg)
+	}
+
+	// Final: no further attempt for this generation.
+	clk.Set(base.Add(10 * time.Minute))
+	svc.step(base.Add(10 * time.Minute))
+	if got := counts.count(); got != 3 {
+		t.Fatalf("calls = %d after final, want 3", got)
+	}
+
+	// A new job before the next tick ignores the old final: fresh budget.
+	rd.set("S1", runningJob(8))
+	stepAndJoin(base.Add(11 * time.Minute))
+	if got := counts.count(); got != 4 {
+		t.Fatalf("calls = %d after new generation, want 4", got)
+	}
+	if rec, _ := attemptRecord(svc, "S1"); rec.gen != 8 || rec.count != 1 || rec.final {
+		t.Fatalf("record = %+v, want fresh count 1 for gen 8", rec)
 	}
 }
 
 // TestFinishPublishesOutcomes drives finish synchronously and pins the
-// published view for ready, metadata-only, pure-failure and discarded
-// outcomes.
+// published view for ready, partial, failed, and selector-moved outcomes.
 func TestFinishPublishesOutcomes(t *testing.T) {
 	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
 	serial := "S1"
 
-	newFixture := func(t *testing.T) (*Service, *fakeConn, *jobReader, *admission) {
+	newFixture := func(t *testing.T) (*Service, *fakeConn, *jobReader, telemetry.JobView, *admission) {
 		clk := &testClock{now: base}
 		conn := newFakeConn(serial)
-		job := settledJob(base, 7)
+		job := runningJob(7)
 		rd := newJobReader(serial, job)
 		svc := newTestService(t, conn, rd, clk, serial)
-		adm := &admission{
-			printer:  config.Printer{Serial: serial},
-			job:      job,
-			gen:      7,
-			rev:      1,
-			epoch:    2,
-			upstream: 4,
-		}
-		reserveSlot(svc)
-		return svc, conn, rd, adm
+		adm := beginAttempt(t, svc, serial, job)
+		return svc, conn, rd, job, adm
 	}
 
 	t.Run("ready result", func(t *testing.T) {
-		svc, _, _, adm := newFixture(t)
+		svc, _, _, job, adm := newFixture(t)
 		png := pngBytes(t, 2, 2)
 		md := &Metadata{Source: sourcePrinter3mf, Title: strPtr("Title")}
 		svc.finish(adm, Result{PNG: png, Metadata: md}, nil)
 		res, ok := svc.Lookup(serial, true)
 		if !ok || res.Preview.Status != StatusReady {
 			t.Fatalf("Lookup = %+v, %v; want ready", res.Preview, ok)
+		}
+		if res.Preview.Reason != "" {
+			t.Fatalf("reason = %q, want empty for a clean ready", res.Preview.Reason)
 		}
 		sum := sha256.Sum256(png)
 		wantURL := previewURLPrefix + serial + "/preview?v=" + hex.EncodeToString(sum[:])
@@ -559,7 +552,7 @@ func TestFinishPublishesOutcomes(t *testing.T) {
 		if _, err := time.Parse(time.RFC3339Nano, *res.Preview.RetrievedAt); err != nil {
 			t.Fatalf("retrieved_at %q does not parse: %v", *res.Preview.RetrievedAt, err)
 		}
-		if res.Preview.JobName != "Benchy" || !res.Preview.Current {
+		if res.Preview.JobName != job.Name || !res.Preview.Current {
 			t.Fatalf("live projection = %+v, want live name and current", res.Preview)
 		}
 		if !slices.Equal(res.PNG, png) {
@@ -574,13 +567,26 @@ func TestFinishPublishesOutcomes(t *testing.T) {
 		}
 	})
 
-	t.Run("metadata-only partial result", func(t *testing.T) {
-		svc, _, _, adm := newFixture(t)
+	t.Run("png plus metadata error publishes ready with reason", func(t *testing.T) {
+		svc, _, _, _, adm := newFixture(t)
+		png := pngBytes(t, 2, 2)
+		svc.finish(adm, Result{PNG: png}, archiveErr(catArchive, "slice info bad"))
+		res, _ := svc.Lookup(serial, true)
+		if res.Preview.Status != StatusReady || res.Preview.Reason != catArchive {
+			t.Fatalf("view = %+v, want ready with reason archive", res.Preview)
+		}
+		if res.Preview.ImageURL == nil || res.PNG == nil {
+			t.Fatal("partial ready result lost its image")
+		}
+	})
+
+	t.Run("metadata-only with image missing publishes unavailable with reason", func(t *testing.T) {
+		svc, _, _, _, adm := newFixture(t)
 		md := &Metadata{Source: sourcePrinter3mf, Title: strPtr("Title")}
 		svc.finish(adm, Result{Metadata: md}, archiveErr(catImageMissing, "plate image missing"))
 		res, _ := svc.Lookup(serial, true)
-		if res.Preview.Status != StatusUnavailable {
-			t.Fatalf("status = %s, want unavailable", res.Preview.Status)
+		if res.Preview.Status != StatusUnavailable || res.Preview.Reason != catImageMissing {
+			t.Fatalf("view = %+v, want unavailable with reason image_missing", res.Preview)
 		}
 		if res.Metadata == nil || res.Metadata.Title == nil || *res.Metadata.Title != "Title" {
 			t.Fatalf("metadata = %+v, want accepted metadata", res.Metadata)
@@ -593,88 +599,102 @@ func TestFinishPublishesOutcomes(t *testing.T) {
 		}
 	})
 
-	t.Run("pure failure", func(t *testing.T) {
-		svc, _, _, adm := newFixture(t)
-		svc.finish(adm, Result{}, errors.New("no such file"))
+	t.Run("archive failure without data is final after one attempt", func(t *testing.T) {
+		svc, _, _, _, adm := newFixture(t)
+		log := activity.New([]config.Printer{{Serial: serial}})
+		svc.SetActivity(log)
+		svc.finish(adm, Result{}, archiveErr(catArchive, "open archive"))
 		res, _ := svc.Lookup(serial, true)
-		if res.Preview.Status != StatusUnavailable {
-			t.Fatalf("status = %s, want unavailable", res.Preview.Status)
+		if res.Preview.Status != StatusUnavailable || res.Preview.Reason != catArchive {
+			t.Fatalf("view = %+v, want unavailable archive", res.Preview)
+		}
+		if rec, _ := attemptRecord(svc, serial); !rec.final || rec.count != 1 {
+			t.Fatalf("record = %+v, want final count 1", rec)
+		}
+		if events := log.Recent(serial); len(events) != 1 || events[0].Kind != "job_preview_unavailable" {
+			t.Fatalf("activity = %+v, want one job_preview_unavailable", events)
+		}
+	})
+
+	t.Run("transient failure schedules a retry", func(t *testing.T) {
+		svc, _, _, _, adm := newFixture(t)
+		svc.finish(adm, Result{}, &testError{cat: catTransport})
+		res, _ := svc.Lookup(serial, true)
+		if res.Preview.Status != StatusPending || res.Preview.Reason != reasonRetryWait {
+			t.Fatalf("view = %+v, want pending retry_wait", res.Preview)
 		}
 		if res.Preview.RetrievedAt != nil || res.Metadata != nil || res.PNG != nil {
 			t.Fatalf("failed attempt published payload: %+v", res)
 		}
 	})
 
-	t.Run("discard after revision change", func(t *testing.T) {
-		svc, _, rd, adm := newFixture(t)
-		svc.begin(serial, adm)
-		j := settledJob(base, 7)
-		j.Revision = 2
-		rd.set(serial, j)
-		svc.finish(adm, Result{PNG: pngBytes(t, 2, 2)}, nil)
+	t.Run("pause and disconnect do not discard", func(t *testing.T) {
+		svc, conn, rd, job, adm := newFixture(t)
+		paused := job
+		paused.State = "PAUSE"
+		rd.set(serial, paused)
+		conn.setConnected(serial, false)
+		png := pngBytes(t, 2, 2)
+		svc.finish(adm, Result{PNG: png}, nil)
 		res, _ := svc.Lookup(serial, true)
-		if res.Preview.Status != StatusUnavailable || res.PNG != nil || res.Preview.ImageURL != nil {
-			t.Fatalf("stale result served as %+v, want terminal unavailable", res.Preview)
+		if res.Preview.Status != StatusReady || !slices.Equal(res.PNG, png) {
+			t.Fatalf("view = %+v, want the ready result published across pause and disconnect", res.Preview)
 		}
 	})
 
-	t.Run("discard after running epoch change", func(t *testing.T) {
-		svc, _, rd, adm := newFixture(t)
-		svc.begin(serial, adm)
-		j := settledJob(base, 7)
-		j.RunningEpoch = 3 // pause/resume restarted the settling interval
-		rd.set(serial, j)
+	t.Run("accepted result with moved selectors retries immediately", func(t *testing.T) {
+		svc, _, rd, job, adm := newFixture(t)
+		moved := job
+		moved.GCodeFile = "other_plate_2.3mf"
+		moved.PlateIndex = intPtr(2)
+		rd.set(serial, moved)
 		svc.finish(adm, Result{PNG: pngBytes(t, 2, 2)}, nil)
 		res, _ := svc.Lookup(serial, true)
-		if res.Preview.Status != StatusUnavailable || res.PNG != nil {
-			t.Fatalf("result landed across a running epoch change: %+v", res.Preview)
+		if res.Preview.Status != StatusPending || res.PNG != nil {
+			t.Fatalf("view = %+v, want pending without payload", res.Preview)
+		}
+		rec, _ := attemptRecord(svc, serial)
+		if !rec.nextAt.Equal(base) {
+			t.Fatalf("nextAt = %v, want immediate retry at %v", rec.nextAt, base)
 		}
 	})
 
-	t.Run("discard after reconnect", func(t *testing.T) {
-		svc, conn, rd, adm := newFixture(t)
-		svc.begin(serial, adm)
-		conn.bump(serial) // the printer reconnected: the pool generation moves
-		j := settledJob(base, 7)
-		j.StateGen = 5
-		j.ObsGen = 5
-		rd.set(serial, j)
-		svc.finish(adm, Result{PNG: pngBytes(t, 2, 2)}, nil)
-		res, _ := svc.Lookup(serial, true)
-		if res.Preview.Status != StatusUnavailable || res.PNG != nil {
-			t.Fatalf("result landed across a reconnect: %+v", res.Preview)
+	t.Run("stale generation outcome records nothing", func(t *testing.T) {
+		svc, _, rd, _, adm := newFixture(t)
+		// The replacement generation starts its own attempt first.
+		next := runningJob(8)
+		rd.set(serial, next)
+		release := func() {
+			svc.mu.Lock()
+			svc.worker = false
+			svc.mu.Unlock()
 		}
-	})
-
-	t.Run("discard after disconnect", func(t *testing.T) {
-		svc, conn, _, adm := newFixture(t)
-		svc.begin(serial, adm)
-		conn.setConnected(serial, false) // the printer dropped before publish
-		svc.finish(adm, Result{PNG: pngBytes(t, 2, 2)}, nil)
-		res, _ := svc.Lookup(serial, true)
-		if res.Preview.Status != StatusUnavailable || res.PNG != nil {
-			t.Fatalf("result landed across a disconnect: %+v", res.Preview)
+		release()
+		reserveSlot(svc)
+		nextAdm := testAdmission(serial, next)
+		if !svc.begin(serial, nextAdm) {
+			t.Fatal("begin refused the replacement generation")
 		}
-	})
-
-	t.Run("discard after observation goes stale", func(t *testing.T) {
-		svc, _, rd, adm := newFixture(t)
-		svc.begin(serial, adm)
-		j := settledJob(base, 7)
-		j.ObsAt = base.Add(-printerview.FreshnessWindow - time.Second) // report gap
-		rd.set(serial, j)
+		var buf bytes.Buffer
+		svc.log = slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
 		svc.finish(adm, Result{PNG: pngBytes(t, 2, 2)}, nil)
+		if buf.Len() != 0 {
+			t.Fatalf("stale outcome logged: %s", buf.String())
+		}
+		if rec, _ := attemptRecord(svc, serial); rec.gen != 8 || rec.count != 1 {
+			t.Fatalf("record = %+v, want the replacement generation untouched", rec)
+		}
 		res, _ := svc.Lookup(serial, true)
-		if res.Preview.Status != StatusUnavailable || res.PNG != nil {
-			t.Fatalf("result landed across a stale observation: %+v", res.Preview)
+		if res.Preview.Status != StatusPending || res.PNG != nil {
+			t.Fatalf("view = %+v, want pending without stale payload", res.Preview)
 		}
 	})
 }
 
 // TestFinishLogRecordShape drives finish across the outcome classes and
-// pins the one-debug-record contract through slog's JSON serializer:
-// fixed string outcome and phase fields, a published bool separating a
-// served result from a fetched-but-discarded one, a timestamp on every
+// pins the one-Info-record contract through slog's JSON serializer: fixed
+// string outcome and phase fields, a published bool, the attempt budget
+// count, retry_in_s only when a retry is scheduled, a timestamp on every
 // record, and no wrapped error text — FTP reply text or credentials —
 // anywhere in the output.
 func TestFinishLogRecordShape(t *testing.T) {
@@ -685,12 +705,10 @@ func TestFinishLogRecordShape(t *testing.T) {
 	newFixture := func(t *testing.T) (*Service, *jobReader, *admission, *bytes.Buffer) {
 		t.Helper()
 		var buf bytes.Buffer
-		// Debug level is test-only; the production logger keeps its
-		// configured level and the record under test is a Debug event.
 		// The wall-clock time is pinned to a fixed value: its random digits
 		// could contain a leak marker such as "550" and fail by chance.
 		log := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{
-			Level: slog.LevelDebug,
+			Level: slog.LevelInfo,
 			ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
 				if len(groups) == 0 && a.Key == slog.TimeKey {
 					return slog.Time(slog.TimeKey, time.Date(2026, 1, 2, 3, 4, 6, 0, time.UTC))
@@ -700,7 +718,7 @@ func TestFinishLogRecordShape(t *testing.T) {
 		}))
 		clk := &testClock{now: base}
 		conn := newFakeConn(serial)
-		job := settledJob(base, 7)
+		job := runningJob(7)
 		rd := newJobReader(serial, job)
 		printers := []config.Printer{{
 			Serial: serial, Address: serial + ".invalid:8883", Username: "u", Password: "p",
@@ -709,15 +727,11 @@ func TestFinishLogRecordShape(t *testing.T) {
 		svc := New(printers, cache, conn, log)
 		svc.readJob = rd.Job
 		svc.now = clk.Now
-		adm := &admission{
-			printer:  printers[0],
-			job:      job,
-			gen:      7,
-			rev:      1,
-			epoch:    2,
-			upstream: 4,
-		}
 		reserveSlot(svc)
+		adm := testAdmission(serial, job)
+		if !svc.begin(serial, adm) {
+			t.Fatal("begin refused a fresh attempt")
+		}
 		return svc, rd, adm, &buf
 	}
 
@@ -736,8 +750,8 @@ func TestFinishLogRecordShape(t *testing.T) {
 		if rec["msg"] != msg {
 			t.Errorf("msg = %v, want %q", rec["msg"], msg)
 		}
-		if rec["level"] != "DEBUG" {
-			t.Errorf("level = %v, want DEBUG", rec["level"])
+		if rec["level"] != "INFO" {
+			t.Errorf("level = %v, want INFO", rec["level"])
 		}
 		if rec["serial"] != serial {
 			t.Errorf("serial = %v, want %q", rec["serial"], serial)
@@ -752,7 +766,7 @@ func TestFinishLogRecordShape(t *testing.T) {
 		return rec
 	}
 
-	expect := func(t *testing.T, rec map[string]any, outcome, phase string, published bool) {
+	expect := func(t *testing.T, rec map[string]any, outcome, phase string, published bool, attempt float64, retryIn float64) {
 		t.Helper()
 		if rec["outcome"] != outcome {
 			t.Errorf("outcome = %v, want %q", rec["outcome"], outcome)
@@ -767,40 +781,54 @@ func TestFinishLogRecordShape(t *testing.T) {
 		if got != published {
 			t.Errorf("published = %v, want %v", got, published)
 		}
+		if rec["attempt"] != attempt {
+			t.Errorf("attempt = %v, want %v", rec["attempt"], attempt)
+		}
+		gotRetry, hasRetry := rec["retry_in_s"]
+		if retryIn == 0 {
+			if hasRetry {
+				t.Errorf("retry_in_s = %v, want absent", gotRetry)
+			}
+			return
+		}
+		if gotRetry != retryIn {
+			t.Errorf("retry_in_s = %v, want %v", gotRetry, retryIn)
+		}
 	}
 
 	t.Run("ready is published with no failure phase", func(t *testing.T) {
 		svc, _, adm, buf := newFixture(t)
-		svc.begin(serial, adm)
 		svc.finish(adm, Result{PNG: pngBytes(t, 2, 2),
 			Metadata: &Metadata{Source: sourcePrinter3mf, Title: strPtr("T")}}, nil)
-		expect(t, lastRecord(t, buf), catReady, phaseNone, true)
+		expect(t, lastRecord(t, buf), catReady, phaseNone, true, 1, 0)
 	})
 
-	t.Run("fetched ready but discarded is not published", func(t *testing.T) {
+	t.Run("accepted result with moved selectors is not published", func(t *testing.T) {
 		svc, rd, adm, buf := newFixture(t)
-		svc.begin(serial, adm)
-		j := settledJob(base, 7)
-		j.Revision = 2
-		rd.set(serial, j)
+		moved := runningJob(7)
+		moved.GCodeFile = "other.3mf"
+		rd.set(serial, moved)
 		svc.finish(adm, Result{PNG: pngBytes(t, 2, 2)}, nil)
 		// outcome stays ready — the fetch itself succeeded — while
 		// published separates it from a served result.
-		expect(t, lastRecord(t, buf), catReady, phaseNone, false)
+		expect(t, lastRecord(t, buf), catReady, phaseNone, false, 1, 0)
+	})
+
+	t.Run("transient failure schedules a retry", func(t *testing.T) {
+		svc, _, adm, buf := newFixture(t)
+		svc.finish(adm, Result{}, &testError{cat: catTransport})
+		expect(t, lastRecord(t, buf), catTransport, phaseNone, false, 1, 30)
 	})
 
 	t.Run("login failure keeps credential text out", func(t *testing.T) {
 		svc, _, adm, buf := newFixture(t)
-		svc.begin(serial, adm)
 		// The injected secret carries a newline: the serializer must
 		// escape it into one parseable record rather than forge a line.
 		secret := "hunter2-secret\nmarker"
 		err := classifyAttempt(context.Background(),
 			fmt.Errorf("530 login incorrect for user u pass %s", secret), phaseLogin)
 		svc.finish(adm, Result{}, err)
-		// The gate still holds, so the terminal unavailable entry is
-		// published; only the identity of the failure is confidential.
-		expect(t, lastRecord(t, buf), catTransport, phaseLogin, true)
+		expect(t, lastRecord(t, buf), catTransport, phaseLogin, false, 1, 30)
 		for _, leak := range []string{secret, "530 login incorrect"} {
 			if strings.Contains(buf.String(), leak) {
 				t.Errorf("log leaked %q", leak)
@@ -810,11 +838,10 @@ func TestFinishLogRecordShape(t *testing.T) {
 
 	t.Run("size failure keeps reply text out", func(t *testing.T) {
 		svc, _, adm, buf := newFixture(t)
-		svc.begin(serial, adm)
 		err := ftpsErrAt(phaseSize, catTransport,
 			&textproto.Error{Code: 550, Msg: "Permission denied secret-marker-2"})
 		svc.finish(adm, Result{}, err)
-		expect(t, lastRecord(t, buf), catTransport, phaseSize, true)
+		expect(t, lastRecord(t, buf), catTransport, phaseSize, false, 1, 30)
 		for _, leak := range []string{"secret-marker-2", "Permission denied", "550"} {
 			if strings.Contains(buf.String(), leak) {
 				t.Errorf("log leaked %q", leak)
@@ -824,21 +851,18 @@ func TestFinishLogRecordShape(t *testing.T) {
 
 	t.Run("accepted partial archive stays published as archive phase", func(t *testing.T) {
 		svc, _, adm, buf := newFixture(t)
-		svc.begin(serial, adm)
 		svc.finish(adm, Result{Metadata: &Metadata{Source: sourcePrinter3mf, Title: strPtr("T")}},
 			archiveErr(catImageMissing, "plate image absent"))
-		expect(t, lastRecord(t, buf), catImageMissing, phaseArchive, true)
+		expect(t, lastRecord(t, buf), catImageMissing, phaseArchive, true, 1, 0)
 	})
 
-	t.Run("cancelled after the gate broke names no phase", func(t *testing.T) {
-		svc, rd, adm, buf := newFixture(t)
-		svc.begin(serial, adm)
-		j := settledJob(base, 7)
-		j.Active = false
-		j.State = "FINISH"
-		rd.set(serial, j)
+	t.Run("cancelled refunds the budget and names no phase", func(t *testing.T) {
+		svc, _, adm, buf := newFixture(t)
 		svc.finish(adm, Result{}, context.Canceled)
-		expect(t, lastRecord(t, buf), catCancelled, phaseNone, false)
+		expect(t, lastRecord(t, buf), catCancelled, phaseNone, false, 0, 0)
+		if rec, _ := attemptRecord(svc, serial); rec.count != 0 {
+			t.Fatalf("record = %+v, want refunded count 0", rec)
+		}
 	})
 }
 
@@ -846,22 +870,17 @@ func TestRetainedResultAfterTerminal(t *testing.T) {
 	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
 	clk := &testClock{now: base}
 	conn := newFakeConn("S1")
-	job := settledJob(base, 7)
+	job := runningJob(7)
 	rd := newJobReader("S1", job)
 	svc := newTestService(t, conn, rd, clk, "S1")
 	png := pngBytes(t, 2, 2)
-	adm := &admission{
-		printer: config.Printer{Serial: "S1"}, job: job, gen: 7, rev: 1, epoch: 2, upstream: 4,
-	}
-	reserveSlot(svc)
-	svc.begin("S1", adm)
+	adm := beginAttempt(t, svc, "S1", job)
 	svc.finish(adm, Result{PNG: png}, nil)
 
 	// The same generation finishes; the result stays, current flips off.
 	done := job
 	done.Active = false
 	done.State = "FINISH"
-	done.ObsAt = base.Add(-time.Second)
 	rd.set("S1", done)
 
 	res, ok := svc.Lookup("S1", true)
@@ -871,7 +890,7 @@ func TestRetainedResultAfterTerminal(t *testing.T) {
 	if res.Preview.Current {
 		t.Fatal("current = true after terminal report, want false")
 	}
-	if res.Preview.JobName != "Benchy" {
+	if res.Preview.JobName != job.Name {
 		t.Fatalf("job_name = %q, want retained identity", res.Preview.JobName)
 	}
 	if res.Preview.ImageURL == nil || !slices.Equal(res.PNG, png) {
@@ -879,11 +898,14 @@ func TestRetainedResultAfterTerminal(t *testing.T) {
 	}
 }
 
-func TestRevisionAndPreparationInvalidateImmediately(t *testing.T) {
+// TestPlateSelectorChangeInvalidatesAndReadmits pins selector ownership: a
+// plate selector change after publication invalidates the entry, and the
+// next tick re-admits within the same generation's budget.
+func TestPlateSelectorChangeInvalidatesAndReadmits(t *testing.T) {
 	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
 	clk := &testClock{now: base}
 	conn := newFakeConn("S1")
-	job := settledJob(base, 7)
+	job := runningJob(7)
 	rd := newJobReader("S1", job)
 	svc := newTestService(t, conn, rd, clk, "S1")
 	counts := &fetchCounter{}
@@ -893,50 +915,53 @@ func TestRevisionAndPreparationInvalidateImmediately(t *testing.T) {
 		started <- struct{}{}
 		return Result{PNG: pngBytes(t, 2, 2)}, nil
 	}
-	adm := &admission{
-		printer: config.Printer{Serial: "S1"}, job: job, gen: 7, rev: 1, epoch: 2, upstream: 4,
-	}
-	reserveSlot(svc)
-	svc.begin("S1", adm)
+	adm := beginAttempt(t, svc, "S1", job)
 	svc.finish(adm, Result{PNG: pngBytes(t, 2, 2)}, nil)
-
-	// Revision bump: the old payload must never be served again, and no
-	// second attempt is granted within the generation.
-	j := job
-	j.Revision = 2
-	rd.set("S1", j)
-	res, _ := svc.Lookup("S1", true)
-	if res.Preview.Status != StatusUnavailable || res.PNG != nil || res.Preview.ImageURL != nil {
-		t.Fatalf("consumed generation after revision = %+v, want unavailable without payload", res.Preview)
+	if res, _ := svc.Lookup("S1", true); res.Preview.Status != StatusReady {
+		t.Fatalf("setup did not publish: %+v", res.Preview)
 	}
+
+	// The printer later reports a different plate selector: the entry no
+	// longer serves, and the next tick re-admits within budget.
+	moved := job
+	moved.PlateIndex = intPtr(2)
+	rd.set("S1", moved)
+	res, _ := svc.Lookup("S1", true)
+	if res.Preview.Status != StatusPending || res.PNG != nil || res.Preview.ImageURL != nil {
+		t.Fatalf("moved selectors served stale payload: %+v", res.Preview)
+	}
+	svc.mu.Lock()
+	svc.worker = false // beginAttempt reserved the slot; free it for step
+	svc.mu.Unlock()
+	clk.Set(base.Add(time.Second))
 	svc.step(base.Add(time.Second))
-	select {
-	case <-started:
-		t.Fatal("revision granted a second attempt")
-	default:
+	await(t, started)
+	svc.wg.Wait()
+	if got := counts.count(); got != 1 {
+		t.Fatalf("calls = %d, want 1 re-admission within budget", got)
+	}
+	if rec, _ := attemptRecord(svc, "S1"); rec.gen != 7 || rec.count != 2 {
+		t.Fatalf("record = %+v, want gen 7 count 2", rec)
+	}
+	res, _ = svc.Lookup("S1", true)
+	if res.Preview.Status != StatusReady {
+		t.Fatalf("re-admitted result = %+v, want ready for the new selectors", res.Preview)
 	}
 
 	// New preparation: new generation, pending, still no attempt while
-	// the printer is not RUNNING.
-	j = job
-	j.Generation = 8
-	j.Revision = 1
-	j.State = "PREPARE"
-	j.RunningSince = time.Time{}
-	j.ObsAt = base.Add(-time.Second)
-	rd.set("S1", j)
+	// the printer is not executing.
+	prep := job
+	prep.Generation = 8
+	prep.State = "PREPARE"
+	rd.set("S1", prep)
 	res, _ = svc.Lookup("S1", true)
-	if res.Preview.Status != StatusPending || !res.Preview.Current {
-		t.Fatalf("new preparation projection = %+v, want pending and current", res.Preview)
+	if res.Preview.Status != StatusPending || !res.Preview.Current || res.Preview.Reason != reasonWaitingForPrint {
+		t.Fatalf("new preparation projection = %+v, want pending waiting_for_print", res.Preview)
 	}
+	clk.Set(base.Add(2 * time.Second))
 	svc.step(base.Add(2 * time.Second))
-	select {
-	case <-started:
-		t.Fatal("PREPARE granted an attempt")
-	default:
-	}
-	if counts.count() != 0 {
-		t.Fatalf("calls = %d, want 0", counts.count())
+	if got := counts.count(); got != 1 {
+		t.Fatalf("calls = %d, want 1: PREPARE must not admit", got)
 	}
 }
 
@@ -944,18 +969,15 @@ func TestLookupBoundaryDoubleSample(t *testing.T) {
 	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
 	clk := &testClock{now: base}
 	conn := newFakeConn("S1")
-	job := settledJob(base, 7)
+	job := runningJob(7)
 	rd := newJobReader("S1", job)
 	svc := newTestService(t, conn, rd, clk, "S1")
 	png := pngBytes(t, 2, 2)
-	adm := &admission{
-		printer: config.Printer{Serial: "S1"}, job: job, gen: 7, rev: 1, epoch: 2, upstream: 4,
-	}
-	reserveSlot(svc)
-	svc.begin("S1", adm)
+	adm := beginAttempt(t, svc, "S1", job)
 	svc.finish(adm, Result{PNG: png}, nil)
 
-	next := settledJob(base, 8) // generation boundary between the two samples
+	next := runningJob(8) // generation boundary between the two samples
+	next.Name = "b.3mf"
 	rd.seq = []telemetry.JobView{job, next}
 	res, ok := svc.Lookup("S1", true)
 	if !ok {
@@ -980,7 +1002,7 @@ func TestLookupUnconfiguredAndUnobserved(t *testing.T) {
 	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
 	clk := &testClock{now: base}
 	conn := newFakeConn("S1")
-	rd := newJobReader("S1", settledJob(base, 7))
+	rd := newJobReader("S1", runningJob(7))
 	svc := newTestService(t, conn, rd, clk, "S1")
 
 	if _, ok := svc.Lookup("OTHER", true); ok {
@@ -1005,7 +1027,7 @@ func TestConcurrentLookupsSingleAttempt(t *testing.T) {
 	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
 	clk := &testClock{now: base}
 	conn := newFakeConn("S1")
-	rd := newJobReader("S1", settledJob(base, 7))
+	rd := newJobReader("S1", runningJob(7))
 	svc := newTestService(t, conn, rd, clk, "S1")
 	counts := &fetchCounter{}
 	started := make(chan struct{}, 4)
@@ -1025,10 +1047,8 @@ func TestConcurrentLookupsSingleAttempt(t *testing.T) {
 			svc.Lookup("S1", i%2 == 0)
 		}(i)
 	}
-	at := base.Add(60 * time.Second)
-	j := settledJob(at, 7)
-	j.RunningSince = base
-	rd.set("S1", j)
+	at := base.Add(time.Second)
+	rd.set("S1", runningJob(7))
 	clk.Set(at)
 	svc.step(at)
 	await(t, started)
@@ -1064,7 +1084,7 @@ func TestCloseCancelsInFlightFetch(t *testing.T) {
 	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
 	clk := &testClock{now: base}
 	conn := newFakeConn("S1")
-	rd := newJobReader("S1", settledJob(base, 7))
+	rd := newJobReader("S1", runningJob(7))
 	svc := newTestService(t, conn, rd, clk, "S1")
 	counts := &fetchCounter{}
 	started := make(chan struct{}, 4)
@@ -1085,10 +1105,8 @@ func TestCloseCancelsInFlightFetch(t *testing.T) {
 		close(fetchDone)
 		return Result{}, ferr
 	}
-	at := base.Add(60 * time.Second)
-	j := settledJob(at, 7)
-	j.RunningSince = base
-	rd.set("S1", j)
+	at := base.Add(time.Second)
+	rd.set("S1", runningJob(7))
 	clk.Set(at)
 	svc.step(at)
 	await(t, started)
@@ -1144,71 +1162,66 @@ func TestCloseCancelsInFlightFetch(t *testing.T) {
 		t.Fatalf("calls = %d, want 1", counts.count())
 	}
 	// After Close, no further reservations and no payload from a
-	// cancelled attempt.
+	// cancelled attempt; the projection names the shutdown.
 	svc.step(base.Add(61 * time.Second))
 	if counts.count() != 1 {
 		t.Fatalf("calls = %d after close, want 1", counts.count())
 	}
 	res, ok := svc.Lookup("S1", true)
-	if !ok || res.Preview.Status != StatusUnavailable {
-		t.Fatalf("Lookup after cancelled attempt = %+v; want terminal unavailable", res.Preview)
+	if !ok || res.Preview.Status != StatusUnavailable || res.Preview.Reason != reasonProxyStopping {
+		t.Fatalf("Lookup after cancelled attempt = %+v; want unavailable proxy_stopping", res.Preview)
 	}
 }
 
-// TestSchedulerCancelsReconnectedUpstream pins the captured-upstream
-// equality in the strict gate: a printer that reconnects and reports fresh
-// RUNNING on the new connection invalidates the attempt admitted on the
-// old one, even with the job otherwise unchanged.
-func TestSchedulerCancelsReconnectedUpstream(t *testing.T) {
+// TestSchedulerSurvivesDisconnectPinsGenerationCancel proves the transfer
+// gate: a connectivity drop mid-transfer never cancels, while a new job
+// generation cancels the attempt and refunds its budget.
+func TestSchedulerSurvivesDisconnectPinsGenerationCancel(t *testing.T) {
 	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
 	clk := &testClock{now: base}
 	conn := newFakeConn("S1")
-	rd := newJobReader("S1", settledJob(base, 7))
+	rd := newJobReader("S1", runningJob(7))
 	svc := newTestService(t, conn, rd, clk, "S1")
-	counts := &fetchCounter{}
 	started := make(chan struct{}, 4)
 	done := make(chan struct{})
 	var ferr error
+	release := make(chan struct{})
 	svc.fetch = func(ctx context.Context, p config.Printer, j telemetry.JobView) (Result, error) {
-		counts.add(p.Serial)
 		started <- struct{}{}
-		<-ctx.Done()
-		ferr = ctx.Err()
+		select {
+		case <-ctx.Done():
+			ferr = ctx.Err()
+		case <-release:
+		}
 		close(done)
 		return Result{}, ferr
 	}
-	at := base.Add(60 * time.Second)
-	j := settledJob(at, 7)
-	j.RunningSince = base
-	rd.set("S1", j)
+	at := base.Add(time.Second)
 	clk.Set(at)
 	svc.step(at)
 	await(t, started)
 
-	// Reconnect: the pool generation moves and the printer reports fresh
-	// RUNNING on the new connection with the same preview generation,
-	// revision and running epoch. Only the captured-upstream equality
-	// catches this.
-	conn.bump("S1")
-	reconnected := settledJob(at, 7)
-	reconnected.StateGen = 5
-	reconnected.ObsGen = 5
-	reconnected.ObsAt = at.Add(-time.Second)
-	rd.set("S1", reconnected)
+	// The printer drops mid-transfer: the attempt keeps running.
+	conn.setConnected("S1", false)
 	clk.Set(at.Add(time.Second))
 	svc.step(at.Add(time.Second))
+	select {
+	case <-done:
+		t.Fatal("connectivity drop cancelled the transfer")
+	default:
+	}
+
+	// A new job generation cancels it and refunds the consumed budget.
+	rd.set("S1", runningJob(8))
+	clk.Set(at.Add(2 * time.Second))
+	svc.step(at.Add(2 * time.Second))
 	await(t, done)
 	svc.wg.Wait()
-
 	if !errors.Is(ferr, context.Canceled) {
 		t.Fatalf("fetch error = %v, want context.Canceled", ferr)
 	}
-	if counts.count() != 1 {
-		t.Fatalf("calls = %d, want 1", counts.count())
-	}
-	res, _ := svc.Lookup("S1", true)
-	if res.Preview.Status != StatusUnavailable || res.PNG != nil {
-		t.Fatalf("reconnected attempt left %+v, want unavailable without payload", res.Preview)
+	if rec, _ := attemptRecord(svc, "S1"); rec.gen != 7 || rec.count != 0 {
+		t.Fatalf("record = %+v, want gen 7 refunded to count 0", rec)
 	}
 }
 
@@ -1216,7 +1229,7 @@ func TestStartCloseIdempotent(t *testing.T) {
 	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
 	clk := &testClock{now: base}
 	conn := newFakeConn("S1")
-	rd := newJobReader("S1", settledJob(base, 7))
+	rd := newJobReader("S1", runningJob(7))
 	svc := newTestService(t, conn, rd, clk, "S1")
 	svc.fetch = func(ctx context.Context, p config.Printer, j telemetry.JobView) (Result, error) {
 		return Result{}, &testError{cat: catTransport}
@@ -1238,7 +1251,7 @@ func TestMetadataDeepCopyIsolation(t *testing.T) {
 	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
 	clk := &testClock{now: base}
 	conn := newFakeConn("S1")
-	job := settledJob(base, 7)
+	job := runningJob(7)
 	rd := newJobReader("S1", job)
 	svc := newTestService(t, conn, rd, clk, "S1")
 	originalPNG := pngBytes(t, 2, 2)
@@ -1252,11 +1265,7 @@ func TestMetadataDeepCopyIsolation(t *testing.T) {
 		Warnings:    []SlicerWarning{{Code: "c", Message: "m"}},
 		Process:     &Process{LayerHeightMM: fPtr(0.2)},
 	}
-	adm := &admission{
-		printer: config.Printer{Serial: "S1"}, job: job, gen: 7, rev: 1, epoch: 2, upstream: 4,
-	}
-	reserveSlot(svc)
-	svc.begin("S1", adm)
+	adm := beginAttempt(t, svc, "S1", job)
 	svc.finish(adm, Result{Metadata: md, PNG: originalPNG}, nil)
 
 	first, _ := svc.Lookup("S1", true)
@@ -1317,18 +1326,20 @@ func TestOutcomeCategories(t *testing.T) {
 }
 
 // TestRealCacheSchedulerFlow drives the service against the real telemetry
-// cache with real report timestamps and real step times: pending while
-// settling, no fetch attempts, and the live projection tracking the job.
+// cache with real report timestamps and real step times: waiting while
+// preparing, one attempt on the first RUNNING tick, the attempt surviving
+// a metadata delta, and the live projection tracking the job.
 func TestRealCacheSchedulerFlow(t *testing.T) {
 	printers := []config.Printer{{Serial: "S1", Address: "s1.invalid:8883"}}
 	cache := telemetry.NewCache(printers, testLogger())
 	conn := newFakeConn("S1")
-	conn.gens["S1"] = 1
 	svc := New(printers, cache, conn, testLogger())
 	counts := &fetchCounter{}
+	started := make(chan struct{}, 4)
 	svc.fetch = func(ctx context.Context, p config.Printer, j telemetry.JobView) (Result, error) {
 		counts.add(p.Serial)
-		return Result{}, errors.New("must not be called")
+		started <- struct{}{}
+		return Result{}, &testError{cat: catTransport}
 	}
 	t.Cleanup(svc.Close)
 
@@ -1347,18 +1358,24 @@ func TestRealCacheSchedulerFlow(t *testing.T) {
 	if !ok || res.Preview.Status != StatusPending || !res.Preview.Current || res.Preview.JobName != "Job One" {
 		t.Fatalf("projection = %+v, %v; want pending current job", res.Preview, ok)
 	}
-
-	cache.ObserveReport("S1", 2, 1, report(map[string]any{"gcode_state": "RUNNING"}))
-	svc.step(time.Now()) // real clock: RUNNING began moments ago, not settled
-	if counts.count() != 0 {
-		t.Fatalf("calls = %d, want 0 while settling", counts.count())
+	if res.Preview.Reason != reasonWaitingForPrint {
+		t.Fatalf("reason = %q, want waiting_for_print", res.Preview.Reason)
 	}
 
-	// Metadata-only deltas never refresh the observation and never fetch.
+	cache.ObserveReport("S1", 2, 1, report(map[string]any{"gcode_state": "RUNNING"}))
+	svc.step(time.Now())
+	await(t, started)
+	svc.wg.Wait()
+	if counts.count() != 1 {
+		t.Fatalf("calls = %d, want 1 on the first RUNNING tick", counts.count())
+	}
+
+	// A metadata-only delta never cancels and never re-admits before the
+	// retry time: the projection names the backoff.
 	cache.ObserveReport("S1", 3, 1, report(map[string]any{"gcode_file": "other.3mf"}))
 	res, _ = svc.Lookup("S1", false)
-	if res.Preview.Status != StatusPending {
-		t.Fatalf("status after metadata delta = %s, want pending", res.Preview.Status)
+	if res.Preview.Status != StatusPending || res.Preview.Reason != reasonRetryWait {
+		t.Fatalf("view after metadata delta = %+v, want pending retry_wait", res.Preview)
 	}
 
 	cache.ObserveReport("S1", 4, 1, report(map[string]any{"gcode_state": "FINISH"}))
@@ -1366,120 +1383,16 @@ func TestRealCacheSchedulerFlow(t *testing.T) {
 	if res.Preview.Status != StatusUnavailable || res.Preview.Current {
 		t.Fatalf("projection after finish = %+v, want unavailable", res.Preview)
 	}
-	if counts.count() != 0 {
-		t.Fatalf("calls = %d, want 0 across the whole flow", counts.count())
-	}
 }
 
-// TestSchedulerCancelsStaleTransfer proves the scheduler owns in-flight
-// invalidation: a tick that finds the job out of RUNNING cancels the
-// transfer, the result is discarded, and the attempt stays consumed.
-func TestSchedulerCancelsStaleTransfer(t *testing.T) {
+// TestTransferSurvivesPause proves pause never invalidates: a tick that
+// finds the job paused leaves the transfer running, and its result still
+// publishes.
+func TestTransferSurvivesPause(t *testing.T) {
 	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
 	clk := &testClock{now: base}
 	conn := newFakeConn("S1")
-	rd := newJobReader("S1", settledJob(base, 7))
-	svc := newTestService(t, conn, rd, clk, "S1")
-	counts := &fetchCounter{}
-	started := make(chan struct{}, 4)
-	done := make(chan struct{})
-	var ferr error
-	svc.fetch = func(ctx context.Context, p config.Printer, j telemetry.JobView) (Result, error) {
-		counts.add(p.Serial)
-		started <- struct{}{}
-		<-ctx.Done()
-		ferr = ctx.Err()
-		close(done)
-		return Result{}, ferr
-	}
-	at := base.Add(60 * time.Second)
-	j := settledJob(at, 7)
-	j.RunningSince = base
-	rd.set("S1", j)
-	clk.Set(at)
-	svc.step(at)
-	await(t, started)
-
-	// The job leaves RUNNING: pause moves the running epoch, exactly as
-	// the telemetry merge does.
-	paused := settledJob(at, 7)
-	paused.State = "PAUSE"
-	paused.RunningEpoch = 3
-	paused.ObsAt = at.Add(-time.Second)
-	rd.set("S1", paused)
-	clk.Set(at.Add(time.Second))
-	svc.step(at.Add(time.Second)) // this tick invalidates and cancels
-	await(t, done)
-	svc.wg.Wait()
-
-	if !errors.Is(ferr, context.Canceled) {
-		t.Fatalf("fetch error = %v, want context.Canceled", ferr)
-	}
-	if counts.count() != 1 {
-		t.Fatalf("calls = %d, want 1", counts.count())
-	}
-	res, _ := svc.Lookup("S1", true)
-	if res.Preview.Status != StatusUnavailable || res.PNG != nil {
-		t.Fatalf("cancelled attempt left %+v, want unavailable without payload", res.Preview)
-	}
-}
-
-// TestTransferCancelBeforeDial pins the pre-dial recheck: a state change
-// between admission and the fetch call must fail the recheck and consume
-// the attempt without any dial.
-func TestTransferCancelBeforeDial(t *testing.T) {
-	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
-	clk := &testClock{now: base}
-	conn := newFakeConn("S1")
-	job := settledJob(base, 7)
-	rd := newJobReader("S1", job)
-	svc := newTestService(t, conn, rd, clk, "S1")
-	adm := &admission{
-		printer: config.Printer{Serial: "S1"}, job: job, gen: 7, rev: 1, epoch: 2, upstream: 4,
-	}
-	if !svc.transferValid(adm, base) {
-		t.Fatal("fresh admission must pass the pre-dial recheck")
-	}
-	j := job
-	j.Revision = 2
-	rd.set("S1", j)
-	if svc.transferValid(adm, base) {
-		t.Fatal("revision change must fail the pre-dial recheck")
-	}
-
-	counts := &fetchCounter{}
-	svc.fetch = func(ctx context.Context, p config.Printer, j telemetry.JobView) (Result, error) {
-		counts.add(p.Serial)
-		return Result{PNG: pngBytes(t, 2, 2)}, nil
-	}
-	done := make(chan struct{})
-	reserveSlot(svc)
-	svc.begin("S1", adm)
-	svc.wg.Add(1) // step registers the slot before launching; mirror it here
-	go func() {
-		svc.transfer(adm)
-		close(done)
-	}()
-	await(t, done)
-	if counts.count() != 0 {
-		t.Fatalf("calls = %d, want 0: fetch must not dial after a failed preflight", counts.count())
-	}
-	res, _ := svc.Lookup("S1", true)
-	if res.Preview.Status != StatusUnavailable || res.PNG != nil {
-		t.Fatalf("cancelled attempt left %+v, want unavailable without payload", res.Preview)
-	}
-}
-
-// TestPublishDiscardedAfterTerminalDuringTransfer: the publish gate is the
-// same strict check as the transfer gate, with no late-landing exception —
-// a success completing after the same generation finished is discarded.
-// (Retention after FINISH applies to already published entries, which
-// TestRetainedResultAfterTerminal covers.)
-func TestPublishDiscardedAfterTerminalDuringTransfer(t *testing.T) {
-	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
-	clk := &testClock{now: base}
-	conn := newFakeConn("S1")
-	rd := newJobReader("S1", settledJob(base, 7))
+	rd := newJobReader("S1", runningJob(7))
 	svc := newTestService(t, conn, rd, clk, "S1")
 	png := pngBytes(t, 2, 2)
 	started := make(chan struct{}, 4)
@@ -1489,77 +1402,154 @@ func TestPublishDiscardedAfterTerminalDuringTransfer(t *testing.T) {
 		<-release
 		return Result{PNG: png}, nil
 	}
-	at := base.Add(60 * time.Second)
-	j := settledJob(at, 7)
-	j.RunningSince = base
-	rd.set("S1", j)
+	at := base.Add(time.Second)
+	clk.Set(at)
+	svc.step(at)
+	await(t, started)
+
+	paused := runningJob(7)
+	paused.State = "PAUSE"
+	rd.set("S1", paused)
+	clk.Set(at.Add(time.Second))
+	svc.step(at.Add(time.Second)) // the transfer slot is busy; nothing cancels
+	close(release)
+	svc.wg.Wait()
+
+	res, _ := svc.Lookup("S1", true)
+	if res.Preview.Status != StatusReady || !slices.Equal(res.PNG, png) {
+		t.Fatalf("view = %+v, want the ready result published across the pause", res.Preview)
+	}
+}
+
+// TestTransferCancelBeforeDial pins the pre-dial recheck: a new job
+// generation between admission and the fetch call must fail the recheck,
+// refund the budget, and skip the dial. A pause in the same window passes.
+func TestTransferCancelBeforeDial(t *testing.T) {
+	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
+	clk := &testClock{now: base}
+	conn := newFakeConn("S1")
+	job := runningJob(7)
+	rd := newJobReader("S1", job)
+	svc := newTestService(t, conn, rd, clk, "S1")
+	adm := testAdmission("S1", job)
+	if !svc.transferValid(adm, base) {
+		t.Fatal("fresh admission must pass the pre-dial recheck")
+	}
+	paused := job
+	paused.State = "PAUSE"
+	rd.set("S1", paused)
+	if !svc.transferValid(adm, base) {
+		t.Fatal("pause must pass the pre-dial recheck")
+	}
+	rd.set("S1", runningJob(8))
+	if svc.transferValid(adm, base) {
+		t.Fatal("generation change must fail the pre-dial recheck")
+	}
+
+	counts := &fetchCounter{}
+	svc.fetch = func(ctx context.Context, p config.Printer, j telemetry.JobView) (Result, error) {
+		counts.add(p.Serial)
+		return Result{PNG: pngBytes(t, 2, 2)}, nil
+	}
+	done := make(chan struct{})
+	reserveSlot(svc)
+	if !svc.begin("S1", adm) {
+		t.Fatal("begin refused a fresh attempt")
+	}
+	svc.wg.Add(1) // step registers the slot before launching; mirror it here
+	go func() {
+		svc.transfer(adm)
+		close(done)
+	}()
+	await(t, done)
+	if counts.count() != 0 {
+		t.Fatalf("calls = %d, want 0: fetch must not dial after a failed preflight", counts.count())
+	}
+	// The cancelled pre-dial attempt refunds its budget: the replacement
+	// generation starts fresh, and the stale admission recorded nothing.
+	if rec, _ := attemptRecord(svc, "S1"); rec.gen != 7 || rec.count != 0 {
+		t.Fatalf("record = %+v, want gen 7 refunded to count 0", rec)
+	}
+}
+
+// TestPublishAfterFinishDuringTransfer: the selectors still match when the
+// same generation finished mid-transfer, so the late success still
+// publishes and is retained with current flipped off.
+func TestPublishAfterFinishDuringTransfer(t *testing.T) {
+	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
+	clk := &testClock{now: base}
+	conn := newFakeConn("S1")
+	rd := newJobReader("S1", runningJob(7))
+	svc := newTestService(t, conn, rd, clk, "S1")
+	png := pngBytes(t, 2, 2)
+	started := make(chan struct{}, 4)
+	release := make(chan struct{})
+	svc.fetch = func(ctx context.Context, p config.Printer, j telemetry.JobView) (Result, error) {
+		started <- struct{}{}
+		<-release
+		return Result{PNG: png}, nil
+	}
+	at := base.Add(time.Second)
 	clk.Set(at)
 	svc.step(at)
 	await(t, started)
 
 	// The generation finishes while the transfer is still in flight; no
 	// tick runs, so the outcome lands once the fetch returns.
-	fin := settledJob(at, 7)
+	fin := runningJob(7)
 	fin.Active = false
 	fin.State = "FINISH"
-	fin.RunningEpoch = 3 // the terminal report leaves RUNNING
-	fin.ObsAt = at.Add(-time.Second)
 	rd.set("S1", fin)
 	close(release)
 	svc.wg.Wait()
 
 	res, _ := svc.Lookup("S1", true)
-	if res.Preview.Status != StatusUnavailable || res.PNG != nil || res.Preview.ImageURL != nil {
-		t.Fatalf("late success after terminal = %+v, want discarded unavailable", res.Preview)
+	if res.Preview.Status != StatusReady || !slices.Equal(res.PNG, png) || res.Preview.Current {
+		t.Fatalf("late success after finish = %+v, want retained ready not current", res.Preview)
 	}
 }
 
-// TestPublishDiscardedAfterPauseDuringTransfer: a pause while transferring
-// discards the result; the generation reads unavailable, never pending.
-func TestPublishDiscardedAfterPauseDuringTransfer(t *testing.T) {
+// TestPublishAfterPauseDuringTransfer: a pause while transferring never
+// discards the result; the generation reads ready.
+func TestPublishAfterPauseDuringTransfer(t *testing.T) {
 	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
 	clk := &testClock{now: base}
 	conn := newFakeConn("S1")
-	rd := newJobReader("S1", settledJob(base, 7))
+	rd := newJobReader("S1", runningJob(7))
 	svc := newTestService(t, conn, rd, clk, "S1")
+	png := pngBytes(t, 2, 2)
 	started := make(chan struct{}, 4)
 	release := make(chan struct{})
 	svc.fetch = func(ctx context.Context, p config.Printer, j telemetry.JobView) (Result, error) {
 		started <- struct{}{}
 		<-release
-		return Result{PNG: pngBytes(t, 2, 2)}, nil
+		return Result{PNG: png}, nil
 	}
-	at := base.Add(60 * time.Second)
-	j := settledJob(at, 7)
-	j.RunningSince = base
-	rd.set("S1", j)
+	at := base.Add(time.Second)
 	clk.Set(at)
 	svc.step(at)
 	await(t, started)
 
-	paused := settledJob(at, 7)
+	paused := runningJob(7)
 	paused.State = "PAUSE"
-	paused.RunningEpoch = 3
-	paused.ObsAt = at.Add(-time.Second)
 	rd.set("S1", paused)
 	close(release)
 	svc.wg.Wait()
 
 	res, _ := svc.Lookup("S1", true)
-	if res.Preview.Status != StatusUnavailable || res.PNG != nil || res.Preview.ImageURL != nil {
-		t.Fatalf("paused transfer outcome = %+v, want discarded unavailable", res.Preview)
+	if res.Preview.Status != StatusReady || !slices.Equal(res.PNG, png) {
+		t.Fatalf("paused transfer outcome = %+v, want ready", res.Preview)
 	}
 }
 
-// TestInFlightAndConsumedStatuses pins the pending/unavailable lifecycle:
-// pending only while the admitted generation's transfer can still produce
-// a result, unavailable once its attempt is consumed, and pending again
-// for a fresh generation.
-func TestInFlightAndConsumedStatuses(t *testing.T) {
+// TestInFlightAndRetryStatuses pins the pending lifecycle: downloading
+// while the transfer is in flight, retry_wait after a transient failure,
+// and a fresh downloading projection for a new generation.
+func TestInFlightAndRetryStatuses(t *testing.T) {
 	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
 	clk := &testClock{now: base}
 	conn := newFakeConn("S1")
-	rd := newJobReader("S1", settledJob(base, 7))
+	rd := newJobReader("S1", runningJob(7))
 	svc := newTestService(t, conn, rd, clk, "S1")
 	counts := &fetchCounter{}
 	started := make(chan struct{}, 4)
@@ -1571,15 +1561,12 @@ func TestInFlightAndConsumedStatuses(t *testing.T) {
 		return Result{}, &testError{cat: catTransport}
 	}
 
-	// Settling, not yet attempted: pending.
+	// Not yet attempted: pending, downloading.
 	res, _ := svc.Lookup("S1", true)
-	if res.Preview.Status != StatusPending {
-		t.Fatalf("settling status = %s, want pending", res.Preview.Status)
+	if res.Preview.Status != StatusPending || res.Preview.Reason != reasonDownloading {
+		t.Fatalf("fresh view = %+v, want pending downloading", res.Preview)
 	}
-	at := base.Add(60 * time.Second)
-	j := settledJob(at, 7)
-	j.RunningSince = base
-	rd.set("S1", j)
+	at := base.Add(time.Second)
 	clk.Set(at)
 	svc.step(at)
 	await(t, started)
@@ -1590,10 +1577,10 @@ func TestInFlightAndConsumedStatuses(t *testing.T) {
 		t.Fatal("in-flight transfer not registered for cancellation")
 	}
 
-	// Transfer in progress for this generation: pending.
+	// Transfer in progress for this generation: pending, downloading.
 	res, _ = svc.Lookup("S1", true)
-	if res.Preview.Status != StatusPending {
-		t.Fatalf("in-flight status = %s, want pending", res.Preview.Status)
+	if res.Preview.Status != StatusPending || res.Preview.Reason != reasonDownloading {
+		t.Fatalf("in-flight view = %+v, want pending downloading", res.Preview)
 	}
 	close(release)
 	svc.wg.Wait()
@@ -1601,61 +1588,64 @@ func TestInFlightAndConsumedStatuses(t *testing.T) {
 		t.Fatal("active transfer outlived the worker slot")
 	}
 
-	// Attempt consumed without a published result: terminal unavailable.
+	// Transient failure: pending, retry_wait.
 	res, _ = svc.Lookup("S1", true)
-	if res.Preview.Status != StatusUnavailable {
-		t.Fatalf("consumed status = %s, want unavailable", res.Preview.Status)
+	if res.Preview.Status != StatusPending || res.Preview.Reason != reasonRetryWait {
+		t.Fatalf("retry view = %+v, want pending retry_wait", res.Preview)
 	}
 	if counts.count() != 1 {
 		t.Fatalf("calls = %d, want 1", counts.count())
 	}
 
-	// A new generation has not spent its attempt: pending again.
-	next := settledJob(base.Add(61*time.Second), 8)
-	rd.set("S1", next)
+	// A new generation ignores the old record: pending, downloading.
+	rd.set("S1", runningJob(8))
 	res, _ = svc.Lookup("S1", true)
-	if res.Preview.Status != StatusPending {
-		t.Fatalf("new generation status = %s, want pending", res.Preview.Status)
+	if res.Preview.Status != StatusPending || res.Preview.Reason != reasonDownloading {
+		t.Fatalf("new generation view = %+v, want pending downloading", res.Preview)
 	}
 }
 
-// TestBeginReservationRules pins begin's guards: the allowance is consumed
-// only by a caller holding the reserved sole transfer slot, only once per
-// generation, and never on a closed service.
+// TestBeginReservationRules pins begin's guards: the budget is consumed
+// only by a caller holding the reserved sole transfer slot, up to
+// maxAttempts per generation outside backoff, and never on a closed
+// service. A new generation replaces the old record.
 func TestBeginReservationRules(t *testing.T) {
 	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
 	conn := newFakeConn("S1")
-	job := settledJob(base, 7)
+	job := runningJob(7)
 	newSvc := func() *Service {
 		return newTestService(t, conn, newJobReader("S1", job), &testClock{now: base}, "S1")
 	}
-	adm := func() *admission {
-		return &admission{printer: config.Printer{Serial: "S1"}, job: job, gen: 7, rev: 1, epoch: 2, upstream: 4}
-	}
+	adm := func() *admission { return testAdmission("S1", job) }
 
 	// Without the reserved sole slot, begin consumes nothing.
 	unreserved := newSvc()
 	if unreserved.begin("S1", adm()) {
 		t.Fatal("begin without the reserved sole slot must fail")
 	}
-	if unreserved.attemptedGeneration("S1", 7) {
-		t.Fatal("a refused reservation consumed the attempt")
+	if _, ok := attemptRecord(unreserved, "S1"); ok {
+		t.Fatal("a refused reservation consumed the budget")
 	}
 
-	// With the slot reserved, exactly one begin per generation succeeds.
+	// With the slot reserved, begins consume the budget up to the cap.
 	svc := newSvc()
 	reserveSlot(svc)
-	if !svc.begin("S1", adm()) {
-		t.Fatal("begin with the reserved sole slot must succeed")
+	for i := 1; i <= maxAttempts; i++ {
+		if !svc.begin("S1", adm()) {
+			t.Fatalf("begin %d with the reserved sole slot must succeed", i)
+		}
 	}
 	if svc.begin("S1", adm()) {
-		t.Fatal("begin must refuse an already consumed generation")
+		t.Fatal("begin past maxAttempts must fail")
+	}
+	if rec, _ := attemptRecord(svc, "S1"); rec.count != maxAttempts {
+		t.Fatalf("record = %+v, want count %d", rec, maxAttempts)
 	}
 	svc.mu.Lock()
 	inflight := svc.inflight["S1"]
 	svc.mu.Unlock()
 	if inflight == nil || inflight.gen != 7 {
-		t.Fatal("the first admission must stay registered as in flight")
+		t.Fatal("the latest admission must stay registered as in flight")
 	}
 
 	// A closed service refuses and consumes nothing.
@@ -1667,31 +1657,34 @@ func TestBeginReservationRules(t *testing.T) {
 	if closedSvc.begin("S1", adm()) {
 		t.Fatal("begin on a closed service must fail")
 	}
-	if closedSvc.attemptedGeneration("S1", 7) {
-		t.Fatal("a closed-service refusal consumed the attempt")
+	if _, ok := attemptRecord(closedSvc, "S1"); ok {
+		t.Fatal("a closed-service refusal consumed the budget")
+	}
+
+	// A new generation replaces the spent record with a fresh budget.
+	next := runningJob(8)
+	nextAdm := testAdmission("S1", next)
+	if !svc.begin("S1", nextAdm) {
+		t.Fatal("begin for a new generation must succeed")
+	}
+	if rec, _ := attemptRecord(svc, "S1"); rec.gen != 8 || rec.count != 1 {
+		t.Fatalf("record = %+v, want fresh gen 8 count 1", rec)
 	}
 }
 
 // TestPreflightBarrierBetweenReservationAndAdmission pins the window
-// between reserving the sole slot and consuming the attempt: a pause or a
-// stale observation in the preflight re-read releases the reservation
-// without consuming the allowance, a revision is absorbed into the
-// re-read snapshot, and a closed service admits nothing.
+// between reserving the sole slot and consuming the budget: a pause in
+// the preflight re-read still proceeds, a generation change or a
+// disconnect in the window releases the reservation without consuming
+// the budget, and a closed service admits nothing.
 func TestPreflightBarrierBetweenReservationAndAdmission(t *testing.T) {
 	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
-	at := base.Add(60 * time.Second)
-	settled := func(obsAt time.Time, rev uint64) telemetry.JobView {
-		j := settledJob(at, 7)
-		j.RunningSince = base
-		j.ObsAt = obsAt
-		j.Revision = rev
-		return j
-	}
+	at := base.Add(time.Second)
 
-	t.Run("pause in preflight releases without consuming", func(t *testing.T) {
+	t.Run("pause in preflight still proceeds", func(t *testing.T) {
 		clk := &testClock{now: base}
 		conn := newFakeConn("S1")
-		rd := newJobReader("S1", settledJob(base, 7))
+		rd := newJobReader("S1", runningJob(7))
 		svc := newTestService(t, conn, rd, clk, "S1")
 		counts := &fetchCounter{}
 		started := make(chan struct{}, 4)
@@ -1701,21 +1694,52 @@ func TestPreflightBarrierBetweenReservationAndAdmission(t *testing.T) {
 			return Result{}, &testError{cat: catTransport}
 		}
 		// The first read passes eligibility; the preflight re-read sees
-		// the pause that landed inside the reservation window.
-		paused := settled(at.Add(-time.Second), 1)
+		// the pause that landed inside the reservation window. Pause is
+		// eligible, so the attempt proceeds.
+		paused := runningJob(7)
 		paused.State = "PAUSE"
-		paused.RunningEpoch = 3
-		rd.seq = []telemetry.JobView{settled(at.Add(-time.Second), 1), paused}
+		rd.seq = []telemetry.JobView{runningJob(7), paused}
 		clk.Set(at)
 		svc.step(at)
+		await(t, started)
+		svc.wg.Wait()
+		if counts.count() != 1 {
+			t.Fatalf("calls = %d, want 1: the pause must not stop the dial", counts.count())
+		}
+	})
+
+	t.Run("generation change in preflight releases without consuming", func(t *testing.T) {
+		clk := &testClock{now: base}
+		conn := newFakeConn("S1")
+		rd := newJobReader("S1", runningJob(7))
+		svc := newTestService(t, conn, rd, clk, "S1")
+		counts := &fetchCounter{}
+		started := make(chan struct{}, 4)
+		svc.fetch = func(ctx context.Context, p config.Printer, j telemetry.JobView) (Result, error) {
+			counts.add(p.Serial)
+			started <- struct{}{}
+			return Result{}, &testError{cat: catTransport}
+		}
+		// The preflight re-read sees the new generation that started
+		// inside the reservation window: the reservation is for gen 7
+		// but the live job is gen 8, so the slot releases without
+		// consuming either generation's budget.
+		rd.seq = []telemetry.JobView{runningJob(7), runningJob(8), runningJob(8)}
+		rd.set("S1", runningJob(8))
+		clk.Set(at)
+		svc.step(at)
+		select {
+		case <-started:
+			t.Fatal("fetch admitted across a generation change in preflight")
+		default:
+		}
 		if counts.count() != 0 {
-			t.Fatalf("calls = %d, want 0: the pause must stop the dial", counts.count())
+			t.Fatalf("calls = %d, want 0", counts.count())
 		}
-		if svc.attemptedGeneration("S1", 7) {
-			t.Fatal("a failed preflight consumed the generation's attempt")
+		if _, ok := attemptRecord(svc, "S1"); ok {
+			t.Fatal("a failed preflight consumed the budget")
 		}
-		// The allowance is intact: the settled generation admits next tick.
-		rd.set("S1", settled(at.Add(-time.Second), 1))
+		// Both budgets are intact: the new generation admits next tick.
 		clk.Set(at.Add(time.Second))
 		svc.step(at.Add(time.Second))
 		await(t, started)
@@ -1725,65 +1749,34 @@ func TestPreflightBarrierBetweenReservationAndAdmission(t *testing.T) {
 		}
 	})
 
-	t.Run("stale observation in preflight releases without consuming", func(t *testing.T) {
+	t.Run("disconnect in preflight releases without consuming", func(t *testing.T) {
 		clk := &testClock{now: base}
 		conn := newFakeConn("S1")
-		rd := newJobReader("S1", settledJob(base, 7))
+		rd := newJobReader("S1", runningJob(7))
 		svc := newTestService(t, conn, rd, clk, "S1")
 		counts := &fetchCounter{}
 		svc.fetch = func(ctx context.Context, p config.Printer, j telemetry.JobView) (Result, error) {
 			counts.add(p.Serial)
 			return Result{}, &testError{cat: catTransport}
 		}
-		// The observation aged past the freshness window between the two
-		// reads: a report gap, not a state change.
-		stale := settled(at.Add(-printerview.FreshnessWindow-time.Second), 1)
-		rd.seq = []telemetry.JobView{settled(at.Add(-time.Second), 1), stale}
+		// The printer drops between the first read and the preflight
+		// re-read: status is sampled fresh, so the disconnect stops the
+		// dial without consuming the budget.
+		conn.setConnected("S1", false)
 		clk.Set(at)
 		svc.step(at)
 		if counts.count() != 0 {
-			t.Fatalf("calls = %d, want 0: the stale observation must stop the dial", counts.count())
+			t.Fatalf("calls = %d, want 0: the disconnect must stop the dial", counts.count())
 		}
-		if svc.attemptedGeneration("S1", 7) {
-			t.Fatal("a failed preflight consumed the generation's attempt")
-		}
-	})
-
-	t.Run("revision in the window is absorbed into the re-read", func(t *testing.T) {
-		clk := &testClock{now: base}
-		conn := newFakeConn("S1")
-		rd := newJobReader("S1", settledJob(base, 7))
-		svc := newTestService(t, conn, rd, clk, "S1")
-		counts := &fetchCounter{}
-		started := make(chan struct{}, 4)
-		var gotRev uint64
-		svc.fetch = func(ctx context.Context, p config.Printer, j telemetry.JobView) (Result, error) {
-			counts.add(p.Serial)
-			gotRev = j.Revision
-			started <- struct{}{}
-			return Result{PNG: pngBytes(t, 2, 2)}, nil
-		}
-		// The revision lands inside the window: the re-read snapshot
-		// carries it, so the single attempt proceeds against revision 2.
-		rd.seq = []telemetry.JobView{settled(at.Add(-time.Second), 1), settled(at.Add(-time.Second), 2)}
-		rd.set("S1", settled(at.Add(-time.Second), 2))
-		clk.Set(at)
-		svc.step(at)
-		await(t, started)
-		svc.wg.Wait()
-		if gotRev != 2 || counts.count() != 1 {
-			t.Fatalf("fetch revision = %d, calls = %d; want the re-read revision 2 in one attempt", gotRev, counts.count())
-		}
-		res, _ := svc.Lookup("S1", true)
-		if res.Preview.Status != StatusReady {
-			t.Fatalf("status = %s, want the result published for revision 2", res.Preview.Status)
+		if _, ok := attemptRecord(svc, "S1"); ok {
+			t.Fatal("a failed preflight consumed the budget")
 		}
 	})
 
 	t.Run("closed service admits nothing", func(t *testing.T) {
 		clk := &testClock{now: base}
 		conn := newFakeConn("S1")
-		rd := newJobReader("S1", settled(at.Add(-time.Second), 1))
+		rd := newJobReader("S1", runningJob(7))
 		svc := newTestService(t, conn, rd, clk, "S1")
 		svc.mu.Lock()
 		svc.closed = true
@@ -1792,74 +1785,274 @@ func TestPreflightBarrierBetweenReservationAndAdmission(t *testing.T) {
 		if adm := svc.admit(at); adm != nil {
 			t.Fatal("admission on a closed service must fail")
 		}
-		if svc.attemptedGeneration("S1", 7) {
-			t.Fatal("a closed-service refusal consumed the attempt")
+		if _, ok := attemptRecord(svc, "S1"); ok {
+			t.Fatal("a closed-service refusal consumed the budget")
 		}
 	})
 }
 
-// TestSchedulerCancelsOnDisconnectOrStaleObservation proves the strict
-// gate beyond state changes: a pure disconnect and a pure telemetry-gap
-// staleness — RUNNING unchanged, same running epoch — each cancel the
-// in-flight attempt and discard its outcome.
-func TestSchedulerCancelsOnDisconnectOrStaleObservation(t *testing.T) {
+// TestLookupReasonTable covers one case per liveResult row: each wait and
+// failure projects its exact status and reason.
+func TestLookupReasonTable(t *testing.T) {
 	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
-	cases := []struct {
-		name       string
-		invalidate func(t *testing.T, conn *fakeConn, rd *jobReader, at time.Time)
-	}{
-		{"disconnect", func(t *testing.T, conn *fakeConn, rd *jobReader, at time.Time) {
-			conn.setConnected("S1", false)
-		}},
-		{"stale observation", func(t *testing.T, conn *fakeConn, rd *jobReader, at time.Time) {
-			stale := settledJob(at, 7)
-			stale.RunningSince = base
-			stale.ObsAt = at.Add(-printerview.FreshnessWindow - time.Second)
-			rd.set("S1", stale)
-		}},
+	newSvc := func(job telemetry.JobView, connected bool) (*Service, *jobReader, *testClock) {
+		clk := &testClock{now: base}
+		conn := newFakeConn("S1")
+		conn.setConnected("S1", connected)
+		rd := newJobReader("S1", job)
+		return newTestService(t, conn, rd, clk, "S1"), rd, clk
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			clk := &testClock{now: base}
-			conn := newFakeConn("S1")
-			rd := newJobReader("S1", settledJob(base, 7))
-			svc := newTestService(t, conn, rd, clk, "S1")
-			counts := &fetchCounter{}
-			started := make(chan struct{}, 4)
-			done := make(chan struct{})
-			var ferr error
-			svc.fetch = func(ctx context.Context, p config.Printer, j telemetry.JobView) (Result, error) {
-				counts.add(p.Serial)
-				started <- struct{}{}
-				<-ctx.Done()
-				ferr = ctx.Err()
-				close(done)
-				return Result{}, ferr
-			}
-			at := base.Add(60 * time.Second)
-			j := settledJob(at, 7)
-			j.RunningSince = base
-			rd.set("S1", j)
-			clk.Set(at)
-			svc.step(at)
-			await(t, started)
 
-			tc.invalidate(t, conn, rd, at)
-			clk.Set(at.Add(time.Second))
-			svc.step(at.Add(time.Second)) // this tick invalidates and cancels
-			await(t, done)
-			svc.wg.Wait()
+	t.Run("valid entry serves its reason", func(t *testing.T) {
+		job := runningJob(7)
+		svc, _, _ := newSvc(job, true)
+		adm := beginAttempt(t, svc, "S1", job)
+		md := &Metadata{Source: sourcePrinter3mf, Title: strPtr("T")}
+		svc.finish(adm, Result{Metadata: md}, archiveErr(catImageMissing, "plate image missing"))
+		res, _ := svc.Lookup("S1", false)
+		if res.Preview.Status != StatusUnavailable || res.Preview.Reason != catImageMissing {
+			t.Fatalf("view = %+v, want unavailable image_missing", res.Preview)
+		}
+	})
 
-			if !errors.Is(ferr, context.Canceled) {
-				t.Fatalf("fetch error = %v, want context.Canceled", ferr)
+	t.Run("closed yields proxy_stopping", func(t *testing.T) {
+		svc, _, _ := newSvc(runningJob(7), true)
+		svc.mu.Lock()
+		svc.closed = true
+		svc.mu.Unlock()
+		res, _ := svc.Lookup("S1", false)
+		if res.Preview.Status != StatusUnavailable || res.Preview.Reason != reasonProxyStopping {
+			t.Fatalf("view = %+v, want unavailable proxy_stopping", res.Preview)
+		}
+	})
+
+	t.Run("inactive has no reason", func(t *testing.T) {
+		job := runningJob(7)
+		job.Active = false
+		svc, _, _ := newSvc(job, true)
+		res, _ := svc.Lookup("S1", false)
+		if res.Preview.Status != StatusUnavailable || res.Preview.Reason != "" {
+			t.Fatalf("view = %+v, want unavailable without reason", res.Preview)
+		}
+	})
+
+	t.Run("in flight reads downloading", func(t *testing.T) {
+		job := runningJob(7)
+		svc, _, _ := newSvc(job, true)
+		beginAttempt(t, svc, "S1", job)
+		res, _ := svc.Lookup("S1", false)
+		if res.Preview.Status != StatusPending || res.Preview.Reason != reasonDownloading {
+			t.Fatalf("view = %+v, want pending downloading", res.Preview)
+		}
+	})
+
+	t.Run("final reads its failure reason", func(t *testing.T) {
+		job := runningJob(7)
+		svc, _, _ := newSvc(job, true)
+		adm := beginAttempt(t, svc, "S1", job)
+		svc.finish(adm, Result{}, archiveErr(catOversized, "archive entry count"))
+		res, _ := svc.Lookup("S1", false)
+		if res.Preview.Status != StatusUnavailable || res.Preview.Reason != catOversized {
+			t.Fatalf("view = %+v, want unavailable oversized", res.Preview)
+		}
+	})
+
+	t.Run("backed off reads retry_wait", func(t *testing.T) {
+		job := runningJob(7)
+		svc, _, _ := newSvc(job, true)
+		adm := beginAttempt(t, svc, "S1", job)
+		svc.finish(adm, Result{}, &testError{cat: catTimeout})
+		res, _ := svc.Lookup("S1", false)
+		if res.Preview.Status != StatusPending || res.Preview.Reason != reasonRetryWait {
+			t.Fatalf("view = %+v, want pending retry_wait", res.Preview)
+		}
+	})
+
+	t.Run("disconnected reads printer_offline", func(t *testing.T) {
+		svc, _, _ := newSvc(runningJob(7), false)
+		res, _ := svc.Lookup("S1", false)
+		if res.Preview.Status != StatusPending || res.Preview.Reason != reasonPrinterOffline {
+			t.Fatalf("view = %+v, want pending printer_offline", res.Preview)
+		}
+	})
+
+	t.Run("preparing reads waiting_for_print", func(t *testing.T) {
+		for _, state := range []string{"PREPARE", "SLICING"} {
+			job := runningJob(7)
+			job.State = state
+			svc, _, _ := newSvc(job, true)
+			res, _ := svc.Lookup("S1", false)
+			if res.Preview.Status != StatusPending || res.Preview.Reason != reasonWaitingForPrint {
+				t.Fatalf("%s: view = %+v, want pending waiting_for_print", state, res.Preview)
 			}
-			if counts.count() != 1 {
-				t.Fatalf("calls = %d, want 1", counts.count())
-			}
-			res, _ := svc.Lookup("S1", true)
-			if res.Preview.Status != StatusUnavailable || res.PNG != nil {
-				t.Fatalf("cancelled attempt left %+v, want unavailable without payload", res.Preview)
-			}
-		})
+		}
+	})
+
+	t.Run("no identity reads waiting_for_file_name", func(t *testing.T) {
+		job := runningJob(7)
+		job.Name = ""
+		job.GCodeFile = ""
+		svc, _, _ := newSvc(job, true)
+		res, _ := svc.Lookup("S1", false)
+		if res.Preview.Status != StatusPending || res.Preview.Reason != reasonWaitingForFileName {
+			t.Fatalf("view = %+v, want pending waiting_for_file_name", res.Preview)
+		}
+	})
+
+	t.Run("busy slot reads queued", func(t *testing.T) {
+		svc, _, _ := newSvc(runningJob(7), true)
+		svc.mu.Lock()
+		svc.worker = true // another printer holds the sole slot
+		svc.mu.Unlock()
+		res, _ := svc.Lookup("S1", false)
+		if res.Preview.Status != StatusPending || res.Preview.Reason != reasonQueued {
+			t.Fatalf("view = %+v, want pending queued", res.Preview)
+		}
+	})
+
+	t.Run("fresh job reads downloading", func(t *testing.T) {
+		svc, _, _ := newSvc(runningJob(7), true)
+		res, _ := svc.Lookup("S1", false)
+		if res.Preview.Status != StatusPending || res.Preview.Reason != reasonDownloading {
+			t.Fatalf("view = %+v, want pending downloading", res.Preview)
+		}
+	})
+}
+
+// TestCloseDuringRetryWaitStopsScheduling pins shutdown inside backoff: the
+// projection names the shutdown and no further attempt starts.
+func TestCloseDuringRetryWaitStopsScheduling(t *testing.T) {
+	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
+	clk := &testClock{now: base}
+	conn := newFakeConn("S1")
+	rd := newJobReader("S1", runningJob(7))
+	svc := newTestService(t, conn, rd, clk, "S1")
+	counts := &fetchCounter{}
+	started := make(chan struct{}, 4)
+	svc.fetch = func(ctx context.Context, p config.Printer, j telemetry.JobView) (Result, error) {
+		counts.add(p.Serial)
+		started <- struct{}{}
+		return Result{}, &testError{cat: catTransport}
 	}
+	clk.Set(base)
+	svc.step(base)
+	await(t, started)
+	svc.wg.Wait()
+	if got := counts.count(); got != 1 {
+		t.Fatalf("calls = %d, want 1", got)
+	}
+	svc.Close()
+	res, _ := svc.Lookup("S1", false)
+	if res.Preview.Status != StatusUnavailable || res.Preview.Reason != reasonProxyStopping {
+		t.Fatalf("view = %+v, want unavailable proxy_stopping", res.Preview)
+	}
+	clk.Set(base.Add(time.Hour))
+	svc.step(base.Add(time.Hour))
+	if got := counts.count(); got != 1 {
+		t.Fatalf("calls = %d after close, want 1", got)
+	}
+}
+
+// TestDisplayPanels pins the module Display hook: nil for disabled, clean
+// ready, and reason-free views; a Print details panel naming the exact
+// reason otherwise, info while pending and warn when unavailable.
+func TestDisplayPanels(t *testing.T) {
+	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
+	newSvc := func(job telemetry.JobView) (*Service, *jobReader) {
+		clk := &testClock{now: base}
+		rd := newJobReader("S1", job)
+		return newTestService(t, newFakeConn("S1"), rd, clk, "S1"), rd
+	}
+
+	svcUnconfigured, _ := newSvc(runningJob(7))
+	if d := svcUnconfigured.Display("OTHER"); d != nil {
+		t.Fatalf("Display(OTHER) = %+v, want nil", d)
+	}
+
+	t.Run("idle printer is nil", func(t *testing.T) {
+		job := runningJob(7)
+		job.Active = false
+		svc, _ := newSvc(job)
+		if d := svc.Display("S1"); d != nil {
+			t.Fatalf("Display = %+v, want nil for a reason-free view", d)
+		}
+	})
+
+	t.Run("clean ready is nil", func(t *testing.T) {
+		job := runningJob(7)
+		svc, _ := newSvc(job)
+		adm := beginAttempt(t, svc, "S1", job)
+		svc.finish(adm, Result{PNG: pngBytes(t, 2, 2)}, nil)
+		if d := svc.Display("S1"); d != nil {
+			t.Fatalf("Display = %+v, want nil for a clean ready", d)
+		}
+	})
+
+	t.Run("ready with reason shows the panel", func(t *testing.T) {
+		job := runningJob(7)
+		svc, _ := newSvc(job)
+		adm := beginAttempt(t, svc, "S1", job)
+		svc.finish(adm, Result{PNG: pngBytes(t, 2, 2)}, archiveErr(catArchive, "slice info bad"))
+		d := svc.Display("S1")
+		if d == nil || d.Panel == nil || d.Panel.Title != "Print details" {
+			t.Fatalf("Display = %+v, want a Print details panel", d)
+		}
+		if len(d.Panel.Rows) != 1 || d.Panel.Rows[0].Value != reasonText(catArchive) || d.Panel.Rows[0].Tone != "warn" {
+			t.Fatalf("rows = %+v, want the archive warn text", d.Panel.Rows)
+		}
+	})
+
+	t.Run("retry wait shows info text", func(t *testing.T) {
+		job := runningJob(7)
+		svc, _ := newSvc(job)
+		adm := beginAttempt(t, svc, "S1", job)
+		svc.finish(adm, Result{}, &testError{cat: catTimeout})
+		d := svc.Display("S1")
+		if d == nil || d.Panel == nil {
+			t.Fatalf("Display = %+v, want a panel", d)
+		}
+		row := d.Panel.Rows[0]
+		if row.Label != "Status" || row.Value != reasonText(reasonRetryWait) || row.Tone != "info" {
+			t.Fatalf("row = %+v, want the retry_wait info text", row)
+		}
+	})
+
+	t.Run("final failure shows warn text", func(t *testing.T) {
+		job := runningJob(7)
+		svc, _ := newSvc(job)
+		adm := beginAttempt(t, svc, "S1", job)
+		svc.finish(adm, Result{}, archiveErr(catOversized, "archive entry count"))
+		d := svc.Display("S1")
+		if d == nil || d.Panel == nil {
+			t.Fatalf("Display = %+v, want a panel", d)
+		}
+		row := d.Panel.Rows[0]
+		if row.Label != "Status" || row.Value != reasonText(catOversized) || row.Tone != "warn" {
+			t.Fatalf("row = %+v, want the oversized warn text", row)
+		}
+	})
+
+	t.Run("reason text covers the catalog", func(t *testing.T) {
+		cases := map[string]string{
+			reasonWaitingForPrint:    "Waiting for the print to start",
+			reasonWaitingForFileName: "Waiting for the printer to report the file name",
+			reasonPrinterOffline:     "Waiting for the printer to reconnect",
+			reasonQueued:             "Waiting for another print file download to finish",
+			reasonDownloading:        "Downloading the print file from the printer",
+			reasonRetryWait:          "Download failed, retrying shortly",
+			reasonProxyStopping:      "Proxy stopping",
+			catNotFound:              "Print file not found on the printer",
+			catTimeout:               "Print file download stalled",
+			catTransport:             "Could not read the print file from the printer",
+			catArchive:               "Print file could not be read",
+			catOversized:             "Print file exceeds the size limit",
+			catAmbiguousPlate:        "Could not tell which plate is printing",
+			catImageMissing:          "Print file has no preview image",
+		}
+		for reason, want := range cases {
+			if got := reasonText(reason); got != want {
+				t.Errorf("reasonText(%q) = %q, want %q", reason, got, want)
+			}
+		}
+	})
 }

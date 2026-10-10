@@ -16,6 +16,7 @@ import (
 
 	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/config"
+	"bambu-mqtt-proxy/internal/hmscodes"
 )
 
 // State is the display projection of one printer's merged reports. Nil
@@ -43,8 +44,13 @@ type State struct {
 	BedTemp      *float64
 	BedTarget    *float64
 	ChamberTemp  *float64
-	PrintError   int        // print_error; 0 means no error
-	HMS          []HMSAlert // current Health Management System alerts
+	PrintError   int // print_error; 0 means no error
+	// announcedError is the last print_error value announced in the
+	// activity log. A cancel marker suppressed on a FAILED transition
+	// never replaces it, so the later clear names the error the user
+	// actually saw.
+	announcedError int
+	HMS            []HMSAlert // current Health Management System alerts
 	// Stage is the raw stg_cur stage id; nil means never reported. The
 	// camera projection maps known ids to names and leaves idle sentinels
 	// and unknown ids unmapped, so the printer state stays the headline.
@@ -94,14 +100,9 @@ type State struct {
 	sessionGen       uint64    // bumps only when a genuinely new print session starts
 	epoch            uint64    // bumps at every state boundary or identity change
 	stateGen         uint64    // upstream generation of the last gcode_state report
-	layerSessionGen  uint64    // print session in which layer_num was last reported
-	layerGen         uint64    // upstream generation of the last layer_num report
 	layerJobGen      uint64    // Job generation of the last layer_num report.
 	speedProfile     *int      // last reported Bambu spd_lvl (1..4)
-	speedGen         uint64    // upstream generation of speedProfile
-	speedSessionGen  uint64    // print session in which speedProfile was reported
 	speedObs         uint64    // increments for each spd_lvl report
-	speedAt          time.Time // time speedProfile was observed
 	trayNow          *int      // raw tray_now selection value; nil = not reported
 	obs              uint64    // real print reports merged (ACKs excluded)
 	obsGen           uint64    // upstream connection generation of the last report
@@ -240,9 +241,9 @@ func (c *Cache) ObserveReport(serial string, seq, gen uint64, payload []byte) {
 			return
 		}
 		st.lastSeq = seq
-		before := activitySnapshot{state: st.PrintingState, sessionGen: st.sessionGen, printError: st.PrintError, hms: append([]HMSAlert(nil), st.HMS...), chamberLight: st.ChamberLight}
+		before := activitySnapshot{state: st.PrintingState, sessionGen: st.sessionGen, jobGen: st.job.generation, printError: st.PrintError, hms: append([]HMSAlert(nil), st.HMS...), chamberLight: st.ChamberLight}
 		real = mergeReport(st, gen, payload, c.now(), c.log)
-		if real {
+		if real || st.job.generation != before.jobGen {
 			events = collectActivityEvents(before, st)
 		} else {
 			events = lightEvents(before, st)
@@ -255,7 +256,11 @@ func (c *Cache) ObserveReport(serial string, seq, gen uint64, payload []byte) {
 	}
 	c.mu.Unlock()
 	for _, event := range events {
-		c.activity.Record(serial, event.kind, event.severity, event.message)
+		if event.url != "" {
+			c.activity.RecordLink(serial, event.kind, event.severity, event.message, event.url)
+		} else {
+			c.activity.RecordObserved(serial, event.kind, event.severity, event.message, event.obs)
+		}
 	}
 	if len(events) > 0 {
 		c.activityMu.Unlock()
@@ -269,6 +274,7 @@ func (c *Cache) ObserveReport(serial string, seq, gen uint64, payload []byte) {
 type activitySnapshot struct {
 	state        string
 	sessionGen   uint64
+	jobGen       uint64
 	printError   int
 	hms          []HMSAlert
 	chamberLight string
@@ -278,6 +284,8 @@ type activitySnapshot struct {
 // after it is released.
 type activityRecord struct {
 	kind, severity, message string
+	url                     string
+	obs                     activity.Observation
 }
 
 // lightEvents reports a chamber light change. The first observation records
@@ -296,19 +304,31 @@ func lightEvents(before activitySnapshot, st *State) []activityRecord {
 }
 
 // collectActivityEvents derives user-facing events from one merged report.
+// It runs under the cache mutex and may update the activity-evidence
+// bookkeeping on st (announcedError) alongside the merged display state.
 func collectActivityEvents(before activitySnapshot, st *State) []activityRecord {
 	var events []activityRecord
 	add := func(kind, severity, message string) {
 		events = append(events, activityRecord{kind: kind, severity: severity, message: message})
 	}
+	addLink := func(kind, severity, message, url string) {
+		events = append(events, activityRecord{kind: kind, severity: severity, message: message, url: url})
+	}
 	filename := ""
 	if st.Filename != "" {
 		filename = " · " + st.Filename
 	}
+	// jobStarted marks a job-generation boundary that this report crossed
+	// into an active job, including a metadata-only report that carried the
+	// identity change without print state.
+	jobStarted := st.job.generation > before.jobGen && st.job.active
+	startObs := activity.Observation{JobGen: st.job.generation}
 	if st.PrintingState != "" && before.state == "" {
-		add("state_initial", activity.Info, "Print first observedstate "+strings.ToLower(st.PrintingState)+filename)
-	} else if st.sessionGen > before.sessionGen {
-		add("print_started", activity.Info, "Print started"+filename)
+		events = append(events, activityRecord{kind: "state_initial", severity: activity.Info, message: "Printer " + strings.ToLower(st.PrintingState) + filename, obs: startObs})
+	} else if st.sessionGen > before.sessionGen || (jobStarted && previewStateExec(st.PrintingState)) {
+		events = append(events, activityRecord{kind: "print_started", severity: activity.Info, message: "Print started" + filename, obs: startObs})
+	} else if jobStarted && (st.PrintingState == "PREPARE" || st.PrintingState == "SLICING") {
+		events = append(events, activityRecord{kind: "print_preparing", severity: activity.Info, message: "Print preparing" + filename, obs: startObs})
 	} else if st.PrintingState != before.state {
 		switch st.PrintingState {
 		case "PREPARE", "SLICING":
@@ -324,7 +344,11 @@ func collectActivityEvents(before activitySnapshot, st *State) []activityRecord 
 		case "FINISH":
 			add("print_finished", activity.Info, "Print finished"+filename)
 		case "FAILED":
-			add("print_failed", activity.Error, "Print failed or was cancelled"+filename)
+			if isCancelCode(st.PrintError) {
+				add("print_cancelled", activity.Warning, "Print cancelled"+filename)
+			} else {
+				add("print_failed", activity.Error, "Print failed"+filename)
+			}
 		case "IDLE":
 			if isControlState(before.state) {
 				add("print_stopped", activity.Warning, "Print stopped before finishing"+filename)
@@ -350,24 +374,78 @@ func collectActivityEvents(before activitySnapshot, st *State) []activityRecord 
 		case "common":
 			severity = activity.Warning
 		}
-		add("hms_alert", severity, "HMS alert "+id+" ("+alert.Severity()+")")
+		info := hmscodes.HMS(alert.Attr)
+		if info.Title != "" {
+			addLink("hms_alert", severity, "Printer alert: "+info.Title+" ("+id+")", info.URL)
+		} else {
+			addLink("hms_alert", severity, "Printer alert "+id+", no description available", info.URL)
+		}
 	}
+	var cleared []string
 	for _, alert := range before.hms {
 		id := alert.ID()
 		if _, active := newHMS[id]; !active {
-			add("hms_cleared", activity.Info, "HMS alert "+id+" cleared")
+			if title := hmscodes.HMS(alert.Attr).Title; title != "" {
+				cleared = append(cleared, title)
+			} else {
+				cleared = append(cleared, id)
+			}
 		}
 	}
+	// A FAILED transition carrying a user-cancel marker suppresses only
+	// the print_error entry for that marker; the marker never becomes the
+	// announced error, so the later clear names the error the user saw.
+	suppressedCancel := st.PrintingState == "FAILED" && before.state != "FAILED" && isCancelCode(st.PrintError)
 	if before.printError != st.PrintError {
 		if st.PrintError == 0 {
-			add("print_error_cleared", activity.Info, "Printer error cleared")
-		} else {
-			code := fmt.Sprintf("%04X_%04X", uint32(st.PrintError)>>16, uint32(st.PrintError)&0xFFFF)
-			add("print_error", activity.Error, "Printer error "+code)
+			if st.announcedError != 0 {
+				cleared = append(cleared, clearedErrorItem(st.announcedError))
+				st.announcedError = 0
+			}
+		} else if !suppressedCancel {
+			code := uint32(st.PrintError)
+			info := hmscodes.PrintError(code)
+			text := fmt.Sprintf("%04X-%04X", code>>16, code&0xFFFF)
+			severity := activity.Error
+			switch info.Severity {
+			case "info":
+				severity = activity.Info
+			case "warning":
+				severity = activity.Warning
+			}
+			if info.Title != "" {
+				addLink("print_error", severity, "Printer error: "+info.Title+" ("+text+")", info.URL)
+			} else {
+				addLink("print_error", severity, "Printer error "+text+", no description available", info.URL)
+			}
+			st.announcedError = st.PrintError
 		}
+	}
+	if len(cleared) > 0 {
+		add("alerts_cleared", activity.Info, "Printer alerts cleared: "+strings.Join(cleared, ", "))
 	}
 	events = append(events, lightEvents(before, st)...)
 	return events
+}
+
+// isCancelCode reports whether a print_error value is one of the printer's
+// user-cancel markers: a FAILED transition carrying one records
+// print_cancelled instead of print_failed.
+func isCancelCode(code int) bool {
+	switch uint32(code) {
+	case 0x0300400C, 0x0500400E:
+		return true
+	}
+	return false
+}
+
+// clearedErrorItem renders the alerts-cleared item for a print error that
+// is leaving: the dataset title when known, else "error XXXX-XXXX".
+func clearedErrorItem(code int) string {
+	if title := hmscodes.PrintError(uint32(code)).Title; title != "" {
+		return title
+	}
+	return "error " + fmt.Sprintf("%04X-%04X", uint32(code)>>16, uint32(code)&0xFFFF)
 }
 
 // notify wakes report watchers, coalescing bursts into one token.
@@ -417,26 +495,23 @@ type SessionView struct {
 	Epoch      uint64 // bumps at every state boundary or identity change
 	StateGen   uint64 // upstream generation of the last gcode_state report
 	// SpeedProfile is nil until a supported profile (1..4) is reported.
-	// Its observation evidence prevents use across print sessions or reconnects.
-	SpeedProfile    *int
-	SpeedGen        uint64
-	SpeedSessionGen uint64
-	SpeedObs        uint64
-	SpeedAt         time.Time
-	Obs             uint64 // real print reports merged
-	ObsAt           time.Time
-	ObsGen          uint64 // upstream generation of the last report
+	SpeedProfile *int
+	SpeedObs     uint64
+	Obs          uint64 // real print reports merged
+	ObsAt        time.Time
+	ObsGen       uint64 // upstream generation of the last report
 	// Progress and RemainingMin carry the merged scalar with presence: nil
 	// means the printer never reported the field, so consumers can keep the
 	// value unknown instead of showing a meaningless 0.
 	Progress     *float64
 	RemainingMin *float64
-	// LayerNum is the current print's layer. It is present only while the
-	// last valid layer_num report belongs to the current print session and
-	// upstream connection and no preview-job boundary has happened since.
-	// Nil means no layer evidence is current, even though the display
-	// State keeps the sticky last value for the camera wall.
-	LayerNum     *int
+	// LayerNum is the last reported layer; use CurrentLayer for decisions
+	// about the current print. It is a copy of the sticky display value
+	// and is exposed in any state, whenever it is non-nil.
+	LayerNum *int
+	// LayerThisJob reports whether LayerNum was reported during the
+	// current preview-job generation.
+	LayerThisJob bool
 	ChamberLight string
 	StartedAt    time.Time
 }
@@ -449,22 +524,37 @@ func (c *Cache) Session(serial string) (SessionView, bool) {
 	if !ok {
 		return SessionView{}, false
 	}
+	return st.sessionView(), true
+}
+
+// Print returns the preview-job and session projections for one serial
+// from a single locked read, so both describe the same instant. An unknown
+// serial returns zero values and false.
+func (c *Cache) Print(serial string) (JobView, SessionView, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	st, ok := c.states[serial]
+	if !ok {
+		return JobView{}, SessionView{}, false
+	}
+	return st.job.view(), st.sessionView(), true
+}
+
+// sessionView builds the session projection. Callers hold the Cache mutex.
+func (st *State) sessionView() SessionView {
 	view := SessionView{
-		Serial:          st.Serial,
-		Active:          st.sessionActive,
-		State:           st.PrintingState,
-		Cookie:          st.cookie,
-		Complete:        st.completeIdentity,
-		SessionGen:      st.sessionGen,
-		Epoch:           st.epoch,
-		StateGen:        st.stateGen,
-		SpeedGen:        st.speedGen,
-		SpeedSessionGen: st.speedSessionGen,
-		SpeedObs:        st.speedObs,
-		SpeedAt:         st.speedAt,
-		Obs:             st.obs,
-		ObsAt:           st.obsAt,
-		ObsGen:          st.obsGen,
+		Serial:     st.Serial,
+		Active:     st.sessionActive,
+		State:      st.PrintingState,
+		Cookie:     st.cookie,
+		Complete:   st.completeIdentity,
+		SessionGen: st.sessionGen,
+		Epoch:      st.epoch,
+		StateGen:   st.stateGen,
+		SpeedObs:   st.speedObs,
+		Obs:        st.obs,
+		ObsAt:      st.obsAt,
+		ObsGen:     st.obsGen,
 	}
 	if st.speedProfile != nil {
 		v := *st.speedProfile
@@ -478,22 +568,17 @@ func (c *Cache) Session(serial string) (SessionView, bool) {
 		v := st.RemainMin
 		view.RemainingMin = &v
 	}
-	// LayerNum is the current print's layer only: the display State keeps
-	// the last reported value for the camera wall, but the session view
-	// exposes it only when it was reported in the current print session on
-	// the current connection and after the last preview-job boundary, so a
-	// previous job's sticky layer can never authorize a new print, a report
-	// that started a new job without carrying a layer cannot leave the old
-	// layer current, and a reconnected printer must re-report it.
-	if st.LayerNum != nil && st.sessionGen != 0 &&
-		st.layerSessionGen == st.sessionGen && st.layerGen == st.obsGen &&
-		st.layerJobGen == st.job.generation {
+	// LayerNum is the last reported layer, exposed in any state whenever
+	// it is non-nil. CurrentLayer decides whether it belongs to the
+	// current print.
+	if st.LayerNum != nil {
 		v := *st.LayerNum
 		view.LayerNum = &v
 	}
+	view.LayerThisJob = st.layerJobGen == st.job.generation
 	view.ChamberLight = st.ChamberLight
 	view.StartedAt = st.StartedAt
-	return view, true
+	return view
 }
 
 // SetConnected records upstream connectivity from the pool status.
@@ -539,8 +624,7 @@ func (c *Cache) State(serial string) (State, bool) {
 // payload carried real print state. Bambu reports nest under a type key
 // ("print"); values change type between prints (number or string), so
 // extraction goes through generic maps instead of a fixed struct. now is
-// the preview clock time, taken once per report for the preview-job
-// projection; session timing is untouched.
+// kept for callers that stamp report time; session timing is untouched.
 func mergeReport(st *State, gen uint64, payload []byte, now time.Time, log *slog.Logger) bool {
 	var report map[string]json.RawMessage
 	if err := json.Unmarshal(payload, &report); err != nil {
@@ -561,9 +645,10 @@ func mergeReport(st *State, gen uint64, payload []byte, now time.Time, log *slog
 	mergeDisplay(st, printObj, log)
 	real := isRealPrintReport(printObj)
 	// Preview-job tracking runs for real and metadata-only reports alike:
-	// the projection keeps its own identity and freshness evidence, and
-	// metadata-only deltas never refresh session evidence.
-	st.trackJob(printObj, gen, now, real)
+	// the projection keeps the last value the printer reported for every
+	// identity field, and metadata-only deltas never refresh session
+	// obs evidence.
+	st.trackJob(printObj)
 	if !real {
 		// Command ACK objects (sequence_id/command/result) and other control
 		// payloads carry no print state. Ignoring them entirely keeps them
@@ -583,26 +668,20 @@ func mergeReport(st *State, gen uint64, payload []byte, now time.Time, log *slog
 	if _, present := lookup(printObj, "layer_num"); present {
 		if v, ok := intField(printObj, "layer_num"); ok {
 			st.LayerNum = &v
-			// Stamp the layer's evidence so Session can tell the current
-			// print's layer from the sticky display value, following the
-			// speedGen/speedSessionGen pattern. trackJob has already run for
-			// this report, so the job generation names the print job the
-			// layer belongs to. A report that omits layer_num restamps
-			// nothing: on one connection, one session and one job the
-			// generations cannot move, so the last reported layer stays
-			// current until a reconnect, a new print session, or a
-			// preview-job boundary.
-			st.layerSessionGen = st.sessionGen
-			st.layerGen = gen
+			// trackJob has already run for this report, so the
+			// job generation names the print job the layer
+			// belongs to. A report that omits layer_num
+			// restamps nothing: the last reported layer is
+			// kept across sessions, connections, and jobs,
+			// and CurrentLayer decides whether it belongs to
+			// the current print.
 			st.layerJobGen = st.job.generation
 		} else {
-			// Present but invalid: the printer contradicted the last valid
-			// layer. Keep the sticky display value, but drop every piece of
-			// evidence (session 0 matches no real session) so an
-			// unparseable report cannot leave the previous layer
-			// authorizing indefinitely.
-			st.layerSessionGen = 0
-			st.layerGen = 0
+			// Present but invalid: the printer contradicted
+			// the last valid layer, so the public field is
+			// cleared. Zero means no job generation has
+			// reported a layer.
+			st.LayerNum = nil
 			st.layerJobGen = 0
 		}
 	}
@@ -614,10 +693,7 @@ func mergeReport(st *State, gen uint64, payload []byte, now time.Time, log *slog
 		if v, ok := intField(printObj, "spd_lvl"); ok && v >= 1 && v <= 4 {
 			st.speedProfile = &v
 		}
-		st.speedGen = gen
-		st.speedSessionGen = st.sessionGen
 		st.speedObs++
-		st.speedAt = time.Now()
 	}
 	if v, ok := intField(printObj, "total_layer_num"); ok {
 		st.TotalLayers = &v
@@ -720,6 +796,7 @@ func idField(obj map[string]any, key string) (string, bool) {
 // RUNNING look current-generation. sessionGen bumps only at real print
 // session starts; epoch keeps marking every boundary for in-flight checks.
 func (st *State) trackSession(printObj map[string]any, gen uint64) {
+	started := false
 	if s, ok := stringField(printObj, "gcode_state"); ok {
 		st.stateGen = gen
 		prev := st.PrintingState
@@ -732,6 +809,7 @@ func (st *State) trackSession(printObj map[string]any, gen uint64) {
 					// A control state entered from outside a session
 					// (idle, finish, failed) is a genuinely new print.
 					st.sessionGen++
+					started = true
 				}
 			} else {
 				st.resetSession()
@@ -739,20 +817,38 @@ func (st *State) trackSession(printObj map[string]any, gen uint64) {
 		case prev == "" && isControlState(s):
 			st.sessionActive = true
 			st.sessionGen++
+			started = true
 		}
 		st.PrintingState = s
 	}
-	if v, ok := idField(printObj, "project_id"); ok {
-		st.projectID = v
+	if _, present := lookup(printObj, "subtask_name"); present {
+		// An absent key keeps the value. A present string sets it,
+		// even when empty; a non-string clears it.
+		s, ok := stringField(printObj, "subtask_name")
+		if ok {
+			st.Filename = s
+		} else {
+			st.Filename = ""
+		}
 	}
-	if v, ok := idField(printObj, "task_id"); ok {
-		st.taskID = v
+	if _, present := lookup(printObj, "project_id"); present {
+		// An absent key keeps the value; a present but invalid id
+		// clears it.
+		if v, ok := idField(printObj, "project_id"); ok {
+			st.projectID = v
+		} else {
+			st.projectID = ""
+		}
 	}
-	if s, ok := stringField(printObj, "subtask_name"); ok && s != "" {
-		st.Filename = s
+	if _, present := lookup(printObj, "task_id"); present {
+		if v, ok := idField(printObj, "task_id"); ok {
+			st.taskID = v
+		} else {
+			st.taskID = ""
+		}
 	}
 	cookie := st.projectID + "-" + st.taskID + "-" + st.Filename
-	if st.cookie != "" && cookie != st.cookie && st.completeIdentity && st.sessionActive {
+	if !started && st.cookie != "" && cookie != st.cookie && st.completeIdentity && st.sessionActive {
 		// A genuinely new print identity while a session is active starts a
 		// new session; incomplete cookies stay sticky until the print ends.
 		st.epoch++
@@ -765,14 +861,11 @@ func (st *State) trackSession(printObj map[string]any, gen uint64) {
 	st.obsAt = time.Now()
 }
 
-// resetSession clears session identity after a print ends. The display
-// filename is kept for the camera wall.
+// resetSession closes the print session after a print ends. Identity and
+// display fields keep the last values the printer reported: only the
+// session-active flag marks the boundary.
 func (st *State) resetSession() {
 	st.sessionActive = false
-	st.cookie = ""
-	st.projectID = ""
-	st.taskID = ""
-	st.completeIdentity = false
 }
 
 // lookup finds the first present key, case-insensitively: some printers
@@ -854,4 +947,19 @@ func intField(obj map[string]any, key string) (int, bool) {
 		return 0, false
 	}
 	return int(f), true
+}
+
+// CurrentLayer returns the layer to use for decisions about the current
+// print, or nil when it is unknown. A reported layer of 0 is valid from any
+// job generation: an idle printer reports 0. A positive layer reported
+// before the current job began belongs to an earlier print and is unknown.
+func (v SessionView) CurrentLayer() *int {
+	if v.LayerNum == nil {
+		return nil
+	}
+	if *v.LayerNum == 0 || v.LayerThisJob {
+		n := *v.LayerNum
+		return &n
+	}
+	return nil
 }

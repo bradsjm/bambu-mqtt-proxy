@@ -9,7 +9,7 @@ import (
 	"bambu-mqtt-proxy/internal/telemetry"
 )
 
-func TestFirstLayerPauseConfirmationRequiresRealFreshPauseBoundary(t *testing.T) {
+func TestFirstLayerPauseConfirmationRequiresSameJobPause(t *testing.T) {
 	for _, state := range []string{"PAUSE", "PAUSED"} {
 		t.Run(state, func(t *testing.T) {
 			f := newLayerFixture(t)
@@ -48,40 +48,30 @@ func TestFirstLayerPauseConfirmationRequiresRealFreshPauseBoundary(t *testing.T)
 	}
 }
 
-func TestFirstLayerConfirmationRejectsInvalidObservationAndExpires(t *testing.T) {
-	for _, tc := range []struct {
-		name       string
-		invalidate func(*fixture, *pendingPause)
-	}{
-		{"old counter", func(f *fixture, p *pendingPause) { f.state.v.Obs = p.obs }},
-		{"old job timestamp", func(f *fixture, p *pendingPause) { f.state.j.ObsAt = p.dispatched }},
-		{"old session timestamp", func(f *fixture, p *pendingPause) { f.state.v.ObsAt = p.dispatched }},
-		{"stale job", func(f *fixture, p *pendingPause) { f.state.j.ObsAt = f.clock.now().Add(-16 * time.Second) }},
-		{"zero job", func(f *fixture, p *pendingPause) { f.state.j.ObsAt = time.Time{} }},
-		{"zero session", func(f *fixture, p *pendingPause) { f.state.v.ObsAt = time.Time{} }},
-		{"stale session", func(f *fixture, p *pendingPause) { f.state.v.ObsAt = f.clock.now().Add(-16 * time.Second) }},
-		{"future job", func(f *fixture, p *pendingPause) { f.state.j.ObsAt = f.clock.now().Add(time.Second) }},
-		{"future session", func(f *fixture, p *pendingPause) { f.state.v.ObsAt = f.clock.now().Add(time.Second) }},
-		{"old job observation connection", func(f *fixture, p *pendingPause) { f.state.j.ObsGen++ }},
-		{"old session observation connection", func(f *fixture, p *pendingPause) { f.state.v.ObsGen++ }},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			f := newLayerFixture(t)
-			f.hint("first_layer_complete")
-			f.step()
-			p := f.w.layerPending
-			f.report("PAUSE", new(2))
-			tc.invalidate(f, p)
-			f.step()
-			if layerStatus(f).Pause == "confirmed" {
-				t.Fatal("invalid observation confirmed")
-			}
-			f.clock.advance(31 * time.Second)
-			f.step()
-			if layerStatus(f).Pause != "unconfirmed" || !f.hasEvent("platecheck_layer1_pause_unconfirmed") {
-				t.Fatal("invalid confirmation did not expire")
-			}
-		})
+func TestFirstLayerConfirmationIsStateBased(t *testing.T) {
+	// Stale stamps and generation counters never block confirmation:
+	// any same-job PAUSE/PAUSED inside the deadline confirms, including
+	// an HMS-driven pause the proxy did not cause.
+	f := newLayerFixture(t)
+	f.hint("first_layer_complete")
+	f.step()
+	f.report("PAUSE", new(2))
+	f.state.edit(func(j *telemetry.JobView, v *telemetry.SessionView) {
+		v.ObsAt = time.Time{}
+		v.ObsGen++
+	})
+	f.step()
+	if layerStatus(f).Pause != "confirmed" || f.w.layerPending != nil || !f.hasEvent("platecheck_layer1_pause_confirmed") {
+		t.Fatalf("stale stamps blocked confirmation: %+v", layerStatus(f))
+	}
+	// A terminal report inside the deadline is unconfirmed, not confirmed.
+	f = newLayerFixture(t)
+	f.hint("first_layer_complete")
+	f.step()
+	f.report("FINISH", new(2))
+	f.step()
+	if layerStatus(f).Pause != "unconfirmed" || f.w.layerPending != nil {
+		t.Fatalf("terminal confirmed: %+v", layerStatus(f))
 	}
 }
 
@@ -90,15 +80,9 @@ func TestFirstLayerPauseIdentityInvalidation(t *testing.T) {
 		name   string
 		change func(*fixture)
 	}{
-		{"reconnect", func(f *fixture) { f.commands.reconnect() }},
-		{"offline", func(f *fixture) { f.commands.offline = map[string]bool{"01S1": true} }},
 		{"job replacement", func(f *fixture) { f.state.j.Generation++ }},
-		{"revision", func(f *fixture) { f.state.j.Revision++ }},
-		{"session", func(f *fixture) { f.state.v.SessionGen++ }},
-		{"running epoch", func(f *fixture) { f.state.j.RunningEpoch++ }},
-		{"session epoch", func(f *fixture) { f.state.v.Epoch++ }},
-		{"pause resume before observation", func(f *fixture) { f.report("PAUSE", new(2)); f.report("RUNNING", new(2)) }},
 		{"terminal", func(f *fixture) { f.report("FINISH", new(2)) }},
+		{"ended idle", func(f *fixture) { f.report("IDLE", nil) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newLayerFixture(t)
@@ -108,6 +92,30 @@ func TestFirstLayerPauseIdentityInvalidation(t *testing.T) {
 			f.step()
 			if layerStatus(f).Pause != "unconfirmed" || f.w.layerPending != nil || len(f.commands.pauses) != 1 {
 				t.Fatalf("invalidation %+v", layerStatus(f))
+			}
+		})
+	}
+	// A reconnect or a pause/resume cycle that returns to RUNNING keeps
+	// the wait open: only a same-job terminal report or a job
+	// replacement ends it early.
+	for _, tc := range []struct {
+		name   string
+		change func(*fixture)
+	}{
+		{"reconnect", func(f *fixture) { f.commands.reconnect() }},
+		{"offline", func(f *fixture) { f.commands.offline = map[string]bool{"01S1": true} }},
+		{"session", func(f *fixture) { f.state.v.SessionGen++ }},
+		{"session epoch", func(f *fixture) { f.state.v.Epoch++ }},
+		{"pause resume before confirmation", func(f *fixture) { f.report("PAUSE", new(2)); f.report("RUNNING", new(2)) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newLayerFixture(t)
+			f.hint("first_layer_complete")
+			f.step()
+			tc.change(f)
+			f.step()
+			if layerStatus(f).Pause != "pending" || f.w.layerPending == nil || len(f.commands.pauses) != 1 {
+				t.Fatalf("wait closed early: %+v", layerStatus(f))
 			}
 		})
 	}
@@ -161,21 +169,21 @@ func TestFirstLayerPauseDeadlineNoReplay(t *testing.T) {
 	}
 }
 
-func TestFirstLayerConfirmationCanRecoverBeforeDeadline(t *testing.T) {
+func TestFirstLayerConfirmationWaitSurvivesRunningReports(t *testing.T) {
 	f := newLayerFixture(t)
 	f.hint("first_layer_complete")
 	f.step()
-	p := f.w.layerPending
-	f.report("PAUSED", new(2))
-	f.state.v.Obs = p.obs
+	// Intermediate RUNNING reports keep the wait open; the later PAUSE
+	// still confirms inside the deadline.
+	f.report("RUNNING", new(2))
 	f.step()
 	if layerStatus(f).Pause != "pending" {
-		t.Fatal("old observation ended valid confirmation window")
+		t.Fatal("RUNNING report ended valid confirmation window")
 	}
 	f.report("PAUSED", new(2))
 	f.step()
 	if layerStatus(f).Pause != "confirmed" {
-		t.Fatal("fresh observation did not confirm")
+		t.Fatal("later pause did not confirm")
 	}
 }
 
@@ -226,7 +234,6 @@ func TestFirstLayerSecondJobGetsIndependentCheck(t *testing.T) {
 	f.step()
 	f.state.edit(func(j *telemetry.JobView, v *telemetry.SessionView) {
 		j.Generation++
-		j.Revision++
 		v.SessionGen++
 		v.Epoch++
 	})

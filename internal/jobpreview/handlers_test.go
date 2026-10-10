@@ -22,15 +22,7 @@ import (
 // admission marking plus finish, so route tests exercise the real stamps.
 func publishReady(t *testing.T, svc *Service, serial string, job telemetry.JobView, png []byte, md *Metadata) {
 	t.Helper()
-	adm := &admission{
-		printer:  config.Printer{Serial: serial},
-		job:      job,
-		gen:      job.Generation,
-		rev:      job.Revision,
-		epoch:    job.RunningEpoch,
-		upstream: 4,
-	}
-	svc.begin(serial, adm)
+	adm := beginAttempt(t, svc, serial, job)
 	svc.finish(adm, Result{PNG: png, Metadata: md}, nil)
 }
 
@@ -54,7 +46,7 @@ func TestPreviewRouteServesVersionedPNG(t *testing.T) {
 	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
 	clk := &testClock{now: base}
 	conn := newFakeConn("S1")
-	job := settledJob(base, 7)
+	job := runningJob(7)
 	rd := newJobReader("S1", job)
 	svc := newTestService(t, conn, rd, clk, "S1")
 	counts := &fetchCounter{}
@@ -122,12 +114,15 @@ func TestPreviewRouteStaleVersionAfterJobSwitch(t *testing.T) {
 	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
 	clk := &testClock{now: base}
 	conn := newFakeConn("S1")
-	job7 := settledJob(base, 7)
+	job7 := runningJob(7)
 	rd := newJobReader("S1", job7)
 	svc := newTestService(t, conn, rd, clk, "S1")
 
 	pngA := pngBytes(t, 3, 4)
 	publishReady(t, svc, "S1", job7, pngA, nil)
+	svc.mu.Lock()
+	svc.worker = false // publishReady reserved the slot; free it for step
+	svc.mu.Unlock()
 	sumA := sha256.Sum256(pngA)
 	vA := hex.EncodeToString(sumA[:])
 
@@ -138,7 +133,7 @@ func TestPreviewRouteStaleVersionAfterJobSwitch(t *testing.T) {
 		started <- struct{}{}
 		return Result{PNG: pngB}, nil
 	}
-	j8 := settledJob(base, 8)
+	j8 := runningJob(8)
 	rd.set("S1", j8)
 	svc.step(base)
 	await(t, started)
@@ -161,7 +156,7 @@ func TestPreviewRouteMetadataOnlyHasNoImage(t *testing.T) {
 	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
 	clk := &testClock{now: base}
 	conn := newFakeConn("S1")
-	job := settledJob(base, 7)
+	job := runningJob(7)
 	rd := newJobReader("S1", job)
 	svc := newTestService(t, conn, rd, clk, "S1")
 	counts := &fetchCounter{}
@@ -170,10 +165,7 @@ func TestPreviewRouteMetadataOnlyHasNoImage(t *testing.T) {
 		return Result{}, nil
 	}
 
-	adm := &admission{
-		printer: config.Printer{Serial: "S1"}, job: job, gen: 7, rev: 1, epoch: 2, upstream: 4,
-	}
-	svc.begin("S1", adm)
+	adm := beginAttempt(t, svc, "S1", job)
 	svc.finish(adm,
 		Result{Metadata: &Metadata{Source: sourcePrinter3mf, Title: strPtr("Title")}},
 		archiveErr(catImageMissing, "plate image missing"))

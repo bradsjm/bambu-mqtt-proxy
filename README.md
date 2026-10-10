@@ -209,7 +209,7 @@ disabled.
 | `/livez`, `/readyz` | `200 ok` once serving (printer state deliberately excluded — clients stay connected while printers recover) |
 | `/status` | JSON: `{"status":"ok","upstreams":{"<serial>":true\|false}}`, plus a `detection` map per printer when AI detection is enabled and a `platecheck` state, covering the startup result and the first-layer phase, when the camera feature is on |
 | `POST /platecheck/snapshots` | Plate-check dry run used by the `/config` page: checks one fresh snapshot per online, camera-capable printer in parallel and streams the exact images and scores as NDJSON (`start`, one `result` per printer, `done`). Offline printers are skipped. Sends no printer command. Covers the startup check only, not the first-layer phase. Mounted when cameras are on |
-| `/activity`, `/activity/{serial}` | Recent per-printer events (in memory; cleared when the proxy restarts) |
+| `/activity`, `/activity/{serial}` | Up to 50 recent per-printer events (in memory; cleared when the proxy restarts); alert and error entries can carry a `url` with an error-code lookup link |
 | `/camera/{serial}/snapshot` | Single JPEG frame (P1/A1 native; X1/P2S/H2-series converted server-side with FFmpeg) |
 | `/camera/{serial}/stream` | Live multipart MJPEG stream (same model support as the snapshot) |
 | `/camera/status` | Display state for every printer (no credentials) |
@@ -248,9 +248,12 @@ Open `http://<host>:8080/camwall`.
   [PrintARA Bambu error code database](https://printara3d.com/tools/bambu-error-codes/).
 - **Detail levels** — click a tile's details panel to step through compact,
   vitals (layer count, finish time, nozzle/bed/chamber temperature gauges),
-  and full details. Full details add the recent activity log (print state
-  changes, alerts, connectivity, AI detection events). The log is held in
-  memory and starts empty after each proxy restart.
+  and full details. Full details add the recent activity log (up to 50
+  entries per printer: print state changes, alerts with the same
+  descriptions as the live alert banner, connectivity, AI detection events).
+  Alert and error entries can carry a `Look up` link to the error-code
+  reference. The log is held in memory and starts empty after each proxy
+  restart.
 - **Fleet chips** in the top bar count printers per state and double as
   filters; **needs attention** collects failed, paused, stale, and
   serious-alert printers, plus detection warnings or pause attempts when the
@@ -273,8 +276,10 @@ Open `http://<host>:8080/camwall`.
   streams, snapshots, and the status stream.
 - **State source** — the wall subscribes to `/camera/events`; report-derived
   state appears when the proxy receives printer reports, such as when an MQTT
-  client or the wall itself holds a report subscription. A busy printer with
-  no report for 2 minutes shows "no recent data".
+  client or the wall itself holds a report subscription. Liveness is the
+  upstream MQTT connection state (`freshness.fresh`): a connected printer
+  stays live through report gaps, and `freshness.last_report_age_seconds` is
+  diagnostic only. A disconnected printer shows as stale.
 - **Stateless privacy** — camera and camera-wall endpoints are unauthenticated
   by design: anyone who can reach the HTTP port can view cameras and
   telemetry. The state endpoints never include credentials.
@@ -338,7 +343,12 @@ On by default; disable with `mcp.enabled: false`. MCP protocol
   and `set_speed_profile`.
 - **Module tools**, served by their modules when those modules run:
   `set_ai_monitoring` with the Gadget AI detection (which also needs the
-  camera feature), and `get_job_preview` with the job preview feature.
+  camera feature), and `get_job_preview` with the job preview feature, which
+  downloads the running print's 3MF over FTPS: admission is immediate on the
+  first RUNNING tick, up to 3 attempts per job generation with 30 s × attempt
+  retries for `not_found`/`timeout`/`transport`, a 10-minute cap with a
+  30-second idle stall timeout, and a `Print details` wall panel naming the
+  `View.Reason` while pending or unavailable.
 - **Printer state** — `get_printer_state` returns
   `state.modules.<name>` per running module (for example
   `state.modules.jobpreview` with the archived job preview,
@@ -398,10 +408,13 @@ turn the chamber light on, uploads that one JPEG to the endpoint, and sends
 `stop` only when the model is sure the view is usable (assessable at least 0.8)
 and the occupied probability is above `stop_confidence`. The startup check does
 not pause or resume prints during startup. Every failure, unclear image, or
-missing camera lets the print continue. It checks only prints that start while
-the proxy watches; a print already underway when the proxy attaches is never
-stopped. A stop sent during PREPARE may be repeated once when the job first
-reaches RUNNING with layer 0.
+missing camera lets the print continue. Admission comes from the activity log:
+`print_started` and `print_preparing` entries carry the job generation, and a
+print already underway when the proxy attaches (`JobView.StartObserved` false)
+is never stopped — the panel says `Proxy started after this print began`. Skip
+and failure entries use plain-English reasons (for example `Plate check
+skipped, printer offline, no stop sent, continuing print`). A stop sent during
+PREPARE may be repeated once when the job first reaches RUNNING with layer 0.
 
 ### Startup decision
 
@@ -421,25 +434,15 @@ result: the print is never stopped on a failure.
 ### First-layer check
 
 The first-layer phase uses the same provider, credential, and model as the
-startup check. For each print job, once the observed layer count rises from 1
-or below to 2 or above while the print is still running, the proxy uploads two
-fresh original JPEGs taken at least 2 seconds apart, in one request. The
-completion event carries the print evidence observed at that moment: the
-independent job projection (job generation, revision, and running epoch) and
-the session projection (session, epoch, connection, and its report time).
-Admission accepts it only while both projections still match the current
-job, session, and upstream connection, so a late event from a replaced
-session or a reconnect cannot check or pause the print that replaced it.
-The job fields also cover a same-identity replacement: when the printer
-replaces a print under the same cookie but a changed start time, only the
-job generation moves, the stale event is rejected, and the new print keeps
-its own first-layer check.
-Arming is equally provenance-bound: the session view exposes the observed
-layer only when `layer_num` was reported inside the current independent job
-generation, so the previous job's sticky layer can never arm the
-replacement. A same-cookie boundary hides the old layer until the new job
-re-reports its own, whether the boundary arrives as a real state report or
-as a metadata-only delta that changes only `gcode_start_time`. The model
+startup check. For each print job, once the current job's layer count rises
+from 1 or below to 2 or above while the print is still running, the proxy
+uploads two fresh original JPEGs taken at least 2 seconds apart, in one
+request. What counts as the current job's layer is
+`SessionView.CurrentLayer()`: a positive `layer_num` reported before the
+current job began is unknown, so the previous job's sticky layer can never arm
+the replacement. The `first_layer_complete` activity entry carries the job
+generation it was proved against, so a late event from a replaced print cannot
+check or pause the print that replaced it. The model
 answers five questions:
 
 | Question | Effect |
@@ -484,7 +487,10 @@ the printer may refuse the command. Stop requests, first-layer warnings, and
 first-layer pause attempts — including failed or unconfirmed pauses — go to the
 activity log and, with notifications on, to Pushover; first-layer passes,
 confirmed pauses, and skips stay in the activity log. The camera wall shows a
-`Plate check` panel covering both phases.
+`Print checks` panel covering both phases, with a `Before printing` section
+(plate state, rule, scores) and an `After layer 1` section (first-layer state,
+rule, view clarity, findings); skips and failures name the reason in a note
+(for example `Printer offline; no stop sent`).
 
 Chamber cameras look across the plate from one corner, so a tangle, a blob, or
 a detached part can be hidden behind the toolhead or the part itself, and small
@@ -539,15 +545,15 @@ service: camera
 snapshots leave your LAN for OctoEverywhere's servers, and the proxy can
 temporarily set print speed to Silent and pause prints without asking. Leave
 the key unset to keep every image local and automatic printer controls off.
-OctoEverywhere documents that images submitted through the public Gadget API
-are not used for AI model training.
-
 **Eligibility.** Detection rides on the camera pipeline, so it covers exactly
 the camera-capable models (P1P, P1S, A1, A1MINI) and only while telemetry
-shows a print actively running. It requires the camera feature
-(`camera.enabled`): with cameras disabled and a key set, nothing runs
-and every printer's `detection` object reports `blocked`. Detection keeps
-running with `http.port: 0`; only its status endpoints are then absent.
+shows a print actively running and the upstream connection is live. It requires
+the camera feature (`camera.enabled`): with cameras disabled and a key set,
+nothing runs and every printer's `detection` object reports `blocked`.
+Detection keeps running with `http.port: 0`; only its status endpoints are
+then absent. The wall text for `awaiting_fresh_telemetry` is `waiting for
+printer data`: it means waiting for the current layer or a live connection,
+not a 15 s report-age timer.
 
 **Allowance.** Enforcement lives entirely on OctoEverywhere's side. Each
 account includes 90,000 free inspection calls per monthly billing period —
@@ -559,8 +565,12 @@ Only**, so inspections stop at the allowance instead of incurring charges.
 
 **Failures and limits.**
 
-- Network errors, timeouts, server errors, and rate limits are retried with
-  capped backoff and never affect printing or camera serving.
+- Network errors, timeouts, server errors, and rate limits degrade detection
+  and retry with capped backoff, never affecting printing or camera serving.
+  A degraded condition is recorded as `AI inspection interrupted, <reason>` in
+  the activity log only after it has lasted 30 s; brief gaps that recover
+  sooner stay silent, and recovery records `AI inspection resumed, monitoring
+  print` only when an interruption was recorded.
 - Invalid or disabled keys, billing failures, IP restrictions, and exhausted
   free allowances suspend detection until restart; account errors suspend it
   across all printers. Logs show safe, structured reasons, not provider error
@@ -572,21 +582,18 @@ Only**, so inspections stop at the allowance instead of incurring charges.
   every status and context. The proxy then cannot restore a Silent profile it
   set before the restart.
 
-Full policy, retry, and state-machine detail lives in
-[DESIGN.md §6.1](DESIGN.md).
-
 ## Pushover notifications (optional)
 
 Enable the Notifications section on `/config` (or the `notifications` YAML
 block) to send print alerts to one [Pushover](https://pushover.net/) account.
 
-- **What notifies** — a print finishing, failing, or stopping before it
-  finishes; printer errors and HMS warnings; AI detection warnings and AI
-  pause attempts, including failed or unconfirmed ones; a build-plate check
-  that requests a startup stop, or a first-layer warning or pause attempt,
-  including failed or unconfirmed first-layer pauses; and a pause that leaves
-  an active printer alert. Starts, resumes, reconnects, cleared alerts, and
-  routine plate-check entries (first-layer passes, confirmed pauses, and
+- **What notifies** — a print finishing, failing, being cancelled, or stopping
+  before it finishes; printer errors and HMS warnings; AI detection warnings
+  and AI pause attempts, including failed or unconfirmed ones; a build-plate
+  check that requests a startup stop, or a first-layer warning or pause
+  attempt, including failed or unconfirmed first-layer pauses; and a pause that
+  leaves an active printer alert. Starts, resumes, reconnects, cleared alerts,
+  and routine plate-check entries (first-layer passes, confirmed pauses, and
   skips) do not notify.
 - **What arrives** — events within 2 seconds group into one message per
   printer: the event summaries, the running file, and each active alert with
@@ -635,8 +642,18 @@ go build ./cmd/bambu-mqtt-proxy
 docker buildx build --platform linux/amd64,linux/arm64 -t bambu-mqtt-proxy .
 ```
 
-[DESIGN.md](DESIGN.md) covers the protocol research, package boundaries,
-failure modes, and the verification plan behind this proxy.
+`tools/capturereports` extracts printer-report replay fixtures from proxy
+container logs:
+
+```sh
+docker logs bambu-mqtt-proxy 2>&1 | go run ./tools/capturereports -serial <serial> -out internal/telemetry/testdata/live_<serial>_<yyyymmdd>
+```
+
+It keeps the `printer report received` lines for exactly that serial, starts a
+new segment at each `mochi mqtt server started` line, and writes one
+`<prefix>_<n>.jsonl` file per non-empty segment (`t_ms`, connection `gen`,
+`payload` per line), which `go test -race -run Replay ./internal/telemetry/`
+replays.
 
 ## License
 

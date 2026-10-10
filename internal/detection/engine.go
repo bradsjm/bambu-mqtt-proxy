@@ -1,6 +1,6 @@
 // Detection engine for the optional OctoEverywhere Gadget integration: one
 // worker goroutine per configured printer schedules frame inspections during
-// active prints, acts on pause suggestions under strict freshness and
+// active prints, acts on pause suggestions under live-connection and
 // generation guards, and publishes display status for the HTTP endpoints.
 // One request is in flight per printer by construction: each worker runs its
 // loop serially and never holds locks across network calls.
@@ -33,8 +33,6 @@ const (
 	// resultValidity bounds how long an inspected frame may still authorize
 	// a pause after the inspection returns.
 	resultValidity = 30 * time.Second
-	// reportFreshMax bounds telemetry staleness for action authorization.
-	reportFreshMax = 15 * time.Second
 	// frameFreshMax bounds camera frame staleness; every inspection needs a
 	// frame unique to it (Seq strictly greater than the previous one).
 	frameFreshMax = 5 * time.Second
@@ -51,11 +49,15 @@ const (
 	intensiveClearCount = 3
 	intensiveClearSpan  = 30 * time.Second
 	// idlePoll paces parked workers; stalePoll re-checks authorization while
-	// waiting for fresh current-generation telemetry; cameraRetry paces
+	// waiting for a live connection or a current layer report; cameraRetry paces
 	// retries while the camera cannot serve a fresh frame.
 	idlePoll    = 5 * time.Second
 	stalePoll   = 5 * time.Second
 	cameraRetry = 10 * time.Second
+	// degradeLogDelay is how long a degraded condition must last before it
+	// is recorded as an AI inspection interruption in the activity log.
+	// Brief gaps that recover sooner stay silent.
+	degradeLogDelay = 30 * time.Second
 )
 
 // Pause lifecycle values for Status.PauseState.
@@ -188,9 +190,11 @@ type PrinterControl interface {
 }
 
 // GenerationSource reports the printer's current upstream connection
-// generation; every reconnect or loss changes the value.
+// generation; every reconnect or loss changes the value. Connected reports
+// whether the upstream connection is live.
 type GenerationSource interface {
 	Generation(serial string) uint64
+	Connected(serial string) bool
 }
 
 // gadgetClient is the API surface the engine uses; *Client implements it.
@@ -223,7 +227,6 @@ type Engine struct {
 	// they are not configuration.
 	kConfirmWait    time.Duration
 	kResultValidity time.Duration
-	kReportFreshMax time.Duration
 	kFrameFreshMax  time.Duration
 	kFrameWait      time.Duration
 	kIdlePoll       time.Duration
@@ -264,7 +267,6 @@ func New(printers []config.Printer, client gadgetClient, frames FrameSource,
 		workers:         workers,
 		kConfirmWait:    confirmWait,
 		kResultValidity: resultValidity,
-		kReportFreshMax: reportFreshMax,
 		kFrameFreshMax:  frameFreshMax,
 		kFrameWait:      frameWait,
 		kIdlePoll:       idlePoll,
@@ -338,7 +340,7 @@ func (e *Engine) suspend(message string) {
 	e.mu.Unlock()
 	e.log.Error("detection suspended until restart", "reason", message)
 	for serial := range e.workers {
-		e.activity.Record(serial, "ai_suspended", activity.Error, "AI inspection suspended: "+message)
+		e.activity.Record(serial, "ai_suspended", activity.Error, "AI inspection suspended until proxy restart, "+message)
 	}
 }
 
@@ -418,7 +420,14 @@ type worker struct {
 	pauseState    string
 	pauseDeadline time.Time
 	degraded      string
-	tempAttempts  int
+	// degradedSince arms the interruption log deadline for the current
+	// degraded episode; degradedMessage is its latest status message and
+	// degradedLogged records whether the interruption was already logged.
+	// Guarded by mu.
+	degradedSince   time.Time
+	degradedMessage string
+	degradedLogged  bool
+	tempAttempts    int
 	// Policy state stays within one print. latestIntervals governs cadence
 	// and retries; nextDue survives pause/resume and override transitions.
 	latestIntervals IntervalSec
@@ -720,9 +729,13 @@ func (w *worker) run(ctx context.Context) {
 			w.parkSuspended(ctx, message)
 			return
 		}
+		flushLeft := w.flushDegradedLog(w.e.now())
 		delay := w.step(ctx)
 		if delay < 0 {
 			return
+		}
+		if flushLeft > 0 && flushLeft < delay {
+			delay = flushLeft
 		}
 		if !w.sleep(ctx, timer, delay) {
 			return
@@ -765,7 +778,7 @@ func (w *worker) step(ctx context.Context) time.Duration {
 	}
 	snap, ok := w.e.sessions.Session(w.serial)
 	switch {
-	case !ok || snap.ObsAt.IsZero():
+	case !ok || snap.Obs == 0:
 		// No report observed yet: nothing is known about this printer.
 		w.releaseCamera()
 		w.publish(func(s *Status) {
@@ -816,7 +829,7 @@ func (w *worker) ensureLight(snap telemetry.SessionView) {
 	}
 	w.mu.Unlock()
 	gen := w.e.gens.Generation(w.serial)
-	if gen != snap.ObsGen {
+	if !w.e.gens.Connected(w.serial) {
 		return
 	}
 	w.mu.Lock()
@@ -826,7 +839,7 @@ func (w *worker) ensureLight(snap telemetry.SessionView) {
 		w.log.Warn("chamber light command failed", append(w.diagnosticAttrs(), "error", err)...)
 		return
 	}
-	w.e.activity.Record(w.serial, "ai_light_on", activity.Info, "Chamber light turned on for AI inspection")
+	w.e.activity.Record(w.serial, "ai_light_on", activity.Info, "Chamber light turned on, AI inspection needs light")
 }
 
 // overrideActive reports whether the user's disable override is in force
@@ -857,7 +870,7 @@ func (w *worker) onIdle() {
 	w.resetSpeedState(0)
 	w.pauseState = PauseNone
 	w.pauseDeadline = time.Time{}
-	w.degraded = ""
+	interrupt, interruptMessage, _ := w.clearDegradedLocked(w.e.now())
 	w.tempAttempts = 0
 	w.nextDue = time.Time{}
 	w.latestIntervals = IntervalSec{}
@@ -872,6 +885,9 @@ func (w *worker) onIdle() {
 	w.lastFailure = ""
 	w.mu.Unlock()
 	w.controlMu.Unlock()
+	if interrupt {
+		w.e.activity.Record(w.serial, "ai_degraded", activity.Warning, "AI inspection interrupted, "+interruptMessage)
+	}
 	if hadSession {
 		w.publish(func(s *Status) {
 			*s = Status{State: StateIdle}
@@ -896,14 +912,17 @@ func (w *worker) onPauseHold(snap telemetry.SessionView) time.Duration {
 	case w.pauseState == PausePending && isPauseState(snap.State):
 		// The printer report confirmed the pause.
 		w.pauseState = PauseConfirmed
-		w.degraded = ""
+		interrupt, interruptMessage, _ := w.clearDegradedLocked(w.e.now())
 		w.mu.Unlock()
+		if interrupt {
+			w.e.activity.Record(w.serial, "ai_degraded", activity.Warning, "AI inspection interrupted, "+interruptMessage)
+		}
 		w.publish(func(s *Status) {
 			s.Reason, s.Message = "", ""
 			s.State = StatePaused
 		})
 		w.log.Info("pause confirmed by printer report", w.diagnosticAttrs()...)
-		w.e.activity.Record(w.serial, "ai_pause_confirmed", activity.Warning, "Printer confirmed AI pause")
+		w.e.activity.Record(w.serial, "ai_pause_confirmed", activity.Warning, "Print paused by AI inspection, check the print before resuming")
 		return w.e.kIdlePoll
 	case w.pauseState == PausePending && w.e.now().After(w.pauseDeadline):
 		w.pauseState = PauseUnconfirmed
@@ -913,7 +932,7 @@ func (w *worker) onPauseHold(snap telemetry.SessionView) time.Duration {
 			s.Message = "pause command was not confirmed within 30s"
 			s.State = StateAttention
 		})
-		w.e.activity.Record(w.serial, "ai_pause_unconfirmed", activity.Error, "Pause was not confirmed within 30 seconds")
+		w.e.activity.Record(w.serial, "ai_pause_unconfirmed", activity.Error, "AI pause not confirmed within 30 seconds, check the printer")
 		return w.e.kIdlePoll
 	default:
 		st := w.st.State
@@ -963,9 +982,10 @@ func (w *worker) onRunning(ctx context.Context, snap telemetry.SessionView) time
 		w.resetForNewSession(snap.SessionGen)
 	}
 	w.noteRunningTransition()
+	layer := snap.CurrentLayer()
 	w.mu.Lock()
-	w.lastLayer = copyLayer(snap.LayerNum)
-	if layerValue(snap.LayerNum) > 0 {
+	w.lastLayer = copyLayer(layer)
+	if layerValue(layer) > 0 {
 		w.layerReady = true
 	}
 	layerReady := w.layerReady
@@ -975,12 +995,12 @@ func (w *worker) onRunning(ctx context.Context, snap telemetry.SessionView) time
 	now := w.e.now()
 	freshAuthorized := w.authorized(snap, w.e.gens.Generation(w.serial))
 
-	// Authorization gate: stale telemetry or an old transport generation is
-	// rejected here, before the camera hold or any request, so a print
-	// waiting for fresh evidence never takes the camera. It precedes the
-	// layer gate so a stale or reconnected RUNNING can never present the
-	// neutral first-layer wait, with or without a layer. inspect keeps its
-	// own recheck as the defense for the race between this gate and the
+	// Authorization gate: a disconnected printer or an old transport
+	// generation is rejected here, before the camera hold or any request, so
+	// a print waiting for a live connection never takes the camera. It
+	// precedes the layer gate so a disconnected RUNNING can never present
+	// the neutral first-layer wait, with or without a layer. inspect keeps
+	// its own recheck as the defense for the race between this gate and the
 	// capture.
 	if !freshAuthorized {
 		if w.log.Enabled(context.Background(), slog.LevelDebug) {
@@ -988,14 +1008,14 @@ func (w *worker) onRunning(ctx context.Context, snap telemetry.SessionView) time
 				"operation", "process", "reason", "telemetry_not_authorized")...)
 		}
 		w.releaseCamera()
-		return w.degrade(ReasonAwaitingTelemetry, "waiting for fresh printer telemetry", w.e.kStalePoll, false)
+		return w.degrade(ReasonAwaitingTelemetry, "printer disconnected", w.e.kStalePoll, false)
 	}
 
-	// Layer gate: on a fresh, authorized observation, never acquire frames
-	// or upload while the current print's layer is unknown or zero. The
-	// session view exposes layer_num only when telemetry observed it on this
-	// print session and connection, so a previous job's sticky layer can
-	// never authorize a new print. The wait releases the camera hold, so a
+	// Layer gate: while connected and authorized, never acquire frames or
+	// upload while the current print's layer is unknown or zero.
+	// CurrentLayer hides a positive layer reported before this job began,
+	// so a previous job's sticky layer can never authorize a new print.
+	// The wait releases the camera hold, so a
 	// print that cannot be inspected yet does not retain the capture. A
 	// print that has not yet shown a layer is in its normal opening: the
 	// wait stays monitoring under awaiting_first_layer with no warning or
@@ -1003,36 +1023,39 @@ func (w *worker) onRunning(ctx context.Context, snap telemetry.SessionView) time
 	// report that carries an eligible layer starts the inspection
 	// immediately. Once a positive layer was seen, a missing layer is lost
 	// evidence and keeps the degraded waiting state.
-	if layerValue(snap.LayerNum) <= 0 {
+	if layerValue(layer) <= 0 {
 		if w.log.Enabled(context.Background(), slog.LevelDebug) {
 			w.log.Debug("detection inspection deferred", append(w.diagnosticAttrs(),
 				"operation", "process", "reason", "layer_unknown")...)
 		}
 		w.releaseCamera()
 		if layerReady {
-			return w.degrade(ReasonAwaitingTelemetry, "waiting for the printer's current layer report", w.e.kStalePoll, false)
+			return w.degrade(ReasonAwaitingTelemetry, "waiting for the printer to report its layer", w.e.kStalePoll, false)
 		}
 		// Fresh evidence ends any earlier waiting degradation, and no
 		// inspection has run yet, so the schedule is only waiting-poll
 		// bookkeeping: clear it so the first eligible layer fires
 		// immediately.
 		w.mu.Lock()
-		w.degraded = ""
+		interrupt, interruptMessage, _ := w.clearDegradedLocked(w.e.now())
 		w.nextDue = time.Time{}
 		w.mu.Unlock()
+		if interrupt {
+			w.e.activity.Record(w.serial, "ai_degraded", activity.Warning, "AI inspection interrupted, "+interruptMessage)
+		}
 		w.publish(func(s *Status) {
 			s.State = StateMonitoring
 			s.Reason = ReasonAwaitingFirstLayer
-			s.Message = "waiting for the printer's first layer report"
+			s.Message = "waiting for the printer to report its layer"
 		})
 		return w.e.kStalePoll
 	}
 
 	w.mu.Lock()
-	// A fresh current-generation state observation can arrive before the
-	// stale-telemetry poll expires. No upload was made while authorization was
-	// stale, so do not make the printer wait for that poll after it recovers.
-	// The authorization gate above guarantees freshness here.
+	// A reconnected printer can come back before the waiting poll expires.
+	// No upload was made while authorization was stale, so do not make the
+	// printer wait for that poll after it recovers. The authorization gate
+	// above guarantees a live connection here.
 	if w.degraded == ReasonAwaitingTelemetry {
 		w.nextDue = now
 	}
@@ -1086,7 +1109,6 @@ func (w *worker) gadgetRequestContext(ctx context.Context, action string, snap t
 		sessionGeneration:    snap.SessionGen,
 		sessionEpoch:         snap.Epoch,
 		connectionGeneration: gen,
-		telemetryAgeMS:       now.Sub(snap.ObsAt).Milliseconds(),
 		layer:                copyLayer(layer),
 	}
 	w.mu.Lock()
@@ -1158,7 +1180,7 @@ func (w *worker) resetForNewSession(sessionGen uint64) {
 	w.awaitingClear = false
 	w.pauseState = PauseNone
 	w.pauseDeadline = time.Time{}
-	w.degraded = ""
+	interrupt, interruptMessage, _ := w.clearDegradedLocked(w.e.now())
 	w.tempAttempts = 0
 	w.nextDue = time.Time{}
 	w.resultAt = time.Time{}
@@ -1174,6 +1196,9 @@ func (w *worker) resetForNewSession(sessionGen uint64) {
 	w.lastFailure = ""
 	w.mu.Unlock()
 	w.controlMu.Unlock()
+	if interrupt {
+		w.e.activity.Record(w.serial, "ai_degraded", activity.Warning, "AI inspection interrupted, "+interruptMessage)
+	}
 	w.publish(func(s *Status) { *s = Status{State: StateMonitoring} })
 	w.log.Info("new print session detected; gadget context reset", w.diagnosticAttrs()...)
 }
@@ -1199,7 +1224,7 @@ func (w *worker) guardPauseOnRunning() {
 				s.Message = "pause command was not confirmed within 30s"
 			})
 			w.recomputeState()
-			w.e.activity.Record(w.serial, "ai_pause_unconfirmed", activity.Error, "Pause was not confirmed within 30 seconds")
+			w.e.activity.Record(w.serial, "ai_pause_unconfirmed", activity.Error, "AI pause not confirmed within 30 seconds, check the printer")
 		}
 	case PauseConfirmed:
 		w.mu.Lock()
@@ -1219,21 +1244,18 @@ func (w *worker) guardPauseOnRunning() {
 func (w *worker) inspect(ctx context.Context, snap telemetry.SessionView) time.Duration {
 	gen := w.e.gens.Generation(w.serial)
 	if !w.authorized(snap, gen) {
-		// Stale or older-generation telemetry: a reconnect's cached RUNNING
-		// report must never authorize an action before a fresh observation
-		// arrives on the current connection.
+		// Disconnected or older-generation telemetry: a disconnected
+		// printer's cached RUNNING must never authorize an action.
 		if w.log.Enabled(context.Background(), slog.LevelDebug) {
 			w.log.Debug("detection inspection deferred", append(w.diagnosticAttrs(),
 				"operation", "process", "reason", "telemetry_not_authorized",
 				"inspection_session_generation", snap.SessionGen,
 				"inspection_session_epoch", snap.Epoch,
 				"inspection_connection_generation", gen,
-				"inspection_telemetry_generation", snap.ObsGen,
-				"inspection_state_generation", snap.StateGen,
-				"inspection_state", snap.State,
-				"inspection_telemetry_age_ms", w.e.now().Sub(snap.ObsAt).Milliseconds())...)
+				"inspection_connected", w.e.gens.Connected(w.serial),
+				"inspection_state", snap.State)...)
 		}
-		return w.degrade(ReasonAwaitingTelemetry, "waiting for fresh printer telemetry", w.e.kStalePoll, false)
+		return w.degrade(ReasonAwaitingTelemetry, "printer disconnected", w.e.kStalePoll, false)
 	}
 	// Snapshot this attempt's work scope: startGen is the marker onResult
 	// compares against, and wctx carries control-path cancellation into the
@@ -1282,21 +1304,21 @@ func (w *worker) inspect(ctx context.Context, snap telemetry.SessionView) time.D
 	// snapshot taken right after the capture. The entry snapshot stays the
 	// authorization anchor, so a session change after this point still
 	// invalidates the result below.
-	layer := snap.LayerNum
+	layer := snap.CurrentLayer()
 	cur, ok := w.e.sessions.Session(w.serial)
 	if ok {
-		layer = cur.LayerNum
+		layer = cur.CurrentLayer()
 	}
 	// Capture-time recheck: the world moved while the camera waited. The
 	// frame may only upload against the print and connection it was
 	// captured for: the pool generation must still match the generation
-	// captured at entry (a reconnect must not ride a restated state), the
-	// current view must keep the same print session and epoch, the full
-	// entry authorization must still hold for the current view — authorized
-	// covers RUNNING on the current connection, its generations, and the
-	// ObsAt freshness bound at the capture moment — and the layer the frame
-	// captured must be known and positive. onResult would discard such a
-	// result anyway; catching it here also keeps the request from happening.
+	// captured at entry (command transport protection: a reconnect must not
+	// ride a restated state), the current view must keep the same print
+	// session and epoch, the full entry authorization must still hold for
+	// the current view — authorized covers a live connection on the
+	// captured generation with RUNNING — and the layer the frame captured
+	// must be known and positive. onResult would discard such a result
+	// anyway; catching it here also keeps the request from happening.
 	if !ok ||
 		w.e.gens.Generation(w.serial) != gen ||
 		cur.Epoch != snap.Epoch || cur.SessionGen != snap.SessionGen ||
@@ -1309,10 +1331,10 @@ func (w *worker) inspect(ctx context.Context, snap telemetry.SessionView) time.D
 				"current_session_generation", cur.SessionGen,
 				"current_connection_generation", w.e.gens.Generation(w.serial),
 				"captured_connection_generation", gen,
-				"current_telemetry_generation", cur.ObsGen,
+				"current_connected", w.e.gens.Connected(w.serial),
 				"current_layer", layerValue(layer))...)
 		}
-		return w.degrade(ReasonAwaitingTelemetry, "waiting for a fresh printer report during frame capture", w.e.kStalePoll, false)
+		return w.degrade(ReasonAwaitingTelemetry, "print changed during camera capture", w.e.kStalePoll, false)
 	}
 	w.mu.Lock()
 	w.sessionGen = snap.SessionGen
@@ -1350,7 +1372,7 @@ func (w *worker) inspect(ctx context.Context, snap telemetry.SessionView) time.D
 			"frame_sequence", frame.Seq,
 			"inspection_reason", detail.inspectionReason,
 			"duration_ms", time.Since(started).Milliseconds())
-		w.e.activity.Record(w.serial, "ai_monitoring", activity.Info, "AI inspection started")
+		w.e.activity.Record(w.serial, "ai_monitoring", activity.Info, "AI inspection started, monitoring print")
 	}
 
 	url := w.sessionURL()
@@ -1552,16 +1574,11 @@ func (w *worker) intensiveLocked(now time.Time) bool {
 		(w.lastLayer != nil && *w.lastLayer > 0 && *w.lastLayer <= 3) || w.riskActive
 }
 
-// authorized reports whether fresh telemetry on the current connection
-// authorizes action for this printer right now. The RUNNING must have been
-// explicitly restated by a gcode_state report on the current connection
-// (StateGen); a temperature-only delta on a new connection never makes a
-// pre-reconnect RUNNING authorize an upload.
+// authorized reports whether the printer's live connection authorizes
+// action for this printer right now. Printer data is usable while the
+// upstream connection is live; report gaps never gate authorization.
 func (w *worker) authorized(snap telemetry.SessionView, gen uint64) bool {
-	return gen != 0 && snap.ObsGen == gen &&
-		snap.StateGen == gen &&
-		w.e.now().Sub(snap.ObsAt) <= w.e.kReportFreshMax &&
-		isRunning(snap.State)
+	return gen != 0 && w.e.gens.Connected(w.serial) && w.e.gens.Generation(w.serial) == gen && isRunning(snap.State)
 }
 
 // resetSpeedState drops every profile decision tied to one print.
@@ -1585,13 +1602,10 @@ func (w *worker) ensureSpeedSession(snap telemetry.SessionView) {
 	}
 }
 
-// freshSpeed reports a profile that belongs to this active print and the
-// current connection, rather than a cached value from an earlier session.
+// freshSpeed reports a profile reported for an active print while the
+// upstream connection is live.
 func (w *worker) freshSpeed(snap telemetry.SessionView, gen uint64) bool {
-	return gen != 0 && snap.Active && snap.SessionGen != 0 &&
-		snap.SpeedProfile != nil && snap.SpeedSessionGen == snap.SessionGen &&
-		snap.SpeedGen == gen && !snap.SpeedAt.IsZero() &&
-		w.e.now().Sub(snap.SpeedAt) <= w.e.kReportFreshMax
+	return gen != 0 && w.e.gens.Connected(w.serial) && snap.Active && snap.SessionGen != 0 && snap.SpeedProfile != nil
 }
 
 // speedAuthorized rechecks the same print, state, connection, and result
@@ -1649,8 +1663,7 @@ func (w *worker) reconcileSpeed(snap telemetry.SessionView) {
 	pausePending := w.pauseState == PausePending
 	w.mu.Unlock()
 	if pausePending || w.speedPrior == nil || w.speedPrintGen != snap.SessionGen ||
-		gen == 0 || snap.ObsGen != gen || snap.StateGen != gen ||
-		w.e.now().Sub(snap.ObsAt) > w.e.kReportFreshMax {
+		gen == 0 || !w.e.gens.Connected(w.serial) || w.e.gens.Generation(w.serial) != gen {
 		return
 	}
 	prior := *w.speedPrior
@@ -1800,7 +1813,7 @@ func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, r
 			"frame_sequence", frame.Seq, "reason", "print_session_changed")
 		return false
 	}
-	// The same freshness and continuity rules that authorize a pause also
+	// The same liveness and continuity rules that authorize a pause also
 	// authorize accepting any analysis. Evidence rejected here must leave
 	// risk counters, clear counters, the degraded condition, resultAt, the
 	// pause latch, and speed ownership untouched; only the transport
@@ -1819,7 +1832,7 @@ func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, r
 	w.mu.Lock()
 	w.tempAttempts = 0
 	wasDegraded := w.degraded != ""
-	w.degraded = ""
+	interrupt, interruptMessage, logged := w.clearDegradedLocked(w.e.now())
 	wasWarning := w.st.Warning
 	newRisk := res.FasterInspectionSuggested || res.WarningSuggested || res.PauseSuggested || res.PrintQuality <= 5
 	if newRisk {
@@ -1848,6 +1861,9 @@ func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, r
 	}
 	pauseWanted := res.PauseSuggested && !w.awaitingClear
 	w.mu.Unlock()
+	if interrupt {
+		w.e.activity.Record(w.serial, "ai_degraded", activity.Warning, "AI inspection interrupted, "+interruptMessage)
+	}
 	pauseState := ""
 	message := ""
 	reason := ""
@@ -1883,7 +1899,7 @@ func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, r
 			}
 		} else {
 			// The print changed while the request was in flight (PAUSE to
-			// RUNNING, a reconnect, or stale telemetry): discard the result.
+			// RUNNING, a reconnect, or a disconnect): discard the result.
 			w.log.Info("pause suggestion discarded; print state changed during inspection",
 				"operation", "pause", "session_generation", snap.SessionGen,
 				"session_epoch", snap.Epoch, "connection_generation", gen,
@@ -1953,20 +1969,20 @@ func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, r
 			s.Reason, s.Message = "", ""
 		}
 	})
-	if wasDegraded {
-		w.e.activity.Record(w.serial, "ai_recovered", activity.Info, "AI inspection recovered")
+	if logged {
+		w.e.activity.Record(w.serial, "ai_recovered", activity.Info, "AI inspection resumed, monitoring print")
 	}
 	if res.WarningSuggested && !wasWarning {
 		w.e.activity.Record(w.serial, "ai_warning", activity.Warning,
-			fmt.Sprintf("Possible print failure · quality %d/10", res.PrintQuality))
+			fmt.Sprintf("Possible print failure, quality %d/10", res.PrintQuality))
 	} else if clear && wasWarning {
-		w.e.activity.Record(w.serial, "ai_warning_cleared", activity.Info, "AI warning cleared")
+		w.e.activity.Record(w.serial, "ai_warning_cleared", activity.Info, "AI warning cleared, print looks normal")
 	}
 	if attempted {
 		if pauseState == PausePending {
-			w.e.activity.Record(w.serial, "ai_pause_sent", activity.Error, "AI requested a pause; waiting for printer confirmation")
+			w.e.activity.Record(w.serial, "ai_pause_sent", activity.Error, "Possible print failure, AI pause sent")
 		} else {
-			w.e.activity.Record(w.serial, "ai_pause_failed", activity.Error, "AI pause command could not be sent")
+			w.e.activity.Record(w.serial, "ai_pause_failed", activity.Error, "AI pause command failed, check the printer")
 		}
 	}
 	w.recomputeState()
@@ -1975,9 +1991,8 @@ func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, r
 
 // pauseAuthorized re-validates every action precondition after the upload
 // returns: same session epoch (so a PAUSE to RUNNING transition during the
-// in-flight request cancels the pause), still running, telemetry fresh on
-// the same connection generation with RUNNING explicitly restated on it,
-// and a still-recent frame.
+// in-flight request cancels the pause), still running on a live connection
+// at the same connection generation, and a still-recent frame.
 func layerValue(layer *int) int {
 	if layer == nil {
 		return 0
@@ -2000,13 +2015,11 @@ func (w *worker) pauseAuthorizationReason(snap telemetry.SessionView, gen uint64
 	case !isRunning(current.State):
 		return "printer_not_running"
 	case nowGen != gen || gen == 0:
+		// Command transport protection: the connection changed after the
+		// captured generation was read.
 		return "connection_generation_changed"
-	case current.ObsGen != nowGen:
-		return "telemetry_not_observed_on_current_connection"
-	case current.StateGen != nowGen:
-		return "running_state_not_observed_on_current_connection"
-	case w.e.now().Sub(current.ObsAt) > w.e.kReportFreshMax:
-		return "printer_telemetry_stale"
+	case !w.e.gens.Connected(w.serial):
+		return "printer_disconnected"
 	default:
 		return ""
 	}
@@ -2055,12 +2068,12 @@ func (w *worker) handleFailure(err error, processCall bool) time.Duration {
 	case errors.As(err, &apiErr) && apiErr.WorkerTerminal():
 		level = slog.LevelError
 		w.blockWorker(reason)
-		w.e.activity.Record(w.serial, "ai_blocked", activity.Error, reason)
+		w.e.activity.Record(w.serial, "ai_blocked", activity.Error, "AI inspection blocked, "+reason)
 		delay = w.e.kIdlePoll
 	case isLocalRequestError(err):
 		level = slog.LevelError
 		w.blockWorker(reason)
-		w.e.activity.Record(w.serial, "ai_blocked", activity.Error, reason)
+		w.e.activity.Record(w.serial, "ai_blocked", activity.Error, "AI inspection blocked, "+reason)
 		delay = w.e.kIdlePoll
 	case IsFrameTooLarge(err):
 		// Locally rejected before any request; the next fresh frame will
@@ -2118,8 +2131,11 @@ func (w *worker) blockWorker(message string) {
 	w.releaseCamera()
 	w.mu.Lock()
 	w.blockedReason = message
-	w.degraded = ""
+	interrupt, interruptMessage, _ := w.clearDegradedLocked(w.e.now())
 	w.mu.Unlock()
+	if interrupt {
+		w.e.activity.Record(w.serial, "ai_degraded", activity.Warning, "AI inspection interrupted, "+interruptMessage)
+	}
 	w.publish(func(s *Status) {
 		s.State = StateBlocked
 		s.Reason = ReasonRequestInvalid
@@ -2205,11 +2221,20 @@ func failureReason(err error) string {
 }
 
 // degrade records a degraded condition with the sticky result preserved.
+// The first call in an episode arms the interruption log deadline; the
+// activity entry is written by flushDegradedLog once the condition has
+// lasted degradeLogDelay, so brief gaps stay silent.
 func (w *worker) degrade(reason, message string, delay time.Duration, cameraLost bool) time.Duration {
+	now := w.e.now()
 	w.mu.Lock()
 	newDegradation := w.degraded == ""
+	if newDegradation {
+		w.degradedSince = now
+		w.degradedLogged = false
+	}
 	w.degraded = reason
-	w.nextDue = w.e.now().Add(delay)
+	w.degradedMessage = message
+	w.nextDue = now.Add(delay)
 	w.mu.Unlock()
 	w.publish(func(s *Status) {
 		s.Reason = reason
@@ -2217,10 +2242,46 @@ func (w *worker) degrade(reason, message string, delay time.Duration, cameraLost
 		s.CameraLost = s.CameraLost || cameraLost
 	})
 	w.recomputeState()
-	if newDegradation {
-		w.e.activity.Record(w.serial, "ai_degraded", activity.Warning, message)
-	}
 	return delay
+}
+
+// flushDegradedLog records the pending interruption once it has lasted
+// degradeLogDelay. It returns the time left until that deadline, or 0 when
+// nothing is pending. Call it on the run scheduling path before each step.
+func (w *worker) flushDegradedLog(now time.Time) time.Duration {
+	w.mu.Lock()
+	if w.degraded == "" || w.degradedLogged {
+		w.mu.Unlock()
+		return 0
+	}
+	if elapsed := now.Sub(w.degradedSince); elapsed < degradeLogDelay {
+		left := degradeLogDelay - elapsed
+		w.mu.Unlock()
+		return left
+	}
+	w.degradedLogged = true
+	message := w.degradedMessage
+	w.mu.Unlock()
+	w.e.activity.Record(w.serial, "ai_degraded", activity.Warning, "AI inspection interrupted, "+message)
+	return 0
+}
+
+// clearDegradedLocked drops the degraded condition. The caller holds w.mu.
+// When the deadline elapsed without a flush, it reports the interruption
+// the caller must record after unlocking. logged reports whether an
+// interruption was recorded for this episode, either by an earlier flush
+// or by this call.
+func (w *worker) clearDegradedLocked(now time.Time) (interrupt bool, message string, logged bool) {
+	previousLogged := w.degradedLogged
+	if w.degraded != "" && !previousLogged && now.Sub(w.degradedSince) >= degradeLogDelay {
+		interrupt = true
+		message = w.degradedMessage
+	}
+	w.degraded = ""
+	w.degradedMessage = ""
+	w.degradedSince = time.Time{}
+	w.degradedLogged = false
+	return interrupt, message, previousLogged || interrupt
 }
 
 // recomputeState derives the display state from the pause lifecycle and the

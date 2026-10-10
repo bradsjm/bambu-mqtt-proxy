@@ -115,10 +115,10 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	activities := activity.New(cfg.Printers)
 	pool.SetConnectivityObserver(func(serial string, connected bool, err error) {
 		if connected {
-			activities.Record(serial, "connected", activity.Info, "Upstream connection established")
+			activities.Record(serial, "connected", activity.Info, "Printer connected")
 			return
 		}
-		activities.Record(serial, "disconnected", activity.Warning, "Upstream connection lost; reconnecting")
+		activities.Record(serial, "disconnected", activity.Warning, "Printer connection lost, reconnecting")
 	})
 	// Telemetry observes upstream reports without changing forwarding. The
 	// wrapper stamps each report with its per-connection delivery order and
@@ -159,6 +159,7 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	var previews *jobpreview.Service
 	if cfg.HTTP.Port > 0 && (cfg.CameraEnabled() || cfg.MCPEnabled()) {
 		previews = jobpreview.New(cfg.Printers, state, pool, logger)
+		previews.SetActivity(activities)
 	}
 
 	// Plate-check settings resolve before camera construction: automatic

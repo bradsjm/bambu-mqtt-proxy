@@ -144,7 +144,7 @@ Panda PWR polls a BigTreeTech smart plug over HTTP for the printer's power draw:
 
 Detection keeps its own `detection:` section, the enable-requires-key rule, and the key test in `internal/detection` as a `config.Section`. While blocked (cameras off) it serves its blocked state but registers neither `PUT /detection/{serial}` nor `set_ai_monitoring`.
 
-First-layer completion is an activity-only module: when a print observed at layer 1 reaches layer 2, it records one `first_layer_complete` entry ("First layer complete") carrying the observation of one coherent Job and Session sample taken when the layer-2 report proved the event: the job projection (generation, revision, and running epoch) and the session projection (session generation, epoch, report evidence, observation time). Arming and recording track the job generation and the session generation independently, so a genuinely new print gets its own transition even when the session stays unchanged. Arming is also layer-provenance-bound: the session view exposes the observed layer only when `layer_num` was reported inside the current independent job generation — a report that omits the layer stamps nothing, and one that contradicts the last layer clears all layer evidence — so a same-cookie replacement, including a metadata-only delta that changes only `gcode_start_time`, cannot arm from the previous job's sticky display layer and waits for its own layer-0/1 observation. With notifications enabled, that entry sends a push with a live camera frame, so someone away from the wall can check the first layer. It opens no camera connection itself, adds no report interest, and records nothing for a print first seen past layer 1. The plate-check module's optional first-layer phase (§6.2) consumes that entry and evaluates the transition with the camera; admission only accepts it while the carried observation still matches the current Job AND Session projections and the connection, so a late event from an earlier print cannot act on the print that replaced it — including a same-cookie replacement with a changed positive `gcode_start_time`, which advances only the job generation; the two modules are otherwise independent.
+First-layer completion is an activity-only module: when the current job's layer (SessionView.CurrentLayer) moves from 1 or below to 2 or above, it records one `first_layer_complete` entry ("First layer complete") carrying `Observation{JobGen}` from the coherent job+session sample that proved the event. A positive `layer_num` reported before the current job began is unknown to CurrentLayer, so a previous job's sticky layer can never arm the replacement. Arming and recording track the job generation.
 
 ## 4. Downstream endpoint (printer-compatible)
 
@@ -254,19 +254,24 @@ Eligibility is checked before any camera socket is opened, with no operator conf
 
 The MCP endpoint (`internal/mcpserver`, official `github.com/modelcontextprotocol/go-sdk`, protocol 2026-07-28, stateless Streamable HTTP) serves nine core tools and one resource, with module tools added by the modules in the running configuration: the read-only `list_printers`, `get_printer_state`, `get_camera_snapshot`, and `watch_printer`, control tools `pause_print`, `resume_print`, `stop_print` (destructive emergency stop with no confirmation), `set_chamber_light`, and `set_speed_profile`, plus the module tools `set_ai_monitoring` (detection) and `get_job_preview` (job preview). Each module registers its tools through its `MCP` hook; `get_printer_state` carries `state.modules.<name>` per module, `list_printers` rows stay core-only, and `watch_printer` emits one `module_changed` event kind with a `module` field naming the module whose state changed. Control calls go through one allow-listed command service; there is no sampling, no MCP Tasks, and no path from a tool call to a Gadget upload. `watch_printer` long-parks up to 30 s on a single shared one-second sampler that diffs a notification-relevant fingerprint per printer (state transitions, job changes, connectivity, real-report freshness, module state changes; progress mode adds 5-point milestones) — it never consumes the detection engine's `WatchReports` channel. Revision tokens are epoch-stamped counters captured before state reads, so a change landing mid-read leaves the token stale and forces `resync_required` instead of being silently consumed. Resource subscriptions ride `subscriptions/listen`; legacy-protocol subscribe requests are refused before touching the bounded 32-slot ceiling. Waits (32), subscriptions (32), bodies (64 KiB), and per-printer snapshot slots are capped; camera Acquire/Release balance on every path; the endpoint never outputs credentials, addresses, or raw MQTT payloads. `http.port: 0` keeps the endpoint off without failing validation.
 
-Telemetry for `/camera/status` comes from a delta-merging cache that observes upstream reports through the pool observer hook. Merges apply only fields present in each report; P1 `pushall` warmup supplies the initial full state. The display-only AMS, external-spool, and stage fields merge before the real-print report gate and never touch detection freshness. The cache never feeds back into MQTT forwarding.
+Telemetry for `/camera/status` comes from a delta-merging cache that observes upstream reports through the pool observer hook. A field keeps the last value the printer reported until the printer reports a different value: an absent key keeps the value, while an explicit empty or invalid key clears the public field. P1 `pushall` warmup supplies the initial full state. `JobView.StartObserved` records whether the proxy saw the print begin (false when the first state ever seen was already active); `SessionView.LayerNum` is the last reported layer in any state, and `SessionView.CurrentLayer()` is the layer to use for decisions about the current print (nil when unknown; 0 is valid from any generation). The cache never feeds back into MQTT forwarding.
 
 The in-memory activity log keeps the 50 newest events per configured printer
 and clears on restart. It records print state changes, changes to HMS alerts
-and `print_error`, upstream connect/loss events, and notable AI detection
-transitions. `/camera/status` and `/camera/events` include each printer's
-activity entries; the camera wall shows them at the Full detail level. The
+and `print_error` (with the same `hmscodes` descriptions the live alert row
+shows, and a `url` lookup link on alert and error entries), upstream
+connect/loss events, and notable AI detection transitions. A FAILED report
+carrying a user-cancel code (`0x0300400C`, `0x0500400E`) records
+`print_cancelled` instead of `print_failed`; one report records one combined
+`alerts_cleared` entry. `/camera/status` and `/camera/events` include each
+printer's activity entries; the camera wall shows up to 50 of them at the Full
+detail level with a `Look up` link for entries carrying a URL. The
 separate `/activity` endpoints work whenever HTTP is enabled, even when the
 camera feature is disabled. Report-derived events require observed reports;
 the proxy does not add report subscriptions solely to populate activity.
 Each entry has an increasing ID, UTC timestamp, stable event kind, severity,
-display message, and server-computed age in seconds. Event ages do not cause
-camera SSE updates by themselves.
+display message, optional URL, and server-computed age in seconds. Event ages
+do not cause camera SSE updates by themselves.
 
 Chamber temperature is model-filtered before `/camera/status` is serialized.
 P1P/P1S and A1/A1 MINI do not have this sensor, and their reported
@@ -334,49 +339,29 @@ training.
   pricing and free-allowance math (180 calls per print-hour) assumes the
   20-second cadence; faster intervals consume the allowance proportionally
   faster (about 125 print hours at 5 s).
-- **Context lifecycle (session freshness).** Sessions derive from telemetry
-  via the print identity cookie `project_id-task_id-subtask_name` (ids
-  normalized to strings; `0` is a valid local-print value; an incomplete
-  cookie — missing parts — is sticky for the session rather than abandoning
-  the context). One Gadget context covers one print session: a genuinely new
-  identity, a print end plus a new print, or a coalesced FINISH→RUNNING
-  transition while RUNNING resets to a new context via the Create Context
-  API (`{}` body, default confidence levels 3; the call is free), which
-  returns `ContextId`, `ProcessRequestUrl`, and
-  `FallbackProcessRequestUrl` — held in memory only. A pause decision is
-  action-fresh only while telemetry is fresh (≤ 15 s), carries `gcode_state`
-  on the current upstream connection generation, still says RUNNING, and
-  the analyzed frame was captured at most 30 s before the decision — a
-  temperature-only delta on a new connection can never make a
-  pre-reconnect RUNNING look current. Telemetry keeps three counters: the
-  session generation identifies the print and resets the context whenever
-  it changes (a control state entered from outside a session, a new
-  identity while a session is active, or a coalesced FINISH→RUNNING with no
-  idle gap); the epoch marks every state boundary and invalidates in-flight
-  results; the observation generation anchors the connection. The provider
-  expires contexts after 14 days; a proxy restart always starts fresh
-  contexts.
+- **Context lifecycle (liveness is connection state).** Liveness is the upstream MQTT connection state, never report age: detection authorizes while `Connected(serial)` holds, and a report gap of any length while connected stays live. Sessions derive from telemetry via the job generation plus the print identity (`project_id`, `task_id`, `subtask_name`, start time): a new generation — a print end plus a new print, a printer-reported transition, or a changed identity inside an active job — resets to a new context via the Create Context API (`{}` body, default confidence levels 3; the call is free), which returns `ContextId`, `ProcessRequestUrl`, and `FallbackProcessRequestUrl` — held in memory only. A pause decision requires a live connection, `gcode_state` RUNNING on the current upstream connection generation, the session epoch unchanged since the inspected frame, and the analyzed frame captured at most 30 s before the decision — a temperature-only delta on a new connection can never make a pre-reconnect RUNNING look current. In-flight generation-equality checks at dispatch are command transport protection, not report freshness. The provider expires contexts after 14 days; a proxy restart always starts fresh contexts.
   Detection keeps results and policy timing in memory only. A restart clears
   them, and quality/age readings start empty with each new context.
 - **Actions on results.** Per-printer detection state, `PrintQuality` (1–10),
   and `WarningSuggested` surface in status only (see Status below).
-  `PauseSuggested = true` triggers a pause only if, at decision time,
-  telemetry still shows RUNNING on fresh, current-generation reports, the
-  session epoch is unchanged since the inspected frame, and the frame is
-  still recent — an inspected result authorizes a pause for at most 30 s
-  after the inspection returns. The proxy then sends exactly one `{"print":{"sequence_id":
-  "0","command":"pause"}}` to `device/{serial}/request` on the exact upstream
-  connection generation the decision was validated against (§7.2), subject to
-  the same firmware constraints as any client (2025+ signed `print.*`
-  firmware may reject unsigned commands). It then waits up to 30 s for a
-  fresh PAUSE report; RUNNING reports during that window do not cut the
-  wait short — a printer may react late. The state becomes `unconfirmed`
-  only when the 30 s pass without a PAUSE report, the guarded publish
-  fails, or the in-flight suggestion fails re-validation. Pauses are never
-  retried or replayed, prints are never resumed automatically, and pausing
-  re-arms only after a later clear result (no warning and no pause
-  suggestion). The attempt is visible as `pause_state` `pending` inside the
-  window and `confirmed` or `unconfirmed` afterwards (see Status below).
+  `PauseSuggested = true` triggers a pause only if, at decision time, the
+  connection is live and telemetry still shows RUNNING on the current
+  generation, the session epoch is unchanged since the inspected frame, and
+  the frame is still recent — an inspected result authorizes a pause for at
+  most 30 s after the inspection returns. The proxy then sends exactly one
+  `{"print":{"sequence_id": "0","command":"pause"}}` to
+  `device/{serial}/request` on the exact upstream connection generation the
+  decision was validated against (§7.2), subject to the same firmware
+  constraints as any client (2025+ signed `print.*` firmware may reject
+  unsigned commands). It then waits up to 30 s for a PAUSE report; RUNNING
+  reports during that window do not cut the wait short — a printer may react
+  late. The state becomes `unconfirmed` only when the 30 s pass without a
+  PAUSE report, the guarded publish fails, or the in-flight suggestion fails
+  re-validation. Pauses are never retried or replayed, prints are never
+  resumed automatically, and pausing re-arms only after a later clear result
+  (no warning and no pause suggestion). The attempt is visible as `pause_state`
+  `pending` inside the window and `confirmed` or `unconfirmed` afterwards (see
+  Status below).
   `Score` (raw 0–100) is ignored.
 - **Error taxonomy.** Temporary errors — network errors and timeouts, HTTP
   5xx, `OE_INTERNAL_ERROR`, `OE_BACKEND_THROTTLED`, `OE_CONTEXT_RATE_LIMITED`,
@@ -387,23 +372,24 @@ training.
   max(Minimum, Recommended) is longer than 10 minutes; rate limiting
   can raise the delay, and success resets backoff. Before the first successful
   analysis in a context, a retry waits at least 20 s. After success, a retry
-  waits at least max(Minimum, Recommended), including in intensive mode. `OE_BAD_ARGS`
-  and `OE_ARGS_PARSE_FAILED` block further detection for that printer until
-  process restart; neither error is retried. On transport failure,
-  `OE_INTERNAL_ERROR`, or an unknown error with a 5xx status, the worker
-  switches to `FallbackProcessRequestUrl` and keeps it for that context's
-  lifetime, per the provider's retry guidance; throttling, invalid-request,
-  and account errors never switch URLs. Account errors suspend ALL detection
-  account-wide until process
-  restart — `OE_INVALID_API_KEY`,
-  `OE_API_KEY_DISABLED`, `OE_API_KEY_BLOCKED_PAYMENT_FAILED`,
-  `OE_API_KEY_IP_RESTRICTED` (never retried, never switched to the fallback
-  URL), and `OE_FREE_USAGE_LIMIT_REACHED` (the proxy tracks no billing
-  periods, so it cannot know when a free allowance resets) — releasing camera
-  holds and keeping the last per-printer status visible. Logs and status show
-  only safe, structured local reasons, not provider error text, response
-  bodies, or raw URLs. Gadget failures never affect MQTT proxying, camera
-  serving, or a print in progress.
+  waits at least max(Minimum, Recommended), including in intensive mode.
+  `OE_BAD_ARGS` and `OE_ARGS_PARSE_FAILED` block further detection for that
+  printer until process restart; neither error is retried. On transport
+  failure, `OE_INTERNAL_ERROR`, or an unknown error with a 5xx status, the
+  worker switches to `FallbackProcessRequestUrl` and keeps it for that
+  context's lifetime, per the provider's retry guidance; throttling,
+  invalid-request, and account errors never switch URLs. Account errors
+  suspend ALL detection account-wide until process restart —
+  `OE_INVALID_API_KEY`, `OE_API_KEY_DISABLED`,
+  `OE_API_KEY_BLOCKED_PAYMENT_FAILED`, `OE_API_KEY_IP_RESTRICTED` (never
+  retried, never switched to the fallback URL), and
+  `OE_FREE_USAGE_LIMIT_REACHED` (the proxy tracks no billing periods, so it
+  cannot know when a free allowance resets) — releasing camera holds and
+  keeping the last per-printer status visible. Logs and status show only safe,
+  structured local reasons, not provider error text, response bodies, or raw
+  URLs. Gadget failures never affect MQTT proxying, camera serving, or a print
+  in progress.
+- **Degradation logging.** A degraded condition records `ai_degraded` ("AI inspection interrupted, " + status message) only after it has lasted `degradeLogDelay` (30 s); brief gaps that recover sooner stay silent, a reason change within one degradation keeps a single pending interruption, and recovery records `ai_recovered` only when an interruption was recorded. Shutdown while degraded records nothing further.
 - **Gates.** Detection requires the API key and the camera feature
   (`camera.enabled`, default on). With the key set but cameras explicitly
   disabled nothing runs — zero API or camera activity, plus a startup
@@ -431,49 +417,50 @@ training.
   `last_inspected_layer`, `faster_inspection`, `camera_lost`,
   `using_fallback`, `suspended`, `reason` (a short machine code such as
   `camera_disabled`, `camera_unsupported`, `awaiting_reports`,
-  `awaiting_fresh_telemetry`, `camera_unavailable`, `api_retrying`,
-  `pause_unconfirmed`, or `pause_command_failed`), and `message` appear when
-  set. `paused` is the print state, while `pause_state` tracks a Gadget
-  pause attempt: `pending` inside the 30 s confirmation window, `confirmed`
-  once the printer's PAUSE report lands, `unconfirmed` when the window
-  expires, the publish fails, or the print resumes without confirmation.
-  `last_inspected_layer` is the layer observed when the inspected frame was
-  captured (the snapshot is taken at inspection start), not after upload.
-  `degraded` marks a temporary failure with the sticky last result (reason
-  `camera_unavailable` or `api_retrying`); `unsupported` marks non-camera
-  printer models. While an account-level suspension is active, the object
-  carries `"suspended": true`, and on `/camera/status` and `/camera/events`
-  the payload adds top-level `detection_suspended` and `detection_message`.
-  The health `/status` payload gains a top-level `detection` map keyed by
-  serial, holding the same complete per-printer object for every configured
-  printer; the field is present only when the API key is configured —
-  omitted entirely, no empty map, when the feature is off, so the no-key
-  `/status` payload stays byte-compatible — and suspension shows only
-  inside each serial's object. There is no separate endpoint.
+  `awaiting_fresh_telemetry` (wall text "waiting for printer data": waiting
+  for the current layer or a live connection, never a report-age timer),
+  `camera_unavailable`, `api_retrying`, `pause_unconfirmed`, or
+  `pause_command_failed`), and `message` appear when set. `paused` is the
+  print state, while `pause_state` tracks a Gadget pause attempt: `pending`
+  inside the 30 s confirmation window, `confirmed` once the printer's PAUSE
+  report lands, `unconfirmed` when the window expires, the publish fails, or
+  the print resumes without confirmation. `last_inspected_layer` is the layer
+  observed when the inspected frame was captured (the snapshot is taken at
+  inspection start), not after upload. `degraded` marks a temporary failure
+  with the sticky last result (reason `camera_unavailable` or `api_retrying`);
+  `unsupported` marks non-camera printer models. While an account-level
+  suspension is active, the object carries `"suspended": true`, and on
+  `/camera/status` and `/camera/events` the payload adds top-level
+  `detection_suspended` and `detection_message`. The health `/status` payload
+  gains a top-level `detection` map keyed by serial, holding the same complete
+  per-printer object for every configured printer; the field is present only
+  when the API key is configured — omitted entirely, no empty map, when the
+  feature is off, so the no-key `/status` payload stays byte-compatible — and
+  suspension shows only inside each serial's object. There is no separate
+  endpoint.
 - **Security.** The key is a write-only secret on the `/config` page: never
   returned by the API, never logged, and stored only in the configuration
-  file, which is written with owner-only permissions (0600). Uploads go only to the two URLs returned by Create Context
-  over TLS; both URLs are validated at creation (HTTPS, vendor host,
-  no userinfo, fragment, or non-default port), redirects are disabled, every
-  request is bounded by a 15 s timeout and a 64 KiB response cap, responses
-  must satisfy the documented contract (quality in 1–10, required warning
-  and pause booleans, positive intervals retained as provider timing floors), and error
-  details are sanitized — no provider text, raw URLs, or response bodies
-  reach logs or status.
+  file, which is written with owner-only permissions (0600). Uploads go only
+  to the two URLs returned by Create Context over TLS; both URLs are validated
+  at creation (HTTPS, vendor host, no userinfo, fragment, or non-default
+  port), redirects are disabled, every request is bounded by a 15 s timeout
+  provider text, raw URLs, or response bodies reach logs or status.
 
-### 6.2 Build-plate check (optional)
-
-The `platecheck` module (`internal/platecheck`) evaluates fresh camera frames against a vision provider (Cloudflare Workers AI models `clef` or `clef-flash`, or a custom HTTPS endpoint with the same schema). It sends `stop`, `pause`, and chamber-light commands through the generation-guarded `upstream.Pool`, uses the shared camera manager, and adds no MQTT subscription or upstream connection.
 
 - **Config.** The `platecheck` section holds `enabled`, `provider` (`cloudflare` or `custom`), `account_id`, `endpoint`, `api_key`, `model`, `stop_confidence`, and the nested `first_layer` object with `enabled` and `pause_confidence`. Without an explicit `enabled`, the check runs when the provider target and key are set; `first_layer.enabled: false` disables the first-layer phase alone, and that phase is otherwise on whenever the check is on. `stop_confidence` and `pause_confidence` accept whole percentages from 0.50 through 0.99 and compare strictly; the defaults are 0.50 and 0.70. Both phases share the provider, credential, and model. Cloudflare builds its URL from the account ID; custom uses `endpoint`. A key is bound to its destination (Cloudflare account or custom endpoint): a blank submitted key falls back to the stored key only for the identical destination, and the client pins its bearer key to its construction-time URL.
 - **Startup decision.** Two fixed questions return numbers in [0,1]. `p_assessable < 0.8` is inconclusive. A stop needs `p_clear < (100 - N)/100` for cutoff `N` percent, so exact equality does not stop. All errors are fail-open and use fixed categories; provider bodies, URLs, and image bytes never enter logs or errors.
 - **First-layer decision.** The phase consumes the `first_layer_complete` entry (§3.1) and triggers at most once per job generation: it arms on an observed layer count of 1 or less, reported inside the current job generation (a layer left over from an earlier job never arms a replacement), and runs when that count reaches 2 or more while the print is still RUNNING. It captures two fresh original JPEGs at least 2 s apart and uploads both in one request that answers five questions: view assessable, filament tangled, part detached, nozzle blob at millimeter scale, and layer incomplete. A view below the 0.8 assessable gate is inconclusive and skips the phase; a missing camera and every error are fail-open. A pause needs the gate and any pause-capable probability strictly above `pause_confidence`. Otherwise any defect probability above 0.5 records a warning, and otherwise the check passes; an incomplete layer or missing material warns only.
-- **First-layer admission.** The `first_layer_complete` entry carries originating evidence sampled from one coherent Job and Session snapshot at event time (job generation, revision, and running epoch; session generation, epoch, state and report generation, and its own observation time; internal activity evidence, never serialized over HTTP). Admission requires a nonzero originating job generation and an exact match of the job fields against the coherent current Job projection and of the session fields against the coherent current Session projection, with the current upstream connection and a real, non-future origin time at most 15 s old; absent evidence is never repaired from current telemetry, and any mismatch — a late event from a replaced session, a new job behind an unchanged session, a changed epoch, or a reconnect — is rejected before anything is queued, consumed, captured, uploaded, or paused, so the current job keeps its own admission. The job fields are what separate print A's event from print B: a same-cookie replacement with a changed positive `gcode_start_time` advances only the job generation, while the session evidence stays equal. The first valid queued source event for a job is kept; later hints for the same job renew nothing. The 25 s work budget runs from the originating evidence time and never restarts after queueing.
-- **First-layer authorization.** A job generation gets at most one pause, and the request is generation-guarded. Before the phase arms, before each capture, and immediately before the pause dispatch, the service rereads both telemetry projections (up to three coherent attempts) and requires the unchanged job generation, revision, and running epoch, the unchanged session generation and epoch, the current upstream connection, both projections fresh (15 s or less and never in the future), and a RUNNING job and session with an observed layer count of 2 or more. It captures two post-trigger frames with distinct sequences, spaces the second frame more than 2 s after the first, and holds a 25 s overall check budget; a frame is usable only while its age is at most 30 s. A startup stop attempt for a job suppresses the first-layer phase for that job generation, even when the stop command fails locally. The service then waits up to 30 s for confirmation: a PAUSE or PAUSED report counts only when it comes from the same job, session, and current connection with a real observation counter newer than the pre-dispatch value and job and session report timestamps after the dispatch boundary and before the deadline; a RUNNING job at its original running epoch keeps the attempt open until that deadline, and any other change closes it early. The service sends no retry, never replays the pause, and never resumes the print. Outcomes record `platecheck_layer1_warning`, `platecheck_layer1_pause_sent`, `platecheck_layer1_pause_failed`, `platecheck_layer1_pause_unconfirmed`, `platecheck_layer1_pause_confirmed`, `platecheck_layer1_passed`, or `platecheck_layer1_skipped`, with severities Warning, Error, Error, Error, Warning, Info, Info. The warning and pause lifecycle kinds notify through `internal/notification`; the pass, confirmed, and skipped kinds stay activity-only.
-- **Admission.** `print_preparing` and `print_started` activity hints admit a job generation. `state_initial` suppresses the attached job. A direct-RUNNING start needs a reported layer 0. At most one evaluation runs per generation.
-- **Authorization.** Before each dispatch the service rereads Job and Session (up to three coherent attempts) and requires the admission generation, revision, connection, epoch rules, report freshness, and, in RUNNING, explicit layer 0. One stop in PREPARE plus at most one in the first RUNNING epoch; the verdict is never re-evaluated. A stop counts as confirmed only by a fresh post-dispatch IDLE or FAILED observation of the same job.
+- **First-layer admission.** The `first_layer_complete` entry carries `Observation{JobGen}` from the coherent job+session sample that proved the event. Admission requires that generation to equal the current job generation on a still-active job; a late event from a replaced print cannot check the print that replaced it. Layer arming uses `SessionView.CurrentLayer()`, so a positive `layer_num` reported before the current job began never arms the replacement.
+- **First-layer authorization.** A job generation gets at most one pause, and the request is generation-guarded: the generation is read first, then authorization rechecks the same generation, a live connection, RUNNING state, and `CurrentLayer()` at 2 or above, and the command sends with that exact generation immediately. It captures two post-trigger frames with distinct sequences, spaces the second frame more than 2 s after the first, and holds a 25 s overall check budget.
+- **Admission.** `print_preparing` and `print_started` activity entries (carrying `Observation{JobGen}`) admit a job generation when it matches the current active generation with `StartObserved` true. `state_initial` on an active job without `StartObserved` records a `start_not_observed` skip with no activity. A direct-RUNNING start needs `CurrentLayer()` at 0; a positive layer from the previous job reads as unknown and waits. At most one evaluation runs per generation.
 - **Diagnostics.** `POST /platecheck/snapshots` skips printers whose upstream connection is down, captures and scores every online camera printer in parallel (5 s capture timeout) using the submitted settings, and streams NDJSON events (`start`, one `result` per printer, `done`) with the exact uploaded JPEGs. It touches no commands, activity, or worker state, and it covers the startup check only: the first-layer phase has no dry-run route. The `/config` page calls `POST /config/platecheck/test` (key check, text only) first.
 - **Limits.** Chamber cameras view the plate from one corner at low resolution, so a tangle, blob, or detached part can be hidden behind the toolhead or the part itself, and small features sit near the resolution limit. The first-layer defect thresholds are unverified model calibration. QoS 0 publication is not scoped to a printer job, so a same-connection printer job replacement after the final local guard can still receive the `stop` or the `pause`. Model accuracy and firmware acceptance of stop during PREPARE are unverified.
+
+### 6.3 Job preview and printer-truth presentation
+
+Job preview (`internal/jobpreview`) downloads the running print's 3MF from the printer over FTPS and serves its plate render and metadata. Admission is immediate on the first RUNNING tick (no settling delay): the job must be active in RUNNING/PAUSE/PAUSED with a live connection and a name or valid archive basename. Each job generation gets up to 3 attempts; `not_found`/`timeout`/`transport` failures retry with linear backoff (30 s × attempt count) while other failures are final after one attempt, and one final failure records `job_preview_unavailable`. A transfer runs under a 10-minute absolute cap with a 30-second FTPS idle stall timeout; disconnects, pauses, and report gaps never cancel a transfer, only a new generation or `Close` does. `View.Reason` names the pending/unavailable cause (`waiting_for_print`, `waiting_for_file_name`, `printer_offline`, `queued`, `downloading`, `retry_wait`, `proxy_stopping`, or the archive failure category), and the module `Display` hook renders it as a `Print details` panel (info tone while pending, warn when unavailable).
+
+Printer liveness (`freshness.fresh`) is the upstream MQTT connection state everywhere — detection, platecheck, firstlayer, jobpreview, and the MCP sampler (which sets `fresh` from the same connectivity value it samples) never gate on report age. `freshness.last_report_age_seconds` and the upstream generation stay diagnostic only, and the wall renders `awaiting_fresh_telemetry` as "waiting for printer data". Skip and failure reasons for both print checks are plain-English catalog text (`internal/platecheck/reasons.go`: `reasonClause`, `activitySentence`, `reasonNote`); there is no "Startup evidence changed or expired" staleness. The checks' `Display` hook renders one `Print checks` panel with `Before printing` (plate state, rule, scores) and `After layer 1` (first-layer state, rule, view clarity, findings) sections, with per-row notes naming the reason.
 
 ## 7. Routing model (core)
 
@@ -485,8 +472,6 @@ serial upstream, and the injector rewrites the report topic's serial level
 to the downstream ID; payloads pass through unchanged. While an alias is
 set, the real serial is refused downstream. Wildcard subscribers receive
 each report once, on the downstream-ID topic.
-
-### 7.1 Subscribe path (downstream → upstream)
 
 ```
 client SUBSCRIBE device/{sn}/report

@@ -10,8 +10,6 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-
-	"bambu-mqtt-proxy/internal/printerview"
 )
 
 // resourceNotifyTimeout bounds one ResourceUpdated fan-out. The SDK applies
@@ -294,16 +292,12 @@ func (s *sampler) lastEvents(serial string) []WatchEvent {
 }
 
 // sampleNow reads the notification-relevant fingerprint of one printer.
-func (s *Server) sampleNow(serial string, now time.Time) sample {
+func (s *Server) sampleNow(serial string, _ time.Time) sample {
 	sm := sample{milestone: -1}
 	if sv, ok := s.state.Session(serial); ok {
 		sm.state = sv.State
 		sm.sessionGen = sv.SessionGen
 		sm.active = sv.Active
-		if !sv.ObsAt.IsZero() {
-			sm.fresh = now.Sub(sv.ObsAt) <= printerview.FreshnessWindow &&
-				s.generation(serial) == sv.ObsGen
-		}
 		if sv.Active && sv.Progress != nil {
 			sm.milestone = int(*sv.Progress / 5)
 		}
@@ -318,6 +312,7 @@ func (s *Server) sampleNow(serial string, now time.Time) sample {
 		sm.printError = st.PrintError
 	}
 	sm.connected = s.connStatus(serial)
+	sm.fresh = sm.connected
 	sm.moduleKeys = make([]moduleSample, 0, len(s.modules))
 	for _, m := range s.modules {
 		if m.State != nil {

@@ -6,7 +6,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"bambu-mqtt-proxy/internal/config"
 )
@@ -21,9 +20,7 @@ func TestRecordObservedCarriesEvidenceByValue(t *testing.T) {
 		observed = append(observed, e)
 	})
 
-	at := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
-	want := Observation{JobGen: 4, JobRevision: 2, RunningEpoch: 5,
-		SessionGen: 7, Epoch: 3, StateGen: 12, ObsGen: 12, ObsAt: at}
+	want := Observation{JobGen: 4}
 	log.RecordObserved("S1", "first_layer_complete", Info, "First layer complete", want)
 
 	if len(observed) != 1 {
@@ -45,8 +42,7 @@ func TestRecordObservedCarriesEvidenceByValue(t *testing.T) {
 	res := httptest.NewRecorder()
 	mux.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/activity/S1", nil))
 	body := res.Body.String()
-	for _, leak := range []string{"Observation", "SessionGen", "Epoch", "StateGen", "ObsGen", "ObsAt",
-		"JobGen", "JobRevision", "RunningEpoch"} {
+	for _, leak := range []string{"Observation", "JobGen"} {
 		if strings.Contains(body, leak) {
 			t.Fatalf("GET /activity/S1 leaked %q: %s", leak, body)
 		}
@@ -97,7 +93,7 @@ func TestRecordOmitsEvidence(t *testing.T) {
 // the unknown-serial guard behave exactly like Record's.
 func TestRecordObservedNilAndUnknownIgnored(t *testing.T) {
 	var nilLog *Log
-	nilLog.RecordObserved("S1", "first_layer_complete", Info, "ignored", Observation{SessionGen: 1})
+	nilLog.RecordObserved("S1", "first_layer_complete", Info, "ignored", Observation{JobGen: 1})
 	if got := nilLog.Recent("S1"); got != nil {
 		t.Fatalf("nil log returned events: %v", got)
 	}
@@ -107,7 +103,7 @@ func TestRecordObservedNilAndUnknownIgnored(t *testing.T) {
 	log.SetObserver(func(serial string, e Entry) {
 		seen = append(seen, e)
 	})
-	log.RecordObserved("unknown", "first_layer_complete", Info, "ignored", Observation{SessionGen: 1})
+	log.RecordObserved("unknown", "first_layer_complete", Info, "ignored", Observation{JobGen: 1})
 	if len(seen) != 0 {
 		t.Fatalf("observer called for unknown serial: %+v", seen)
 	}

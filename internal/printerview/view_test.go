@@ -52,3 +52,28 @@ func TestBuildEmitsEmptyListsAndNulls(t *testing.T) {
 		}
 	}
 }
+
+// TestBuildFreshnessIsConnectionState pins liveness to the upstream
+// connection: connected with no report is fresh, disconnected with the same
+// generation is not, and a 60 s report gap while connected stays fresh.
+func TestBuildFreshnessIsConnectionState(t *testing.T) {
+	c := telemetry.NewCache([]config.Printer{{Serial: "S1", Name: "Shop"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	st, _ := c.State("S1")
+	sv, _ := c.Session("S1")
+	now := time.Now()
+	if v := Build(st, sv, true, 3, now); !v.Freshness.Fresh {
+		t.Fatalf("connected without a report: fresh=%v", v.Freshness.Fresh)
+	}
+	if v := Build(st, sv, false, 3, now); v.Freshness.Fresh {
+		t.Fatalf("disconnected without a report: fresh=%v", v.Freshness.Fresh)
+	}
+	old := sv
+	old.ObsAt = now.Add(-60 * time.Second)
+	old.ObsGen = 3
+	if v := Build(st, old, true, 3, now); !v.Freshness.Fresh {
+		t.Fatalf("60 s gap while connected: fresh=%v", v.Freshness.Fresh)
+	}
+	if v := Build(st, old, false, 3, now); v.Freshness.Fresh {
+		t.Fatalf("same evidence while disconnected: fresh=%v", v.Freshness.Fresh)
+	}
+}

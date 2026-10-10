@@ -122,4 +122,8 @@ type Row struct {
 	Value string `json:"value"`
 	// Tone colors the value with the Badge tone vocabulary.
 	Tone string `json:"tone,omitempty"`
+	// Section is a subheading rendered when it differs from the previous row's.
+	Section string `json:"section,omitempty"`
+	// Note is a muted line under the value.
+	Note string `json:"note,omitempty"`
 }

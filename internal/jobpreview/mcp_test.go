@@ -15,7 +15,6 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/module"
 )
 
@@ -79,7 +78,7 @@ func decodePreview(t *testing.T, res *mcp.CallToolResult) previewOut {
 func TestGetJobPreviewUnknownSerial(t *testing.T) {
 	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
 	clk := &testClock{now: base}
-	rd := newJobReader("S1", settledJob(base, 7))
+	rd := newJobReader("S1", runningJob(7))
 	svc := newTestService(t, newFakeConn("S1"), rd, clk, "S1")
 	client := connectPreviewMCP(t, svc)
 
@@ -100,7 +99,7 @@ func TestGetJobPreviewUnknownSerial(t *testing.T) {
 func TestGetJobPreviewNotReady(t *testing.T) {
 	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
 	clk := &testClock{now: base}
-	rd := newJobReader("S1", settledJob(base, 7))
+	rd := newJobReader("S1", runningJob(7))
 	svc := newTestService(t, newFakeConn("S1"), rd, clk, "S1")
 	client := connectPreviewMCP(t, svc)
 
@@ -132,17 +131,9 @@ func TestGetJobPreviewNotReady(t *testing.T) {
 func TestGetJobPreviewReady(t *testing.T) {
 	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
 	clk := &testClock{now: base}
-	rd := newJobReader("S1", settledJob(base, 7))
+	rd := newJobReader("S1", runningJob(7))
 	svc := newTestService(t, newFakeConn("S1"), rd, clk, "S1")
-	adm := &admission{
-		printer:  config.Printer{Serial: "S1", Address: "S1.invalid:8883", Username: "u", Password: "p"},
-		job:      settledJob(base, 7),
-		gen:      7,
-		rev:      1,
-		epoch:    2,
-		upstream: 4,
-	}
-	reserveSlot(svc)
+	adm := beginAttempt(t, svc, "S1", runningJob(7))
 	png := pngBytes(t, 2, 2)
 	title := "Title"
 	svc.finish(adm, Result{PNG: png, Metadata: &Metadata{Source: sourcePrinter3mf, Title: &title}}, nil)
@@ -157,7 +148,7 @@ func TestGetJobPreviewReady(t *testing.T) {
 	}
 	out := decodePreview(t, res)
 	if out.Error != nil || out.Serial != "S1" ||
-		out.JobPreview.Status != StatusReady || out.JobPreview.JobName != "Benchy" {
+		out.JobPreview.Status != StatusReady || out.JobPreview.JobName != "a.3mf" {
 		t.Fatalf("ready structured = %+v", out)
 	}
 	if out.JobMetadata == nil || out.JobMetadata.Source != sourcePrinter3mf ||

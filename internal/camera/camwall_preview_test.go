@@ -106,8 +106,9 @@ func TestTilesNoPreviewModuleWithoutModuleState(t *testing.T) {
 // TestPreviewStateUnavailableBeforeArchive wires a real preview service
 // over a telemetry cache and requires the module state to show the
 // unavailable projection before anything is observed or archived: no job
-// name, not current, and no metadata. The disabled projection is the
-// module-off state, asserted by TestTilesNoPreviewModuleWithoutModuleState.
+// name, not current, no reason, and no metadata. The disabled projection
+// is the module-off state, asserted by
+// TestTilesNoPreviewModuleWithoutModuleState.
 func TestPreviewStateUnavailableBeforeArchive(t *testing.T) {
 	renderer, _, _ := newPreviewRenderer(t, true)
 
@@ -121,8 +122,9 @@ func TestPreviewStateUnavailableBeforeArchive(t *testing.T) {
 		t.Fatalf("decode module state: %v", err)
 	}
 	if st.JobPreview.Status != jobpreview.StatusUnavailable || st.JobPreview.Current ||
-		st.JobPreview.JobName != "" || st.JobPreview.RetrievedAt != nil || st.JobPreview.ImageURL != nil {
-		t.Fatalf("view = %+v, want status %q with null optional fields", st.JobPreview, jobpreview.StatusUnavailable)
+		st.JobPreview.JobName != "" || st.JobPreview.Reason != "" ||
+		st.JobPreview.RetrievedAt != nil || st.JobPreview.ImageURL != nil {
+		t.Fatalf("view = %+v, want status %q with null optional fields and no reason", st.JobPreview, jobpreview.StatusUnavailable)
 	}
 	if st.JobMetadata != nil {
 		t.Fatalf("job_metadata = %+v, want nil before retrieval", st.JobMetadata)
@@ -132,7 +134,8 @@ func TestPreviewStateUnavailableBeforeArchive(t *testing.T) {
 // TestPreviewStateFollowsLiveProjection requires the module state to follow
 // the live projection: pending while a job is active, then unavailable
 // once it ends, with the job name and Current flag always mirroring the
-// current view.
+// current view. The fixture connectivity reports no printer connected, so
+// the active projection names the printer_offline wait.
 func TestPreviewStateFollowsLiveProjection(t *testing.T) {
 	renderer, state, _ := newPreviewRenderer(t, true)
 
@@ -154,16 +157,19 @@ func TestPreviewStateFollowsLiveProjection(t *testing.T) {
 	if st.JobPreview.Status != jobpreview.StatusPending || !st.JobPreview.Current || st.JobPreview.JobName != "benchy.3mf" {
 		t.Fatalf("active view = %+v, want pending current benchy.3mf", st.JobPreview)
 	}
+	if st.JobPreview.Reason != "printer_offline" {
+		t.Fatalf("active reason = %q, want printer_offline while disconnected", st.JobPreview.Reason)
+	}
 	if st.JobPreview.RetrievedAt != nil || st.JobPreview.ImageURL != nil || st.JobMetadata != nil {
-		t.Fatalf("unsettled job must carry no retrieved fields: %+v / %+v", st.JobPreview, st.JobMetadata)
+		t.Fatalf("unattempted job must carry no retrieved fields: %+v / %+v", st.JobPreview, st.JobMetadata)
 	}
 
 	// The job ends without any attempt: the projection switches to
 	// unavailable and stops claiming current.
 	observeReport(t, state, 2, `{"print":{"gcode_state":"FINISH"}}`)
 	st = decode()
-	if st.JobPreview.Status != jobpreview.StatusUnavailable || st.JobPreview.Current {
-		t.Fatalf("finished view = %+v, want unavailable and not current", st.JobPreview)
+	if st.JobPreview.Status != jobpreview.StatusUnavailable || st.JobPreview.Current || st.JobPreview.Reason != "" {
+		t.Fatalf("finished view = %+v, want unavailable without reason and not current", st.JobPreview)
 	}
 }
 

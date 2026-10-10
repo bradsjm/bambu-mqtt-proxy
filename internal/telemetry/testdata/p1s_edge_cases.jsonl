@@ -1,0 +1,7 @@
+{"t_ms":0,"gen":1,"payload":{"print":{"command":"push_status","msg":0,"gcode_state":"IDLE","subtask_name":"edge.3mf","gcode_file":"edge.3mf","layer_num":0,"project_id":"0","task_id":"0"}}}
+{"t_ms":1000,"gen":1,"payload":{"print":{"command":"push_status","msg":1,"gcode_state":"RUNNING"}}}
+{"t_ms":2000,"gen":1,"payload":{"print":{"command":"push_status","msg":1,"subtask_name":""}}}
+{"t_ms":3000,"gen":1,"payload":{"print":{"command":"push_status","msg":1,"layer_num":"x"}}}
+{"t_ms":4000,"gen":1,"payload":{"print":{"command":"push_status","msg":1,"layer_num":3}}}
+{"t_ms":5000,"gen":1,"payload":{"print":{"command":"push_status","msg":1,"gcode_state":"FINISH"}}}
+{"t_ms":6000,"gen":1,"payload":{"print":{"command":"push_status","msg":1,"gcode_state":"RUNNING","subtask_name":"edge2.3mf"}}}

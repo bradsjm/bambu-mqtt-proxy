@@ -555,8 +555,8 @@ func TestMCPToolCalls(t *testing.T) {
 	if sc.Serial != "P001" || sc.State.Name != "Alpha" || !sc.State.Connected {
 		t.Fatalf("state = %s", res.Result)
 	}
-	if sc.State.Freshness.Fresh {
-		t.Fatal("state without a real report counted fresh")
+	if !sc.State.Freshness.Fresh {
+		t.Fatal("connected printer without a matching generation counted stale")
 	}
 	if sc.State.Progress == nil || *sc.State.Progress != 30 {
 		t.Fatalf("progress presence broken: %s", res.Result)
@@ -689,8 +689,8 @@ func TestMCPWatchToolWire(t *testing.T) {
 		t.Fatalf("resync revision = %q", fresh)
 	}
 
-	// Reconnect the upstream and let the report become fresh again; the
-	// resulting attention bump invalidates `fresh`, so re-baseline.
+	// Reconnect the upstream; liveness returns at once, and the resulting
+	// attention bump invalidates `fresh`, so re-baseline.
 	w.conn.set("P001", true)
 	w.gens.set("P001", 1)
 	w.step()
@@ -704,10 +704,10 @@ func TestMCPWatchToolWire(t *testing.T) {
 		t.Fatalf("baseline poll = %+v", steady)
 	}
 
-	// A second reconnect (generation bump over a still-recent report) must
-	// surface as reports_stale. The poll parks first and the change lands
-	// while it is in flight, which is the changed flow a long poll exists
-	// for; a bump that lands before the park is a resync, not a change.
+	// A disconnect must surface as connectivity_lost plus reports_stale.
+	// The poll parks first and the change lands while it is in flight,
+	// which is the changed flow a long poll exists for; a bump that lands
+	// before the park is a resync, not a change.
 	token3, _ := steady["revision"].(string)
 	type posted struct {
 		msgs []sseMessage
@@ -728,7 +728,7 @@ func TestMCPWatchToolWire(t *testing.T) {
 	if !waitWatchParked() {
 		t.Fatal("freshness-loss watch never parked")
 	}
-	w.gens.set("P001", 2)
+	w.conn.set("P001", false)
 	w.step()
 	var res posted
 	select {

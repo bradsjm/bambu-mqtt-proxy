@@ -369,6 +369,7 @@ body.kiosk .bar { display: none; }
 .act-list time { flex: none; color: var(--dim); font-variant-numeric: tabular-nums; }
 .act-msg { min-width: 0; overflow-wrap: anywhere; }
 .act-ago { min-width: 6ch; text-align: right; color: var(--faint); font-size: .7rem; font-variant-numeric: tabular-nums; }
+.act-link { margin-left: .4rem; color: var(--dim); }
 .act-empty { margin: 0; color: var(--dim); font-size: .78rem; }
 /* Filament overview (full detail only): one spool strip per AMS unit, drawn
    in SVG — the same drawing for every AMS model. Spools are edge-on: the
@@ -420,6 +421,8 @@ svg.ams-svg { display: block; width: 100%; height: auto; }
 .mod-sec .facts { grid-template-columns: fit-content(45%) minmax(0, 1fr); }
 .mod-sec h3 span, .mod-sec .facts dt { min-width: 0; overflow-wrap: anywhere; }
 .mod-sec .facts dd[data-tone] { color: var(--tone, var(--text)); }
+.mod-sec .facts .mod-sub { grid-column: 1 / -1; margin-top: .35rem; color: var(--text); font-weight: 600; font-size: .74rem; }
+.mod-sec .facts .mod-note { grid-column: 2; color: var(--faint); font-size: .72rem; margin-top: -.2rem; }
 
 /* Smooth expand: rows animate between 0fr and 1fr. */
 .more { display: grid; grid-template-rows: 0fr; opacity: 0;
@@ -886,7 +889,7 @@ const DETECT_REASONS = {
   camera_unsupported: "camera unsupported",
   awaiting_first_layer: "waiting for first layer",
   awaiting_reports: "awaiting printer reports",
-  awaiting_fresh_telemetry: "awaiting fresh telemetry",
+  awaiting_fresh_telemetry: "waiting for printer data",
   camera_unavailable: "camera unavailable",
   api_retrying: "API retrying",
   pause_unconfirmed: "pause not confirmed by printer",
@@ -1273,8 +1276,8 @@ function createTile(p) {
 }
 
 function renderActivity(t) {
-  const events = Array.isArray(t.data.activity) ? t.data.activity.slice(0, 12) : [];
-  const key = events.map(e => `${e.id}:${Math.floor(Number(e.age_seconds) || 0)}`).join(",");
+  const events = Array.isArray(t.data.activity) ? t.data.activity : [];
+  const key = events.map(e => `${e.id}:${Math.floor(Number(e.age_seconds) || 0)}:${typeof e.url === "string" ? e.url : ""}`).join(",");
   if (key === t.activityKey) return;
   t.activityKey = key;
   t.r.actEmpty.hidden = events.length > 0;
@@ -1292,6 +1295,15 @@ function renderActivity(t) {
     const message = document.createElement("span");
     message.className = "act-msg";
     message.textContent = e.message || e.kind;
+    if (typeof e.url === "string" && e.url.startsWith("https://")) {
+      const link = document.createElement("a");
+      link.className = "act-link";
+      link.textContent = "Look up";
+      link.href = e.url;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      message.append(link);
+    }
     const ago = document.createElement("span");
     ago.className = "act-ago";
     ago.textContent = fmtAgo(Math.max(0, Math.floor(Number(e.age_seconds) || 0)));
@@ -1335,15 +1347,31 @@ function renderModules(t) {
     const pn = m.panel && typeof m.panel === "object" ? m.panel : null;
     const facts = document.createElement("dl");
     facts.className = "facts";
+    let section = "";
     for (const row of Array.isArray(pn?.rows) ? pn.rows : []) {
       const label = str(row?.label), value = str(row?.value);
       if (!label && !value) continue;
+      const next = str(row?.section);
+      if (next && next !== section) {
+        section = next;
+        const sub = document.createElement("dt");
+        sub.className = "mod-sub";
+        sub.textContent = section;
+        facts.append(sub);
+      }
       const dt = document.createElement("dt");
       dt.textContent = label;
       const dd = document.createElement("dd");
       dd.textContent = value;
       if (tone(row.tone)) dd.dataset.tone = row.tone;
       facts.append(dt, dd);
+      const note = str(row?.note);
+      if (note) {
+        const nd = document.createElement("dd");
+        nd.className = "mod-note";
+        nd.textContent = note;
+        facts.append(nd);
+      }
     }
     if (!facts.childElementCount) continue;
     const title = str(pn.title) || name;

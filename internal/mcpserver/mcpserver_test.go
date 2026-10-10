@@ -376,9 +376,9 @@ func TestAttentionEventTransitions(t *testing.T) {
 		{"job change during session", nil, set(func(c *sample) { c.sessionGen = 2 }), []string{kindJobChanged}, false},
 		{"new print from idle", func(p *sample) { p.active = false },
 			set(func(c *sample) { c.sessionGen = 2 }), []string{kindPrintStarted}, false},
-		{"connectivity lost", nil, set(func(c *sample) { c.connected = false }), []string{kindConnectLost}, false},
-		{"connectivity restored", func(p *sample) { p.connected = false },
-			set(func(c *sample) { c.connected = true }), []string{kindConnectRestored}, false},
+		{"connectivity lost", nil, set(func(c *sample) { c.connected = false; c.fresh = false }), []string{kindConnectLost, kindReportsStale}, false},
+		{"connectivity restored", func(p *sample) { p.connected = false; p.fresh = false },
+			set(func(c *sample) { c.connected = true; c.fresh = true }), []string{kindConnectRestored, kindReportsFresh}, false},
 		{"reports stale", nil, set(func(c *sample) { c.fresh = false }), []string{kindReportsStale}, false},
 		{"reports fresh again", func(p *sample) { p.fresh = false },
 			set(func(c *sample) { c.fresh = true }), []string{kindReportsFresh}, false},
@@ -970,28 +970,49 @@ func TestPrinterStateFreshnessAcrossReconnect(t *testing.T) {
 	f.gens.set("P001", 1)
 	f.conn.set("P001", true)
 	f.state.setSession("P001", printingSession("P001", f.now, 7, 10))
-	f.step() // baseline: a fresh report on generation 1
+	f.step() // baseline: connected, so live
 
 	st, ok := f.srv.buildPrinterState("P001", f.now)
 	if !ok || !st.Freshness.Fresh {
-		t.Fatalf("fresh report: fresh=%v ok=%v", st.Freshness.Fresh, ok)
+		t.Fatalf("connected: fresh=%v ok=%v", st.Freshness.Fresh, ok)
 	}
 
-	// An upstream reconnect bumps the generation; the observation predates
-	// it, so the evidence is stale even though its age is small.
+	// An upstream generation bump with no new report keeps the live bit:
+	// liveness is the connection, and the old observation stays visible
+	// only as diagnostics.
 	f.gens.set("P001", 2)
 	st, _ = f.srv.buildPrinterState("P001", f.now)
-	if st.Freshness.Fresh {
-		t.Fatalf("pre-reconnect report counted fresh: %+v", st.Freshness)
+	if !st.Freshness.Fresh {
+		t.Fatalf("reconnect without a report counted stale: %+v", st.Freshness)
 	}
 	if st.Freshness.LastReportAgeSeconds == nil || st.Freshness.UpstreamGeneration == nil {
-		t.Fatalf("stale evidence lost its fields: %+v", st.Freshness)
+		t.Fatalf("diagnostics lost their fields: %+v", st.Freshness)
+	}
+	f.step()
+	if rev := f.srv.sampler.revision("P001"); rev.attention != 1 {
+		t.Fatalf("generation bump moved attention: %+v", rev)
 	}
 
-	// The sampler sees the same flip and reports it once.
+	// A disconnect flips liveness off immediately; a reconnect flips it
+	// back on without waiting for another report.
+	f.conn.set("P001", false)
+	st, _ = f.srv.buildPrinterState("P001", f.now)
+	if st.Freshness.Fresh {
+		t.Fatalf("disconnected counted fresh: %+v", st.Freshness)
+	}
 	f.step()
 	events := f.srv.sampler.lastEvents("P001")
-	if len(events) != 1 || events[0].Kind != kindReportsStale {
+	if len(events) != 2 || events[0].Kind != kindConnectLost || events[1].Kind != kindReportsStale {
+		t.Fatalf("disconnect events = %+v", events)
+	}
+	f.conn.set("P001", true)
+	st, _ = f.srv.buildPrinterState("P001", f.now)
+	if !st.Freshness.Fresh {
+		t.Fatalf("reconnected without a new report counted stale: %+v", st.Freshness)
+	}
+	f.step()
+	events = f.srv.sampler.lastEvents("P001")
+	if len(events) != 2 || events[0].Kind != kindConnectRestored || events[1].Kind != kindReportsFresh {
 		t.Fatalf("reconnect events = %+v", events)
 	}
 }
@@ -1200,8 +1221,9 @@ func TestModuleSampleJSONKeysAndIsolation(t *testing.T) {
 		t.Fatalf("sample keys share backing storage: %+v", first.moduleKeys)
 	}
 	second.connected = true
+	second.fresh = true
 	events := attentionEvents(first, second)
-	if len(events) != 2 || events[0].Kind != kindConnectRestored || events[1].Kind != kindModuleChanged || events[1].Module != "example" {
+	if len(events) != 3 || events[0].Kind != kindConnectRestored || events[1].Kind != kindReportsFresh || events[2].Kind != kindModuleChanged || events[2].Module != "example" {
 		t.Fatalf("core/module event order = %+v", events)
 	}
 	value = nil

@@ -92,6 +92,30 @@ func TestEventSummaryPlatecheckLayer1Kinds(t *testing.T) {
 	}
 }
 
+// TestEventSummaryPrintOutcomeKinds pins the Phase 4 telemetry map: failed
+// and cancelled prints notify with short summaries, errors follow the HMS
+// severity pattern, and cleared alerts stay activity-only.
+func TestEventSummaryPrintOutcomeKinds(t *testing.T) {
+	for _, tc := range []struct {
+		kind, severity, want string
+	}{
+		{"print_failed", activity.Error, "Print failed"},
+		{"print_cancelled", activity.Warning, "Print cancelled"},
+		{"print_error", activity.Error, "Printer error"},
+		{"print_error", activity.Warning, "Printer warning"},
+		{"print_error", activity.Info, ""},
+		{"hms_alert", activity.Error, "Printer error"},
+		{"hms_alert", activity.Warning, "Printer warning"},
+		{"hms_alert", activity.Info, ""},
+		{"alerts_cleared", activity.Info, ""},
+	} {
+		entry := activity.Entry{Kind: tc.kind, Severity: tc.severity}
+		if got := eventSummary(entry); got != tc.want {
+			t.Errorf("eventSummary(%s/%s) = %q, want %q", tc.kind, tc.severity, got, tc.want)
+		}
+	}
+}
+
 // TestServiceSendsFinishedPrintWithSnapshot pins the happy path: one
 // message whose title is the printer name, whose body carries the summary
 // and the file line, and whose JPEG comes from the camera seam.

@@ -59,12 +59,14 @@ const (
 )
 
 // Transport timing and size seams. The values below are the plan's fixed
-// policy: a 60-second attempt deadline, a five-second TCP plus control
-// TLS bound, and the 32 MiB archive cap. Only this package's fake-server
-// tests replace them, and always restore them.
+// policy: a ten-minute absolute attempt deadline, a five-second TCP plus
+// control TLS bound, a thirty-second data-socket idle stall limit, and
+// the 32 MiB archive cap. Only this package's fake-server tests replace
+// them, and always restore them.
 var (
-	ftpsAttemptTimeout = 60 * time.Second
+	ftpsAttemptTimeout = 10 * time.Minute
 	ftpsControlBound   = 5 * time.Second
+	ftpsIdleTimeout    = 30 * time.Second
 	ftpsArchiveMax     = int64(32) << 20
 )
 
@@ -134,8 +136,10 @@ func ftpsErrAt(phase, category string, err error) error {
 // archive locally. The host comes from the configured MQTT address; the
 // implicit-TLS control port is always 990; credentials come only from the
 // printer configuration. The attempt is always capped at the fixed
-// 60-second policy; a shorter caller deadline wins and is never
-// extended. There is no retry, no REST or range read, no directory
+// ten-minute policy; a shorter caller deadline wins and is never
+// extended. A data-socket read stall longer than the idle limit fails
+// the attempt even while the absolute cap still holds. There is no
+// retry inside the transport, no REST or range read, no directory
 // listing, no second archive, no TCP6000 fallback, and no reconnect.
 // parseArchive's accepted partial results pass through unchanged, so a
 // valid plate image stays ready even when a metadata entry failed.
@@ -150,7 +154,7 @@ func fetch(ctx context.Context, printer config.Printer, job telemetry.JobView) (
 	if err != nil || host == "" {
 		return Result{}, ftpsErr(catTransport, errFtpsAddress)
 	}
-	// The attempt stays capped at the fixed 60-second policy even when
+	// The attempt stays capped at the fixed ten-minute policy even when
 	// the caller's context carries a longer deadline; a shorter caller
 	// deadline still wins and is never extended.
 	deadline := time.Now().Add(ftpsAttemptTimeout)
@@ -381,7 +385,9 @@ func dataStreamPhase(err error) string {
 // The byte count must match SIZE exactly before the archive is parsed.
 // The temporary file is removed on every completion, error, and
 // cancellation path; only bounded metadata and the validated PNG ever
-// stay in memory.
+// stay in memory. When the copy itself fails, the transfer is already
+// decided and the closing 226 reply is not waited for: the server may
+// never send it after a stalled stream.
 func downloadArchive(ctx context.Context, conn *ftp.ServerConn, remote string, size int64, job telemetry.JobView) (Result, error) {
 	resp, err := conn.Retr(remote)
 	if err != nil {
@@ -395,11 +401,18 @@ func downloadArchive(ctx context.Context, conn *ftp.ServerConn, remote string, s
 	tmpPath := tmp.Name()
 	defer os.Remove(tmpPath)
 	written, copyErr := io.Copy(tmp, io.LimitReader(resp, ftpsArchiveMax+1))
+	if copyErr != nil {
+		_ = tmp.Close()
+		// The transfer already failed; do not wait for the closing
+		// 226 reply, which a stalled server may never send. The
+		// attempt sweep closes the sockets under this Close, so it
+		// cannot block past fetch's return.
+		go func() { _ = resp.Close() }()
+		return Result{}, classifyAttempt(ctx, copyErr, dataStreamPhase(copyErr))
+	}
 	shutErr := resp.Close()
 	closeErr := tmp.Close()
 	switch {
-	case copyErr != nil:
-		return Result{}, classifyAttempt(ctx, copyErr, dataStreamPhase(copyErr))
 	case written > ftpsArchiveMax:
 		return Result{}, ftpsErrAt(phaseDownload, catOversized, nil)
 	case written != size:
@@ -553,7 +566,8 @@ func (d *ftpsDialer) register(c net.Conn) error {
 // five-second bound, after which the fixed attempt deadline is restored
 // before the hook returns. Later calls are passive data connections: TLS
 // is wrapped but the handshake stays lazy until the first RETR read,
-// bounded by the attempt deadline and by cancellation.
+// bounded by the attempt deadline, the per-read idle stall limit, and
+// cancellation.
 func (d *ftpsDialer) dial(network, address string) (net.Conn, error) {
 	d.mu.Lock()
 	if d.closed {
@@ -587,9 +601,11 @@ func (d *ftpsDialer) dial(network, address string) (net.Conn, error) {
 	}
 	if !first {
 		// Data socket: lazy TLS handshake on the first RETR read,
-		// bounded by the absolute attempt deadline and cancellation.
+		// bounded by the absolute attempt deadline and cancellation,
+		// plus a per-read idle stall limit below the TLS layer. The
+		// raw socket stays registered for the sweep.
 		_ = raw.SetDeadline(d.deadline)
-		return tls.Client(raw, d.tlsCfg), nil
+		return tls.Client(&idleConn{Conn: raw, idle: ftpsIdleTimeout, limit: d.deadline}, d.tlsCfg), nil
 	}
 	// Control socket: bound TCP plus TLS establishment by the
 	// five-second budget, then restore the fixed attempt deadline for
@@ -607,6 +623,28 @@ func (d *ftpsDialer) dial(network, address string) (net.Conn, error) {
 	// ciphertext. RemoteAddr delegates through to the raw socket and
 	// stays a *net.TCPAddr for the library's Dial assertion.
 	return &ftpsControlConn{Conn: tlsConn, budget: ftpsControlReadCap}, nil
+}
+
+// idleConn refreshes the data socket's read deadline before every read:
+// each read gets the idle stall budget, capped at the absolute attempt
+// deadline. Steady progress keeps the transfer alive; a stall longer
+// than the idle budget fails it. Every other method delegates to the
+// wrapped socket, keeping RemoteAddr a *net.TCPAddr for the sweep and
+// the library's address handling.
+type idleConn struct {
+	net.Conn
+	idle  time.Duration
+	limit time.Time
+}
+
+// Read arms the stall budget for one read, then delegates.
+func (c *idleConn) Read(p []byte) (int, error) {
+	t := time.Now().Add(c.idle)
+	if c.limit.Before(t) {
+		t = c.limit
+	}
+	_ = c.Conn.SetReadDeadline(t)
+	return c.Conn.Read(p)
 }
 
 // ftpsControlConn bounds the cumulative plaintext bytes read from the

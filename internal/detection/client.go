@@ -225,7 +225,6 @@ type requestLogContext struct {
 	frameSequence        uint64
 	frameBytes           int
 	layer                *int
-	telemetryAgeMS       int64
 	frameAgeMS           int64
 	retryAttempt         int
 	intensive            bool
@@ -277,7 +276,6 @@ func (d requestLogContext) logAttrs() []any {
 		"connection_generation", d.connectionGeneration,
 		"frame_sequence", d.frameSequence,
 		"frame_bytes", d.frameBytes,
-		"telemetry_age_ms", d.telemetryAgeMS,
 		"frame_age_ms", d.frameAgeMS,
 		"retry_attempt", d.retryAttempt,
 		"intensive_inspection", d.intensive,

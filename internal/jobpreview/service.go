@@ -1,8 +1,8 @@
 // Package jobpreview shares one best-effort preview of the current print:
 // the selected plate's archived render plus bounded sliced metadata,
-// retrieved once per settled job generation directly from the printer's
-// FTPS surface. Scheduler, transfer and handler wiring live in their own
-// files; this file defines the shared data contracts. Every string in
+// retrieved directly from the printer's FTPS surface with bounded retries
+// per job generation. Scheduler, transfer and handler wiring live in their
+// own files; this file defines the shared data contracts. Every string in
 // Metadata and every archive-derived View field originates in the
 // printer's 3MF archive and is untrusted: it is bounded,
 // whitespace-normalized plain text — never HTML, Markdown, or links — and
@@ -21,8 +21,8 @@ import (
 	"sync"
 	"time"
 
+	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/config"
-	"bambu-mqtt-proxy/internal/printerview"
 	"bambu-mqtt-proxy/internal/telemetry"
 )
 
@@ -35,18 +35,22 @@ const (
 )
 
 // View is the display projection of one printer's job preview. Status
-// pending covers settling, waiting for transfer capacity, and an in-flight
-// transfer; ready requires a validated PNG; unavailable covers unknown or
-// idle printers without a job and terminal failed attempts. RetrievedAt is
+// pending covers waiting, queued, and in-flight transfers; ready requires
+// a validated PNG; unavailable covers unknown or idle printers without a
+// job, unusable archive data, and terminal failed attempts. RetrievedAt is
 // stamped by the retrieval caller in UTC RFC3339Nano once an archive has
 // been accepted (including metadata-only results) and is null before that;
-// ImageURL is non-null only while the PNG is ready.
+// ImageURL is non-null only while the PNG is ready. Reason is the fixed
+// machine identifier for the current status: the wait cause while pending,
+// the failure category when the archive or transfer failed, and empty for
+// a clean ready or an idle printer.
 type View struct {
 	Status      string  `json:"status"`
 	JobName     string  `json:"job_name"`
 	Current     bool    `json:"current"`
 	RetrievedAt *string `json:"retrieved_at"`
 	ImageURL    *string `json:"image_url"`
+	Reason      string  `json:"reason,omitempty"`
 }
 
 // Result is one atomic preview read: the view, the optional accepted
@@ -141,7 +145,8 @@ type Process struct {
 
 // Fixed outcome categories. Every attempt logs exactly one of these, and
 // the transport reuses them for its own failures; archive parse failures
-// carry the parser's categories instead.
+// carry the parser's categories instead. The failure categories double as
+// the final View.Reason values.
 const (
 	catReady     = "ready"
 	catNotFound  = "not_found"
@@ -150,7 +155,7 @@ const (
 	catCancelled = "cancelled"
 )
 
-// Fixed failure phases for the one debug record per attempt. The phase
+// Fixed failure phases for the one Info record per attempt. The phase
 // names the protocol step where the attempt stopped, independently of the
 // outcome category: none covers a success and any failure before a
 // protocol step started. These are fixed identifiers, never reply text.
@@ -165,27 +170,35 @@ const (
 	phaseArchive  = "archive"
 )
 
-// Scheduler policy. settleDelay is the continuous fresh RUNNING interval
-// one job generation must show before its single attempt; freshnessWindow
-// bounds the age of the last real report at admission and publish;
-// attemptTimeout bounds the whole transfer. These are fixed internal
-// policy, not settings.
+// Scheduler policy. attemptTimeout bounds the whole transfer; maxAttempts
+// bounds the tries per job generation; retryBase scales the linear
+// backoff between retries. These are fixed internal policy, not settings.
 const (
-	settleDelay     = 60 * time.Second
-	freshnessWindow = printerview.FreshnessWindow
-	attemptTimeout  = 60 * time.Second
-
-	runningState = "RUNNING"
+	attemptTimeout = 10 * time.Minute
+	maxAttempts    = 3
+	retryBase      = 30 * time.Second
 
 	previewURLPrefix = "/camera/"
 )
 
-// Connectivity is the upstream readiness surface the scheduler polls.
-// The upstream Pool satisfies it structurally; jobpreview never imports
-// that package from production code.
+// Wait reasons for View.Reason while the preview is pending. The archive
+// failure categories in archive.go complete the pending and unavailable
+// reasons from the plan's job preview catalog.
+const (
+	reasonWaitingForPrint    = "waiting_for_print"
+	reasonWaitingForFileName = "waiting_for_file_name"
+	reasonPrinterOffline     = "printer_offline"
+	reasonQueued             = "queued"
+	reasonDownloading        = "downloading"
+	reasonRetryWait          = "retry_wait"
+	reasonProxyStopping      = "proxy_stopping"
+)
+
+// Connectivity is the upstream liveness surface the scheduler polls. The
+// upstream Pool satisfies it structurally; jobpreview never imports that
+// package from production code.
 type Connectivity interface {
 	Status() map[string]bool
-	Generation(serial string) uint64
 }
 
 // categorizer is implemented by transfer failures so the scheduler can log
@@ -202,39 +215,49 @@ type phaser interface {
 	phase() string
 }
 
-// entry is one published preview for one serial. gen and rev pin the entry
-// to the job generation and revision it was retrieved for; a different
-// live generation or revision refuses to serve it.
+// entry is one published preview for one serial. gen pins the entry to
+// the job generation it was retrieved for; plate and gcodeFile pin it to
+// the archive selectors of the admitting snapshot. A different live
+// generation or selector refuses to serve it.
 type entry struct {
-	gen    uint64
-	rev    uint64
-	result Result
+	gen       uint64
+	plate     *int
+	gcodeFile string
+	result    Result
 }
 
-// admission is one consumed attempt: the chosen printer, the job snapshot
-// it was admitted with, and the identity tuple re-validated before the
-// result may publish.
+// admission is one started attempt: the chosen printer, the job snapshot
+// it was admitted with, and the generation that may still publish.
 type admission struct {
-	printer  config.Printer
-	job      telemetry.JobView
-	gen      uint64
-	rev      uint64
-	epoch    uint64
-	upstream uint64
+	printer config.Printer
+	job     telemetry.JobView
+	gen     uint64
+}
+
+// attempt is the per-printer retry bookkeeping for one job generation. A
+// record whose gen differs from the live generation counts as absent and
+// is replaced. Guarded by Service.mu.
+type attempt struct {
+	gen    uint64
+	count  int
+	nextAt time.Time
+	final  bool
+	reason string
 }
 
 // activeTransfer is the one in-flight attempt; the scheduler holds its
-// cancel so a tick can stop it the moment the admission tuple breaks.
+// cancel so a tick can stop it the moment a new job generation starts.
 type activeTransfer struct {
 	adm    *admission
 	cancel context.CancelFunc
 }
 
-// Service schedules at most one bounded archive retrieval per preview job
-// generation and shares the accepted result with every consumer. One
-// global transfer slot exists; lookups are pure cache reads. fetch, readJob
-// and now are seams for deterministic tests and must be replaced before
-// Start or while the scheduler goroutine is stopped.
+// Service schedules bounded archive retrievals for the current print,
+// with up to maxAttempts tries per job generation, and shares the
+// accepted result with every consumer. One global transfer slot exists;
+// lookups are pure cache reads. fetch, readJob and now are seams for
+// deterministic tests and must be replaced before Start or while the
+// scheduler goroutine is stopped.
 type Service struct {
 	printers []config.Printer // sorted by serial
 	bySerial map[string]config.Printer
@@ -254,16 +277,18 @@ type Service struct {
 	// now is the scheduler clock.
 	now func() time.Time
 
-	mu        sync.Mutex
-	entries   map[string]*entry
-	attempted map[string]uint64 // serial -> generation whose attempt was consumed
-	inflight  map[string]*admission
-	active    *activeTransfer // sole in-flight transfer, cancellable by step
-	worker    bool            // sole transfer slot
-	started   bool
-	closed    bool
-	wg        sync.WaitGroup
-	stopMu    sync.Mutex // serializes Close callers until the join completes
+	activity *activity.Log // optional final-failure sink; nil records nothing
+
+	mu       sync.Mutex
+	entries  map[string]*entry
+	attempts map[string]*attempt // serial -> retry bookkeeping for one generation
+	inflight map[string]*admission
+	active   *activeTransfer // sole in-flight transfer, cancellable by step
+	worker   bool            // sole transfer slot
+	started  bool
+	closed   bool
+	wg       sync.WaitGroup
+	stopMu   sync.Mutex // serializes Close callers until the join completes
 }
 
 // New builds the preview service for the configured printers. The state
@@ -283,18 +308,18 @@ func New(printers []config.Printer, state *telemetry.Cache, connectivity Connect
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Service{
-		printers:  sorted,
-		bySerial:  bySerial,
-		state:     state,
-		conn:      connectivity,
-		log:       log,
-		ctx:       ctx,
-		cancel:    cancel,
-		fetch:     fetch,
-		now:       time.Now,
-		entries:   make(map[string]*entry),
-		attempted: make(map[string]uint64),
-		inflight:  make(map[string]*admission),
+		printers: sorted,
+		bySerial: bySerial,
+		state:    state,
+		conn:     connectivity,
+		log:      log,
+		ctx:      ctx,
+		cancel:   cancel,
+		fetch:    fetch,
+		now:      time.Now,
+		entries:  make(map[string]*entry),
+		attempts: make(map[string]*attempt),
+		inflight: make(map[string]*admission),
 	}
 	if state != nil {
 		s.readJob = state.Job
@@ -352,9 +377,18 @@ func (s *Service) Close() {
 	s.wg.Wait()
 }
 
+// SetActivity attaches the optional activity log that receives one
+// job_preview_unavailable entry per terminal generation failure. Call it
+// before Start; a nil log records nothing.
+func (s *Service) SetActivity(log *activity.Log) {
+	s.mu.Lock()
+	s.activity = log
+	s.mu.Unlock()
+}
+
 // step runs one scheduler tick. It first cancels the in-flight attempt if
-// its admission tuple stopped holding — the scheduler owns invalidation,
-// so transfers carry no ticker of their own. With the sole transfer slot
+// its job generation ended — the scheduler owns invalidation, so
+// transfers carry no ticker of their own. With the sole transfer slot
 // free it then picks the first eligible printer in sorted serial order and
 // transfers in a fresh goroutine; a busy or closed service returns
 // immediately. now is injected by tests; production passes the wall clock.
@@ -371,9 +405,9 @@ func (s *Service) step(now time.Time) {
 		s.mu.Unlock()
 		return
 	}
-	// Reserve the sole slot without setting attempted. The WaitGroup slot
-	// is registered in the same critical section so Close can never wait
-	// on an unregistered goroutine.
+	// Reserve the sole slot without touching attempt bookkeeping. The
+	// WaitGroup slot is registered in the same critical section so Close
+	// can never wait on an unregistered goroutine.
 	s.worker = true
 	s.wg.Add(1)
 	s.mu.Unlock()
@@ -388,36 +422,34 @@ func (s *Service) step(now time.Time) {
 }
 
 // admit chooses the first eligible printer in sorted serial order and
-// consumes its generation's single attempt. It performs no network work
-// and never holds the service mutex across telemetry or pool reads.
+// records one attempt against its retry budget. It performs no network
+// work and never holds the service mutex across telemetry or pool reads.
 // Eligibility is evaluated fresh, then re-read in full immediately before
-// the attempt is marked.
+// the attempt is marked, so a job change inside the reservation window
+// releases the slot without consuming the budget.
 func (s *Service) admit(now time.Time) *admission {
 	status := s.conn.Status()
 	for _, p := range s.printers {
 		job, ok := s.readJob(p.Serial)
-		if !ok || s.attemptedGeneration(p.Serial, job.Generation) {
+		if !ok || s.skipped(p.Serial, job, now) {
 			continue
 		}
-		if !eligible(job, status[p.Serial], s.conn.Generation(p.Serial), now) {
+		if !eligible(job, status[p.Serial]) {
 			continue
 		}
-		// Sole slot reserved: re-read everything before consuming the
+		// Sole slot reserved: re-read everything before consuming one
 		// attempt. A failed preflight releases the reservation without
-		// consuming it.
+		// touching the budget.
+		wantGen := job.Generation
 		status = s.conn.Status()
 		job, ok = s.readJob(p.Serial)
-		upstream := s.conn.Generation(p.Serial)
-		if !ok || !eligible(job, status[p.Serial], upstream, now) {
+		if !ok || job.Generation != wantGen || s.skipped(p.Serial, job, now) || !eligible(job, status[p.Serial]) {
 			continue
 		}
 		candidate := &admission{
-			printer:  p,
-			job:      job,
-			gen:      job.Generation,
-			rev:      job.Revision,
-			epoch:    job.RunningEpoch,
-			upstream: upstream,
+			printer: p,
+			job:     job,
+			gen:     job.Generation,
 		}
 		if !s.begin(p.Serial, candidate) {
 			return nil
@@ -427,11 +459,52 @@ func (s *Service) admit(now time.Time) *admission {
 	return nil
 }
 
+// skipped reports whether the printer must not start an attempt now: its
+// retry record for the live generation is final, backing off, or spent,
+// or a valid entry is already published for the live selectors.
+func (s *Service) skipped(serial string, job telemetry.JobView, now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec := s.attempts[serial]
+	if rec != nil && rec.gen == job.Generation {
+		if rec.final || rec.count >= maxAttempts || now.Before(rec.nextAt) {
+			return true
+		}
+	}
+	return entryValid(s.entries[serial], job)
+}
+
+// entryValid reports whether the published entry serves the live job: the
+// generation and the archive selectors — gcode file and plate index —
+// all match.
+func entryValid(e *entry, job telemetry.JobView) bool {
+	if e == nil || e.gen != job.Generation || e.gcodeFile != job.GCodeFile {
+		return false
+	}
+	if e.plate == nil || job.PlateIndex == nil {
+		return e.plate == nil && job.PlateIndex == nil
+	}
+	return *e.plate == *job.PlateIndex
+}
+
+// selectorsEqual reports whether the live job still carries the selectors
+// of the admitting snapshot.
+func selectorsEqual(live, admitted telemetry.JobView) bool {
+	if live.Generation != admitted.Generation || live.GCodeFile != admitted.GCodeFile {
+		return false
+	}
+	if live.PlateIndex == nil || admitted.PlateIndex == nil {
+		return live.PlateIndex == nil && admitted.PlateIndex == nil
+	}
+	return *live.PlateIndex == *admitted.PlateIndex
+}
+
 // transfer runs the admitted attempt under the shared attempt deadline. It
-// re-verifies full eligibility immediately before the dial — a state
-// change in that window is a consumed, cancelled attempt — and registers
-// its cancel so scheduler ticks can stop it. The outcome is validated once
-// more before publishing, and the sole slot is released only afterwards.
+// re-verifies the job generation immediately before the dial — a new job
+// in that window cancels the attempt and refunds its budget — and
+// registers its cancel so scheduler ticks can stop it. The outcome is
+// recorded once more before publishing, and the sole slot is released
+// only afterwards.
 func (s *Service) transfer(adm *admission) {
 	defer s.wg.Done()
 	ctx, cancel := context.WithTimeout(s.ctx, attemptTimeout)
@@ -465,76 +538,171 @@ func (s *Service) transfer(adm *admission) {
 }
 
 // transferValid reports whether an admitted attempt may keep running (or
-// may start dialling): the admission tuple still matches live state, the
-// captured upstream generation still equals the live one, and the job is
-// still a settled, fresh, connected RUNNING. Any pause, reconnect,
-// revision, new generation or telemetry gap invalidates it.
+// may start dialling): the live job is still the admitted generation.
+// Disconnects, pauses, report gaps, and field enrichment never cancel;
+// only a new generation or Close cancels.
 func (s *Service) transferValid(adm *admission, now time.Time) bool {
+	_ = now
 	job, ok := s.readJob(adm.printer.Serial)
-	upstream := s.conn.Generation(adm.printer.Serial)
-	return ok &&
-		job.Generation == adm.gen &&
-		job.Revision == adm.rev &&
-		job.RunningEpoch == adm.epoch &&
-		upstream == adm.upstream &&
-		eligible(job, s.conn.Status()[adm.printer.Serial], upstream, now)
+	return ok && job.Generation == adm.gen
 }
 
-// finish publishes the stamped result only when the same strict gate that
-// guards the transfer still holds — full admission tuple plus running,
-// fresh and connected state — and the service is not closed, checked under
-// the publication mutex. Retention after FINISH/FAILED/IDLE applies to
-// already published entries only; a transfer completing after its
-// generation ended is discarded. Every outcome consumes the generation's
-// allowance; discards leave no cache entry and no retry.
+// finish records one attempt outcome: it publishes an accepted archive
+// result against unchanged selectors, schedules a retry for a transient
+// failure, or marks the generation final and records one
+// job_preview_unavailable activity entry. Bookkeeping mutates only while
+// the attempt record still belongs to the admitted generation; a stale
+// outcome records nothing. The activity entry is recorded outside the
+// service mutex.
 func (s *Service) finish(adm *admission, res Result, err error) {
+	serial := adm.printer.Serial
 	now := s.now()
-	publish := s.transferValid(adm, now)
-	var stamped Result
-	if publish {
-		stamped = stampedResult(adm.printer.Serial, res, now)
+	outcome := outcomeCategory(err)
+	accepted := res.Metadata != nil || len(res.PNG) > 0
+	selectorsOK := false
+	if live, ok := s.readJob(serial); ok {
+		selectorsOK = selectorsEqual(live, adm.job)
 	}
+
 	s.mu.Lock()
-	delete(s.inflight, adm.printer.Serial)
-	published := publish && !s.closed
-	if published {
-		s.entries[adm.printer.Serial] = &entry{gen: adm.gen, rev: adm.rev, result: stamped}
+	rec := s.attempts[serial]
+	if rec == nil || rec.gen != adm.gen {
+		s.mu.Unlock()
+		return
 	}
+	if s.inflight[serial] == adm {
+		delete(s.inflight, serial)
+	}
+	var stamped Result
+	published := false
+	retryIn := time.Duration(0)
+	finalReason := ""
+	switch {
+	case s.closed:
+		// No publish and no schedule.
+	case outcome == catCancelled:
+		// A generation change or Close cancelled the attempt: the
+		// budget it consumed is refunded and nothing is recorded.
+		rec.count--
+	case accepted && selectorsOK:
+		stamped = stampedResult(serial, res, now)
+		if err != nil {
+			stamped.Preview.Reason = outcome
+		}
+		s.entries[serial] = &entry{
+			gen:       adm.gen,
+			plate:     clonePlate(adm.job.PlateIndex),
+			gcodeFile: adm.job.GCodeFile,
+			result:    stamped,
+		}
+		published = true
+	case accepted:
+		// The archive parsed but the selectors moved: retry
+		// immediately on the next tick with the new selectors.
+		rec.nextAt = now
+		retryIn = 0
+	default:
+		if (outcome == catNotFound || outcome == catTimeout || outcome == catTransport) && rec.count < maxAttempts {
+			rec.nextAt = now.Add(retryBase * time.Duration(rec.count))
+			rec.reason = reasonRetryWait
+			retryIn = retryBase * time.Duration(rec.count)
+		} else {
+			rec.final = true
+			rec.reason = outcome
+			finalReason = outcome
+		}
+	}
+	count := rec.count
+	activityLog := s.activity
 	s.mu.Unlock()
-	// Exactly one fixed-field debug record per attempt: outcome is the
+
+	if finalReason != "" && activityLog != nil {
+		t := reasonText(finalReason)
+		activityLog.Record(serial, "job_preview_unavailable", activity.Info,
+			"Print details unavailable, "+strings.ToLower(t[:1])+t[1:])
+	}
+	// Exactly one fixed-field Info record per attempt: outcome is the
 	// fetched result's category, phase names the protocol step that
-	// stopped a failed attempt, and published separates a served result
-	// from a fetched-but-discarded one (ready with published=false was
-	// never served). No reply text, filename, credential, or error text
-	// ever joins the record.
-	s.log.Debug("job preview attempt finished",
-		"serial", adm.printer.Serial,
-		"outcome", outcomeCategory(err),
+	// stopped a failed attempt, published separates a served result from
+	// a recorded-but-discarded one, and attempt is the generation's
+	// consumed budget after this outcome. No reply text, filename,
+	// credential, or error text ever joins the record.
+	args := []any{
+		"serial", serial,
+		"outcome", outcome,
 		"phase", outcomePhase(err),
-		"published", published)
+		"published", published,
+		"attempt", count,
+	}
+	if retryIn > 0 {
+		args = append(args, "retry_in_s", retryIn.Seconds())
+	}
+	s.log.Info("job preview attempt finished", args...)
 }
 
 // eligible reports whether one preview attempt may start for this job
-// snapshot: a running, connected, fresh job settled for at least
-// settleDelay with a usable identity. Cloud project and task IDs are
-// deliberately not required; local prints often have none.
-func eligible(job telemetry.JobView, connected bool, upstreamGen uint64, now time.Time) bool {
-	if !job.Active || job.State != runningState {
+// snapshot: an active, connected, executing job with a usable identity.
+// Cloud project and task IDs are deliberately not required; local prints
+// often have none.
+func eligible(job telemetry.JobView, connected bool) bool {
+	if !job.Active {
 		return false
 	}
-	if job.RunningSince.IsZero() || now.Sub(job.RunningSince) < settleDelay {
+	switch job.State {
+	case "RUNNING", "PAUSE", "PAUSED":
+	default:
 		return false
 	}
 	if !connected {
 		return false
 	}
-	if job.StateGen != upstreamGen || job.ObsGen != upstreamGen {
-		return false
-	}
-	if job.ObsAt.IsZero() || now.Sub(job.ObsAt) > freshnessWindow {
-		return false
-	}
 	return job.Name != "" || validArchiveBasename(job.GCodeFile)
+}
+
+// reasonText renders one View.Reason as the plain-English wall text. An
+// unknown reason is a programming error and reads as a generic failure.
+func reasonText(reason string) string {
+	switch reason {
+	case reasonWaitingForPrint:
+		return "Waiting for the print to start"
+	case reasonWaitingForFileName:
+		return "Waiting for the printer to report the file name"
+	case reasonPrinterOffline:
+		return "Waiting for the printer to reconnect"
+	case reasonQueued:
+		return "Waiting for another print file download to finish"
+	case reasonDownloading:
+		return "Downloading the print file from the printer"
+	case reasonRetryWait:
+		return "Download failed, retrying shortly"
+	case reasonProxyStopping:
+		return "Proxy stopping"
+	case catNotFound:
+		return "Print file not found on the printer"
+	case catTimeout:
+		return "Print file download stalled"
+	case catTransport:
+		return "Could not read the print file from the printer"
+	case catArchive:
+		return "Print file could not be read"
+	case catOversized:
+		return "Print file exceeds the size limit"
+	case catAmbiguousPlate:
+		return "Could not tell which plate is printing"
+	case catImageMissing:
+		return "Print file has no preview image"
+	}
+	return "Print details unavailable"
+}
+
+// clonePlate duplicates one optional plate selector so cached entries
+// share nothing with the admitting snapshot.
+func clonePlate(p *int) *int {
+	if p == nil {
+		return nil
+	}
+	c := *p
+	return &c
 }
 
 // validArchiveBasename reports whether a reported gcode file can name a
@@ -567,7 +735,7 @@ func validArchiveBasename(file string) bool {
 // Lookup returns the cached preview for one serial and whether the serial
 // is configured. It never performs network work: pending and unavailable
 // are live projections of the current job view, and payloads come only
-// from published entries pinned to the sampled generation and revision.
+// from published entries pinned to the sampled generation and selectors.
 // The job view is sampled before and after the entry copy, so a job
 // boundary during the read serves the live projection without the stale
 // payload. includeImage=false never copies PNG bytes; includeImage=true
@@ -583,24 +751,31 @@ func (s *Service) Lookup(serial string, includeImage bool) (Result, bool) {
 	var res Result
 	have := false
 	s.mu.Lock()
-	if e := s.entries[serial]; e != nil && e.gen == job1.Generation && e.rev == job1.Revision {
+	if e := s.entries[serial]; entryValid(e, job1) {
 		res = copyResult(e.result, includeImage)
 		have = true
 	}
 	inflight := s.inflight[serial]
-	spent := s.attempted[serial]
+	var rec *attempt
+	if a := s.attempts[serial]; a != nil && a.gen == job1.Generation {
+		cp := *a
+		rec = &cp
+	}
+	closed := s.closed
+	worker := s.worker
 	s.mu.Unlock()
+	connected := s.conn.Status()[serial]
 
 	job2, ok2 := s.readJob(serial)
-	if !ok2 || job2.Generation != job1.Generation || job2.Revision != job1.Revision {
+	if !ok2 || job2.Generation != job1.Generation {
 		cur := job1
 		if ok2 {
 			cur = job2
 		}
-		return liveResult(cur, inflight, spent), true
+		return s.liveResult(cur, inflight, rec, connected, closed, worker), true
 	}
 	if !have {
-		return liveResult(job2, inflight, spent), true
+		return s.liveResult(job2, inflight, rec, connected, closed, worker), true
 	}
 	// Current and job name always reflect the live view, even for results
 	// retained after the job finished.
@@ -609,20 +784,34 @@ func (s *Service) Lookup(serial string, includeImage bool) (Result, bool) {
 	return res, true
 }
 
-// liveResult projects a job view without cached data. Pending covers a
-// settling job, one waiting for the sole transfer slot, and a transfer in
-// progress for the same generation. Unavailable covers an ended job and a
-// generation whose single attempt was already consumed without a
-// published result — it can never return to pending.
-func liveResult(job telemetry.JobView, inflight *admission, spent uint64) Result {
+// liveResult projects a job view without cached data. The reason table
+// names the exact wait or failure behind every non-ready status; only an
+// attempt record for the live generation is considered.
+func (s *Service) liveResult(job telemetry.JobView, inflight *admission, rec *attempt, connected, closed, worker bool) Result {
 	v := View{JobName: job.Name, Current: job.Active, Status: StatusPending}
 	switch {
+	case closed:
+		v.Status = StatusUnavailable
+		v.Reason = reasonProxyStopping
 	case !job.Active:
 		v.Status = StatusUnavailable
 	case inflight != nil && inflight.gen == job.Generation:
-		// The generation's transfer is reserved or in flight.
-	case spent == job.Generation:
+		v.Reason = reasonDownloading
+	case rec != nil && rec.final:
 		v.Status = StatusUnavailable
+		v.Reason = rec.reason
+	case rec != nil && rec.count > 0:
+		v.Reason = reasonRetryWait
+	case !connected:
+		v.Reason = reasonPrinterOffline
+	case job.State == "PREPARE" || job.State == "SLICING":
+		v.Reason = reasonWaitingForPrint
+	case job.Name == "" && !validArchiveBasename(job.GCodeFile):
+		v.Reason = reasonWaitingForFileName
+	case worker && (inflight == nil || inflight.gen != job.Generation):
+		v.Reason = reasonQueued
+	default:
+		v.Reason = reasonDownloading
 	}
 	return Result{Preview: v}
 }
@@ -661,6 +850,7 @@ func copyResult(r Result, includeImage bool) Result {
 			Current:     r.Preview.Current,
 			RetrievedAt: clonePtr(r.Preview.RetrievedAt),
 			ImageURL:    clonePtr(r.Preview.ImageURL),
+			Reason:      r.Preview.Reason,
 		},
 		Metadata: copyMetadata(r.Metadata),
 	}
@@ -740,25 +930,30 @@ func clonePtr[T any](p *T) *T {
 	return &c
 }
 
-// attemptedGeneration reports whether this generation's attempt is spent.
-func (s *Service) attemptedGeneration(serial string, gen uint64) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.attempted[serial] == gen
-}
-
-// begin consumes the generation's allowance and records the in-flight
-// admission that Lookup projects as pending. It refuses — leaving the
-// allowance untouched — when the service was closed between reservation
-// and admission, when the caller no longer holds the reserved sole
-// transfer slot, or when this generation's attempt was already consumed.
+// begin records one attempt against the generation's retry budget and
+// registers the in-flight admission that Lookup projects as pending. A
+// record for another generation counts as absent and is replaced. It
+// refuses — leaving the budget untouched — when the service was closed
+// between reservation and admission, when the caller no longer holds the
+// reserved sole transfer slot, or when this generation's budget is final,
+// backing off, or spent.
 func (s *Service) begin(serial string, adm *admission) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed || !s.worker || s.attempted[serial] == adm.gen {
+	if s.closed || !s.worker {
 		return false
 	}
-	s.attempted[serial] = adm.gen
+	rec := s.attempts[serial]
+	if rec == nil || rec.gen != adm.gen {
+		rec = &attempt{gen: adm.gen}
+		s.attempts[serial] = rec
+	}
+	now := s.now()
+	if rec.final || rec.count >= maxAttempts || now.Before(rec.nextAt) {
+		return false
+	}
+	rec.count++
+	rec.nextAt = time.Time{}
 	s.inflight[serial] = adm
 	return true
 }
