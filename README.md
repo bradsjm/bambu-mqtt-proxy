@@ -403,18 +403,25 @@ provider target and key are set. The key is write-only on the page, a blank valu
 keeps the stored key, and a stored key is never sent to a different account or
 endpoint than the one it belongs to.
 
-For each new print job, the startup check waits for a fresh camera frame, may
-turn the chamber light on, uploads that one JPEG to the endpoint, and sends
-`stop` only when the model is sure the view is usable (assessable at least 0.8)
-and the occupied probability is above `stop_confidence`. The startup check does
-not pause or resume prints during startup. Every failure, unclear image, or
-missing camera lets the print continue. Admission comes from the activity log:
-`print_started` and `print_preparing` entries carry the job generation, and a
-print already underway when the proxy attaches (`JobView.StartObserved` false)
-is never stopped — the panel says `Proxy started after this print began`. Skip
-and failure entries use plain-English reasons (for example `Plate check
-skipped, printer offline, no stop sent, continuing print`). A stop sent during
-PREPARE may be repeated once when the job first reaches RUNNING with layer 0.
+For each new print job, the startup check runs in two passes. Pass 1 checks at
+PREPARE (or at RUNNING layer 0), when the bed may still sit lowered and out of
+camera view. Pass 2 checks again after the toolhead homes: once the printer
+has reported stage (`stg_cur`) 13 or 14 during the job, it checks at RUNNING
+layer 0. Bed leveling (stage
+1) is not a trigger, because leveling is optional per job. Each pass waits for
+a fresh camera frame, may turn the chamber light on, uploads that one JPEG to
+the endpoint, and sends `stop` only when the model is sure the view is usable
+(assessable at least 0.8) and the occupied probability is above
+`stop_confidence`. The startup check does not pause or resume prints during
+startup. Every failure, unclear image, or missing camera lets the print
+continue. Admission comes from the activity log: `print_started` and
+`print_preparing` entries carry the job generation, and a print already
+underway when the proxy attaches (`JobView.StartObserved` false) is never
+stopped — the panel says `Proxy started after this print began`. Skip and
+failure entries use plain-English reasons (for example `Plate check skipped,
+printer offline, no stop sent, continuing print`); pass 2 entries use the
+check name `Plate check after homing`. A stop sent during PREPARE may be
+repeated once when the job first reaches RUNNING with layer 0.
 
 ### Startup decision
 

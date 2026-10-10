@@ -14,6 +14,8 @@ type ModuleState struct {
 	State string `json:"state"`
 	// Reason is the skip or failure code behind State, empty otherwise.
 	Reason string `json:"reason,omitempty"`
+	// Homing marks the second startup pass, after the toolhead homed.
+	Homing bool `json:"homing,omitempty"`
 	// Cutoff is the configured strict occupied-probability threshold.
 	Cutoff float64 `json:"cutoff"`
 	// PClear is nil unless the last check returned a valid score.
@@ -187,10 +189,15 @@ func clarity(p *float64) float64 {
 // plateRow renders the Before printing Plate row for one startup state.
 func plateRow(v ModuleState) module.Row {
 	row := module.Row{Label: "Plate", Section: "Before printing"}
+	name := "Plate check"
+	if v.Homing {
+		row.Label = "Plate (after homing)"
+		name = "Plate check after homing"
+	}
 	switch v.State {
 	case "idle":
 		row.Value = "Not checked yet"
-		row.Note = "Checks the plate when a print starts"
+		row.Note = "Checks the plate when a print starts and again after homing"
 	case "checking":
 		row.Value, row.Tone = "Checking", "info"
 	case "clear":
@@ -203,10 +210,10 @@ func plateRow(v ModuleState) module.Row {
 		row.Note = "Camera view too unclear to judge; printing continued"
 	case "error":
 		row.Value, row.Tone = "Check failed", "warn"
-		row.Note = reasonNote("Plate check", v.Reason)
+		row.Note = reasonNote(name, v.Reason)
 	case "skipped":
 		row.Value = "Not checked"
-		row.Note = reasonNote("Plate check", v.Reason)
+		row.Note = reasonNote(name, v.Reason)
 	case "blocked":
 		row.Value, row.Tone = "Unavailable", "warn"
 		row.Note = reasonNote("Plate check", "camera_disabled")
@@ -224,7 +231,7 @@ func plateRow(v ModuleState) module.Row {
 		row.Note = "Check the printer now"
 	default:
 		row.Value = "Not checked yet"
-		row.Note = "Checks the plate when a print starts"
+		row.Note = "Checks the plate when a print starts and again after homing"
 	}
 	return row
 }

@@ -80,12 +80,18 @@ type jobTrack struct {
 	// gcode_state has merged and is never reset.
 	startObserved bool
 	stateKnown    bool
-	// lastProjectID, lastTaskID and lastStarted are the sticky strong
-	// identities. They survive invalid or absent updates so a
-	// valid-empty-same-valid sequence cannot look like a change.
+	// lastProjectID, lastTaskID, lastStarted, and lastName are the sticky
+	// strong identities. They survive invalid or absent updates so a
+	// valid-empty-same-valid sequence cannot look like a change, and an
+	// emptied name followed by a different name still starts a
+	// generation. Only cleared public name lacks its own "known" flag:
+	// the empty string is both the unset and the cleared value, so a
+	// non-empty name over an empty lastName is enrichment, not a
+	// boundary.
 	lastProjectID string
 	lastTaskID    string
 	lastStarted   int64
+	lastName      string
 	knownProject  bool
 	knownTask     bool
 	knownStarted  bool
@@ -142,7 +148,10 @@ func (c *Cache) Job(serial string) (JobView, bool) {
 // lifecycle boundary fired: a known valid project or task id changing to
 // a different valid value, a known positive start time changing to a
 // different positive value, or a new non-empty subtask name over an
-// already known one. A gcode_file change never starts a generation.
+// already known one. The name boundary compares against the sticky
+// last-reported non-empty name, so a cleared name followed by a
+// different name still starts a generation. A gcode_file change never
+// starts a generation.
 //
 // Field keys are checked for presence separately from validity: an absent
 // key keeps the previous merged value, while a key that is present but
@@ -200,7 +209,7 @@ func (st *State) trackJob(printObj map[string]any) {
 			newGen = true
 		case hasStarted && startedF > 0 && j.knownStarted && int64(startedF) != j.lastStarted:
 			newGen = true
-		case hasName && name != "" && j.name != "" && name != j.name:
+		case hasName && name != "" && j.lastName != "" && name != j.lastName:
 			newGen = true
 		}
 	}
@@ -227,8 +236,16 @@ func (st *State) trackJob(printObj map[string]any) {
 	if namePresent {
 		if hasName {
 			j.name = name
+			// The sticky name only ever records a valid
+			// non-empty name: an explicit empty name clears
+			// the public field but keeps the last known one
+			// for boundary detection.
+			if name != "" {
+				j.lastName = name
+			}
 		} else {
-			// Present but not a string: clear the field.
+			// Present but not a string: clear the public
+			// field only; the sticky name is retained.
 			j.name = ""
 		}
 	}

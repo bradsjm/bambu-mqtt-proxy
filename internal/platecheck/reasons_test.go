@@ -130,4 +130,21 @@ func TestReasonCatalogCoversEveryCode(t *testing.T) {
 			t.Errorf("fixedSentence(%q) lost its /config sentence", code)
 		}
 	}
+	// The second startup pass names its check "Plate check after homing"
+	// and, like pass 1, sends a stop rather than a pause.
+	for code := range clauses {
+		plate, homing := activitySentence("Plate check", "skipped", code), activitySentence("Plate check after homing", "skipped", code)
+		if want := "Plate check after homing" + plate[len("Plate check"):]; homing != want {
+			t.Errorf("activitySentence(homing, %q) = %q, want %q", code, homing, want)
+		}
+		if plateNote, homingNote := reasonNote("Plate check", code), reasonNote("Plate check after homing", code); homingNote != plateNote {
+			t.Errorf("reasonNote(homing, %q) = %q, want the pass 1 note %q", code, homingNote, plateNote)
+		}
+	}
+	if got := activitySentence("Plate check after homing", "skipped", "printer_offline"); got != "Plate check after homing skipped, printer offline, no stop sent" {
+		t.Errorf("homing printer_offline = %q", got)
+	}
+	if got := reasonNote("Plate check after homing", "printer_offline"); got != "Printer offline; no stop sent" {
+		t.Errorf("homing printer_offline note = %q", got)
+	}
 }

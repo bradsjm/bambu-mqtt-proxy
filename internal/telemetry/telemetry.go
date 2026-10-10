@@ -92,20 +92,27 @@ type State struct {
 
 	// Print session bookkeeping. Not display state: these fields track the
 	// current print session for every consumer of Session. Guarded by the Cache mutex like every other field.
-	projectID        string    // raw project_id; "0" is a valid local print
-	taskID           string    // raw task_id
-	cookie           string    // projectID-taskID-subtaskName identity cookie
-	completeIdentity bool      // every identity part has been reported
-	sessionActive    bool      // a print session is in progress
-	sessionGen       uint64    // bumps only when a genuinely new print session starts
-	epoch            uint64    // bumps at every state boundary or identity change
-	stateGen         uint64    // upstream generation of the last gcode_state report
-	layerJobGen      uint64    // Job generation of the last layer_num report.
+	projectID        string // raw project_id; "0" is a valid local print
+	taskID           string // raw task_id
+	cookie           string // projectID-taskID-subtaskName identity cookie
+	completeIdentity bool   // every identity part has been reported
+	sessionActive    bool   // a print session is in progress
+	sessionGen       uint64 // bumps only when a genuinely new print session starts
+	epoch            uint64 // bumps at every state boundary or identity change
+	stateGen         uint64 // upstream generation of the last gcode_state report
+	layerJobGen      uint64 // Job generation of the last layer_num report.
+	// stagesThisJobGen is the job generation the stage history belongs to.
+	// stagesThisJob holds the distinct valid stg_cur values merged while
+	// stagesThisJobGen is the current job generation, in first-seen order.
+	// Both live on the merge path after trackJob, never in mergeDisplay,
+	// so they cannot predate a job boundary in the same payload.
+	stagesThisJobGen uint64
+	stagesThisJob    []int
 	speedProfile     *int      // last reported Bambu spd_lvl (1..4)
 	speedObs         uint64    // increments for each spd_lvl report
 	trayNow          *int      // raw tray_now selection value; nil = not reported
 	obs              uint64    // real print reports merged (ACKs excluded)
-	obsGen           uint64    // upstream connection generation of the last report
+	obsGen           uint64    // upstream generation of the last report
 	obsAt            time.Time // time of the last real report
 	lastSeq          uint64    // paho delivery order token of the last merge
 	// job is the private preview-job projection (job.go): preview
@@ -512,8 +519,13 @@ type SessionView struct {
 	// LayerThisJob reports whether LayerNum was reported during the
 	// current preview-job generation.
 	LayerThisJob bool
-	ChamberLight string
-	StartedAt    time.Time
+	// StagesThisJob holds the distinct stages the printer reported during
+	// the current job, in first-seen order. It is a copy of the sticky
+	// per-job history, so a stage replaced by a later one still counts as
+	// reported for this job.
+	StagesThisJob []int
+	ChamberLight  string
+	StartedAt     time.Time
 }
 
 // Session returns the shared print-session projection for one serial.
@@ -576,6 +588,14 @@ func (st *State) sessionView() SessionView {
 		view.LayerNum = &v
 	}
 	view.LayerThisJob = st.layerJobGen == st.job.generation
+	// StagesThisJob copies the sticky per-job history in first-seen order,
+	// but only when it belongs to the current job: a job boundary without
+	// a new stage report leaves the old history behind, exactly as
+	// CurrentLayer treats a positive layer from an earlier print as
+	// unknown.
+	if st.stagesThisJobGen == st.job.generation && len(st.stagesThisJob) > 0 {
+		view.StagesThisJob = append([]int(nil), st.stagesThisJob...)
+	}
 	view.ChamberLight = st.ChamberLight
 	view.StartedAt = st.StartedAt
 	return view
@@ -649,6 +669,14 @@ func mergeReport(st *State, gen uint64, payload []byte, now time.Time, log *slog
 	// identity field, and metadata-only deltas never refresh session
 	// obs evidence.
 	st.trackJob(printObj)
+	// Stage history records after trackJob so a same-payload job boundary
+	// dates the stage to the new job. mergeDisplay already merged the raw
+	// stage value before the gate. Recording stays outside trackSession:
+	// stg_cur is not a print-state marker, so stage-only deltas must
+	// never refresh session obs evidence.
+	if v, ok := intField(printObj, "stg_cur"); ok {
+		st.recordStage(v)
+	}
 	if !real {
 		// Command ACK objects (sequence_id/command/result) and other control
 		// payloads carry no print state. Ignoring them entirely keeps them
@@ -734,6 +762,31 @@ func mergeReport(st *State, gen uint64, payload []byte, now time.Time, log *slog
 		}
 	}
 	return true
+}
+
+// maxStagesThisJob bounds the per-job stage history. History past the bound
+// is dropped: the printer reports a small stage vocabulary, and staleness
+// cannot hide a homing stage already recorded.
+const maxStagesThisJob = 64
+
+// recordStage appends one valid stg_cur value to the current job's stage
+// history. A generation change resets the history first, so stages from a
+// previous job never linger; a repeated value keeps its first-seen slot.
+// Callers hold the Cache mutex.
+func (st *State) recordStage(stage int) {
+	if st.stagesThisJobGen != st.job.generation {
+		st.stagesThisJobGen = st.job.generation
+		st.stagesThisJob = nil
+	}
+	for _, seen := range st.stagesThisJob {
+		if seen == stage {
+			return
+		}
+	}
+	if len(st.stagesThisJob) >= maxStagesThisJob {
+		return
+	}
+	st.stagesThisJob = append(st.stagesThisJob, stage)
 }
 
 // printStateMarkers are the report keys that mark a "print" object as real

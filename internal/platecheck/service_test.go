@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -44,6 +45,9 @@ func (f *fakeState) Print(string) (telemetry.JobView, telemetry.SessionView, boo
 	v := f.v
 	if v.LayerNum != nil {
 		v.LayerNum = new(*v.LayerNum)
+	}
+	if len(v.StagesThisJob) > 0 {
+		v.StagesThisJob = append([]int(nil), v.StagesThisJob...)
 	}
 	return f.j, v, true
 }
@@ -748,7 +752,7 @@ func TestModuleDisabledBlockedAndApprovedDisplay(t *testing.T) {
 		reason string
 		want   want
 	}{
-		{"idle", "", want{"Not checked yet", "", "Checks the plate when a print starts"}},
+		{"idle", "", want{"Not checked yet", "", "Checks the plate when a print starts and again after homing"}},
 		{"checking", "", want{"Checking", "info", ""}},
 		{"blocked", "", want{"Unavailable", "warn", "Camera is disabled in configuration"}},
 		{"clear", "", want{"Clear", "calm", ""}},
@@ -866,7 +870,26 @@ func TestDisplayScoresAndFirstLayerRows(t *testing.T) {
 	}
 }
 
-// rowByLabel returns the first panel row with the label.
+// TestDisplayHomingLabel pins that a second-pass status labels its Plate row
+// "Plate (after homing)" while every other row stays the same.
+func TestDisplayHomingLabel(t *testing.T) {
+	f := newFixture(t, "RUNNING")
+	f.w.setStatusWithReasonPass("clear", &Result{PClear: .9, POccupied: .1, PAssessable: .9}, "", true)
+	d := f.s.Display("01S1")
+	got := d.Panel.Rows[0]
+	if got.Label != "Plate (after homing)" || got.Section != "Before printing" || got.Value != "Clear" || got.Tone != "calm" {
+		t.Fatalf("homing plate row = %+v", got)
+	}
+	if rule := rowByLabel(t, d, "Rule"); rule.Section != "Before printing" || !strings.Contains(rule.Value, "Stops the print") {
+		t.Fatalf("homing rule row = %+v", rule)
+	}
+	f.w.setStatusWithReasonPass("skipped", nil, "print_past_start", true)
+	got = f.s.Display("01S1").Panel.Rows[0]
+	if got.Label != "Plate (after homing)" || got.Value != "Not checked" || got.Note != "Printing had already started; printing continued" {
+		t.Fatalf("homing skip row = %+v", got)
+	}
+}
+
 func rowByLabel(t *testing.T, d *module.Display, label string) module.Row {
 	t.Helper()
 	for _, row := range d.Panel.Rows {
@@ -966,6 +989,31 @@ func TestTerminalAfterConfirmationWindowNeverConfirms(t *testing.T) {
 	f.step()
 	if f.status() != "stop_unconfirmed" || f.hasEvent("platecheck_stopped") {
 		t.Fatal("late terminal falsely confirmed")
+	}
+}
+
+// TestStopConfirmationRejectsReportProcessedAfterDeadline covers the
+// post-read deadline check: the clock samples before the deadline, then
+// advances past it between the first sample and the post-read sample
+// while the state read already holds a same-job terminal report. The
+// late state must not confirm.
+func TestStopConfirmationRejectsReportProcessedAfterDeadline(t *testing.T) {
+	f := newFixture(t, "RUNNING")
+	f.hint("print_started")
+	f.step()
+	if f.w.pending == nil {
+		t.Fatal("no pending stop after the check")
+	}
+	f.report("FAILED", nil)
+	f.clock.advance(30*time.Second - 2*time.Millisecond)
+	f.s.now = func() time.Time {
+		t := f.clock.now()
+		f.clock.advance(2 * time.Millisecond)
+		return t
+	}
+	f.step()
+	if f.status() != "stop_unconfirmed" || f.hasEvent("platecheck_stopped") {
+		t.Fatalf("report processed after the deadline confirmed: %s", f.status())
 	}
 }
 
@@ -1311,5 +1359,214 @@ func TestCommandGateSendsTheAuthorizedGeneration(t *testing.T) {
 	f.step()
 	if len(f.commands.lights) != 1 || f.commands.lights[0] != 1 {
 		t.Fatalf("lights=%+v", f.commands.lights)
+	}
+}
+
+// reportStages sets the SessionView stage history the way the printer
+// reporting stg_cur values would: StagesThisJob holds the distinct stages
+// reported during the current job, in first-seen order.
+func reportStages(t *testing.T, f *fixture, stages ...int) {
+	t.Helper()
+	f.state.edit(func(_ *telemetry.JobView, v *telemetry.SessionView) {
+		v.StagesThisJob = append([]int(nil), stages...)
+	})
+}
+
+// pass1Clear runs pass 1 at PREPARE with a clear plate: exactly one check,
+// one passed line, and the generation consumed, ready for pass 2.
+func pass1Clear(t *testing.T, f *fixture) {
+	t.Helper()
+	f.client.result = Result{PClear: .9, POccupied: .1, PAssessable: .9, Model: "clef"}
+	f.hint("print_preparing")
+	f.step()
+	if f.client.calls != 1 {
+		t.Fatalf("pass 1 Evaluate calls = %d, want 1", f.client.calls)
+	}
+	if f.w.processed != 1 {
+		t.Fatalf("processed = %d, want 1 after pass 1", f.w.processed)
+	}
+}
+
+// homingEvents returns the plate-check activity messages in record order.
+func homingEvents(f *fixture) []string {
+	var out []string
+	for _, e := range f.activity.Recent("01S1") {
+		if e.Kind == "platecheck_passed" || e.Kind == "platecheck_skipped" || e.Kind == "platecheck_failed" {
+			out = append([]string{e.Message}, out...)
+		}
+	}
+	return out
+}
+
+// TestHomingPassRunsOnceAfterToolheadHoming pins pass 2: pass 1 checks at
+// PREPARE, then a stage 14 reported at RUNNING layer 0 runs exactly one
+// more check with the after-homing text.
+func TestHomingPassRunsOnceAfterToolheadHoming(t *testing.T) {
+	f := newFixture(t, "PREPARE")
+	pass1Clear(t, f)
+	f.report("RUNNING", new(0))
+	reportStages(t, f, 14)
+	f.step()
+	if f.client.calls != 2 {
+		t.Fatalf("Evaluate calls = %d, want 2 (one per pass)", f.client.calls)
+	}
+	if f.w.homingProcessed != 1 {
+		t.Fatalf("homingProcessed = %d, want 1 after pass 2", f.w.homingProcessed)
+	}
+	got := homingEvents(f)
+	want := []string{
+		"Plate check passed, plate clear",
+		"Plate check after homing passed, plate clear",
+	}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("activity = %q, want %q", got, want)
+	}
+	if v := f.s.moduleState("01S1").(ModuleState); !v.Homing {
+		t.Fatalf("Homing = false, want the pass 2 status marked: %+v", v)
+	}
+	// A later step runs nothing more for the generation.
+	f.step()
+	if f.client.calls != 2 {
+		t.Fatalf("Evaluate calls = %d, want still 2", f.client.calls)
+	}
+}
+
+// TestHomingTriggerStages pins which stages trigger pass 2: 13 and 14 do,
+// while bed leveling (1) alone never does.
+func TestHomingTriggerStages(t *testing.T) {
+	for _, tc := range []struct {
+		stage int
+		want  int
+	}{
+		{13, 2},
+		{14, 2},
+		{1, 1},
+		{2, 1},
+		{77, 1},
+		{255, 1},
+	} {
+		t.Run(fmt.Sprintf("stage_%d", tc.stage), func(t *testing.T) {
+			f := newFixture(t, "PREPARE")
+			pass1Clear(t, f)
+			f.report("RUNNING", new(0))
+			reportStages(t, f, tc.stage)
+			f.step()
+			if f.client.calls != tc.want {
+				t.Fatalf("stage %d: Evaluate calls = %d, want %d", tc.stage, f.client.calls, tc.want)
+			}
+		})
+	}
+}
+
+// TestHomingHistorySurvivesTheStageMovingOn pins pass 2 against the stage
+// history: stage 14 reported, then replaced by stage 1 before RUNNING
+// layer 0 arrives, still runs pass 2 once the print is ready.
+func TestHomingHistorySurvivesTheStageMovingOn(t *testing.T) {
+	f := newFixture(t, "PREPARE")
+	pass1Clear(t, f)
+	// Homing reports while the print is still in PREPARE: pass 2 is due
+	// but cannot run yet.
+	reportStages(t, f, 14)
+	f.step()
+	if f.client.calls != 1 || f.w.homingProcessed != 0 {
+		t.Fatalf("calls = %d homingProcessed = %d, want the pass held without a check", f.client.calls, f.w.homingProcessed)
+	}
+	// The printer replaces the stage with bed leveling before the worker
+	// steps at RUNNING: the history still holds 14.
+	f.report("RUNNING", new(0))
+	reportStages(t, f, 14, 1)
+	f.step()
+	if f.client.calls != 2 {
+		t.Fatalf("Evaluate calls = %d, want 2 after the due pass ran", f.client.calls)
+	}
+	got := homingEvents(f)
+	if len(got) != 2 || got[1] != "Plate check after homing passed, plate clear" {
+		t.Fatalf("activity = %q, want the after-homing line second", got)
+	}
+}
+
+// TestHomingStageFromThePreviousJobNeverTriggers pins that a stage 14
+// reported in the previous job does not trigger pass 2 for the new job:
+// the history holds only the current job's stages.
+func TestHomingStageFromThePreviousJobNeverTriggers(t *testing.T) {
+	f := newFixture(t, "PREPARE")
+	pass1Clear(t, f)
+	f.report("RUNNING", new(0))
+	// The new job has reported no stage yet: an empty history means the
+	// previous job's homing stage never triggers.
+	reportStages(t, f)
+	f.step()
+	if f.client.calls != 1 || f.w.homingProcessed != 0 {
+		t.Fatalf("calls = %d homingProcessed = %d, want no pass 2 without this job's stage", f.client.calls, f.w.homingProcessed)
+	}
+	// The job's own report of the same stage runs pass 2 normally.
+	reportStages(t, f, 14)
+	f.step()
+	if f.client.calls != 2 {
+		t.Fatalf("Evaluate calls = %d, want 2 after this job's own stage", f.client.calls)
+	}
+}
+
+// TestHomingPassSkippedOnceLayerOnePrints pins the pass-2 layer race: a
+// due pass that meets layer 1 before it can run records a
+// print_past_start skip with the after-homing check name.
+func TestHomingPassSkippedOnceLayerOnePrints(t *testing.T) {
+	f := newFixture(t, "PREPARE")
+	pass1Clear(t, f)
+	reportStages(t, f, 14)
+	f.step()
+	if f.client.calls != 1 || f.w.homingProcessed != 0 {
+		t.Fatalf("calls = %d homingProcessed = %d, want the pass due without a check at PREPARE", f.client.calls, f.w.homingProcessed)
+	}
+	f.report("RUNNING", new(1))
+	f.step()
+	if f.client.calls != 1 {
+		t.Fatalf("Evaluate calls = %d, want 1 (the due pass skipped)", f.client.calls)
+	}
+	if f.w.homingProcessed != 1 {
+		t.Fatalf("homingProcessed = %d, want the due pass consumed", f.w.homingProcessed)
+	}
+	got := homingEvents(f)
+	want := "Plate check after homing skipped, printing had already started, continuing print"
+	if len(got) != 2 || got[1] != want {
+		t.Fatalf("activity = %q, want %q second", got, want)
+	}
+	v := f.s.moduleState("01S1").(ModuleState)
+	if v.State != "skipped" || v.Reason != "print_past_start" || !v.Homing {
+		t.Fatalf("status = %+v, want the after-homing skip", v)
+	}
+}
+
+// TestHomingNeverRunsAfterAPass1Stop pins that a pass 1 stop blocks pass 2:
+// startupStopped owns the generation, so the homing stage runs nothing.
+func TestHomingNeverRunsAfterAPass1Stop(t *testing.T) {
+	f := newFixture(t, "PREPARE")
+	f.hint("print_preparing")
+	f.step()
+	if f.commands.count() != 1 || f.w.startupStopped != 1 {
+		t.Fatalf("stops = %d startupStopped = %d, want the pass 1 stop", f.commands.count(), f.w.startupStopped)
+	}
+	f.report("RUNNING", new(0))
+	reportStages(t, f, 14)
+	f.step()
+	if f.client.calls != 1 || f.w.homingProcessed != 0 {
+		t.Fatalf("calls = %d homingProcessed = %d, want no pass 2", f.client.calls, f.w.homingProcessed)
+	}
+}
+
+// TestHomingNeedsStartObserved pins that a mid-print attach runs no pass 2:
+// processed is set without a check, but StartObserved is false.
+func TestHomingNeedsStartObserved(t *testing.T) {
+	f := newFixture(t, "PREPARE")
+	f.state.edit(func(j *telemetry.JobView, _ *telemetry.SessionView) { j.StartObserved = false })
+	f.s.ObserveActivity("01S1", activity.Entry{Kind: "state_initial", Time: f.clock.now(), Observation: activity.Observation{JobGen: 1}})
+	f.report("RUNNING", new(0))
+	reportStages(t, f, 14)
+	f.step()
+	if f.client.calls != 0 || f.w.homingProcessed != 0 {
+		t.Fatalf("calls = %d homingProcessed = %d, want no pass 2 without StartObserved", f.client.calls, f.w.homingProcessed)
+	}
+	if got := len(f.activity.Recent("01S1")); got != 0 {
+		t.Fatalf("activity entries = %d, want none", got)
 	}
 }

@@ -2041,6 +2041,7 @@ func TestDisplayPanels(t *testing.T) {
 			reasonDownloading:        "Downloading the print file from the printer",
 			reasonRetryWait:          "Download failed, retrying shortly",
 			reasonProxyStopping:      "Proxy stopping",
+			reasonSelectionChanged:   "Printer changed the selected plate or file",
 			catNotFound:              "Print file not found on the printer",
 			catTimeout:               "Print file download stalled",
 			catTransport:             "Could not read the print file from the printer",
@@ -2055,4 +2056,225 @@ func TestDisplayPanels(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestLookupSelectorChangeBetweenReadsServesLive pins the Lookup double
+// sample: when plate_idx or gcode_file changes between the two reads, the
+// cached entry from the first read must not be served with the second
+// read's job name.
+func TestLookupSelectorChangeBetweenReadsServesLive(t *testing.T) {
+	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
+	clk := &testClock{now: base}
+	conn := newFakeConn("S1")
+	job := runningJob(7)
+	rd := newJobReader("S1", job)
+	svc := newTestService(t, conn, rd, clk, "S1")
+	png := pngBytes(t, 2, 2)
+	adm := beginAttempt(t, svc, "S1", job)
+	svc.finish(adm, Result{PNG: png}, nil)
+
+	cases := []struct {
+		name   string
+		mutate func(telemetry.JobView) telemetry.JobView
+	}{
+		{"plate index", func(j telemetry.JobView) telemetry.JobView { j.PlateIndex = intPtr(2); return j }},
+		{"gcode file", func(j telemetry.JobView) telemetry.JobView { j.GCodeFile = "other_plate_2.3mf"; return j }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			moved := tc.mutate(job)
+			moved.Name = "moved.3mf"
+			rd.seq = []telemetry.JobView{job, moved}
+			res, ok := svc.Lookup("S1", true)
+			if !ok {
+				t.Fatal("Lookup lost configured serial")
+			}
+			if res.Preview.Status == StatusReady || res.PNG != nil || res.Preview.ImageURL != nil {
+				t.Fatalf("selector-moved lookup served old payload: %+v", res.Preview)
+			}
+			if res.Preview.JobName != moved.Name {
+				t.Fatalf("job_name = %q, want %q", res.Preview.JobName, moved.Name)
+			}
+		})
+	}
+}
+
+// TestFinishAcceptedSelectorsMovedExhaustedFinalizes pins the spent-budget
+// end of an accepted transfer: two transient failures, then an accepted
+// third attempt whose selectors moved, ends the generation as unavailable
+// with selection_changed and one activity entry.
+func TestFinishAcceptedSelectorsMovedExhaustedFinalizes(t *testing.T) {
+	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
+	serial := "S1"
+	clk := &testClock{now: base}
+	conn := newFakeConn(serial)
+	job := runningJob(7)
+	rd := newJobReader(serial, job)
+	svc := newTestService(t, conn, rd, clk, serial)
+	log := activity.New([]config.Printer{{Serial: serial}})
+	svc.SetActivity(log)
+
+	releaseSlot := func() {
+		svc.mu.Lock()
+		svc.worker = false
+		svc.mu.Unlock()
+	}
+	for range 2 {
+		adm := beginAttempt(t, svc, serial, job)
+		svc.finish(adm, Result{}, &testError{cat: catTransport})
+		releaseSlot()
+		clk.Advance(retryBase * time.Duration(2))
+	}
+	adm := beginAttempt(t, svc, serial, job)
+	moved := job
+	moved.PlateIndex = intPtr(2)
+	moved.GCodeFile = "other_plate_2.3mf"
+	rd.set(serial, moved)
+	svc.finish(adm, Result{PNG: pngBytes(t, 2, 2)}, nil)
+
+	rec, _ := attemptRecord(svc, serial)
+	if !rec.final || rec.reason != reasonSelectionChanged || rec.count != maxAttempts {
+		t.Fatalf("record = %+v, want final selection_changed count %d", rec, maxAttempts)
+	}
+	res, _ := svc.Lookup(serial, true)
+	if res.Preview.Status != StatusUnavailable || res.Preview.Reason != reasonSelectionChanged {
+		t.Fatalf("view = %+v, want unavailable selection_changed", res.Preview)
+	}
+	if res.PNG != nil || res.Preview.ImageURL != nil {
+		t.Fatalf("finalized lookup served payload: %+v", res.Preview)
+	}
+	events := log.Recent(serial)
+	if len(events) != 1 || events[0].Kind != "job_preview_unavailable" || events[0].Severity != activity.Info {
+		t.Fatalf("activity = %+v, want one info job_preview_unavailable", events)
+	}
+	wantMsg := "Print details unavailable, " + strings.ToLower(reasonText(reasonSelectionChanged)[:1]) + reasonText(reasonSelectionChanged)[1:]
+	if events[0].Message != wantMsg {
+		t.Fatalf("message = %q, want %q", events[0].Message, wantMsg)
+	}
+}
+
+// TestSpentPublishedEntryInvalidatedFinalizesAfterStep pins the late
+// selector change: a published third-attempt entry invalidated later by a
+// plate change becomes unavailable with selection_changed after the next
+// step, with one activity entry.
+func TestSpentPublishedEntryInvalidatedFinalizesAfterStep(t *testing.T) {
+	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
+	serial := "S1"
+	clk := &testClock{now: base}
+	conn := newFakeConn(serial)
+	job := runningJob(7)
+	rd := newJobReader(serial, job)
+	svc := newTestService(t, conn, rd, clk, serial)
+	log := activity.New([]config.Printer{{Serial: serial}})
+	svc.SetActivity(log)
+
+	releaseSlot := func() {
+		svc.mu.Lock()
+		svc.worker = false
+		svc.mu.Unlock()
+	}
+	for range 2 {
+		adm := beginAttempt(t, svc, serial, job)
+		svc.finish(adm, Result{}, &testError{cat: catTransport})
+		releaseSlot()
+		clk.Advance(retryBase * time.Duration(2))
+	}
+	adm := beginAttempt(t, svc, serial, job)
+	svc.finish(adm, Result{PNG: pngBytes(t, 2, 2)}, nil)
+	releaseSlot()
+	if res, _ := svc.Lookup(serial, true); res.Preview.Status != StatusReady {
+		t.Fatalf("setup did not publish: %+v", res.Preview)
+	}
+
+	moved := job
+	moved.PlateIndex = intPtr(2)
+	rd.set(serial, moved)
+	at := clk.Now().Add(time.Second)
+	clk.Set(at)
+	svc.step(at)
+	svc.wg.Wait()
+
+	rec, _ := attemptRecord(svc, serial)
+	if !rec.final || rec.reason != reasonSelectionChanged {
+		t.Fatalf("record = %+v, want final selection_changed", rec)
+	}
+	res, _ := svc.Lookup(serial, true)
+	if res.Preview.Status != StatusUnavailable || res.Preview.Reason != reasonSelectionChanged {
+		t.Fatalf("view = %+v, want unavailable selection_changed", res.Preview)
+	}
+	events := log.Recent(serial)
+	if len(events) != 1 || events[0].Kind != "job_preview_unavailable" {
+		t.Fatalf("activity = %+v, want one job_preview_unavailable", events)
+	}
+	// A further step records nothing more: the final entry is once only.
+	at = at.Add(time.Second)
+	clk.Set(at)
+	svc.step(at)
+	svc.wg.Wait()
+	if events := log.Recent(serial); len(events) != 1 {
+		t.Fatalf("activity = %+v, want exactly one entry", events)
+	}
+}
+
+// TestFinishAcceptedDuringJobChangeDiscardsWithoutFinalizing pins the
+// stale-generation finish: two transient failures, then an accepted third
+// attempt whose job moves to a new generation before finish. No
+// replacement attempt installs first, so the record still belongs to the
+// old admission. finish discards the result, refunds the budget like a
+// cancellation, and records nothing; the new generation admits fresh on
+// the next step.
+func TestFinishAcceptedDuringJobChangeDiscardsWithoutFinalizing(t *testing.T) {
+	base := time.Date(2026, 3, 4, 8, 0, 0, 0, time.UTC)
+	serial := "S1"
+	clk := &testClock{now: base}
+	conn := newFakeConn(serial)
+	job := runningJob(7)
+	rd := newJobReader(serial, job)
+	svc := newTestService(t, conn, rd, clk, serial)
+	log := activity.New([]config.Printer{{Serial: serial}})
+	svc.SetActivity(log)
+
+	releaseSlot := func() {
+		svc.mu.Lock()
+		svc.worker = false
+		svc.mu.Unlock()
+	}
+	for range 2 {
+		adm := beginAttempt(t, svc, serial, job)
+		svc.finish(adm, Result{}, &testError{cat: catTransport})
+		releaseSlot()
+		clk.Advance(retryBase * time.Duration(2))
+	}
+	adm := beginAttempt(t, svc, serial, job)
+	// The job moves to a new generation mid-transfer, with no
+	// replacement attempt record installed first: the worker slot stays
+	// held until finish settles.
+	rd.set(serial, runningJob(8))
+	svc.finish(adm, Result{PNG: pngBytes(t, 2, 2)}, nil)
+	releaseSlot()
+
+	if rec, _ := attemptRecord(svc, serial); rec.gen != 7 || rec.final || rec.count != 2 {
+		t.Fatalf("record = %+v, want gen 7 refunded to count 2 without final", rec)
+	}
+	if events := log.Recent(serial); len(events) != 0 {
+		t.Fatalf("activity = %+v, want no job_preview_unavailable for the obsolete attempt", events)
+	}
+	if res, _ := svc.Lookup(serial, true); res.PNG != nil || res.Preview.ImageURL != nil {
+		t.Fatalf("lookup served stale payload: %+v", res.Preview)
+	}
+
+	// The new generation admits on the next step with a fresh budget.
+	started := make(chan struct{}, 1)
+	svc.fetch = func(ctx context.Context, p config.Printer, j telemetry.JobView) (Result, error) {
+		started <- struct{}{}
+		return Result{}, &testError{cat: catTransport}
+	}
+	at := clk.Now().Add(time.Second)
+	clk.Set(at)
+	svc.step(at)
+	await(t, started)
+	svc.wg.Wait()
+	if rec, _ := attemptRecord(svc, serial); rec.gen != 8 || rec.count != 1 || rec.final {
+		t.Fatalf("record = %+v, want fresh count 1 for gen 8", rec)
+	}
 }

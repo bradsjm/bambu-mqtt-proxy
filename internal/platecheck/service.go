@@ -119,6 +119,8 @@ type boundCheck struct {
 	generation uint64
 	// prepare allows only one PREPARE-to-first-RUNNING transition.
 	prepare bool
+	// homing marks the second startup pass, after the toolhead homed.
+	homing bool
 	// admitted is the step admission time, the boundary that starts the
 	// overall-check budget.
 	admitted time.Time
@@ -156,6 +158,8 @@ type worker struct {
 	candidate *candidate
 	// processed prevents repeated checks for a generation.
 	processed uint64
+	// homingProcessed prevents a repeated second pass for a generation.
+	homingProcessed uint64
 	// status is the last automatic status, never diagnostic state.
 	status ModuleState
 	// pending is owned exclusively by the worker loop.
@@ -267,7 +271,7 @@ func (s *Service) ObserveActivity(serial string, entry activity.Entry) {
 			if j.Active && !j.StartObserved {
 				w.processed = max(w.processed, j.Generation)
 				w.candidate = nil
-				w.setStatusLocked("skipped", nil, "start_not_observed")
+				w.setStatusLocked("skipped", nil, "start_not_observed", false)
 			}
 			return
 		}
@@ -370,7 +374,7 @@ func (w *worker) commandGateFull(b boundCheck) (uint64, telemetry.JobView, telem
 	return gen, j, v, reason
 }
 
-// step advances both phases: it confirms one pending pause or stop, then admits one startup or first-layer hint without inventing events.
+// step advances all phases: it confirms one pending pause or stop, then admits one startup hint, then the second startup pass, then one first-layer hint, without inventing events.
 func (w *worker) step(ctx context.Context) {
 	if w.layerPending != nil {
 		w.confirmPause()
@@ -388,7 +392,7 @@ func (w *worker) step(ctx context.Context) {
 	c := w.candidate
 	if c == nil || c.generation <= w.processed {
 		w.mu.Unlock()
-		w.stepLayer(ctx)
+		w.stepHoming(ctx)
 		return
 	}
 	now := w.s.now()
@@ -459,17 +463,78 @@ func (w *worker) consumeLocked(generation uint64) {
 	}
 }
 
+// homingStages are the stg_cur values that report toolhead homing: 13 homes
+// the toolhead, and 14 cleans the nozzle tip with the bed raised into view.
+// Bed leveling (1) is not a trigger: leveling is optional per job.
+var homingStages = map[int]bool{13: true, 14: true}
+
+// stepHoming admits the second startup pass: pass 1 consumed the generation
+// at PREPARE while the bed may still sit lowered and out of camera view,
+// and pass 2 rechecks once the head homed and the bed rose into view. Pass
+// 2 is due when the job's stage history holds a homing stage: the history
+// persists for the job, so a stage processed during pass 1 or between
+// polling ticks still counts. The check runs once the print reaches
+// RUNNING at layer 0, or records a print_past_start skip once layer 1
+// prints.
+func (w *worker) stepHoming(ctx context.Context) {
+	w.mu.Lock()
+	j, v, ok := w.s.state.Print(w.printer.Serial)
+	if !ok {
+		w.mu.Unlock()
+		return
+	}
+	if !(j.Active && j.StartObserved && j.Generation == w.processed && j.Generation > w.homingProcessed && w.startupStopped != j.Generation && reportedHoming(v.StagesThisJob)) {
+		w.mu.Unlock()
+		w.stepLayer(ctx)
+		return
+	}
+	g := j.Generation
+	now := w.s.now()
+	layer := v.CurrentLayer()
+	switch {
+	case layer != nil && *layer > 0:
+		w.homingProcessed = max(w.homingProcessed, g)
+		w.mu.Unlock()
+		w.skipHoming("skipped", "print_past_start", 0)
+		return
+	case !w.s.commands.Connected(w.printer.Serial) || j.State != "RUNNING" || layer == nil:
+		// Waiting for RUNNING at layer 0 never expires: pass 2 either
+		// checks or meets a later print_past_start.
+		w.mu.Unlock()
+		w.stepLayer(ctx)
+		return
+	default:
+		w.homingProcessed = max(w.homingProcessed, g)
+		w.mu.Unlock()
+		w.check(ctx, boundCheck{generation: g, homing: true, admitted: now, operation: operations.Add(1)})
+		return
+	}
+}
+
+// reportedHoming reports whether the current job's stage history holds a
+// homing stage: the printer reported 13 or 14 during this job, even if a
+// later stage already replaced it.
+func reportedHoming(stages []int) bool {
+	for _, stage := range stages {
+		if homingStages[stage] {
+			return true
+		}
+	}
+	return false
+}
+
 // setStatus publishes immutable numeric values without retaining images.
-// Every other status change clears the skip reason; skip sets it.
+// Every other status change clears the skip reason; skip sets it. Homing is
+// false: only the second startup pass sets it.
 func (w *worker) setStatus(state string, r *Result) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.setStatusLocked(state, r, "")
+	w.setStatusLocked(state, r, "", false)
 }
 
-// setStatusLocked publishes the status and reason. The caller holds w.mu.
-func (w *worker) setStatusLocked(state string, r *Result, reason string) {
-	v := ModuleState{State: state, Cutoff: w.s.settings.StopConfidence, Reason: reason}
+// setStatusLocked publishes the status, reason, and pass. The caller holds w.mu.
+func (w *worker) setStatusLocked(state string, r *Result, reason string, homing bool) {
+	v := ModuleState{State: state, Cutoff: w.s.settings.StopConfidence, Reason: reason, Homing: homing}
 	if r != nil {
 		v.PClear = new(r.PClear)
 		v.POccupied = new(r.POccupied)
@@ -481,40 +546,71 @@ func (w *worker) setStatusLocked(state string, r *Result, reason string) {
 
 // skip records a cataloged fail-open reason and clears any previous scores.
 func (w *worker) skip(state, reason string, operation uint64) {
-	w.setStatusWithReason(state, nil, reason)
+	w.skipPass(state, reason, operation, false)
+}
+
+// skipHoming records a cataloged fail-open reason for the second startup
+// pass. It shares skip's body; only the check name differs.
+func (w *worker) skipHoming(state, reason string, operation uint64) {
+	w.skipPass(state, reason, operation, true)
+}
+
+// skipPass records a cataloged fail-open reason for one startup pass.
+func (w *worker) skipPass(state, reason string, operation uint64, homing bool) {
+	w.setStatusWithReasonPass(state, nil, reason, homing)
 	w.s.log.Info("Plate check skipped", "operation", operation, "serial", w.printer.Serial, "state", state, "error_code", reason)
 	kind, severity := "platecheck_skipped", activity.Info
 	if state == "error" {
 		kind, severity = "platecheck_failed", activity.Warning
 	}
-	w.s.activity.Record(w.printer.Serial, kind, severity, activitySentence("Plate check", state, reason))
+	w.s.activity.Record(w.printer.Serial, kind, severity, activitySentence(checkName(homing), state, reason))
 }
 
-// setStatusWithReason publishes the status with a skip reason.
+// checkName returns the activity name of one startup pass.
+func checkName(homing bool) string {
+	if homing {
+		return "Plate check after homing"
+	}
+	return "Plate check"
+}
+
+// inconclusiveSentence renders the inconclusive activity line of one startup pass.
+func inconclusiveSentence(homing bool) string {
+	if homing {
+		return "Plate view after homing inconclusive, continuing print"
+	}
+	return "Plate view inconclusive, continuing print"
+}
+
 func (w *worker) setStatusWithReason(state string, r *Result, reason string) {
+	w.setStatusWithReasonPass(state, r, reason, false)
+}
+
+// setStatusWithReasonPass publishes the status with a skip reason for one startup pass.
+func (w *worker) setStatusWithReasonPass(state string, r *Result, reason string, homing bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.setStatusLocked(state, r, reason)
+	w.setStatusLocked(state, r, reason, homing)
 }
 
 // check captures and evaluates once within the overall startup budget.
 func (w *worker) check(parent context.Context, b boundCheck) {
 	ctx, cancel := context.WithTimeout(context.WithValue(parent, operationKey{}, b.operation), w.s.kCheck)
 	defer cancel()
-	w.setStatus("checking", nil)
+	w.setStatusWithReasonPass("checking", nil, "", b.homing)
 	w.s.log.InfoContext(ctx, "Plate check started", "operation", b.operation, "serial", w.printer.Serial)
 	boundary := w.s.now()
 	if _, _, reason := w.authorize(b); reason != "" {
-		w.skip("skipped", reason, b.operation)
+		w.skipPass("skipped", reason, b.operation, b.homing)
 		return
 	} else if ctx.Err() != nil {
-		w.skip("skipped", w.contextReason(ctx), b.operation)
+		w.skipPass("skipped", w.contextReason(ctx), b.operation, b.homing)
 		return
 	}
 	if gen, v, reason := w.commandGate(b); v.ChamberLight == "off" {
 		// The final local guard cannot eliminate a printer-side change after dispatch.
 		if reason != "" {
-			w.skip("skipped", reason, b.operation)
+			w.skipPass("skipped", reason, b.operation, b.homing)
 			return
 		}
 		if err := w.s.commands.SetChamberLight(w.printer.Serial, gen, true); err == nil {
@@ -525,19 +621,19 @@ func (w *worker) check(parent context.Context, b boundCheck) {
 	}
 	frame, err := w.s.frames.Capture(ctx, w.printer.Serial, boundary)
 	if err != nil {
-		w.skip("error", errorCategory(err), b.operation)
+		w.skipPass("error", errorCategory(err), b.operation, b.homing)
 		return
 	}
 	b.captured = frame.Captured
 	if !frame.Captured.After(boundary) || frame.Captured.After(w.s.now()) {
-		w.skip("skipped", "capture_timeout", b.operation)
+		w.skipPass("skipped", "capture_timeout", b.operation, b.homing)
 		return
 	}
 	if _, _, reason := w.authorize(b); reason != "" {
-		w.skip("skipped", reason, b.operation)
+		w.skipPass("skipped", reason, b.operation, b.homing)
 		return
 	} else if ctx.Err() != nil || w.s.now().Sub(b.admitted) > w.s.kCheck {
-		w.skip("skipped", w.budgetReason(ctx), b.operation)
+		w.skipPass("skipped", w.budgetReason(ctx), b.operation, b.homing)
 		return
 	}
 	if w.s.log.Enabled(ctx, slog.LevelDebug) {
@@ -545,18 +641,18 @@ func (w *worker) check(parent context.Context, b boundCheck) {
 	}
 	result, err := w.s.client.Evaluate(ctx, frame.JPEG, config.DisplayModel(w.printer.Model, w.printer.Serial))
 	if err != nil {
-		w.skip("error", errorCategory(err), b.operation)
+		w.skipPass("error", errorCategory(err), b.operation, b.homing)
 		return
 	}
 	if !validResult(result) {
-		w.skip("error", "bad_response", b.operation)
+		w.skipPass("error", "bad_response", b.operation, b.homing)
 		return
 	}
 	if _, _, reason := w.authorize(b); reason != "" {
-		w.skip("skipped", reason, b.operation)
+		w.skipPass("skipped", reason, b.operation, b.homing)
 		return
 	} else if ctx.Err() != nil || w.s.now().Sub(b.admitted) > w.s.kCheck || w.s.now().Sub(frame.Captured) > w.s.kCheck {
-		w.skip("skipped", w.budgetReason(ctx), b.operation)
+		w.skipPass("skipped", w.budgetReason(ctx), b.operation, b.homing)
 		return
 	}
 	decision := classify(result, w.s.settings.StopConfidence)
@@ -568,16 +664,16 @@ func (w *worker) check(parent context.Context, b boundCheck) {
 	if state == "would_stop" {
 		state = "checking"
 	}
-	w.setStatus(state, &result)
+	w.setStatusWithReasonPass(state, &result, "", b.homing)
 	switch decision {
 	case "inconclusive":
-		w.s.activity.Record(w.printer.Serial, "platecheck_skipped", activity.Info, "Plate view inconclusive, continuing print")
+		w.s.activity.Record(w.printer.Serial, "platecheck_skipped", activity.Info, inconclusiveSentence(b.homing))
 		return
 	case "clear":
-		w.s.activity.Record(w.printer.Serial, "platecheck_passed", activity.Info, "Plate check passed, plate clear")
+		w.s.activity.Record(w.printer.Serial, "platecheck_passed", activity.Info, checkName(b.homing)+" passed, plate clear")
 		return
 	case "below_threshold":
-		w.s.activity.Record(w.printer.Serial, "platecheck_passed", activity.Info, "Plate check passed, plate may not be empty but is below the stop threshold")
+		w.s.activity.Record(w.printer.Serial, "platecheck_passed", activity.Info, checkName(b.homing)+" passed, plate may not be empty but is below the stop threshold")
 		return
 	case "would_stop":
 		w.pending = &pendingStop{bound: b}
@@ -617,7 +713,7 @@ func (w *worker) dispatch(ctx context.Context) {
 	if reason != "" {
 		if p.attempts == 0 {
 			w.pending = nil
-			w.skip("skipped", reason, p.bound.operation)
+			w.skipPass("skipped", reason, p.bound.operation, p.bound.homing)
 		} else {
 			w.unconfirmed()
 		}
@@ -644,7 +740,7 @@ func (w *worker) dispatch(ctx context.Context) {
 	}
 }
 
-// setStatusKeepingScores changes the stop lifecycle without copying old check scores.
+// setStatusKeepingScores changes the stop lifecycle without copying old check scores. It keeps the pass: the lifecycle belongs to the check that set it.
 func (w *worker) setStatusKeepingScores(state string) {
 	w.mu.Lock()
 	w.status.State = state
@@ -653,6 +749,10 @@ func (w *worker) setStatusKeepingScores(state string) {
 }
 
 // confirm waits for the printer to report the job ended after dispatch.
+// The state read sits between two deadline checks: the first avoids work
+// after expiry, and the second rejects a report processed after the
+// deadline, so a late state can neither confirm nor trigger the PREPARE
+// follow-up stop.
 func (w *worker) confirm(ctx context.Context) {
 	p := w.pending
 	now := w.s.now()
@@ -662,6 +762,10 @@ func (w *worker) confirm(ctx context.Context) {
 	}
 	j, _, ok := w.s.state.Print(w.printer.Serial)
 	if !ok {
+		return
+	}
+	if now = w.s.now(); !now.Before(p.deadline) {
+		w.unconfirmed()
 		return
 	}
 	if j.Generation != p.bound.generation {

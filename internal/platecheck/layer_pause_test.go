@@ -169,6 +169,31 @@ func TestFirstLayerPauseDeadlineNoReplay(t *testing.T) {
 	}
 }
 
+// TestFirstLayerConfirmationRejectsReportProcessedAfterDeadline covers
+// the post-read deadline check: the clock samples before the deadline,
+// then advances past it between the first sample and the post-read
+// sample while the state read already holds a same-job PAUSE report.
+// The late pause must not confirm.
+func TestFirstLayerConfirmationRejectsReportProcessedAfterDeadline(t *testing.T) {
+	f := newLayerFixture(t)
+	f.hint("first_layer_complete")
+	f.step()
+	if f.w.layerPending == nil {
+		t.Fatal("no pending pause after the check")
+	}
+	f.report("PAUSE", new(2))
+	f.clock.advance(30*time.Second - 2*time.Millisecond)
+	f.s.now = func() time.Time {
+		t := f.clock.now()
+		f.clock.advance(2 * time.Millisecond)
+		return t
+	}
+	f.step()
+	if layerStatus(f).Pause != "unconfirmed" || f.hasEvent("platecheck_layer1_pause_confirmed") {
+		t.Fatalf("report processed after the deadline confirmed: %+v", layerStatus(f))
+	}
+}
+
 func TestFirstLayerConfirmationWaitSurvivesRunningReports(t *testing.T) {
 	f := newLayerFixture(t)
 	f.hint("first_layer_complete")

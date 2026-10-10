@@ -258,7 +258,10 @@ func (w *worker) layerBudgetReason(ctx context.Context) string {
 	return "check_timeout"
 }
 
-// confirmPause accepts a same-job pause report inside the deadline.
+// confirmPause accepts a same-job pause report inside the deadline. The
+// state read sits between two deadline checks: the first avoids work
+// after expiry, and the second rejects a report processed after the
+// deadline, so a late pause cannot confirm.
 func (w *worker) confirmPause() {
 	p := w.layerPending
 	now := w.s.now()
@@ -268,6 +271,10 @@ func (w *worker) confirmPause() {
 	}
 	j, _, ok := w.s.state.Print(w.printer.Serial)
 	if !ok {
+		return
+	}
+	if now = w.s.now(); !now.Before(p.deadline) {
+		w.unconfirmedPause()
 		return
 	}
 	if j.Generation != p.bound.generation || !j.Active {

@@ -181,9 +181,11 @@ const (
 	previewURLPrefix = "/camera/"
 )
 
-// Wait reasons for View.Reason while the preview is pending. The archive
-// failure categories in archive.go complete the pending and unavailable
-// reasons from the plan's job preview catalog.
+// Wait reasons for View.Reason while the preview is pending, plus the
+// terminal selection reason when the printer moves selectors after the
+// retry budget is spent. The archive failure categories in archive.go
+// complete the pending and unavailable reasons from the plan's job preview
+// catalog.
 const (
 	reasonWaitingForPrint    = "waiting_for_print"
 	reasonWaitingForFileName = "waiting_for_file_name"
@@ -192,6 +194,7 @@ const (
 	reasonDownloading        = "downloading"
 	reasonRetryWait          = "retry_wait"
 	reasonProxyStopping      = "proxy_stopping"
+	reasonSelectionChanged   = "selection_changed"
 )
 
 // Connectivity is the upstream liveness surface the scheduler polls. The
@@ -432,6 +435,7 @@ func (s *Service) admit(now time.Time) *admission {
 	for _, p := range s.printers {
 		job, ok := s.readJob(p.Serial)
 		if !ok || s.skipped(p.Serial, job, now) {
+			s.finalizeExhaustedSelection(p.Serial, job, ok)
 			continue
 		}
 		if !eligible(job, status[p.Serial]) {
@@ -444,6 +448,7 @@ func (s *Service) admit(now time.Time) *admission {
 		status = s.conn.Status()
 		job, ok = s.readJob(p.Serial)
 		if !ok || job.Generation != wantGen || s.skipped(p.Serial, job, now) || !eligible(job, status[p.Serial]) {
+			s.finalizeExhaustedSelection(p.Serial, job, ok)
 			continue
 		}
 		candidate := &admission{
@@ -472,6 +477,36 @@ func (s *Service) skipped(serial string, job telemetry.JobView, now time.Time) b
 		}
 	}
 	return entryValid(s.entries[serial], job)
+}
+
+// finalizeExhaustedSelection marks a spent generation final when its
+// published entry no longer matches the live selectors and no attempt is
+// in flight: the budget cannot serve the new plate or file, so the wall
+// names the selection change instead of waiting forever. It records one
+// job_preview_unavailable entry outside the service mutex.
+func (s *Service) finalizeExhaustedSelection(serial string, job telemetry.JobView, ok bool) {
+	if !ok {
+		return
+	}
+	s.mu.Lock()
+	rec := s.attempts[serial]
+	if rec == nil || rec.gen != job.Generation || rec.final || rec.count < maxAttempts {
+		s.mu.Unlock()
+		return
+	}
+	if s.inflight[serial] != nil || entryValid(s.entries[serial], job) {
+		s.mu.Unlock()
+		return
+	}
+	rec.final = true
+	rec.reason = reasonSelectionChanged
+	activityLog := s.activity
+	s.mu.Unlock()
+	if activityLog != nil {
+		t := reasonText(reasonSelectionChanged)
+		activityLog.Record(serial, "job_preview_unavailable", activity.Info,
+			"Print details unavailable, "+strings.ToLower(t[:1])+t[1:])
+	}
 }
 
 // entryValid reports whether the published entry serves the live job: the
@@ -551,18 +586,19 @@ func (s *Service) transferValid(adm *admission, now time.Time) bool {
 // result against unchanged selectors, schedules a retry for a transient
 // failure, or marks the generation final and records one
 // job_preview_unavailable activity entry. Bookkeeping mutates only while
-// the attempt record still belongs to the admitted generation; a stale
-// outcome records nothing. The activity entry is recorded outside the
-// service mutex.
+// the attempt record still belongs to the admitted generation; an outcome
+// for a replaced record records nothing at all. When the live job has
+// moved to another generation but the record still belongs to the
+// admitted one, the result is discarded and its budget refunded, like a
+// cancellation. The activity entry is recorded outside the service mutex.
 func (s *Service) finish(adm *admission, res Result, err error) {
 	serial := adm.printer.Serial
 	now := s.now()
 	outcome := outcomeCategory(err)
 	accepted := res.Metadata != nil || len(res.PNG) > 0
-	selectorsOK := false
-	if live, ok := s.readJob(serial); ok {
-		selectorsOK = selectorsEqual(live, adm.job)
-	}
+	live, ok := s.readJob(serial)
+	stale := !ok || live.Generation != adm.gen
+	selectorsOK := !stale && selectorsEqual(live, adm.job)
 
 	s.mu.Lock()
 	rec := s.attempts[serial]
@@ -584,6 +620,13 @@ func (s *Service) finish(adm *admission, res Result, err error) {
 		// A generation change or Close cancelled the attempt: the
 		// budget it consumed is refunded and nothing is recorded.
 		rec.count--
+	case stale:
+		// The job moved on while the attempt was in flight, but the
+		// replacement has not started yet, so the record still
+		// belongs to the old admission. The result belongs to no
+		// live job: refund the budget like a cancellation and record
+		// nothing.
+		rec.count--
 	case accepted && selectorsOK:
 		stamped = stampedResult(serial, res, now)
 		if err != nil {
@@ -597,10 +640,19 @@ func (s *Service) finish(adm *admission, res Result, err error) {
 		}
 		published = true
 	case accepted:
-		// The archive parsed but the selectors moved: retry
-		// immediately on the next tick with the new selectors.
-		rec.nextAt = now
-		retryIn = 0
+		// The archive parsed but the plate or file selectors moved
+		// within the same generation: retry immediately on the next
+		// tick with the new selectors. When the budget is already
+		// spent no retry can start, so the generation ends with the
+		// selection change named.
+		if rec.count >= maxAttempts {
+			rec.final = true
+			rec.reason = reasonSelectionChanged
+			finalReason = reasonSelectionChanged
+		} else {
+			rec.nextAt = now
+			retryIn = 0
+		}
 	default:
 		if (outcome == catNotFound || outcome == catTimeout || outcome == catTransport) && rec.count < maxAttempts {
 			rec.nextAt = now.Add(retryBase * time.Duration(rec.count))
@@ -677,6 +729,8 @@ func reasonText(reason string) string {
 		return "Download failed, retrying shortly"
 	case reasonProxyStopping:
 		return "Proxy stopping"
+	case reasonSelectionChanged:
+		return "Printer changed the selected plate or file"
 	case catNotFound:
 		return "Print file not found on the printer"
 	case catTimeout:
@@ -737,9 +791,9 @@ func validArchiveBasename(file string) bool {
 // are live projections of the current job view, and payloads come only
 // from published entries pinned to the sampled generation and selectors.
 // The job view is sampled before and after the entry copy, so a job
-// boundary during the read serves the live projection without the stale
-// payload. includeImage=false never copies PNG bytes; includeImage=true
-// returns an independent copy.
+// boundary or selector change during the read serves the live projection
+// without the stale payload. includeImage=false never copies PNG bytes;
+// includeImage=true returns an independent copy.
 func (s *Service) Lookup(serial string, includeImage bool) (Result, bool) {
 	if _, configured := s.bySerial[serial]; !configured {
 		return Result{}, false
@@ -767,7 +821,7 @@ func (s *Service) Lookup(serial string, includeImage bool) (Result, bool) {
 	connected := s.conn.Status()[serial]
 
 	job2, ok2 := s.readJob(serial)
-	if !ok2 || job2.Generation != job1.Generation {
+	if !ok2 || job2.Generation != job1.Generation || !selectorsEqual(job2, job1) {
 		cur := job1
 		if ok2 {
 			cur = job2

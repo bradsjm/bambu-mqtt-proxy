@@ -1075,3 +1075,68 @@ func TestCollectActivityEventsCatalog(t *testing.T) {
 		})
 	}
 }
+
+// TestStagesThisJobTracksTheCurrentJob pins the per-job stage history: a
+// report that carries both gcode_state and stg_cur records the stage on
+// the job boundary it opens, a repeated stage keeps its first-seen slot,
+// and a new generation resets the history so stages from the previous job
+// never linger.
+func TestStagesThisJobTracksTheCurrentJob(t *testing.T) {
+	c := NewCache([]config.Printer{{Serial: "S1", Name: "Shop"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	report := func(seq uint64, payload string) {
+		t.Helper()
+		c.ObserveReport("S1", seq, 1, []byte(payload))
+	}
+	stages := func() []int {
+		t.Helper()
+		v, _ := c.Session("S1")
+		return v.StagesThisJob
+	}
+	// Job 1 reports a homing stage in the report that opens its own job
+	// generation.
+	report(1, `{"print":{"gcode_state":"IDLE"}}`)
+	report(2, `{"print":{"gcode_state":"PREPARE","stg_cur":14,"subtask_name":"a.3mf"}}`)
+	if got := stages(); !reflect.DeepEqual(got, []int{14}) {
+		t.Fatalf("stages = %v, want [14] on the opening job", got)
+	}
+	// A stage-only delta appends in first-seen order; a repeat reorders
+	// nothing.
+	report(3, `{"print":{"stg_cur":1}}`)
+	report(4, `{"print":{"stg_cur":14}}`)
+	if got := stages(); !reflect.DeepEqual(got, []int{14, 1}) {
+		t.Fatalf("stages = %v, want [14 1]", got)
+	}
+	// The next job starts without reporting a stage: the history resets,
+	// and the previous job's stages do not linger.
+	report(5, `{"print":{"gcode_state":"FINISH"}}`)
+	report(6, `{"print":{"gcode_state":"RUNNING","subtask_name":"b.3mf"}}`)
+	j, _ := c.Job("S1")
+	if j.Generation != 2 {
+		t.Fatalf("job generation = %d, want 2", j.Generation)
+	}
+	if got := stages(); len(got) != 0 {
+		t.Fatalf("stages = %v, want the history reset on the new job", got)
+	}
+	// The new job's own stage report starts a fresh history.
+	report(7, `{"print":{"stg_cur":13}}`)
+	if got := stages(); !reflect.DeepEqual(got, []int{13}) {
+		t.Fatalf("stages = %v, want [13] for the new job", got)
+	}
+}
+
+// TestStagesThisJobExposesACopy pins that the stage history projection is a
+// copy: mutating the reported slice cannot corrupt the cached history.
+func TestStagesThisJobExposesACopy(t *testing.T) {
+	c := NewCache([]config.Printer{{Serial: "S1", Name: "Shop"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	c.ObserveReport("S1", 1, 1, []byte(`{"print":{"gcode_state":"IDLE"}}`))
+	c.ObserveReport("S1", 2, 1, []byte(`{"print":{"gcode_state":"PREPARE","stg_cur":14}}`))
+	v, _ := c.Session("S1")
+	if len(v.StagesThisJob) != 1 {
+		t.Fatalf("stages = %v, want [14]", v.StagesThisJob)
+	}
+	v.StagesThisJob[0] = 1
+	u, _ := c.Session("S1")
+	if !reflect.DeepEqual(u.StagesThisJob, []int{14}) {
+		t.Fatalf("stages = %v, want the mutation to stay on the projection", u.StagesThisJob)
+	}
+}

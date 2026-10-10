@@ -686,3 +686,45 @@ func TestJobExplicitEmptyNameClearsIdentityAndDisplay(t *testing.T) {
 		t.Fatalf("explicit empty name must not start a generation: gen=%d", j.Generation)
 	}
 }
+
+// TestJobClearedNameStillDetectsNewName covers the sticky-name rule: an
+// explicit empty or invalid name clears the public field but keeps the
+// last known name for boundary detection. A later different non-empty
+// name while still active starts a new generation; the same name
+// returning does not.
+func TestJobClearedNameStillDetectsNewName(t *testing.T) {
+	c := newJobTestCache(t)
+
+	jobObserve(t, c, 1, 1, map[string]any{
+		"gcode_state": "RUNNING", "subtask_name": "a.3mf",
+	})
+	jobObserve(t, c, 2, 1, map[string]any{"subtask_name": ""})
+	v, _ := c.Job("S1")
+	if v.Generation != 1 || v.Name != "" {
+		t.Fatalf("explicit empty name: %+v", v)
+	}
+	jobObserve(t, c, 3, 1, map[string]any{
+		"gcode_state": "RUNNING", "subtask_name": "b.3mf",
+	})
+	v, _ = c.Job("S1")
+	if !v.Active || v.Generation != 2 || v.Name != "b.3mf" || !v.StartObserved {
+		t.Fatalf("different name after a cleared name: %+v", v)
+	}
+
+	d := newJobTestCache(t)
+	jobObserve(t, d, 1, 1, map[string]any{
+		"gcode_state": "RUNNING", "subtask_name": "a.3mf",
+	})
+	jobObserve(t, d, 2, 1, map[string]any{"subtask_name": 7})
+	v, _ = d.Job("S1")
+	if v.Generation != 1 || v.Name != "" {
+		t.Fatalf("invalid name: %+v", v)
+	}
+	jobObserve(t, d, 3, 1, map[string]any{
+		"gcode_state": "RUNNING", "subtask_name": "a.3mf",
+	})
+	v, _ = d.Job("S1")
+	if v.Generation != 1 || v.Name != "a.3mf" {
+		t.Fatalf("same name returning after an invalid name: %+v", v)
+	}
+}

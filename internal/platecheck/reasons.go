@@ -56,8 +56,8 @@ func reasonClause(code string) string {
 }
 
 // activitySentence renders the activity-log sentence for a skipped or failed
-// check. Check is "Plate check" or "First-layer check", and state is
-// "skipped" or "error".
+// check. Check is "Plate check", "Plate check after homing", or "First-layer
+// check", and state is "skipped" or "error".
 func activitySentence(check, state, code string) string {
 	switch code {
 	case "print_ended":
@@ -69,10 +69,10 @@ func activitySentence(check, state, code string) string {
 	case "startup_stopped":
 		return check + " skipped, plate check stopped this print"
 	case "printer_offline":
-		if check == "Plate check" {
-			return check + " skipped, printer offline, no stop sent"
+		if check == "First-layer check" {
+			return check + " skipped, printer offline, no pause sent"
 		}
-		return check + " skipped, printer offline, no pause sent"
+		return check + " skipped, printer offline, no stop sent"
 	}
 	if state == "error" {
 		return check + " failed, " + reasonClause(code) + ", continuing print"
@@ -81,7 +81,7 @@ func activitySentence(check, state, code string) string {
 }
 
 // reasonNote renders the camera-wall note for a skipped or failed check.
-// Check is "Plate check" or "First-layer check".
+// Check is "Plate check", "Plate check after homing", or "First-layer check".
 func reasonNote(check, code string) string {
 	switch code {
 	case "print_ended":
@@ -91,10 +91,10 @@ func reasonNote(check, code string) string {
 	case "canceled":
 		return "Proxy stopping"
 	case "printer_offline":
-		if check == "Plate check" {
-			return "Printer offline; no stop sent"
+		if check == "First-layer check" {
+			return "Printer offline; no pause sent"
 		}
-		return "Printer offline; no pause sent"
+		return "Printer offline; no stop sent"
 	case "start_not_observed":
 		return "Proxy started after this print began"
 	case "startup_stopped":
