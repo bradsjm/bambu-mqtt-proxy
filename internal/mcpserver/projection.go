@@ -159,7 +159,7 @@ func (s *Server) buildPrinterState(serial string, now time.Time) (PrinterState, 
 	st.Serial, st.Name, st.Model = info.serial, info.name, info.model
 	sv, _ := s.state.Session(serial)
 	out := PrinterState{
-		View:     printerview.Build(st, sv, s.connStatus(serial), s.generation(serial), now),
+		View:     printerview.Build(st, sv, s.connStatus(serial), now),
 		Camera:   s.cameraState(serial),
 		Activity: []activity.Entry{},
 		Controls: []string{},

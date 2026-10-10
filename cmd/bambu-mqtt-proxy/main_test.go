@@ -21,7 +21,7 @@ import (
 	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/detection"
 	"bambu-mqtt-proxy/internal/health"
-	"bambu-mqtt-proxy/internal/upstream"
+	"bambu-mqtt-proxy/internal/printer"
 )
 
 // childEnv marks a re-executed test binary as the serving child of
@@ -42,7 +42,7 @@ func TestDetectionModuleNoKeyWiring(t *testing.T) {
 	engine := detection.New(
 		[]config.Printer{{Serial: "01P1TESTENABLED", Model: "P1S"}},
 		detection.NewGadgetClient("test-key"),
-		detection.IdleFrames{}, nil, nil, nil, logger,
+		detection.IdleFrames{}, nil, nil, logger,
 	)
 	value := engine.Module().StatusValue()
 	statuses, ok := value.(map[string]any)
@@ -57,11 +57,11 @@ func TestDetectionModuleNoKeyWiring(t *testing.T) {
 		Printers: []config.Printer{noKeyPrinter()},
 	}
 	cfg.ApplyDefaults()
-	pool := upstream.NewPool(cfg.Printers, nil, cfg.Behavior, logger)
-	t.Cleanup(pool.Stop)
+	links := printer.New(cfg.Printers, logger, nil, nil)
+	t.Cleanup(links.Close)
 
 	mux := http.NewServeMux()
-	health.Routes(mux, pool, nil)
+	health.Routes(mux, links, nil)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 

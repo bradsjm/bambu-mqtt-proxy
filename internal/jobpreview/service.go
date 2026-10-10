@@ -197,8 +197,8 @@ const (
 	reasonSelectionChanged   = "selection_changed"
 )
 
-// Connectivity is the upstream liveness surface the scheduler polls. The
-// upstream Pool satisfies it structurally; jobpreview never imports that
+// Connectivity is the printer link liveness surface the scheduler polls.
+// The printer Links satisfy it structurally; jobpreview never imports that
 // package from production code.
 type Connectivity interface {
 	Status() map[string]bool

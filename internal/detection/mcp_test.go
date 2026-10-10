@@ -159,7 +159,7 @@ func TestSetAIMonitoringModuleRegistration(t *testing.T) {
 	// Module must declare the MCP hook through a valid tool schema; AddTool
 	// panics on a malformed input schema.
 	e := New([]config.Printer{{Serial: "S1", Name: "Shop", Model: "P1S"}},
-		&etClient{}, &etFrames{}, &etSessions{}, &etPauser{}, &etGens{gen: 1},
+		&etClient{}, &etFrames{}, &etSessions{}, &etPauser{},
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	m := e.Module()
 	if m.Name != "detection" || m.MCP == nil || m.State == nil {

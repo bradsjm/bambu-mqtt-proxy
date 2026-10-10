@@ -1,6 +1,6 @@
 // Package telemetry merges Bambu MQTT report deltas into a small display
-// state per printer for the camera wall and camera status endpoints. It reads
-// upstream reports through the pool observer without changing forwarding.
+// state per printer for the camera wall and camera status endpoints. It
+// observes printer reports without changing forwarding.
 package telemetry
 
 import (
@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"bambu-mqtt-proxy/internal/activity"
@@ -83,8 +82,8 @@ type State struct {
 	// AccessoryChamberTemp and AccessoryChamberAt hold the accessory chamber
 	// reading from a module, stamped onto State copies at read time by the
 	// optional chamber source. They are display-only: mergeReport never
-	// writes them, and they never refresh the report sequence, freshness,
-	// activity, or session state, nor the native ChamberTemp. Nil means
+	// writes them, and they never refresh freshness, activity, or session
+	// state, nor the native ChamberTemp. Nil means
 	// nothing was observed; consumers decide freshness from
 	// AccessoryChamberAt against their own clock.
 	AccessoryChamberTemp *float64
@@ -99,7 +98,6 @@ type State struct {
 	sessionActive    bool   // a print session is in progress
 	sessionGen       uint64 // bumps only when a genuinely new print session starts
 	epoch            uint64 // bumps at every state boundary or identity change
-	stateGen         uint64 // upstream generation of the last gcode_state report
 	layerJobGen      uint64 // Job generation of the last layer_num report.
 	// stagesThisJobGen is the job generation the stage history belongs to.
 	// stagesThisJob holds the distinct valid stg_cur values merged while
@@ -112,9 +110,7 @@ type State struct {
 	speedObs         uint64    // increments for each spd_lvl report
 	trayNow          *int      // raw tray_now selection value; nil = not reported
 	obs              uint64    // real print reports merged (ACKs excluded)
-	obsGen           uint64    // upstream generation of the last report
 	obsAt            time.Time // time of the last real report
-	lastSeq          uint64    // paho delivery order token of the last merge
 	// job is the private preview-job projection (job.go): preview
 	// generations, identity revisions and RUNNING settling evidence for the
 	// optional job preview service. It never feeds display values, and its
@@ -163,10 +159,8 @@ func (a HMSAlert) Severity() string {
 // Cache stores merged state for every configured printer.
 type Cache struct {
 	mu          sync.Mutex
-	activityMu  sync.Mutex // keeps activity events in report-merge order
 	states      map[string]*State
 	watch       map[string]chan struct{}
-	seq         atomic.Uint64
 	log         *slog.Logger
 	activity    *activity.Log                                             // optional recent-event log
 	chamberRead func(serial string) (temp float64, at time.Time, ok bool) // optional accessory chamber reading from a module
@@ -214,51 +208,19 @@ func (c *Cache) stampAccessory(s *State) {
 	}
 }
 
-// obsSeqBase starts the cache-assigned sequence space far above the pool's
-// per-connection counters so legacy Observe calls can never collide with
-// pool-ordered reports.
-const obsSeqBase = 1 << 62
-
-// Observe is the pool observer hook: merge one raw report payload.
+// Observe merges one raw report payload for one printer with session
+// bookkeeping. Unknown serials are ignored.
 func (c *Cache) Observe(serial string, payload []byte) {
-	c.ObserveReport(serial, 0, 0, payload)
-}
-
-// ObserveReport merges one upstream report with session bookkeeping. Seq
-// is the per-connection paho delivery token assigned when the message
-// handler was entered (0 lets the cache assign one); paho dispatches
-// concurrently, so an older report that arrives after a newer one is
-// dropped instead of regressing the merged state. Gen is the upstream
-// connection generation the report arrived on, read before the merge so
-// cached state is never newer than the connection it came from.
-func (c *Cache) ObserveReport(serial string, seq, gen uint64, payload []byte) {
-	if seq == 0 {
-		seq = obsSeqBase + c.seq.Add(1)
-	}
 	var events []activityRecord
 	var real bool
 	c.mu.Lock()
 	if st, ok := c.states[serial]; ok {
-		if seq < st.lastSeq {
-			// Wire ordering limitation: paho handler entry order approximates
-			// but cannot prove wire order. Dropping the straggler keeps the
-			// merged session state conservative; boundary epochs invalidate
-			// any action window that spanned the overlap.
-			c.mu.Unlock()
-			return
-		}
-		st.lastSeq = seq
 		before := activitySnapshot{state: st.PrintingState, sessionGen: st.sessionGen, jobGen: st.job.generation, printError: st.PrintError, hms: append([]HMSAlert(nil), st.HMS...), chamberLight: st.ChamberLight}
-		real = mergeReport(st, gen, payload, c.now(), c.log)
+		real = mergeReport(st, payload, c.now(), c.log)
 		if real || st.job.generation != before.jobGen {
 			events = collectActivityEvents(before, st)
 		} else {
 			events = lightEvents(before, st)
-		}
-		if len(events) > 0 {
-			// Reserve event-recording order while report merges are still
-			// serialized. Record after releasing c.mu to avoid nested locks.
-			c.activityMu.Lock()
 		}
 	}
 	c.mu.Unlock()
@@ -268,9 +230,6 @@ func (c *Cache) ObserveReport(serial string, seq, gen uint64, payload []byte) {
 		} else {
 			c.activity.RecordObserved(serial, event.kind, event.severity, event.message, event.obs)
 		}
-	}
-	if len(events) > 0 {
-		c.activityMu.Unlock()
 	}
 	if real {
 		c.notify(serial)
@@ -500,13 +459,11 @@ type SessionView struct {
 	// and pauses are invalidated without resetting the session context.
 	SessionGen uint64
 	Epoch      uint64 // bumps at every state boundary or identity change
-	StateGen   uint64 // upstream generation of the last gcode_state report
 	// SpeedProfile is nil until a supported profile (1..4) is reported.
 	SpeedProfile *int
 	SpeedObs     uint64
 	Obs          uint64 // real print reports merged
 	ObsAt        time.Time
-	ObsGen       uint64 // upstream generation of the last report
 	// Progress and RemainingMin carry the merged scalar with presence: nil
 	// means the printer never reported the field, so consumers can keep the
 	// value unknown instead of showing a meaningless 0.
@@ -562,11 +519,9 @@ func (st *State) sessionView() SessionView {
 		Complete:   st.completeIdentity,
 		SessionGen: st.sessionGen,
 		Epoch:      st.epoch,
-		StateGen:   st.stateGen,
 		SpeedObs:   st.speedObs,
 		Obs:        st.obs,
 		ObsAt:      st.obsAt,
-		ObsGen:     st.obsGen,
 	}
 	if st.speedProfile != nil {
 		v := *st.speedProfile
@@ -601,7 +556,7 @@ func (st *State) sessionView() SessionView {
 	return view
 }
 
-// SetConnected records upstream connectivity from the pool status.
+// SetConnected records connected-and-subscribed status from the printer links.
 func (c *Cache) SetConnected(statuses map[string]bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -645,7 +600,7 @@ func (c *Cache) State(serial string) (State, bool) {
 // ("print"); values change type between prints (number or string), so
 // extraction goes through generic maps instead of a fixed struct. now is
 // kept for callers that stamp report time; session timing is untouched.
-func mergeReport(st *State, gen uint64, payload []byte, now time.Time, log *slog.Logger) bool {
+func mergeReport(st *State, payload []byte, now time.Time, log *slog.Logger) bool {
 	var report map[string]json.RawMessage
 	if err := json.Unmarshal(payload, &report); err != nil {
 		return false // not a JSON report (health probes, tests); ignore
@@ -684,7 +639,7 @@ func mergeReport(st *State, gen uint64, payload []byte, now time.Time, log *slog
 		// on; only genuine print state reports may authorize actions.
 		return false
 	}
-	st.trackSession(printObj, gen)
+	st.trackSession(printObj)
 	if v, ok := numberField(printObj, "mc_percent"); ok {
 		st.Progress = v
 		st.progressSeen = true
@@ -699,8 +654,8 @@ func mergeReport(st *State, gen uint64, payload []byte, now time.Time, log *slog
 			// trackJob has already run for this report, so the
 			// job generation names the print job the layer
 			// belongs to. A report that omits layer_num
-			// restamps nothing: the last reported layer is
-			// kept across sessions, connections, and jobs,
+			// restamps nothing: the last reported layer is kept across
+			// sessions and jobs,
 			// and CurrentLayer decides whether it belongs to
 			// the current print.
 			st.layerJobGen = st.job.generation
@@ -844,14 +799,11 @@ func idField(obj map[string]any, key string) (string, bool) {
 // (cookie project_id-task_id-subtask_name; "0" is a valid local id; missing
 // parts leave a sticky incomplete cookie until the print ends).
 //
-// stateGen is stamped only when the report carries gcode_state, so a
-// temperature-only delta on a new connection can never make a pre-reconnect
-// RUNNING look current-generation. sessionGen bumps only at real print
-// session starts; epoch keeps marking every boundary for in-flight checks.
-func (st *State) trackSession(printObj map[string]any, gen uint64) {
+// SessionGen bumps only at real print session starts; epoch keeps marking
+// every boundary for in-flight checks.
+func (st *State) trackSession(printObj map[string]any) {
 	started := false
 	if s, ok := stringField(printObj, "gcode_state"); ok {
-		st.stateGen = gen
 		prev := st.PrintingState
 		switch {
 		case prev != "" && s != prev:
@@ -910,7 +862,6 @@ func (st *State) trackSession(printObj map[string]any, gen uint64) {
 	st.cookie = cookie
 	st.completeIdentity = st.projectID != "" && st.taskID != "" && st.Filename != ""
 	st.obs++
-	st.obsGen = gen
 	st.obsAt = time.Now()
 }
 

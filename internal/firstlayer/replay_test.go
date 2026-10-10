@@ -14,8 +14,8 @@ import (
 	"bambu-mqtt-proxy/internal/telemetry"
 )
 
-// replayLine mirrors the telemetry replay fixture: one captured upstream
-// report with its connection generation and decoded payload.
+// replayLine mirrors the telemetry replay fixture: one captured printer
+// report with its decoded payload.
 type replayLine struct {
 	TMS     int64           `json:"t_ms"`
 	Gen     uint64          `json:"gen"`
@@ -64,7 +64,7 @@ func TestReplayCancelResendArmsOnZeroThenCompletes(t *testing.T) {
 	var session printSession
 
 	for i, line := range lines {
-		cache.ObserveReport("S1", uint64(i+1), line.Gen, line.Payload)
+		cache.Observe("S1", line.Payload)
 		switch i {
 		case 7:
 			if obs, ok := svc.sample("S1", &session); ok {

@@ -32,7 +32,7 @@ func (w *worker) authorizeLayer(b boundCheck) (telemetry.SessionView, string) {
 	if !ok || j.Generation != b.generation || !j.Active {
 		return v, "print_ended"
 	}
-	if !w.s.commands.Connected(w.printer.Serial) {
+	if !w.s.commands.Online(w.printer.Serial) {
 		return v, "printer_offline"
 	}
 	if j.State != "RUNNING" {
@@ -46,17 +46,6 @@ func (w *worker) authorizeLayer(b boundCheck) (telemetry.SessionView, string) {
 		return v, "first_layer_not_complete"
 	}
 	return v, ""
-}
-
-// layerCommandGate reads the upstream connection generation first, then
-// authorizes the bound first-layer check. Every command sends with the
-// returned generation immediately: the generation is never re-read after
-// authorization, and the pool rejects the command if the connection
-// changed after that read.
-func (w *worker) layerCommandGate(b boundCheck) (uint64, telemetry.SessionView, string) {
-	gen := w.s.commands.Generation(w.printer.Serial)
-	v, reason := w.authorizeLayer(b)
-	return gen, v, reason
 }
 
 // stepLayer admits one queued first-layer hint without inventing events.
@@ -92,7 +81,7 @@ func (w *worker) stepLayer(ctx context.Context) {
 		h.waitReason = ""
 		w.mu.Unlock()
 		return
-	case !w.s.commands.Connected(w.printer.Serial):
+	case !w.s.commands.Online(w.printer.Serial):
 		if w.waitExpired("printer_offline", now, &h.waitReason, &h.waitSince) {
 			w.consumeLayerLocked(h.generation)
 			w.mu.Unlock()
@@ -170,12 +159,12 @@ func (w *worker) checkLayer(parent context.Context, b boundCheck) {
 		w.layerSkip("skipped", w.layerBudgetReason(ctx), b.operation)
 		return
 	}
-	if gen, v, reason := w.layerCommandGate(b); v.ChamberLight == "off" {
+	if v, reason := w.authorizeLayer(b); v.ChamberLight == "off" {
 		if reason != "" {
 			w.layerSkip("skipped", reason, b.operation)
 			return
 		}
-		if err := w.s.commands.SetChamberLight(w.printer.Serial, gen, true); err == nil {
+		if err := w.s.commands.Light(w.printer.Serial, true); err == nil {
 			boundary = w.s.now()
 		}
 	}
@@ -232,12 +221,12 @@ func (w *worker) checkLayer(parent context.Context, b boundCheck) {
 		}
 		p := &pendingPause{bound: b, dispatched: w.s.now(), issues: layerIssues(result, w.s.settings.FirstLayer.PauseConfidence, false)}
 		p.deadline = p.dispatched.Add(w.s.kConfirm)
-		gen, _, reason := w.layerCommandGate(b)
+		_, reason := w.authorizeLayer(b)
 		if reason != "" {
 			w.layerSkip("skipped", reason, b.operation)
 			return
 		}
-		if err := w.s.commands.PausePrint(w.printer.Serial, gen); err != nil {
+		if err := w.s.commands.Pause(w.printer.Serial); err != nil {
 			w.setLayerPause("failed")
 			w.layerEvent("platecheck_layer1_pause_failed", activity.Error, "First-layer pause command failed: "+p.issues+", check the printer", b.operation)
 			return

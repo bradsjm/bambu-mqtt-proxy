@@ -4,6 +4,8 @@ import (
 	"crypto/tls"
 	"fmt"
 	"log/slog"
+	"net"
+	"strconv"
 
 	mqtt "github.com/mochi-mqtt/server/v2"
 	"github.com/mochi-mqtt/server/v2/listeners"
@@ -11,16 +13,17 @@ import (
 	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/routing"
 	"bambu-mqtt-proxy/internal/tlsutil"
-	"bambu-mqtt-proxy/internal/upstream"
 )
 
-// Injector forwards upstream reports into the downstream broker. The mqtt
-// server is attached after construction to break the pool/server dependency
-// cycle.
+// Injector forwards upstream reports into the downstream broker.
+// The server is attached before the printer links start.
 type Injector struct {
-	srv   *mqtt.Server
+	// srv delivers injected reports to downstream subscribers.
+	srv *mqtt.Server
+	// table replaces printer serials with downstream aliases.
 	table *routing.Table
-	log   *slog.Logger
+	// log records failed downstream injections.
+	log *slog.Logger
 }
 
 // NewInjector creates an unattached injector.
@@ -46,14 +49,14 @@ func (i *Injector) PublishDownstream(topic string, payload []byte) {
 // Server wraps the downstream mochi broker with the bridge hook and TLS
 // listeners.
 type Server struct {
+	// srv owns the broker, hooks, and listeners.
 	srv *mqtt.Server
-	log *slog.Logger
 }
 
 // New assembles the downstream broker: mochi server, bridge hook, and one
 // listener per configured port (TLS with a generated or loaded self-signed
 // certificate where enabled).
-func New(cfg *config.Config, table *routing.Table, pool *upstream.Pool, inject *Injector, log *slog.Logger) (*Server, error) {
+func New(cfg *config.Config, table *routing.Table, links Sender, inject *Injector, log *slog.Logger) (*Server, error) {
 	srv := mqtt.New(&mqtt.Options{InlineClient: true, Logger: log})
 	// The printer's broker speaks QoS 0 only; so does the proxy. Mochi
 	// grants QoS 0 on every SUBACK and downgrades every PUBLISH to QoS 0.
@@ -67,16 +70,16 @@ func New(cfg *config.Config, table *routing.Table, pool *upstream.Pool, inject *
 		return nil, err
 	}
 
-	if err := srv.AddHook(newBridge(cfg, table, pool, log), nil); err != nil {
+	if err := srv.AddHook(newBridge(cfg, table, links, log), nil); err != nil {
 		return fail(fmt.Errorf("add bridge hook: %w", err))
 	}
 
-	s := &Server{srv: srv, log: log}
+	s := &Server{srv: srv}
 	for i, ln := range cfg.Listen {
 		lc := listeners.Config{
 			Type:    "tcp",
 			ID:      fmt.Sprintf("tcp-%d-%d", ln.Port, i),
-			Address: fmt.Sprintf(":%d", ln.Port),
+			Address: net.JoinHostPort("", strconv.Itoa(ln.Port)),
 		}
 		if ln.TLS {
 			cert, err := tlsutil.Ensure(ln.CertFile, ln.KeyFile)

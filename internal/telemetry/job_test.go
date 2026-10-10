@@ -16,7 +16,7 @@ func newJobTestCache(t *testing.T) *Cache {
 	return NewCache([]config.Printer{{Serial: "S1", Name: "Shop"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
-// jobReport builds one upstream report payload from key/value pairs.
+// jobReport builds one printer report payload from key/value pairs.
 func jobReport(t *testing.T, kv map[string]any) []byte {
 	t.Helper()
 	raw, err := json.Marshal(map[string]any{"print": kv})
@@ -26,11 +26,10 @@ func jobReport(t *testing.T, kv map[string]any) []byte {
 	return raw
 }
 
-// jobObserve merges one report on the given sequence, upstream generation,
-// and payload keys.
-func jobObserve(t *testing.T, c *Cache, seq, gen uint64, kv map[string]any) {
+// jobObserve merges one report built from the given payload keys.
+func jobObserve(t *testing.T, c *Cache, kv map[string]any) {
 	t.Helper()
-	c.ObserveReport("S1", seq, gen, jobReport(t, kv))
+	c.Observe("S1", jobReport(t, kv))
 }
 
 // TestJobLifecycleKeepsOneGenerationAcrossPauseResume covers the ordered
@@ -40,7 +39,7 @@ func jobObserve(t *testing.T, c *Cache, seq, gen uint64, kv map[string]any) {
 func TestJobLifecycleKeepsOneGenerationAcrossPauseResume(t *testing.T) {
 	c := newJobTestCache(t)
 
-	jobObserve(t, c, 1, 5, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"gcode_state": "PREPARE", "project_id": 1, "task_id": 2, "subtask_name": "a.3mf",
 	})
 	v, ok := c.Job("S1")
@@ -49,8 +48,8 @@ func TestJobLifecycleKeepsOneGenerationAcrossPauseResume(t *testing.T) {
 		t.Fatalf("after PREPARE: ok=%v view=%+v", ok, v)
 	}
 
-	for i, state := range []string{"RUNNING", "PAUSE", "RUNNING", "PAUSED", "RUNNING"} {
-		jobObserve(t, c, uint64(i+2), 5, map[string]any{"gcode_state": state})
+	for _, state := range []string{"RUNNING", "PAUSE", "RUNNING", "PAUSED", "RUNNING"} {
+		jobObserve(t, c, map[string]any{"gcode_state": state})
 		v, _ = c.Job("S1")
 		if v.Generation != 1 || !v.Active || v.State != state {
 			t.Fatalf("after %s: gen=%d active=%v state=%s", state, v.Generation, v.Active, v.State)
@@ -60,9 +59,9 @@ func TestJobLifecycleKeepsOneGenerationAcrossPauseResume(t *testing.T) {
 	// PREPARE and SLICING move inside one generation while no executing
 	// state has intervened.
 	d := newJobTestCache(t)
-	jobObserve(t, d, 1, 5, map[string]any{"gcode_state": "PREPARE"})
-	for i, state := range []string{"SLICING", "PREPARE", "SLICING"} {
-		jobObserve(t, d, uint64(i+2), 5, map[string]any{"gcode_state": state})
+	jobObserve(t, d, map[string]any{"gcode_state": "PREPARE"})
+	for _, state := range []string{"SLICING", "PREPARE", "SLICING"} {
+		jobObserve(t, d, map[string]any{"gcode_state": state})
 		v, _ = d.Job("S1")
 		if v.Generation != 1 || !v.Active || v.State != state {
 			t.Fatalf("after %s: gen=%d active=%v state=%s", state, v.Generation, v.Active, v.State)
@@ -76,7 +75,7 @@ func TestJobLifecycleKeepsOneGenerationAcrossPauseResume(t *testing.T) {
 func TestJobFirstObservationRules(t *testing.T) {
 	c := newJobTestCache(t)
 
-	jobObserve(t, c, 1, 3, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"gcode_state": "IDLE", "subtask_name": "old.3mf",
 	})
 	v, _ := c.Job("S1")
@@ -88,7 +87,7 @@ func TestJobFirstObservationRules(t *testing.T) {
 		t.Fatalf("IDLE first observation did not merge: %+v", v)
 	}
 
-	jobObserve(t, c, 2, 3, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"gcode_state": "RUNNING", "subtask_name": "benchy.3mf", "plate_idx": 2,
 	})
 	v, _ = c.Job("S1")
@@ -104,7 +103,7 @@ func TestJobFirstObservationRules(t *testing.T) {
 func TestJobTerminalReportMergesAndEndsWithoutNewGeneration(t *testing.T) {
 	c := newJobTestCache(t)
 
-	jobObserve(t, c, 1, 4, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"gcode_state": "RUNNING", "project_id": 7, "task_id": 8,
 		"subtask_name": "a.3mf", "gcode_start_time": 1000, "plate_idx": 3,
 	})
@@ -113,7 +112,7 @@ func TestJobTerminalReportMergesAndEndsWithoutNewGeneration(t *testing.T) {
 		t.Fatalf("initial: %+v", v)
 	}
 
-	jobObserve(t, c, 2, 4, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"gcode_state": "FINISH", "subtask_name": "", "project_id": 0,
 		"task_id": 0, "gcode_start_time": 0, "plate_idx": 0,
 	})
@@ -132,7 +131,7 @@ func TestJobTerminalReportMergesAndEndsWithoutNewGeneration(t *testing.T) {
 	}
 	// The sticky strong identities survive the terminal explicit values,
 	// so the same valid values returning never start a generation.
-	jobObserve(t, c, 3, 4, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"gcode_state": "RUNNING", "project_id": 7, "task_id": 8,
 		"subtask_name": "a.3mf", "gcode_start_time": 1000, "plate_idx": 3,
 	})
@@ -149,7 +148,7 @@ func TestJobTerminalReportMergesAndEndsWithoutNewGeneration(t *testing.T) {
 func TestJobStrongIdentityChangesStartGeneration(t *testing.T) {
 	c := newJobTestCache(t)
 
-	jobObserve(t, c, 1, 2, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"gcode_state": "RUNNING", "task_id": 10, "gcode_start_time": 5000, "subtask_name": "a.3mf",
 	})
 	v, _ := c.Job("S1")
@@ -157,32 +156,32 @@ func TestJobStrongIdentityChangesStartGeneration(t *testing.T) {
 		t.Fatalf("initial: %+v", v)
 	}
 
-	jobObserve(t, c, 2, 2, map[string]any{"gcode_state": "RUNNING", "task_id": 11, "gcode_start_time": 5000})
+	jobObserve(t, c, map[string]any{"gcode_state": "RUNNING", "task_id": 11, "gcode_start_time": 5000})
 	v, _ = c.Job("S1")
 	if v.Generation != 2 || v.TaskID != "11" {
 		t.Fatalf("task change: %+v", v)
 	}
 
-	jobObserve(t, c, 3, 2, map[string]any{"gcode_state": "RUNNING", "task_id": 11, "gcode_start_time": 6000})
+	jobObserve(t, c, map[string]any{"gcode_state": "RUNNING", "task_id": 11, "gcode_start_time": 6000})
 	v, _ = c.Job("S1")
 	if v.Generation != 3 || !v.StartedAt.Equal(time.Unix(6000, 0)) {
 		t.Fatalf("start time change: gen=%d started=%v", v.Generation, v.StartedAt)
 	}
 
-	jobObserve(t, c, 4, 2, map[string]any{"gcode_state": "RUNNING", "task_id": 11, "gcode_start_time": 6000, "subtask_name": "b.3mf"})
+	jobObserve(t, c, map[string]any{"gcode_state": "RUNNING", "task_id": 11, "gcode_start_time": 6000, "subtask_name": "b.3mf"})
 	v, _ = c.Job("S1")
 	if v.Generation != 4 || v.Name != "b.3mf" {
 		t.Fatalf("name change: %+v", v)
 	}
 
-	jobObserve(t, c, 5, 2, map[string]any{"gcode_state": "RUNNING", "task_id": 11, "gcode_start_time": 6000, "subtask_name": "b.3mf"})
+	jobObserve(t, c, map[string]any{"gcode_state": "RUNNING", "task_id": 11, "gcode_start_time": 6000, "subtask_name": "b.3mf"})
 	v, _ = c.Job("S1")
 	if v.Generation != 4 {
 		t.Fatalf("identical report must change nothing: gen=%d", v.Generation)
 	}
 
 	// A gcode_file change never starts a generation: it only merges.
-	jobObserve(t, c, 6, 2, map[string]any{"gcode_file": "other.3mf"})
+	jobObserve(t, c, map[string]any{"gcode_file": "other.3mf"})
 	v, _ = c.Job("S1")
 	if v.Generation != 4 || v.GCodeFile != "other.3mf" {
 		t.Fatalf("file change must merge without a boundary: %+v", v)
@@ -196,7 +195,7 @@ func TestJobStrongIdentityChangesStartGeneration(t *testing.T) {
 func TestJobStickyIdentityAcrossInvalidUpdates(t *testing.T) {
 	c := newJobTestCache(t)
 
-	jobObserve(t, c, 1, 2, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"gcode_state": "RUNNING", "project_id": 5, "task_id": 6, "gcode_start_time": 100,
 	})
 	v, _ := c.Job("S1")
@@ -205,14 +204,14 @@ func TestJobStickyIdentityAcrossInvalidUpdates(t *testing.T) {
 	}
 
 	// Absent identity fields: retained, no generation.
-	jobObserve(t, c, 2, 2, map[string]any{"gcode_state": "RUNNING"})
+	jobObserve(t, c, map[string]any{"gcode_state": "RUNNING"})
 	v, _ = c.Job("S1")
 	if v.ProjectID != "5" || v.TaskID != "6" || v.StartedAt.IsZero() || v.Generation != 1 {
 		t.Fatalf("absent fields must retain identity: %+v", v)
 	}
 
 	// The same valid values return: no new generation.
-	jobObserve(t, c, 3, 2, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"gcode_state": "RUNNING", "project_id": 5, "task_id": 6, "gcode_start_time": 100,
 	})
 	v, _ = c.Job("S1")
@@ -222,7 +221,7 @@ func TestJobStickyIdentityAcrossInvalidUpdates(t *testing.T) {
 
 	// An explicit empty project id clears the public field; the sticky
 	// identity survives for boundary detection.
-	jobObserve(t, c, 4, 2, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"gcode_state": "RUNNING", "project_id": "", "task_id": 6,
 	})
 	v, _ = c.Job("S1")
@@ -232,7 +231,7 @@ func TestJobStickyIdentityAcrossInvalidUpdates(t *testing.T) {
 
 	// The same valid value returning restores the field without a
 	// generation: valid, empty, valid never grants an attempt.
-	jobObserve(t, c, 5, 2, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"gcode_state": "RUNNING", "project_id": 5, "task_id": 6,
 	})
 	v, _ = c.Job("S1")
@@ -241,14 +240,14 @@ func TestJobStickyIdentityAcrossInvalidUpdates(t *testing.T) {
 	}
 
 	// An explicit zero timestamp clears the merged field only.
-	jobObserve(t, c, 6, 2, map[string]any{"gcode_state": "RUNNING", "gcode_start_time": 0})
+	jobObserve(t, c, map[string]any{"gcode_state": "RUNNING", "gcode_start_time": 0})
 	v, _ = c.Job("S1")
 	if !v.StartedAt.IsZero() || v.Generation != 1 {
 		t.Fatalf("nonpositive timestamp must clear only the field: %+v", v)
 	}
 
 	// The sticky timestamp returning never grants a new generation.
-	jobObserve(t, c, 7, 2, map[string]any{"gcode_state": "RUNNING", "gcode_start_time": 100})
+	jobObserve(t, c, map[string]any{"gcode_state": "RUNNING", "gcode_start_time": 100})
 	v, _ = c.Job("S1")
 	if v.Generation != 1 || !v.StartedAt.Equal(time.Unix(100, 0)) {
 		t.Fatalf("sticky timestamp return: gen=%d started=%v", v.Generation, v.StartedAt)
@@ -262,7 +261,7 @@ func TestJobStickyIdentityAcrossInvalidUpdates(t *testing.T) {
 func TestJobInvalidTypeValuesClearPreviewFields(t *testing.T) {
 	c := newJobTestCache(t)
 
-	jobObserve(t, c, 1, 1, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"gcode_state": "RUNNING", "project_id": 5, "task_id": 6,
 		"subtask_name": "a.3mf", "gcode_file": "a.3mf", "plate_idx": 2,
 		"gcode_start_time": 100,
@@ -274,7 +273,7 @@ func TestJobInvalidTypeValuesClearPreviewFields(t *testing.T) {
 		t.Fatalf("initial: %+v", v)
 	}
 
-	jobObserve(t, c, 2, 1, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"subtask_name": 7, "gcode_file": true, "plate_idx": "later",
 		"gcode_start_time": "soon", "project_id": false, "task_id": []any{1},
 	})
@@ -290,7 +289,7 @@ func TestJobInvalidTypeValuesClearPreviewFields(t *testing.T) {
 	// The same valid values return without a generation: the sticky
 	// identities bridged the invalid updates. gcode_file has no sticky
 	// identity, so it stays cleared until the printer reports it.
-	jobObserve(t, c, 3, 1, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"project_id": 5, "task_id": 6, "subtask_name": "a.3mf",
 		"plate_idx": 2, "gcode_start_time": 100,
 	})
@@ -308,7 +307,7 @@ func TestJobInvalidTypeValuesClearPreviewFields(t *testing.T) {
 func TestJobMetadataOnlyDeltas(t *testing.T) {
 	c := newJobTestCache(t)
 
-	jobObserve(t, c, 1, 3, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"gcode_state": "RUNNING", "subtask_name": "a.3mf", "task_id": 10, "gcode_start_time": 5000,
 	})
 	before, _ := c.Job("S1")
@@ -316,7 +315,7 @@ func TestJobMetadataOnlyDeltas(t *testing.T) {
 
 	// gcode_file is not a strong identity, so the metadata delta merges
 	// without a boundary.
-	jobObserve(t, c, 2, 3, map[string]any{"gcode_file": "part.3mf", "plate_idx": 1})
+	jobObserve(t, c, map[string]any{"gcode_file": "part.3mf", "plate_idx": 1})
 	v, _ := c.Job("S1")
 	if v.GCodeFile != "part.3mf" || v.PlateIndex == nil || *v.PlateIndex != 1 {
 		t.Fatalf("metadata delta must merge fields: %+v", v)
@@ -332,7 +331,7 @@ func TestJobMetadataOnlyDeltas(t *testing.T) {
 	// A metadata-only change to a known strong identity (start time
 	// carries no real-print marker) starts a generation without touching
 	// the session counters.
-	jobObserve(t, c, 3, 3, map[string]any{"gcode_start_time": 6000})
+	jobObserve(t, c, map[string]any{"gcode_start_time": 6000})
 	v, _ = c.Job("S1")
 	if v.Generation != before.Generation+1 || !v.StartedAt.Equal(time.Unix(6000, 0)) {
 		t.Fatalf("metadata-only identity boundary: %+v", v)
@@ -343,13 +342,13 @@ func TestJobMetadataOnlyDeltas(t *testing.T) {
 	}
 }
 
-// TestJobReconnectTemperatureStreamKeepsJob covers the reconnect rule: a
-// temperature stream on a new connection keeps the job, its generation,
-// and its identity untouched. No state restatement is needed.
-func TestJobReconnectTemperatureStreamKeepsJob(t *testing.T) {
+// TestJobTemperatureStreamKeepsJob covers the temperature-stream rule: a
+// stream of temperature-only reports keeps the job, its generation, and
+// its identity untouched. No state restatement is needed.
+func TestJobTemperatureStreamKeepsJob(t *testing.T) {
 	c := newJobTestCache(t)
 
-	jobObserve(t, c, 1, 5, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"gcode_state": "RUNNING", "subtask_name": "a.3mf", "task_id": 1,
 	})
 	v, _ := c.Job("S1")
@@ -357,21 +356,21 @@ func TestJobReconnectTemperatureStreamKeepsJob(t *testing.T) {
 		t.Fatalf("initial: %+v", v)
 	}
 
-	// More than 60 seconds of temperature-only reports on the new
-	// connection. The job keeps every last-reported value.
+	// A long stream of temperature-only reports. The job keeps every
+	// last-reported value.
 	for i := 0; i < 70; i++ {
-		jobObserve(t, c, uint64(i+2), 6, map[string]any{"nozzle_temper": 220.0})
+		jobObserve(t, c, map[string]any{"nozzle_temper": 220.0})
 	}
 	v, _ = c.Job("S1")
 	if v.Generation != 1 || !v.Active || v.State != "RUNNING" ||
 		v.Name != "a.3mf" || v.TaskID != "1" {
-		t.Fatalf("reconnect stream must keep the job: %+v", v)
+		t.Fatalf("temperature stream must keep the job: %+v", v)
 	}
 
-	jobObserve(t, c, 72, 6, map[string]any{"gcode_state": "RUNNING"})
+	jobObserve(t, c, map[string]any{"gcode_state": "RUNNING"})
 	v, _ = c.Job("S1")
 	if v.Generation != 1 || !v.Active || v.State != "RUNNING" {
-		t.Fatalf("state report after reconnect: %+v", v)
+		t.Fatalf("state report after the stream: %+v", v)
 	}
 }
 
@@ -380,10 +379,10 @@ func TestJobReconnectTemperatureStreamKeepsJob(t *testing.T) {
 func TestJobReportGapKeepsJob(t *testing.T) {
 	c := newJobTestCache(t)
 
-	jobObserve(t, c, 1, 1, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"gcode_state": "RUNNING", "subtask_name": "a.3mf",
 	})
-	jobObserve(t, c, 2, 1, map[string]any{"mc_percent": 10.0})
+	jobObserve(t, c, map[string]any{"mc_percent": 10.0})
 	v, _ := c.Job("S1")
 	if v.Generation != 1 || !v.Active || v.Name != "a.3mf" {
 		t.Fatalf("gap must keep the job: %+v", v)
@@ -396,7 +395,7 @@ func TestJobReportGapKeepsJob(t *testing.T) {
 func TestJobLocalPrintWithoutIDsAndEnrichment(t *testing.T) {
 	c := newJobTestCache(t)
 
-	jobObserve(t, c, 1, 1, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"gcode_state": "RUNNING", "subtask_name": "local.3mf",
 	})
 	v, _ := c.Job("S1")
@@ -404,7 +403,7 @@ func TestJobLocalPrintWithoutIDsAndEnrichment(t *testing.T) {
 		t.Fatalf("local print without ids: %+v", v)
 	}
 
-	jobObserve(t, c, 2, 1, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"gcode_state": "RUNNING", "subtask_name": "local.3mf",
 	})
 	v, _ = c.Job("S1")
@@ -412,7 +411,7 @@ func TestJobLocalPrintWithoutIDsAndEnrichment(t *testing.T) {
 		t.Fatalf("unchanged report: gen=%d", v.Generation)
 	}
 
-	jobObserve(t, c, 3, 1, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"gcode_state": "RUNNING", "project_id": 0,
 	})
 	v, _ = c.Job("S1")
@@ -427,7 +426,7 @@ func TestJobLocalPrintWithoutIDsAndEnrichment(t *testing.T) {
 func TestJobCoalescedPrepareAndIdentityChangeOnce(t *testing.T) {
 	c := newJobTestCache(t)
 
-	jobObserve(t, c, 1, 1, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"gcode_state": "RUNNING", "task_id": 1, "subtask_name": "a.3mf",
 	})
 	v, _ := c.Job("S1")
@@ -435,7 +434,7 @@ func TestJobCoalescedPrepareAndIdentityChangeOnce(t *testing.T) {
 		t.Fatalf("initial: gen=%d", v.Generation)
 	}
 
-	jobObserve(t, c, 2, 1, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"gcode_state": "PREPARE", "task_id": 2, "subtask_name": "b.3mf",
 	})
 	v, _ = c.Job("S1")
@@ -450,27 +449,27 @@ func TestJobCoalescedPrepareAndIdentityChangeOnce(t *testing.T) {
 func TestJobPreparationTransitions(t *testing.T) {
 	c := newJobTestCache(t)
 
-	observe := func(seq uint64, state string) {
-		jobObserve(t, c, seq, 1, map[string]any{
+	observe := func(state string) {
+		jobObserve(t, c, map[string]any{
 			"gcode_state": state, "task_id": 1,
 		})
 	}
 
-	observe(1, "PREPARE")
-	observe(2, "SLICING")
+	observe("PREPARE")
+	observe("SLICING")
 	v, _ := c.Job("S1")
 	if v.Generation != 1 || v.State != "SLICING" {
 		t.Fatalf("PREPARE to SLICING: gen=%d state=%s", v.Generation, v.State)
 	}
 
-	observe(3, "PREPARE")
+	observe("PREPARE")
 	v, _ = c.Job("S1")
 	if v.Generation != 1 {
 		t.Fatalf("SLICING to PREPARE must stay one generation: %d", v.Generation)
 	}
 
-	observe(4, "RUNNING")
-	observe(5, "PREPARE")
+	observe("RUNNING")
+	observe("PREPARE")
 	v, _ = c.Job("S1")
 	if v.Generation != 2 || v.State != "PREPARE" {
 		t.Fatalf("RUNNING to PREPARE must restart the job: gen=%d state=%s", v.Generation, v.State)
@@ -484,7 +483,7 @@ func TestJobPreparationTransitions(t *testing.T) {
 func TestJobCorrectionMergesWithoutNewGeneration(t *testing.T) {
 	c := newJobTestCache(t)
 
-	jobObserve(t, c, 1, 1, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"gcode_state": "RUNNING", "subtask_name": "wrong.3mf", "plate_idx": 1,
 	})
 	v, _ := c.Job("S1")
@@ -495,14 +494,14 @@ func TestJobCorrectionMergesWithoutNewGeneration(t *testing.T) {
 
 	// A file correction and an explicit plate zero merge inside the same
 	// generation: neither is a strong identity.
-	jobObserve(t, c, 2, 1, map[string]any{"gcode_file": "right.3mf", "plate_idx": 0})
+	jobObserve(t, c, map[string]any{"gcode_file": "right.3mf", "plate_idx": 0})
 	v, _ = c.Job("S1")
 	if v.Generation != gen || v.GCodeFile != "right.3mf" || v.PlateIndex != nil {
 		t.Fatalf("file correction: %+v", v)
 	}
 
 	// Absent fields keep their values across the correction.
-	jobObserve(t, c, 3, 1, map[string]any{"mc_percent": 10.0})
+	jobObserve(t, c, map[string]any{"mc_percent": 10.0})
 	v, _ = c.Job("S1")
 	if v.Generation != gen || v.Name != "wrong.3mf" || v.GCodeFile != "right.3mf" {
 		t.Fatalf("absent fields must survive corrections: %+v", v)
@@ -517,7 +516,7 @@ func TestJobViewCopyIsolation(t *testing.T) {
 		t.Fatal("unknown serial must report false")
 	}
 
-	jobObserve(t, c, 1, 1, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"gcode_state": "RUNNING", "plate_idx": 4,
 	})
 	v, _ := c.Job("S1")
@@ -533,19 +532,19 @@ func TestJobViewCopyIsolation(t *testing.T) {
 // later lifecycle or strong-identity boundary.
 func TestStartObservedTracksOriginOfGeneration(t *testing.T) {
 	c := newJobTestCache(t)
-	jobObserve(t, c, 1, 1, map[string]any{"gcode_state": "RUNNING", "subtask_name": "a.3mf"})
+	jobObserve(t, c, map[string]any{"gcode_state": "RUNNING", "subtask_name": "a.3mf"})
 	if v, _ := c.Job("S1"); v.Generation != 1 || v.StartObserved {
 		t.Fatalf("first report RUNNING: %+v", v)
 	}
 
 	d := newJobTestCache(t)
-	jobObserve(t, d, 1, 1, map[string]any{"gcode_state": "IDLE"})
-	jobObserve(t, d, 2, 1, map[string]any{"gcode_state": "RUNNING", "subtask_name": "a.3mf", "project_id": 1})
+	jobObserve(t, d, map[string]any{"gcode_state": "IDLE"})
+	jobObserve(t, d, map[string]any{"gcode_state": "RUNNING", "subtask_name": "a.3mf", "project_id": 1})
 	if v, _ := d.Job("S1"); v.Generation != 1 || !v.StartObserved {
 		t.Fatalf("IDLE then RUNNING: %+v", v)
 	}
-	jobObserve(t, d, 3, 1, map[string]any{"project_id": 2})
-	jobObserve(t, d, 4, 1, map[string]any{"project_id": 3})
+	jobObserve(t, d, map[string]any{"project_id": 2})
+	jobObserve(t, d, map[string]any{"project_id": 3})
 	if v, _ := d.Job("S1"); v.Generation != 3 || !v.StartObserved {
 		t.Fatalf("consecutive strong boundaries: %+v", v)
 	}
@@ -558,17 +557,17 @@ func TestStartObservedTracksOriginOfGeneration(t *testing.T) {
 func TestJobFailedFullReportThenRunningDeltaRetainsName(t *testing.T) {
 	c := newJobTestCache(t)
 
-	jobObserve(t, c, 1, 1, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"gcode_state": "RUNNING", "subtask_name": "Sunlu_AMS_Heater",
 		"gcode_file": "Sunlu_AMS_Heater.gcode.3mf", "layer_num": 0,
 	})
-	jobObserve(t, c, 2, 1, map[string]any{"gcode_state": "FAILED"})
+	jobObserve(t, c, map[string]any{"gcode_state": "FAILED"})
 	v, _ := c.Job("S1")
 	if v.Active || v.Generation != 1 {
 		t.Fatalf("FAILED must end job 1: %+v", v)
 	}
 
-	jobObserve(t, c, 3, 1, map[string]any{"gcode_state": "RUNNING"})
+	jobObserve(t, c, map[string]any{"gcode_state": "RUNNING"})
 	v, _ = c.Job("S1")
 	if !v.Active || v.Generation != 2 || v.Name != "Sunlu_AMS_Heater" ||
 		v.GCodeFile != "Sunlu_AMS_Heater.gcode.3mf" || !v.StartObserved {
@@ -582,10 +581,10 @@ func TestJobFailedFullReportThenRunningDeltaRetainsName(t *testing.T) {
 func TestJobRunningToFailedWithChangedNameMergesWithoutNewGeneration(t *testing.T) {
 	c := newJobTestCache(t)
 
-	jobObserve(t, c, 1, 1, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"gcode_state": "RUNNING", "subtask_name": "A",
 	})
-	jobObserve(t, c, 2, 1, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"gcode_state": "FAILED", "subtask_name": "B",
 	})
 	v, _ := c.Job("S1")
@@ -600,10 +599,10 @@ func TestJobRunningToFailedWithChangedNameMergesWithoutNewGeneration(t *testing.
 func TestJobFailedLayerZeroThenRunningDeltaExposesZero(t *testing.T) {
 	c := newJobTestCache(t)
 
-	jobObserve(t, c, 1, 1, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"gcode_state": "FAILED", "layer_num": 0,
 	})
-	jobObserve(t, c, 2, 1, map[string]any{"gcode_state": "RUNNING"})
+	jobObserve(t, c, map[string]any{"gcode_state": "RUNNING"})
 	_, s, _ := c.Print("S1")
 	if layer := s.CurrentLayer(); layer == nil || *layer != 0 {
 		t.Fatalf("CurrentLayer after the re-entry delta = %v, want 0", layer)
@@ -617,11 +616,11 @@ func TestJobFailedLayerZeroThenRunningDeltaExposesZero(t *testing.T) {
 func TestJobIdleRestartWithoutLayerHidesPreviousPositiveLayer(t *testing.T) {
 	c := newJobTestCache(t)
 
-	jobObserve(t, c, 1, 1, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"gcode_state": "RUNNING", "layer_num": 300,
 	})
-	jobObserve(t, c, 2, 1, map[string]any{"gcode_state": "IDLE"})
-	jobObserve(t, c, 3, 1, map[string]any{"gcode_state": "RUNNING"})
+	jobObserve(t, c, map[string]any{"gcode_state": "IDLE"})
+	jobObserve(t, c, map[string]any{"gcode_state": "RUNNING"})
 	_, s, _ := c.Print("S1")
 	if s.LayerNum == nil || *s.LayerNum != 300 {
 		t.Fatalf("session view lost the last reported layer: %+v", s.LayerNum)
@@ -631,21 +630,21 @@ func TestJobIdleRestartWithoutLayerHidesPreviousPositiveLayer(t *testing.T) {
 	}
 }
 
-// TestJobReconnectDeltaWithoutLayerKeepsLayer covers the reconnect rule: a
-// reconnect delta without a layer keeps the last reported layer value.
-func TestJobReconnectDeltaWithoutLayerKeepsLayer(t *testing.T) {
+// TestJobTemperatureDeltaWithoutLayerKeepsLayer covers the temperature-delta
+// rule: a temperature delta without a layer keeps the last reported layer.
+func TestJobTemperatureDeltaWithoutLayerKeepsLayer(t *testing.T) {
 	c := newJobTestCache(t)
 
-	jobObserve(t, c, 1, 1, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"gcode_state": "RUNNING", "layer_num": 12,
 	})
-	jobObserve(t, c, 2, 2, map[string]any{"nozzle_temper": 220.0})
+	jobObserve(t, c, map[string]any{"nozzle_temper": 220.0})
 	_, s, _ := c.Print("S1")
 	if s.LayerNum == nil || *s.LayerNum != 12 {
-		t.Fatalf("reconnect delta lost the layer: %+v", s.LayerNum)
+		t.Fatalf("temperature delta lost the layer: %+v", s.LayerNum)
 	}
 	if layer := s.CurrentLayer(); layer == nil || *layer != 12 {
-		t.Fatalf("CurrentLayer after the reconnect delta = %v, want 12", layer)
+		t.Fatalf("CurrentLayer after the temperature delta = %v, want 12", layer)
 	}
 }
 
@@ -654,10 +653,10 @@ func TestJobReconnectDeltaWithoutLayerKeepsLayer(t *testing.T) {
 func TestJobInvalidLayerClearsPublicField(t *testing.T) {
 	c := newJobTestCache(t)
 
-	jobObserve(t, c, 1, 1, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"gcode_state": "RUNNING", "layer_num": 7,
 	})
-	jobObserve(t, c, 2, 1, map[string]any{"layer_num": "bad"})
+	jobObserve(t, c, map[string]any{"layer_num": "bad"})
 	_, s, _ := c.Print("S1")
 	if s.LayerNum != nil {
 		t.Fatalf("invalid layer must clear the field: %+v", s.LayerNum)
@@ -673,10 +672,10 @@ func TestJobInvalidLayerClearsPublicField(t *testing.T) {
 func TestJobExplicitEmptyNameClearsIdentityAndDisplay(t *testing.T) {
 	c := newJobTestCache(t)
 
-	jobObserve(t, c, 1, 1, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"gcode_state": "RUNNING", "subtask_name": "a.3mf",
 	})
-	jobObserve(t, c, 2, 1, map[string]any{"subtask_name": ""})
+	jobObserve(t, c, map[string]any{"subtask_name": ""})
 	j, _, _ := c.Print("S1")
 	st, _ := c.State("S1")
 	if j.Name != "" || st.Filename != "" {
@@ -695,15 +694,15 @@ func TestJobExplicitEmptyNameClearsIdentityAndDisplay(t *testing.T) {
 func TestJobClearedNameStillDetectsNewName(t *testing.T) {
 	c := newJobTestCache(t)
 
-	jobObserve(t, c, 1, 1, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"gcode_state": "RUNNING", "subtask_name": "a.3mf",
 	})
-	jobObserve(t, c, 2, 1, map[string]any{"subtask_name": ""})
+	jobObserve(t, c, map[string]any{"subtask_name": ""})
 	v, _ := c.Job("S1")
 	if v.Generation != 1 || v.Name != "" {
 		t.Fatalf("explicit empty name: %+v", v)
 	}
-	jobObserve(t, c, 3, 1, map[string]any{
+	jobObserve(t, c, map[string]any{
 		"gcode_state": "RUNNING", "subtask_name": "b.3mf",
 	})
 	v, _ = c.Job("S1")
@@ -712,15 +711,15 @@ func TestJobClearedNameStillDetectsNewName(t *testing.T) {
 	}
 
 	d := newJobTestCache(t)
-	jobObserve(t, d, 1, 1, map[string]any{
+	jobObserve(t, d, map[string]any{
 		"gcode_state": "RUNNING", "subtask_name": "a.3mf",
 	})
-	jobObserve(t, d, 2, 1, map[string]any{"subtask_name": 7})
+	jobObserve(t, d, map[string]any{"subtask_name": 7})
 	v, _ = d.Job("S1")
 	if v.Generation != 1 || v.Name != "" {
 		t.Fatalf("invalid name: %+v", v)
 	}
-	jobObserve(t, d, 3, 1, map[string]any{
+	jobObserve(t, d, map[string]any{
 		"gcode_state": "RUNNING", "subtask_name": "a.3mf",
 	})
 	v, _ = d.Job("S1")

@@ -15,8 +15,8 @@ import (
 	"bambu-mqtt-proxy/internal/telemetry"
 )
 
-// replayLine mirrors the telemetry replay fixture: one captured upstream
-// report with its connection generation and decoded payload.
+// replayLine mirrors the telemetry replay fixture: one captured printer
+// report with its decoded payload.
 type replayLine struct {
 	TMS     int64           `json:"t_ms"`
 	Gen     uint64          `json:"gen"`
@@ -87,7 +87,7 @@ func TestReplayCancelResendAttemptStartsAfterResend(t *testing.T) {
 
 	// Feed the capture up to the resend without stepping the scheduler.
 	for i := 0; i < 8; i++ {
-		cache.ObserveReport("S1", uint64(i+1), lines[i].Gen, lines[i].Payload)
+		cache.Observe("S1", lines[i].Payload)
 	}
 	job, ok := cache.Job("S1")
 	if !ok || job.Generation != 2 || !job.Active {
@@ -109,9 +109,9 @@ func TestReplayCancelResendAttemptStartsAfterResend(t *testing.T) {
 		t.Fatalf("projection while in flight = %+v, want pending downloading", res.Preview)
 	}
 
-	// The line-9 gap report is a temperature-only delta on the same
-	// generation: stepping after it must not cancel the attempt.
-	cache.ObserveReport("S1", 9, lines[8].Gen, lines[8].Payload)
+	// The line-9 gap report is a temperature-only delta: stepping after
+	// it must not cancel the attempt.
+	cache.Observe("S1", lines[8].Payload)
 	clk.Set(base.Add(time.Second))
 	svc.step(base.Add(time.Second))
 	select {

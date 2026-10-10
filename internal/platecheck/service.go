@@ -23,18 +23,16 @@ type StateSource interface {
 	Print(string) (telemetry.JobView, telemetry.SessionView, bool)
 }
 
-// PrinterCommands supplies connection status and guarded light, stop, and pause commands.
+// PrinterCommands supplies printer liveness plus light, stop, and pause commands.
 type PrinterCommands interface {
-	// Connected reports whether the upstream MQTT connection is established.
-	Connected(string) bool
-	// Generation returns the current upstream connection generation.
-	Generation(string) uint64
-	// StopPrint sends a generation-guarded QoS 0 stop request.
-	StopPrint(string, uint64) error
-	// PausePrint sends one generation-guarded QoS 0 pause request.
-	PausePrint(string, uint64) error
-	// SetChamberLight sends a generation-guarded light request.
-	SetChamberLight(string, uint64, bool) error
+	// Online reports whether the printer link is established.
+	Online(string) bool
+	// Stop sends one QoS 0 stop request.
+	Stop(string) error
+	// Pause sends one QoS 0 pause request.
+	Pause(string) error
+	// Light sends one chamber light request.
+	Light(string, bool) error
 }
 
 // operationKey identifies a local operation in client contexts.
@@ -58,7 +56,7 @@ type Service struct {
 	frames FrameSource
 	// state supplies coherent job and session snapshots.
 	state StateSource
-	// commands owns generation-guarded printer commands.
+	// commands owns printer commands.
 	commands PrinterCommands
 	// log is the host logger scoped to this module.
 	log *slog.Logger
@@ -336,7 +334,7 @@ func (w *worker) authorize(b boundCheck) (telemetry.JobView, telemetry.SessionVi
 	if !ok || j.Generation != b.generation || !j.Active {
 		return j, v, "print_ended"
 	}
-	if !w.s.commands.Connected(w.printer.Serial) {
+	if !w.s.commands.Online(w.printer.Serial) {
 		return j, v, "printer_offline"
 	}
 	layer := v.CurrentLayer()
@@ -355,23 +353,12 @@ func (w *worker) authorize(b boundCheck) (telemetry.JobView, telemetry.SessionVi
 	return j, v, "print_paused"
 }
 
-// commandGate reads the upstream connection generation first, then
-// authorizes the bound check. Every command sends with the returned
-// generation immediately: the generation is never re-read after
-// authorization, and the pool rejects the command if the connection
-// changed after that read.
-func (w *worker) commandGate(b boundCheck) (uint64, telemetry.SessionView, string) {
-	gen, _, v, reason := w.commandGateFull(b)
-	return gen, v, reason
-}
-
-// commandGateFull is commandGate with the authorized job view attached,
-// so dispatch can read the PREPARE state from the same coherent read
-// that authorized the stop instead of racing it with a second read.
-func (w *worker) commandGateFull(b boundCheck) (uint64, telemetry.JobView, telemetry.SessionView, string) {
-	gen := w.s.commands.Generation(w.printer.Serial)
+// commandGateFull authorizes the bound check and attaches the authorized
+// job view, so dispatch reads the PREPARE state from the same coherent
+// read that authorized the stop instead of racing it with a second read.
+func (w *worker) commandGateFull(b boundCheck) (telemetry.JobView, telemetry.SessionView, string) {
 	j, v, reason := w.authorize(b)
-	return gen, j, v, reason
+	return j, v, reason
 }
 
 // step advances all phases: it confirms one pending pause or stop, then admits one startup hint, then the second startup pass, then one first-layer hint, without inventing events.
@@ -417,7 +404,7 @@ func (w *worker) step(ctx context.Context) {
 		c.waitReason = ""
 		w.mu.Unlock()
 		return
-	case !w.s.commands.Connected(w.printer.Serial):
+	case !w.s.commands.Online(w.printer.Serial):
 		if w.waitExpired("printer_offline", now, &c.waitReason, &c.waitSince) {
 			w.consumeLocked(c.generation)
 			w.mu.Unlock()
@@ -497,7 +484,7 @@ func (w *worker) stepHoming(ctx context.Context) {
 		w.mu.Unlock()
 		w.skipHoming("skipped", "print_past_start", 0)
 		return
-	case !w.s.commands.Connected(w.printer.Serial) || j.State != "RUNNING" || layer == nil:
+	case !w.s.commands.Online(w.printer.Serial) || j.State != "RUNNING" || layer == nil:
 		// Waiting for RUNNING at layer 0 never expires: pass 2 either
 		// checks or meets a later print_past_start.
 		w.mu.Unlock()
@@ -607,13 +594,13 @@ func (w *worker) check(parent context.Context, b boundCheck) {
 		w.skipPass("skipped", w.contextReason(ctx), b.operation, b.homing)
 		return
 	}
-	if gen, v, reason := w.commandGate(b); v.ChamberLight == "off" {
+	if _, v, reason := w.authorize(b); v.ChamberLight == "off" {
 		// The final local guard cannot eliminate a printer-side change after dispatch.
 		if reason != "" {
 			w.skipPass("skipped", reason, b.operation, b.homing)
 			return
 		}
-		if err := w.s.commands.SetChamberLight(w.printer.Serial, gen, true); err == nil {
+		if err := w.s.commands.Light(w.printer.Serial, true); err == nil {
 			boundary = w.s.now()
 		} else {
 			w.s.log.DebugContext(ctx, "Plate-check light command failed", "operation", b.operation, "serial", w.printer.Serial, "error_code", "command_failed")
@@ -709,7 +696,7 @@ func validResult(r Result) bool {
 // dispatch revalidates the original evidence immediately before each stop attempt.
 func (w *worker) dispatch(ctx context.Context) {
 	p := w.pending
-	gen, j, _, reason := w.commandGateFull(p.bound)
+	j, _, reason := w.commandGateFull(p.bound)
 	if reason != "" {
 		if p.attempts == 0 {
 			w.pending = nil
@@ -727,7 +714,7 @@ func (w *worker) dispatch(ctx context.Context) {
 	w.startupStopped = max(w.startupStopped, p.bound.generation)
 	w.mu.Unlock()
 	// Count and record the attempt even if local publication fails.
-	err := w.s.commands.StopPrint(w.printer.Serial, gen)
+	err := w.s.commands.Stop(w.printer.Serial)
 	p.dispatched = w.s.now()
 	p.deadline = p.dispatched.Add(w.s.kConfirm)
 	w.setStatusKeepingScores("stop_requested")

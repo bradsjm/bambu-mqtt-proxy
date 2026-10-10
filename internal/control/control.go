@@ -6,9 +6,9 @@ package control
 import (
 	"errors"
 	"fmt"
-	"slices"
 
 	"bambu-mqtt-proxy/internal/activity"
+	"bambu-mqtt-proxy/internal/printer"
 	"bambu-mqtt-proxy/internal/telemetry"
 )
 
@@ -39,21 +39,18 @@ type Result struct {
 var (
 	ErrUnknownPrinter = errors.New("unknown printer")
 	ErrInvalidRequest = errors.New("invalid control request")
-	ErrNotAvailable   = errors.New("control not available in the current printer state")
 	ErrNotConnected   = errors.New("printer is not connected")
 	ErrSendFailed     = errors.New("command could not be sent")
 )
 
-// Commander publishes guarded printer commands. It is satisfied by
-// *upstream.Pool.
+// Commander sends printer commands. It is satisfied by *printer.Links.
 type Commander interface {
-	Status() map[string]bool
-	Generation(serial string) uint64
-	PausePrint(serial string, generation uint64) error
-	ResumePrint(serial string, generation uint64) error
-	StopPrint(serial string, generation uint64) error
-	SetSpeedProfile(serial string, generation uint64, profile int) error
-	SetChamberLight(serial string, generation uint64, on bool) error
+	Online(serial string) bool
+	Pause(serial string) error
+	Resume(serial string) error
+	Stop(serial string) error
+	Speed(serial string, level int) error
+	Light(serial string, on bool) error
 }
 
 // StateSource reads merged printer state. It is satisfied by
@@ -77,12 +74,14 @@ func New(cmd Commander, state StateSource, log *activity.Log) *Service {
 	return &Service{cmd: cmd, state: state, log: log}
 }
 
-// Available lists the actions allowed right now, in a fixed order. A
-// disconnected or unknown printer has none. Stop is always available while
-// connected: it is the emergency stop, and stale state must never block it.
+// Available lists the actions the printer's last reported state suggests
+// right now, in a fixed order. It is a UI hint only: Do never consults
+// it, so stale state can never block a command. A disconnected or unknown
+// printer has none. Stop is always listed while connected: it is the
+// emergency stop.
 func (s *Service) Available(serial string) []string {
 	st, ok := s.state.State(serial)
-	if !ok || !s.cmd.Status()[serial] {
+	if !ok || !s.cmd.Online(serial) {
 		return []string{}
 	}
 	out := []string{ActionLight}
@@ -117,37 +116,36 @@ func (s *Service) Do(serial, origin string, req Request) (Result, error) {
 	default:
 		return res, fmt.Errorf("%w: unknown action %q", ErrInvalidRequest, req.Action)
 	}
-	if !s.cmd.Status()[serial] {
+	if !s.cmd.Online(serial) {
 		return res, ErrNotConnected
 	}
-	if !slices.Contains(s.Available(serial), req.Action) {
-		return res, ErrNotAvailable
-	}
-	gen := s.cmd.Generation(serial)
 	var err error
 	var message string
 	switch req.Action {
 	case ActionLight:
-		err = s.cmd.SetChamberLight(serial, gen, *req.On)
+		err = s.cmd.Light(serial, *req.On)
 		word := "off"
 		if *req.On {
 			word = "on"
 		}
 		message = "Chamber light " + word + " sent from " + origin
 	case ActionPause:
-		err = s.cmd.PausePrint(serial, gen)
+		err = s.cmd.Pause(serial)
 		message = "Pause sent from " + origin
 	case ActionResume:
-		err = s.cmd.ResumePrint(serial, gen)
+		err = s.cmd.Resume(serial)
 		message = "Resume sent from " + origin
 	case ActionSpeed:
-		err = s.cmd.SetSpeedProfile(serial, gen, profile)
+		err = s.cmd.Speed(serial, profile)
 		message = "Speed set to " + req.Profile + " from " + origin
 	case ActionStop:
-		err = s.cmd.StopPrint(serial, gen)
+		err = s.cmd.Stop(serial)
 		message = "Emergency stop sent from " + origin
 	}
 	if err != nil {
+		if errors.Is(err, printer.ErrOffline) {
+			return res, ErrNotConnected
+		}
 		return res, fmt.Errorf("%w: %v", ErrSendFailed, err)
 	}
 	severity := activity.Info

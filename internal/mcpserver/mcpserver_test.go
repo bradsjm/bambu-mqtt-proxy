@@ -111,24 +111,6 @@ func (f *fakeConn) set(serial string, connected bool) {
 	f.st[serial] = connected
 }
 
-// fakeGens is a GenerationSource over a mutable map.
-type fakeGens struct {
-	mu sync.Mutex
-	g  map[string]uint64
-}
-
-func (f *fakeGens) Generation(serial string) uint64 {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.g[serial]
-}
-
-func (f *fakeGens) set(serial string, gen uint64) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.g[serial] = gen
-}
-
 // fakeCams is a SnapshotSource with balanced Acquire/Release accounting.
 type fakeCams struct {
 	mu       sync.Mutex
@@ -196,10 +178,9 @@ func (f *fakeCams) balanced(t *testing.T) {
 }
 
 // fakeCommander records control commands over the fixture's connectivity
-// and generation fakes.
+// fake.
 type fakeCommander struct {
 	*fakeConn
-	*fakeGens
 	mu   sync.Mutex
 	sent []string
 }
@@ -217,13 +198,12 @@ func (f *fakeCommander) sentList() []string {
 	return append([]string(nil), f.sent...)
 }
 
-func (f *fakeCommander) PausePrint(string, uint64) error           { return f.record("pause") }
-func (f *fakeCommander) ResumePrint(string, uint64) error          { return f.record("resume") }
-func (f *fakeCommander) StopPrint(string, uint64) error            { return f.record("stop") }
-func (f *fakeCommander) SetSpeedProfile(string, uint64, int) error { return f.record("speed") }
-func (f *fakeCommander) SetChamberLight(string, uint64, bool) error {
-	return f.record("light")
-}
+func (f *fakeCommander) Online(serial string) bool { return f.Status()[serial] }
+func (f *fakeCommander) Pause(string) error        { return f.record("pause") }
+func (f *fakeCommander) Resume(string) error       { return f.record("resume") }
+func (f *fakeCommander) Stop(string) error         { return f.record("stop") }
+func (f *fakeCommander) Speed(string, int) error   { return f.record("speed") }
+func (f *fakeCommander) Light(string, bool) error  { return f.record("light") }
 
 // fixture bundles one server with mutable fakes and a fixed clock.
 type fixture struct {
@@ -231,7 +211,6 @@ type fixture struct {
 	cmd   *fakeCommander
 	state *fakeState
 	conn  *fakeConn
-	gens  *fakeGens
 	cams  *fakeCams
 	now   time.Time
 }
@@ -248,11 +227,10 @@ func newFixture(t *testing.T, mods ...module.Module) *fixture {
 	f := &fixture{
 		state: st,
 		conn:  &fakeConn{st: map[string]bool{}},
-		gens:  &fakeGens{g: map[string]uint64{}},
 		cams:  cams,
 		now:   now,
 	}
-	f.cmd = &fakeCommander{fakeConn: f.conn, fakeGens: f.gens}
+	f.cmd = &fakeCommander{fakeConn: f.conn}
 	f.srv = New(Deps{
 		Printers: []config.Printer{
 			{Serial: "P001", Name: "Alpha", Model: "P1S", Address: "secret-a", Password: "pw-a"},
@@ -261,7 +239,6 @@ func newFixture(t *testing.T, mods ...module.Module) *fixture {
 		},
 		State:        st,
 		Connectivity: f.conn,
-		Generations:  f.gens,
 		Cameras:      cams,
 		Modules:      mods,
 		Control:      control.New(f.cmd, st, nil),
@@ -285,7 +262,6 @@ func printingSession(serial string, now time.Time, gen uint64, progress float64)
 		SessionGen: gen,
 		Obs:        3,
 		ObsAt:      now,
-		ObsGen:     1,
 		Progress:   &p,
 	}
 }
@@ -967,7 +943,6 @@ func TestCameraSnapshotSlotLimit(t *testing.T) {
 
 func TestPrinterStateFreshnessAcrossReconnect(t *testing.T) {
 	f := newFixture(t)
-	f.gens.set("P001", 1)
 	f.conn.set("P001", true)
 	f.state.setSession("P001", printingSession("P001", f.now, 7, 10))
 	f.step() // baseline: connected, so live
@@ -976,21 +951,8 @@ func TestPrinterStateFreshnessAcrossReconnect(t *testing.T) {
 	if !ok || !st.Freshness.Fresh {
 		t.Fatalf("connected: fresh=%v ok=%v", st.Freshness.Fresh, ok)
 	}
-
-	// An upstream generation bump with no new report keeps the live bit:
-	// liveness is the connection, and the old observation stays visible
-	// only as diagnostics.
-	f.gens.set("P001", 2)
-	st, _ = f.srv.buildPrinterState("P001", f.now)
-	if !st.Freshness.Fresh {
-		t.Fatalf("reconnect without a report counted stale: %+v", st.Freshness)
-	}
-	if st.Freshness.LastReportAgeSeconds == nil || st.Freshness.UpstreamGeneration == nil {
-		t.Fatalf("diagnostics lost their fields: %+v", st.Freshness)
-	}
-	f.step()
-	if rev := f.srv.sampler.revision("P001"); rev.attention != 1 {
-		t.Fatalf("generation bump moved attention: %+v", rev)
+	if st.Freshness.LastReportAgeSeconds == nil {
+		t.Fatalf("diagnostics lost the report age: %+v", st.Freshness)
 	}
 
 	// A disconnect flips liveness off immediately; a reconnect flips it

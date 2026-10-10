@@ -69,17 +69,10 @@ type StateSource interface {
 	Snapshot() []telemetry.State
 }
 
-// StatusSource reports per-printer upstream MQTT connectivity. It is
-// satisfied by *upstream.Pool.
+// StatusSource reports per-printer link state. It is satisfied by
+// *printer.Links.
 type StatusSource interface {
 	Status() map[string]bool
-}
-
-// GenerationSource reports the current upstream connection generation per
-// serial, which turns cached real-report evidence stale after a reconnect.
-// It is satisfied by *upstream.Pool.
-type GenerationSource interface {
-	Generation(serial string) uint64
 }
 
 // SnapshotSource is the camera read surface the server uses. It mirrors the
@@ -115,7 +108,6 @@ type Deps struct {
 	Printers     []config.Printer
 	State        StateSource
 	Connectivity StatusSource
-	Generations  GenerationSource
 	Cameras      SnapshotSource // nil when the camera feature is disabled
 	Modules      []module.Module
 	Activity     ActivitySource // nil yields empty activity lists
@@ -131,7 +123,6 @@ type Server struct {
 	serials  []string // sorted; the fixed list universe
 	state    StateSource
 	conn     StatusSource
-	gens     GenerationSource
 	cams     SnapshotSource
 	modules  []module.Module
 	activity ActivitySource
@@ -181,7 +172,6 @@ func New(deps Deps) *Server {
 		serials:     serials,
 		state:       deps.State,
 		conn:        deps.Connectivity,
-		gens:        deps.Generations,
 		cams:        deps.Cameras,
 		modules:     append([]module.Module(nil), deps.Modules...),
 		activity:    deps.Activity,
@@ -282,7 +272,7 @@ func (s *Server) Register(mux *http.ServeMux) {
 // serveMCP runs one Streamable HTTP request under a context that is a child
 // of the server root context, so Close unblocks every in-flight watch park
 // and listen stream immediately, before the process tears down the camera
-// manager and the upstream pool.
+// manager and the printer links.
 func (s *Server) serveMCP(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
@@ -293,7 +283,7 @@ func (s *Server) serveMCP(w http.ResponseWriter, r *http.Request) {
 
 // Close cancels the root context, which unwinds every in-flight request and
 // listen stream, then stops the sampler and its notification dispatcher.
-// Call it before the camera manager and the upstream pool shut down.
+// Call it before the camera manager and the printer links shut down.
 func (s *Server) Close() {
 	s.closeMu.Lock()
 	defer s.closeMu.Unlock()
@@ -415,21 +405,12 @@ func mustJSON(v any) json.RawMessage {
 	return raw
 }
 
-// connStatus reads upstream connectivity; a missing serial maps to false.
+// connStatus reads printer link state; a missing serial maps to false.
 func (s *Server) connStatus(serial string) bool {
 	if s.conn == nil {
 		return false
 	}
 	return s.conn.Status()[serial]
-}
-
-// generation reads the current upstream connection generation; 0 when the
-// pool has not connected the printer (or in tests without a source).
-func (s *Server) generation(serial string) uint64 {
-	if s.gens == nil {
-		return 0
-	}
-	return s.gens.Generation(serial)
 }
 
 // cameraState names the explicit camera feature state for one printer.

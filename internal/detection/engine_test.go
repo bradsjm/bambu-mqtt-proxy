@@ -65,7 +65,7 @@ func (s *etSessions) running(clock *etClock, epoch, sessionGen uint64, state str
 	s.set(telemetry.SessionView{
 		Serial: "S1", Active: true, State: state,
 		SessionGen: sessionGen, Epoch: epoch,
-		ObsAt: clock.Now(), Obs: 1, ObsGen: 1, StateGen: 1, LayerNum: intPtr(4), LayerThisJob: true,
+		ObsAt: clock.Now(), Obs: 1, LayerNum: intPtr(4), LayerThisJob: true,
 	}, true)
 }
 
@@ -183,40 +183,35 @@ func (c *etClient) counts() (creates, processes int) {
 
 type etPauser struct {
 	mu       sync.Mutex
-	gens     []uint64
+	pauses   int
 	err      error
 	lights   []bool
 	lightErr error
-	speeds   []etSpeedCall
+	speeds   []int
+	offline  map[string]bool
 }
 
-// etSpeedCall records one guarded speed-profile command.
-type etSpeedCall struct {
-	gen     uint64
-	profile int
-}
-
-func (p *etPauser) PausePrint(_ string, gen uint64) error {
+func (p *etPauser) Pause(string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.gens = append(p.gens, gen)
+	p.pauses++
 	return p.err
 }
 
-func (p *etPauser) SetSpeedProfile(_ string, gen uint64, profile int) error {
+func (p *etPauser) Speed(_ string, profile int) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.speeds = append(p.speeds, etSpeedCall{gen: gen, profile: profile})
+	p.speeds = append(p.speeds, profile)
 	return p.err
 }
 
-func (p *etPauser) speedCalls() []etSpeedCall {
+func (p *etPauser) speedCalls() []int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return append([]etSpeedCall(nil), p.speeds...)
+	return append([]int(nil), p.speeds...)
 }
 
-func (p *etPauser) SetChamberLight(_ string, _ uint64, on bool) error {
+func (p *etPauser) Light(_ string, on bool) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.lights = append(p.lights, on)
@@ -232,26 +227,22 @@ func (p *etPauser) lightCalls() []bool {
 func (p *etPauser) calls() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return len(p.gens)
+	return p.pauses
 }
 
-type etGens struct {
-	mu        sync.Mutex
-	gen       uint64
-	connected map[string]bool // an absent key means connected
+func (p *etPauser) Online(serial string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return !p.offline[serial]
 }
 
-func (g *etGens) Connected(serial string) bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	c, ok := g.connected[serial]
-	return !ok || c
-}
-
-func (g *etGens) Generation(string) uint64 {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.gen
+func (p *etPauser) setOffline(serial string, offline bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.offline == nil {
+		p.offline = map[string]bool{}
+	}
+	p.offline[serial] = offline
 }
 
 // ---- harness ----
@@ -262,7 +253,6 @@ type etWorld struct {
 	frames   *etFrames
 	sessions *etSessions
 	pauser   *etPauser
-	gens     *etGens
 	engine   *Engine
 	worker   *worker
 }
@@ -275,12 +265,11 @@ func newEtWorld(t *testing.T) *etWorld {
 		frames:   &etFrames{clock: newEtClock(), acquireOK: true, serve: true},
 		sessions: &etSessions{},
 		pauser:   &etPauser{},
-		gens:     &etGens{gen: 1},
 	}
 	// The frame fake shares the world clock.
 	w.frames.clock = w.clock
 	e := New([]config.Printer{{Serial: "S1", Name: "Shop", Model: "P1S"}},
-		w.client, w.frames, w.sessions, w.pauser, w.gens,
+		w.client, w.frames, w.sessions, w.pauser,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	e.now = w.clock.Now
 	// Tighten nothing: tests drive step() directly, so the defaults never
@@ -379,24 +368,11 @@ type gateBoundary struct {
 }
 
 func gateBoundaries() []gateBoundary {
-	reconnect := func(_ uint64) func(t *testing.T, w *etWorld) {
-		return func(t *testing.T, w *etWorld) {
-			w.gens.mu.Lock()
-			w.gens.gen = 2
-			w.gens.mu.Unlock()
-		}
-	}
 	disconnect := func(t *testing.T, w *etWorld) {
-		w.gens.mu.Lock()
-		if w.gens.connected == nil {
-			w.gens.connected = map[string]bool{}
-		}
-		w.gens.connected["S1"] = false
-		w.gens.mu.Unlock()
+		w.pauser.setOffline("S1", true)
 	}
 	return []gateBoundary{
 		{name: "accepted", accepted: true},
-		{name: "reconnect", logHint: "reason=connection_generation_changed", mutate: reconnect(2)},
 		{name: "frame-expired", logHint: "reason=inspection_frame_expired", mutate: func(t *testing.T, w *etWorld) {
 			w.clock.Advance(31 * time.Second)
 		}},
@@ -583,16 +559,13 @@ func TestEngineResultGateAcceptsFreshResults(t *testing.T) {
 		t.Fatalf("warning not published: %+v", st)
 	}
 
-	// A fresh pause suggestion still dispatches exactly one guarded pause.
+	// A fresh pause suggestion still dispatches exactly one pause.
 	w.clock.Advance(5 * time.Second)
 	w.sessions.running(w.clock, 1, 1, "RUNNING")
 	w.client.queue(etPauseResult())
 	w.worker.step(context.Background())
 	if calls := w.pauser.calls(); calls != 1 {
 		t.Fatalf("pause calls = %d, want one", calls)
-	}
-	if gen := w.pauser.gens[0]; gen != 1 {
-		t.Fatalf("pause generation = %d, want 1", gen)
 	}
 	if got := w.status().PauseState; got != PausePending {
 		t.Fatalf("pause_state = %q, want pending", got)
@@ -619,8 +592,8 @@ func TestEngineWarningSpeedEpisodeSendsOnceAndRestoresOnClear(t *testing.T) {
 	w.worker.step(context.Background())
 
 	speeds := w.pauser.speedCalls()
-	if len(speeds) != 1 || speeds[0] != (etSpeedCall{gen: 1, profile: 1}) {
-		t.Fatalf("speed calls = %+v, want one Silent command on generation 1", speeds)
+	if len(speeds) != 1 || speeds[0] != 1 {
+		t.Fatalf("speed calls = %+v, want one Silent command", speeds)
 	}
 
 	// A newer speed report on the same connection confirms the command.
@@ -640,7 +613,7 @@ func TestEngineWarningSpeedEpisodeSendsOnceAndRestoresOnClear(t *testing.T) {
 	w.worker.step(context.Background())
 
 	speeds = w.pauser.speedCalls()
-	if len(speeds) != 2 || speeds[0] != (etSpeedCall{gen: 1, profile: 1}) || speeds[1] != (etSpeedCall{gen: 1, profile: 3}) {
+	if len(speeds) != 2 || speeds[0] != 1 || speeds[1] != 3 {
 		t.Fatalf("speed calls = %+v, want one Silent then one restore of profile 3", speeds)
 	}
 	w.worker.controlMu.Lock()
@@ -679,12 +652,7 @@ func TestEngineStaleClearKeepsSpeedOwnershipAndRiskCounters(t *testing.T) {
 	// The clear result goes stale during the upload: the connection drops.
 	w.client.queue(etClearResult())
 	w.client.beforeReply = func() {
-		w.gens.mu.Lock()
-		if w.gens.connected == nil {
-			w.gens.connected = map[string]bool{}
-		}
-		w.gens.connected["S1"] = false
-		w.gens.mu.Unlock()
+		w.pauser.setOffline("S1", true)
 	}
 	w.clock.Advance(5 * time.Second)
 	w.sessions.running(w.clock, 1, 1, "RUNNING")
@@ -707,8 +675,7 @@ func TestEngineStaleClearKeepsSpeedOwnershipAndRiskCounters(t *testing.T) {
 	}
 }
 
-// startSession starts a RUNNING print observation on generation 1 with a
-// live connection.
+// startSession starts a RUNNING print observation with an online printer.
 func (w *etWorld) startSession(epoch, sessionGen uint64) {
 	w.sessions.running(w.clock, epoch, sessionGen, "RUNNING")
 }
@@ -781,7 +748,7 @@ func TestEngineFirstLayerWaitIsNeutralWithoutAcquireOrUpload(t *testing.T) {
 		w.sessions.set(telemetry.SessionView{
 			Serial: "S1", Active: true, State: "RUNNING",
 			SessionGen: 1, Epoch: 1,
-			ObsAt: w.clock.Now(), Obs: 1, ObsGen: 1, StateGen: 1, LayerNum: layer, LayerThisJob: true,
+			ObsAt: w.clock.Now(), Obs: 1, LayerNum: layer, LayerThisJob: true,
 		}, true)
 	}
 	for _, tc := range []struct {
@@ -909,29 +876,19 @@ func TestEngineLayerLossAfterReadinessDegrades(t *testing.T) {
 	})
 }
 
-// TestEngineUnauthorizedMissingLayerDegrades pins the gate order: a
-// disconnected RUNNING with no layer must degrade as disconnected, never
+// TestEngineUnauthorizedMissingLayerDegrades pins the gate order: an
+// offline RUNNING with no layer must degrade as disconnected, never
 // present the neutral first-layer wait, whatever the layer evidence
-// history. The recovery phase proves a reconnected printer that still
+// history. The recovery phase proves a printer back online that still
 // lacks a positive layer turns the wait neutral and clears the internal
 // awaiting-telemetry degradation and its poll schedule, so no countdown
 // remains and no new warning is recorded.
 func TestEngineUnauthorizedMissingLayerDegrades(t *testing.T) {
 	disconnect := func(w *etWorld) {
-		w.gens.mu.Lock()
-		if w.gens.connected == nil {
-			w.gens.connected = map[string]bool{}
-		}
-		w.gens.connected["S1"] = false
-		w.gens.mu.Unlock()
+		w.pauser.setOffline("S1", true)
 	}
-	reconnect := func(w *etWorld) {
-		w.gens.mu.Lock()
-		if w.gens.connected == nil {
-			w.gens.connected = map[string]bool{}
-		}
-		w.gens.connected["S1"] = true
-		w.gens.mu.Unlock()
+	recover := func(w *etWorld) {
+		w.pauser.setOffline("S1", false)
 	}
 	for _, tc := range []struct {
 		name    string
@@ -939,8 +896,8 @@ func TestEngineUnauthorizedMissingLayerDegrades(t *testing.T) {
 		shake   func(w *etWorld)
 		recover func(w *etWorld)
 	}{
-		{"disconnected_zero_layer", intPtr(0), disconnect, reconnect},
-		{"disconnected_unknown_layer", nil, disconnect, reconnect},
+		{"disconnected_zero_layer", intPtr(0), disconnect, recover},
+		{"disconnected_unknown_layer", nil, disconnect, recover},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			w := newEtWorld(t)
@@ -949,7 +906,7 @@ func TestEngineUnauthorizedMissingLayerDegrades(t *testing.T) {
 			w.sessions.set(telemetry.SessionView{
 				Serial: "S1", Active: true, State: "RUNNING",
 				SessionGen: 1, Epoch: 1,
-				ObsAt: w.clock.Now(), Obs: 1, ObsGen: 1, StateGen: 1, LayerNum: tc.layer, LayerThisJob: true,
+				ObsAt: w.clock.Now(), Obs: 1, LayerNum: tc.layer, LayerThisJob: true,
 			}, true)
 			tc.shake(w)
 
@@ -985,7 +942,7 @@ func TestEngineUnauthorizedMissingLayerDegrades(t *testing.T) {
 			}
 			warnings := degradedCount()
 
-			// A reconnected printer that still lacks a positive layer
+			// A printer back online that still lacks a positive layer
 			// recovers the neutral wait: the internal
 			// awaiting-telemetry degradation and its poll schedule clear,
 			// so no countdown remains and no new warning is recorded.
@@ -1013,9 +970,8 @@ func TestEngineUnauthorizedMissingLayerDegrades(t *testing.T) {
 }
 
 // TestEngineWorldChangeDuringCaptureDiscardsFrame pins the capture-time
-// recheck: a new print boundary, a layer reset, or a reconnect while the
-// camera waited must discard the frame without spending the upload, even
-// when the new connection restates a positive layer.
+// recheck: a new print boundary, a layer reset, or a disconnect while the
+// camera waited must discard the frame without spending the upload.
 func TestEngineWorldChangeDuringCaptureDiscardsFrame(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -1033,22 +989,10 @@ func TestEngineWorldChangeDuringCaptureDiscardsFrame(t *testing.T) {
 			v.LayerThisJob = true
 			w.sessions.set(v, true)
 		}},
-		// The printer reconnected during the camera wait: the attempt still
-		// rides the captured generation, so the frame must not upload.
-		{"reconnect_restate_state", func(w *etWorld) {
-			w.gens.mu.Lock()
-			w.gens.gen = 2
-			w.gens.mu.Unlock()
-		}},
-		// The connection dropped during the camera wait: the frame may not
-		// upload while the printer is disconnected.
+		// The printer went offline during the camera wait: the frame may
+		// not upload while the printer is disconnected.
 		{"disconnected_during_capture", func(w *etWorld) {
-			w.gens.mu.Lock()
-			if w.gens.connected == nil {
-				w.gens.connected = map[string]bool{}
-			}
-			w.gens.connected["S1"] = false
-			w.gens.mu.Unlock()
+			w.pauser.setOffline("S1", true)
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1091,36 +1035,18 @@ func TestEngineGateWaitsReleaseCameraWithoutAcquire(t *testing.T) {
 			w.sessions.set(v, true)
 		}, nil},
 		{"disconnected", func(w *etWorld) {
-			w.gens.mu.Lock()
-			if w.gens.connected == nil {
-				w.gens.connected = map[string]bool{}
-			}
-			w.gens.connected["S1"] = false
-			w.gens.mu.Unlock()
+			w.pauser.setOffline("S1", true)
 		}, func(w *etWorld) {
-			w.gens.mu.Lock()
-			if w.gens.connected == nil {
-				w.gens.connected = map[string]bool{}
-			}
-			w.gens.connected["S1"] = true
-			w.gens.mu.Unlock()
+			w.pauser.setOffline("S1", false)
 		}},
-		// The printer disconnected mid-print: the cached RUNNING must not
-		// authorize camera work until the connection is live again.
-		{"reconnect_before_any_report",
+		// The printer went offline mid-print: the cached RUNNING must not
+		// authorize camera work until the printer is online again.
+		{"offline_before_any_report",
 			func(w *etWorld) {
-				w.gens.mu.Lock()
-				w.gens.gen = 2
-				if w.gens.connected == nil {
-					w.gens.connected = map[string]bool{}
-				}
-				w.gens.connected["S1"] = false
-				w.gens.mu.Unlock()
+				w.pauser.setOffline("S1", true)
 			},
 			func(w *etWorld) {
-				w.gens.mu.Lock()
-				w.gens.connected["S1"] = true
-				w.gens.mu.Unlock()
+				w.pauser.setOffline("S1", false)
 				w.sessions.running(w.clock, 1, 1, "RUNNING")
 			}},
 	} {
@@ -1345,7 +1271,7 @@ func TestEngineResumeAfterConfirmedPauseClearsLifecycle(t *testing.T) {
 func TestEnginePauseCommandFailureIsSingleShot(t *testing.T) {
 	w := newEtWorld(t)
 	w.startSession(1, 1)
-	w.pauser.err = errors.New("generation changed")
+	w.pauser.err = errors.New("printer offline")
 	w.client.queue(etPauseResult())
 	w.worker.step(context.Background())
 
@@ -1432,27 +1358,23 @@ func TestEngineDelayedResultDiscardedOnUserPause(t *testing.T) {
 	}
 }
 
-func TestEngineDelayedResultDiscardedOnReconnect(t *testing.T) {
+func TestEngineDelayedResultDiscardedOnDisconnect(t *testing.T) {
 	w := newEtWorld(t)
 	w.startSession(1, 1)
 	w.client.queue(etPauseResult())
 	w.client.beforeReply = func() {
-		w.gens.mu.Lock()
-		w.gens.gen = 2
-		w.gens.mu.Unlock()
+		w.pauser.setOffline("S1", true)
 	}
 	w.worker.step(context.Background())
 	if calls := w.pauser.calls(); calls != 0 {
-		t.Fatalf("pause calls = %d, want no command on a newer connection", calls)
+		t.Fatalf("pause calls = %d, want no command once the printer is offline", calls)
 	}
 }
 
 func TestEngineDisconnectedNeverAuthorizes(t *testing.T) {
 	w := newEtWorld(t)
 	w.startSession(1, 1)
-	w.gens.mu.Lock()
-	w.gens.connected = map[string]bool{"S1": false}
-	w.gens.mu.Unlock()
+	w.pauser.setOffline("S1", true)
 
 	delay := w.worker.step(context.Background())
 	creates, processes := w.client.counts()
@@ -1466,16 +1388,14 @@ func TestEngineDisconnectedNeverAuthorizes(t *testing.T) {
 		t.Fatalf("delay = %v, want the re-check poll", delay)
 	}
 
-	// A report gap while connected never gates authorization: an old
-	// observation with a live connection still uploads.
-	w.gens.mu.Lock()
-	w.gens.connected["S1"] = true
-	w.gens.mu.Unlock()
+	// A report gap while online never gates authorization: an old
+	// observation with a live printer still uploads.
+	w.pauser.setOffline("S1", false)
 	w.clock.Advance(60 * time.Second)
 	w.client.queue(etClearResult())
 	w.worker.step(context.Background())
 	if _, processes := w.client.counts(); processes != 1 {
-		t.Fatalf("processes = %d, want the upload on a live connection despite the gap", processes)
+		t.Fatalf("processes = %d, want the upload on a live printer despite the gap", processes)
 	}
 }
 
@@ -1504,9 +1424,8 @@ func TestEngineTerminalErrorSuspendsAllPrinters(t *testing.T) {
 	frames := &etFrames{clock: clock, acquireOK: true, serve: true}
 	sessions := &etSessions{}
 	pauser := &etPauser{}
-	gens := &etGens{gen: 1}
 	printers := []config.Printer{{Serial: "S1", Name: "A", Model: "P1S"}, {Serial: "S2", Name: "B", Model: "P1S"}}
-	e := New(printers, client, frames, sessions, pauser, gens,
+	e := New(printers, client, frames, sessions, pauser,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	e.now = clock.Now
 	// Real goroutines with tiny pacing so the test stays fast.
@@ -1629,7 +1548,7 @@ func TestEngineMonitoringRecoveryStartsIntensiveWindow(t *testing.T) {
 	w.worker.mu.Unlock()
 	w.worker.degrade(ReasonAPIRetrying, "temporary failure", time.Second, false)
 
-	if !w.worker.onResult(snap, 1, Frame{Seq: 1, Captured: w.clock.now}, etClearResult(), nil, 0) {
+	if !w.worker.onResult(snap, Frame{Seq: 1, Captured: w.clock.now}, etClearResult(), nil, 0) {
 		t.Fatal("recovery result was discarded")
 	}
 	w.worker.mu.Lock()
@@ -1660,12 +1579,10 @@ type etbWorld struct {
 	client   *etClient
 	frames   *etFrames
 	pauser   *etPauser
-	gens     *etGens
 	engine   *Engine
 	worker   *worker
 	cache    *telemetry.Cache
 	activity *activity.Log
-	seq      uint64
 }
 
 func newEtbWorld(t *testing.T) *etbWorld {
@@ -1680,13 +1597,12 @@ func newEtbWorld(t *testing.T) *etbWorld {
 		client:   &etClient{},
 		frames:   &etFrames{acquireOK: true, serve: true},
 		pauser:   &etPauser{},
-		gens:     &etGens{gen: 1},
 		cache:    cache,
 		activity: activities,
 	}
 	w.frames.clock = w.clock
 	e := New([]config.Printer{{Serial: "S1", Name: "Shop", Model: "P1S"}},
-		w.client, w.frames, w.cache, w.pauser, w.gens,
+		w.client, w.frames, w.cache, w.pauser,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	e.now = w.clock.Now
 	e.SetActivity(activities)
@@ -1699,11 +1615,10 @@ func (w *etbWorld) status() *Status {
 	return w.engine.DetectionStatus("S1").(*Status)
 }
 
-// report merges one upstream report payload on the current generation.
+// report merges one printer report payload.
 func (w *etbWorld) report(t *testing.T, payload string) {
 	t.Helper()
-	w.seq++
-	w.cache.ObserveReport("S1", w.seq, w.gens.gen, []byte(payload))
+	w.cache.Observe("S1", []byte(payload))
 }
 
 func etbRunning(project, task int, file string, layer int) string {
@@ -1922,42 +1837,37 @@ func TestEngineTelemetryDelayedResultDiscardedOnUserPause(t *testing.T) {
 	}
 }
 
-func TestEngineTelemetryTempDeltaAfterReconnectAuthorizes(t *testing.T) {
+func TestEngineTelemetryTempDeltaAuthorizes(t *testing.T) {
 	w := newEtbWorld(t)
 	w.report(t, etbRunning(1, 11, "a.gcode", 4))
 
-	// Mid-print reconnect: a temperature delta plus the layer arrives on the
-	// new connection while the merged RUNNING still comes from the old one.
-	// The live connection authorizes the upload; no state restatement is
-	// needed.
-	w.gens.gen = 2
+	// A temperature delta plus the layer arrives while the merged RUNNING
+	// still comes from an earlier report. The online printer authorizes
+	// the upload; no state restatement is needed.
 	w.report(t, `{"print":{"nozzle_temper":220,"bed_temper":55,"layer_num":4}}`)
 	w.client.queue(etPauseResult())
 	w.worker.step(context.Background())
 	if creates, processes := w.client.counts(); creates != 1 || processes != 1 {
-		t.Fatalf("creates/processes = %d/%d, want the upload on the live connection", creates, processes)
+		t.Fatalf("creates/processes = %d/%d, want the upload on the online printer", creates, processes)
 	}
 	if calls := w.pauser.calls(); calls != 1 {
-		t.Fatalf("pause calls = %d, want one command on the current connection", calls)
-	}
-	if gen := w.pauser.gens[0]; gen != 2 {
-		t.Fatalf("pause generation = %d, want the current connection 2", gen)
+		t.Fatalf("pause calls = %d, want one command on the online printer", calls)
 	}
 }
 
-func TestEngineTelemetryReconnectDuringUploadDoesNotPause(t *testing.T) {
+func TestEngineTelemetryDisconnectDuringUploadDoesNotPause(t *testing.T) {
 	w := newEtbWorld(t)
 	w.report(t, etbRunning(1, 11, "a.gcode", 4))
 	w.client.queue(etPauseResult())
 	w.client.beforeReply = func() {
-		// The connection drops during the upload and a temperature-only
-		// delta on the new connection refreshes the merged freshness.
-		w.gens.gen = 2
+		// The printer goes offline during the upload while a
+		// temperature-only delta refreshes the merged freshness.
+		w.pauser.setOffline("S1", true)
 		w.report(t, `{"print":{"nozzle_temper":220}}`)
 	}
 	w.worker.step(context.Background())
 	if calls := w.pauser.calls(); calls != 0 {
-		t.Fatalf("pause calls = %d, want no command on a newer connection", calls)
+		t.Fatalf("pause calls = %d, want no command while the printer is offline", calls)
 	}
 }
 

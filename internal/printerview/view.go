@@ -14,8 +14,8 @@ import (
 )
 
 // FreshnessWindow bounds how long an accessory chamber reading stays valid.
-// It no longer gates printer liveness, which is the upstream connection
-// state; it only bounds the accessory fallback in Build and the pandabreath link state.
+// It no longer gates printer liveness, which is the printer link state; it
+// only bounds the accessory fallback in Build and the pandabreath link state.
 const FreshnessWindow = 15 * time.Second
 
 // View is the shared printer projection.
@@ -88,27 +88,22 @@ type Alert struct {
 	URL      string `json:"url,omitempty"`
 }
 
-// Freshness describes liveness evidence for one printer. Fresh is the upstream
-// connection state; the age and generation are diagnostics that never gate liveness.
+// Freshness describes liveness evidence for one printer. Fresh is the printer
+// link state; the age is a diagnostic that never gates liveness.
 type Freshness struct {
-	// Fresh is true when the upstream connection is live.
+	// Fresh is true when the printer link is live.
 	Fresh bool `json:"fresh"`
 	// LastReportAgeSeconds is the age of the last real report; null when no
 	// real report was ever observed.
 	LastReportAgeSeconds *float64 `json:"last_report_age_seconds"`
-	// UpstreamGeneration identifies the connection the last real report
-	// arrived on; null when none was ever observed. It changes on every
-	// reconnect, so a pre-reconnect observation never looks current.
-	UpstreamGeneration *uint64 `json:"upstream_generation"`
 }
 
 // speedProfiles names Bambu spd_lvl values 1..4.
 var speedProfiles = [...]string{"silent", "standard", "sport", "ludicrous"}
 
-// Build projects one printer. Live is the upstream connection state; now is
-// injected so tests can freeze time. currentGen is kept for diagnostic
-// callers and no longer gates liveness.
-func Build(st telemetry.State, sv telemetry.SessionView, connected bool, _ uint64, now time.Time) View {
+// Build projects one printer. Live is the printer link state; now is
+// injected so tests can freeze time.
+func Build(st telemetry.State, sv telemetry.SessionView, connected bool, now time.Time) View {
 	v := View{
 		Serial:               st.Serial,
 		Name:                 st.Name,
@@ -188,9 +183,7 @@ func Build(st telemetry.State, sv telemetry.SessionView, connected bool, _ uint6
 	v.Freshness.Fresh = connected
 	if !sv.ObsAt.IsZero() {
 		age := now.Sub(sv.ObsAt).Seconds()
-		gen := sv.ObsGen
 		v.Freshness.LastReportAgeSeconds = &age
-		v.Freshness.UpstreamGeneration = &gen
 	}
 	return v
 }

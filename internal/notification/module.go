@@ -8,7 +8,6 @@ func (s *Service) Module() module.Module {
 		Name:            "notification",
 		Start:           s.Start,
 		Stop:            s.Close,
-		NeedsReports:    true,
 		ObserveActivity: s.Observe,
 	}
 }

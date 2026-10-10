@@ -214,21 +214,20 @@ type requestLogContextKey struct{}
 // requestLogContext ties one Gadget HTTP request to the printer state and
 // camera frame that caused it. It contains no image bytes or credentials.
 type requestLogContext struct {
-	requestID            string
-	action               string
-	serial               string
-	inspectionReason     string
-	printState           string
-	sessionGeneration    uint64
-	sessionEpoch         uint64
-	connectionGeneration uint64
-	frameSequence        uint64
-	frameBytes           int
-	layer                *int
-	frameAgeMS           int64
-	retryAttempt         int
-	intensive            bool
-	usingFallback        bool
+	requestID         string
+	action            string
+	serial            string
+	inspectionReason  string
+	printState        string
+	sessionGeneration uint64
+	sessionEpoch      uint64
+	frameSequence     uint64
+	frameBytes        int
+	layer             *int
+	frameAgeMS        int64
+	retryAttempt      int
+	intensive         bool
+	usingFallback     bool
 }
 
 // withRequestLogContext attaches diagnostic metadata to one Gadget request.
@@ -273,7 +272,6 @@ func (d requestLogContext) logAttrs() []any {
 		"print_state", d.printState,
 		"session_generation", d.sessionGeneration,
 		"session_epoch", d.sessionEpoch,
-		"connection_generation", d.connectionGeneration,
 		"frame_sequence", d.frameSequence,
 		"frame_bytes", d.frameBytes,
 		"frame_age_ms", d.frameAgeMS,

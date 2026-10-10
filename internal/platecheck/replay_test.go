@@ -17,10 +17,9 @@ import (
 )
 
 // replayLine mirrors the telemetry replay fixture: one captured upstream
-// report with its connection generation and decoded payload.
+// report with its decoded payload.
 type replayLine struct {
 	TMS     int64           `json:"t_ms"`
-	Gen     uint64          `json:"gen"`
 	Payload json.RawMessage `json:"payload"`
 }
 
@@ -32,8 +31,7 @@ func readCancelResendFixture(t *testing.T) []replayLine {
 }
 
 // readReplayFixture loads one JSONL capture from the telemetry testdata
-// directory: one upstream report per line with its connection generation
-// and decoded payload.
+// directory: one upstream report per line with its decoded payload.
 func readReplayFixture(t *testing.T, name string) []replayLine {
 	t.Helper()
 	f, err := os.Open(filepath.Join("..", "telemetry", "testdata", name))
@@ -74,12 +72,12 @@ func replayPrintStarted(t *testing.T, log *activity.Log, serial string, gen uint
 }
 
 // TestReplayCancelResendStartupAndFirstLayer feeds the cancel/resend
-// capture through a real telemetry cache with a connected fakeCommands at
-// generation 1. The worker steps explicitly between lines with no timers.
-// After line 2 the recorded print_started entry for generation 1 admits
-// one startup check; after line 8 the generation 2 entry admits one more;
-// after line 11 a first_layer_complete carrying Observation{JobGen: 2}
-// admits one first-layer check.
+// capture through a real telemetry cache with online fakeCommands. The
+// worker steps explicitly between lines with no timers. After line 2 the
+// recorded print_started entry for generation 1 admits one startup check;
+// after line 8 the generation 2 entry admits one more; after line 11 a
+// first_layer_complete carrying Observation{JobGen: 2} admits one
+// first-layer check.
 func TestReplayCancelResendStartupAndFirstLayer(t *testing.T) {
 	lines := readCancelResendFixture(t)
 	if len(lines) != 11 {
@@ -90,16 +88,15 @@ func TestReplayCancelResendStartupAndFirstLayer(t *testing.T) {
 	telemetryLog := activity.New(printers)
 	cache.SetActivity(telemetryLog)
 	f := newRealCacheFixture(t, cache)
-	if f.commands.gen != 1 || f.commands.Connected("01S1") != true {
-		t.Fatal("real-cache fixture must start connected at generation 1")
+	if !f.commands.Online("01S1") {
+		t.Fatal("real-cache fixture must start online")
 	}
 	// A clear plate keeps the startup checks from dispatching a stop, so
 	// both job generations can complete without confirmation traffic.
-	// The first-layer verdict pauses, which only arms a pending pause.
 	f.client.result = Result{PClear: .9, POccupied: .1, PAssessable: .9, Model: "clef"}
 	startedAt := map[int]uint64{1: 1, 7: 2}
 	for i, line := range lines {
-		cache.ObserveReport("01S1", uint64(i+1), line.Gen, line.Payload)
+		cache.Observe("01S1", line.Payload)
 		if gen, ok := startedAt[i]; ok {
 			f.s.ObserveActivity("01S1", replayPrintStarted(t, telemetryLog, "01S1", gen))
 		}
@@ -130,7 +127,7 @@ func TestReplayCancelResendStartupAndFirstLayer(t *testing.T) {
 			if f.client.layerCalls != 1 {
 				t.Fatalf("after line 11: first-layer EvaluateFirstLayer calls = %d, want 1", f.client.layerCalls)
 			}
-			if got := len(f.commands.pauses); got != 1 {
+			if got := f.commands.pauses; got != 1 {
 				t.Fatalf("after line 11: pause commands = %d, want 1", got)
 			}
 			if f.w.layerProcessed != 2 {
@@ -150,10 +147,10 @@ func TestReplayCancelResendStartupAndFirstLayer(t *testing.T) {
 }
 
 // TestReplayLivePrintChecksTwicePerJob feeds the live P1S capture through a
-// real telemetry cache with a connected fakeCommands at generation 1. The
-// worker steps explicitly between lines with no timers. The job runs one
-// pass 1 at PREPARE (line 6) and one pass 2 after stg_cur 14 (line 107):
-// exactly two checks for the job, the second with the after-homing text.
+// real telemetry cache with online fakeCommands. The worker steps
+// explicitly between lines with no timers. The job runs one pass 1 at
+// PREPARE (line 6) and one pass 2 after stg_cur 14 (line 107): exactly two
+// checks for the job, the second with the after-homing text.
 func TestReplayLivePrintChecksTwicePerJob(t *testing.T) {
 	serial := "01S00C351100139"
 	lines := readReplayFixture(t, "live_01S00C351100139_20261010.jsonl")
@@ -164,7 +161,7 @@ func TestReplayLivePrintChecksTwicePerJob(t *testing.T) {
 	// newRealCacheFixture wires serial 01S1; rebuild the same worker for
 	// the capture's printer serial instead.
 	client := &fakeDecision{result: Result{PClear: .9, POccupied: .1, PAssessable: .9, Model: "clef"}}
-	commands := &fakeCommands{gen: 1}
+	commands := &fakeCommands{}
 	data := testJPEG(t)
 	seq := uint64(0)
 	frames := frameFunc(func(_ context.Context, _ string, after time.Time) (Frame, error) {
@@ -180,12 +177,12 @@ func TestReplayLivePrintChecksTwicePerJob(t *testing.T) {
 	s.SetActivity(events)
 	w := s.workers[serial]
 	step := func() { w.step(context.Background()) }
-	if !commands.Connected(serial) || commands.Generation(serial) != 1 {
-		t.Fatal("live replay must start connected at generation 1")
+	if !commands.Online(serial) {
+		t.Fatal("live replay must start online")
 	}
 	delivered := map[string]bool{}
 	for i, line := range lines {
-		cache.ObserveReport(serial, uint64(i+1), line.Gen, line.Payload)
+		cache.Observe(serial, line.Payload)
 		// Deliver each start entry once, as the activity observer would.
 		for _, e := range telemetryLog.Recent(serial) {
 			if (e.Kind == "print_preparing" || e.Kind == "print_started") && !delivered[e.Kind] {
@@ -249,11 +246,9 @@ func TestHomingStageReplacedBeforeTheNextStepStillRunsPass2(t *testing.T) {
 	cache.SetActivity(telemetryLog)
 	f := newRealCacheFixture(t, cache)
 	f.client.result = Result{PClear: .9, POccupied: .1, PAssessable: .9, Model: "clef"}
-	seq := uint64(0)
 	report := func(payload string) {
 		t.Helper()
-		seq++
-		cache.ObserveReport(serial, seq, 1, []byte(payload))
+		cache.Observe(serial, []byte(payload))
 	}
 	deliverStarts := func() {
 		t.Helper()

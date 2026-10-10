@@ -53,7 +53,7 @@ type FirstLayerState struct {
 // Module declares lifecycle, startup and first-layer activity interest, diagnostics, and display hooks.
 func (s *Service) Module() module.Module {
 	on := s.settings.On() && s.blocked == ""
-	m := module.Module{Name: "platecheck", Start: s.Start, Stop: s.Close, NeedsReports: on, State: s.moduleState, Display: s.Display, StatusValue: s.statusMap}
+	m := module.Module{Name: "platecheck", Start: s.Start, Stop: s.Close, State: s.moduleState, Display: s.Display, StatusValue: s.statusMap}
 	if on {
 		m.ObserveActivity = s.ObserveActivity
 	}

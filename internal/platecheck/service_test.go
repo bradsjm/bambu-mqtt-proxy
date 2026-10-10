@@ -58,74 +58,50 @@ func (f *fakeState) edit(fn func(*telemetry.JobView, *telemetry.SessionView)) {
 }
 
 type fakeCommands struct {
-	mu                  sync.Mutex
-	offline             map[string]bool
-	gen                 uint64
-	stops, lights       []uint64
-	stopErr, lightErr   error
-	stopHook, lightHook func()
-	pauses              []uint64
-	pauseErr            error
-	pauseHook           func()
-	// strict models the pool's generation guard: sends with a stale
-	// generation are rejected and never delivered.
-	strict bool
-	// race runs inside StopPrint before the generation check, so a test
-	// can interleave a reconnect between the gate's generation read and
-	// the send.
-	race func()
-	// delivered records generations the pool accepted.
-	delivered []uint64
+	mu                sync.Mutex
+	offline           map[string]bool
+	stops, lights     int
+	stopErr, lightErr error
+	stopHook          func()
+	lightHook         func()
+	pauses            int
+	pauseErr          error
+	pauseHook         func()
 }
 
-func (f *fakeCommands) Generation(string) uint64 { f.mu.Lock(); defer f.mu.Unlock(); return f.gen }
-func (f *fakeCommands) Connected(serial string) bool {
+func (f *fakeCommands) Online(serial string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return !f.offline[serial]
 }
-func (f *fakeCommands) StopPrint(_ string, g uint64) error {
+func (f *fakeCommands) Stop(string) error {
 	f.mu.Lock()
-	f.stops = append(f.stops, g)
-	race := f.race
+	f.stops++
 	f.mu.Unlock()
-	if race != nil {
-		race()
-	}
 	if f.stopHook != nil {
 		f.stopHook()
 	}
-	if f.stopErr != nil {
-		return f.stopErr
-	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.strict && g != f.gen {
-		return errors.New("connection generation changed")
-	}
-	f.delivered = append(f.delivered, g)
-	return nil
+	return f.stopErr
 }
-func (f *fakeCommands) PausePrint(_ string, g uint64) error {
+func (f *fakeCommands) Pause(string) error {
 	f.mu.Lock()
-	f.pauses = append(f.pauses, g)
+	f.pauses++
 	f.mu.Unlock()
 	if f.pauseHook != nil {
 		f.pauseHook()
 	}
 	return f.pauseErr
 }
-func (f *fakeCommands) SetChamberLight(_ string, g uint64, _ bool) error {
+func (f *fakeCommands) Light(string, bool) error {
 	f.mu.Lock()
-	f.lights = append(f.lights, g)
+	f.lights++
 	f.mu.Unlock()
 	if f.lightHook != nil {
 		f.lightHook()
 	}
 	return f.lightErr
 }
-func (f *fakeCommands) count() int { f.mu.Lock(); defer f.mu.Unlock(); return len(f.stops) }
-func (f *fakeCommands) reconnect() { f.mu.Lock(); f.gen++; f.mu.Unlock() }
+func (f *fakeCommands) count() int { f.mu.Lock(); defer f.mu.Unlock(); return f.stops }
 
 type fakeDecision struct {
 	mu          sync.Mutex
@@ -181,14 +157,14 @@ type fixture struct {
 func newFixture(t *testing.T, state string) *fixture {
 	t.Helper()
 	clock := &testClock{t: time.Date(2026, 1, 1, 1, 0, 0, 0, time.UTC)}
-	st := &fakeState{j: telemetry.JobView{Generation: 1, Active: true, State: state, StartObserved: true}, v: telemetry.SessionView{State: state, Epoch: 3, StateGen: 1, ObsGen: 1, Obs: 10, ObsAt: clock.now()}}
+	st := &fakeState{j: telemetry.JobView{Generation: 1, Active: true, State: state, StartObserved: true}, v: telemetry.SessionView{State: state, Epoch: 3, Obs: 10, ObsAt: clock.now()}}
 	if state == "RUNNING" {
 		st.v.Active = true
 		st.v.SessionGen = 1
 		st.v.LayerNum = new(0)
 		st.v.LayerThisJob = true
 	}
-	commands := &fakeCommands{gen: 1}
+	commands := &fakeCommands{}
 	client := &fakeDecision{result: Result{PClear: .1, POccupied: 1 - .1, PAssessable: .9, Model: "clef"}}
 	data := testJPEG(t)
 	frames := frameFunc(func(ctx context.Context, serial string, after time.Time) (Frame, error) {
@@ -428,20 +404,6 @@ func TestNoCommandAfterEvidenceChangesInCapture(t *testing.T) {
 			}
 		})
 	}
-	// A reconnect alone changes no authorization input, so the check
-	// continues and the pool fake still accepts the same-generation send.
-	f := newFixture(t, "PREPARE")
-	base := f.s.frames
-	f.s.frames = frameFunc(func(ctx context.Context, s string, after time.Time) (Frame, error) {
-		frame, err := base.Capture(ctx, s, after)
-		f.commands.reconnect()
-		return frame, err
-	})
-	f.hint("print_preparing")
-	f.step()
-	if f.commands.count() != 1 || f.client.calls != 1 {
-		t.Fatalf("reconnect revoked local authorization: count=%d calls=%d", f.commands.count(), f.client.calls)
-	}
 }
 
 func TestOriginalEpochAllowsOnlyFirstRunningDuringCapture(t *testing.T) {
@@ -560,7 +522,7 @@ func TestLightGuardAndPostSendBoundary(t *testing.T) {
 	start := f.clock.now()
 	f.hint("print_preparing")
 	f.step()
-	if len(f.commands.lights) != 1 || !boundary.Equal(start.Add(time.Second)) {
+	if f.commands.lights != 1 || !boundary.Equal(start.Add(time.Second)) {
 		t.Fatalf("light boundary %v", boundary)
 	}
 	f = newFixture(t, "PREPARE")
@@ -568,7 +530,7 @@ func TestLightGuardAndPostSendBoundary(t *testing.T) {
 	f.commands.lightErr = errors.New("private marker")
 	f.hint("print_preparing")
 	f.step()
-	if f.commands.count() != 1 || len(f.commands.lights) != 1 {
+	if f.commands.count() != 1 || f.commands.lights != 1 {
 		t.Fatal("failed lighting blocked fresh view")
 	}
 }
@@ -592,7 +554,7 @@ func TestStopConfirmationIsStateBased(t *testing.T) {
 		{"replacement", func(f *fixture) {
 			f.state.edit(func(j *telemetry.JobView, v *telemetry.SessionView) { j.Generation++ })
 		}, "stop_unconfirmed"},
-		{"reconnect", func(f *fixture) { f.commands.reconnect() }, "stop_requested"},
+		{"offline during wait", func(f *fixture) { f.commands.offline = map[string]bool{"01S1": true} }, "stop_requested"},
 		{"expiry", func(f *fixture) { f.clock.advance(30 * time.Second) }, "stop_unconfirmed"},
 		{"exact deadline", func(f *fixture) {
 			f.clock.advance(30*time.Second - time.Millisecond)
@@ -668,10 +630,9 @@ func TestRealTelemetryIdentityContinuityAndCoalescedReplacement(t *testing.T) {
 	for _, tc := range []string{"continuous", "pause resume", "replacement", "canceled"} {
 		t.Run(tc, func(t *testing.T) {
 			cache := telemetry.NewCache(printers, slog.New(slog.NewTextHandler(io.Discard, nil)))
-			commands := &fakeCommands{gen: 1}
+			commands := &fakeCommands{}
 			client := &fakeDecision{result: Result{PClear: .1, POccupied: 1 - .1, PAssessable: .9}}
-			seq := uint64(0)
-			report := func(body string) { seq++; cache.ObserveReport("01S1", seq, 1, []byte(body)) }
+			report := func(body string) { cache.Observe("01S1", []byte(body)) }
 			report(`{"print":{"gcode_state":"IDLE"}}`)
 			report(`{"print":{"gcode_state":"PREPARE","project_id":1,"task_id":2,"subtask_name":"a.3mf"}}`)
 			admission, _, _ := cache.Print("01S1")
@@ -711,7 +672,7 @@ func TestModuleDisabledBlockedAndApprovedDisplay(t *testing.T) {
 	f := newFixture(t, "PREPARE")
 	f.s.settings.Enabled = new(false)
 	m := f.s.Module()
-	if m.NeedsReports || m.ObserveActivity != nil || len(m.Routes) != 1 || m.State("01S1") != nil || m.Display("01S1") != nil {
+	if m.ObserveActivity != nil || len(m.Routes) != 1 || m.State("01S1") != nil || m.Display("01S1") != nil {
 		t.Fatal("off contract")
 	}
 	if f.s.status("01S1").(ModuleState).State != "disabled" {
@@ -720,7 +681,7 @@ func TestModuleDisabledBlockedAndApprovedDisplay(t *testing.T) {
 	f.s.settings.Enabled = new(true)
 	f.s.SetBlocked(ReasonCameraDisabled)
 	m = f.s.Module()
-	if m.NeedsReports || m.ObserveActivity != nil || len(m.Routes) != 0 || m.State("01S1").(ModuleState).State != "blocked" {
+	if m.ObserveActivity != nil || len(m.Routes) != 0 || m.State("01S1").(ModuleState).State != "blocked" {
 		t.Fatal("blocked contract")
 	}
 	blocked := f.s.Display("01S1")
@@ -914,12 +875,8 @@ func layerRule(t *testing.T, d *module.Display) module.Row {
 }
 
 func TestAdmissionNeedsConnectivityNotReportFreshness(t *testing.T) {
-	// Stale stamps and a zero connection generation never block
-	// admission: only Connected gates the check.
+	// Stale stamps never block admission: only Online gates the check.
 	for _, edit := range []func(*fixture){
-		func(f *fixture) { f.commands.gen = 0 },
-		func(f *fixture) { f.state.v.StateGen = 0 },
-		func(f *fixture) { f.state.v.ObsGen = 0 },
 		func(f *fixture) { f.clock.advance(16 * time.Second) },
 		func(f *fixture) { f.state.v.ObsAt = time.Time{} },
 	} {
@@ -944,7 +901,7 @@ func TestAdmissionNeedsConnectivityNotReportFreshness(t *testing.T) {
 	if f.status() != "skipped" || f.s.moduleState("01S1").(ModuleState).Reason != "printer_offline" {
 		t.Fatalf("offline expiry: %+v", f.s.moduleState("01S1"))
 	}
-	// A reconnect during the wait admits without a new report.
+	// Coming back online during the wait admits without a new report.
 	f = newFixture(t, "PREPARE")
 	f.commands.offline = map[string]bool{"01S1": true}
 	f.hint("print_preparing")
@@ -952,7 +909,7 @@ func TestAdmissionNeedsConnectivityNotReportFreshness(t *testing.T) {
 	f.commands.offline = nil
 	f.step()
 	if f.commands.count() != 1 {
-		t.Fatal("reconnect did not admit the waiting hint")
+		t.Fatal("coming back online did not admit the waiting hint")
 	}
 }
 
@@ -1305,60 +1262,11 @@ func TestCloseWithPendingStopRecordsUnconfirmed(t *testing.T) {
 	f.s.kPoll = time.Hour
 	f.s.Start()
 	f.s.Close()
-	if f.status() != "stop_unconfirmed" || f.w.pending != nil || len(f.commands.stops) != 1 {
-		t.Fatalf("shutdown: state=%s stops=%d", f.status(), len(f.commands.stops))
+	if f.status() != "stop_unconfirmed" || f.w.pending != nil || f.commands.stops != 1 {
+		t.Fatalf("shutdown: state=%s stops=%d", f.status(), f.commands.stops)
 	}
 	if !f.hasEvent("platecheck_stop_unconfirmed") {
 		t.Fatal("missing platecheck_stop_unconfirmed")
-	}
-}
-
-func TestStaleGenerationStopIsRejectedBeforeTheNewJob(t *testing.T) {
-	f := newFixture(t, "PREPARE")
-	f.commands.strict = true
-	// A reconnect plus job change lands between the gate's generation
-	// read and the send: the pool fake rejects the stale generation, so
-	// no stop reaches the new job on the new connection.
-	f.commands.race = func() {
-		f.commands.reconnect()
-		f.state.edit(func(j *telemetry.JobView, v *telemetry.SessionView) {
-			j.Generation = 2
-			j.State = "RUNNING"
-		})
-	}
-	f.hint("print_preparing")
-	f.step()
-	if len(f.commands.delivered) != 0 {
-		t.Fatalf("stale stop delivered: %+v", f.commands.delivered)
-	}
-	if f.status() != "stop_failed" || !f.hasEvent("platecheck_stop_failed") {
-		t.Fatalf("state=%s events=%+v", f.status(), f.activity.Recent("01S1"))
-	}
-	// The new job is untouched: confirmation sees the replacement and
-	// closes the attempt as unconfirmed without another send.
-	f.commands.race = nil
-	f.step()
-	if f.status() != "stop_unconfirmed" || len(f.commands.delivered) != 0 {
-		t.Fatalf("state=%s delivered=%+v", f.status(), f.commands.delivered)
-	}
-}
-
-func TestCommandGateSendsTheAuthorizedGeneration(t *testing.T) {
-	f := newFixture(t, "PREPARE")
-	f.commands.strict = true
-	f.hint("print_preparing")
-	f.step()
-	if len(f.commands.delivered) != 1 || f.commands.delivered[0] != 1 || len(f.commands.lights) != 0 {
-		t.Fatalf("stops=%+v delivered=%+v lights=%+v", f.commands.stops, f.commands.delivered, f.commands.lights)
-	}
-	// The light command uses the same gate: the generation read before
-	// authorization is the generation sent.
-	f = newFixture(t, "PREPARE")
-	f.state.v.ChamberLight = "off"
-	f.hint("print_preparing")
-	f.step()
-	if len(f.commands.lights) != 1 || f.commands.lights[0] != 1 {
-		t.Fatalf("lights=%+v", f.commands.lights)
 	}
 }
 

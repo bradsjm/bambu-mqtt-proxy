@@ -556,7 +556,7 @@ func TestMCPToolCalls(t *testing.T) {
 		t.Fatalf("state = %s", res.Result)
 	}
 	if !sc.State.Freshness.Fresh {
-		t.Fatal("connected printer without a matching generation counted stale")
+		t.Fatal("connected printer counted stale")
 	}
 	if sc.State.Progress == nil || *sc.State.Progress != 30 {
 		t.Fatalf("progress presence broken: %s", res.Result)
@@ -689,10 +689,9 @@ func TestMCPWatchToolWire(t *testing.T) {
 		t.Fatalf("resync revision = %q", fresh)
 	}
 
-	// Reconnect the upstream; liveness returns at once, and the resulting
+	// Reconnect the link; liveness returns at once, and the resulting
 	// attention bump invalidates `fresh`, so re-baseline.
 	w.conn.set("P001", true)
-	w.gens.set("P001", 1)
 	w.step()
 	rebas := watch(23, map[string]any{"serial": "P001", "after_revision": fresh, "timeout_seconds": 0})
 	if !flag(rebas, "resync_required") {
@@ -1310,7 +1309,17 @@ func TestMCPControlTools(t *testing.T) {
 		t.Fatalf("sent = %v", got)
 	}
 	assertToolError(t, call(2, "set_chamber_light", map[string]any{"serial": "P002", "on": true}), errUpstreamUnavailable)
-	assertToolError(t, call(3, "pause_print", map[string]any{"serial": "P001"}), errInvalidState)
+	// Pause sends even with no RUNNING state on file: the printer decides.
+	paused := call(3, "pause_print", map[string]any{"serial": "P001"})
+	var pout struct {
+		IsError           bool `json:"isError"`
+		StructuredContent struct {
+			Sent bool `json:"sent"`
+		} `json:"structuredContent"`
+	}
+	if err := json.Unmarshal(paused.Result, &pout); err != nil || pout.IsError || !pout.StructuredContent.Sent {
+		t.Fatalf("pause_print = %s, err %v", paused.Result, err)
+	}
 	assertToolError(t, call(4, "stop_print", map[string]any{"serial": "NOPE"}), module.CodeUnknownSerial)
 	if bad := call(6, "set_speed_profile", map[string]any{"serial": "P001", "profile": "turbo"}); bad.Error == nil {
 		var r struct {
@@ -1320,8 +1329,8 @@ func TestMCPControlTools(t *testing.T) {
 			t.Fatalf("invalid profile accepted: %s", bad.Result)
 		}
 	}
-	if got := w.cmd.sentList(); len(got) != 1 {
-		t.Fatalf("sent = %v, want only the stop", got)
+	if got := w.cmd.sentList(); !slices.Equal(got, []string{"stop", "pause"}) {
+		t.Fatalf("sent = %v, want the stop and the pause", got)
 	}
 }
 

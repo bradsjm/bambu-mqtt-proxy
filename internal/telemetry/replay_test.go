@@ -15,12 +15,10 @@ import (
 	"bambu-mqtt-proxy/internal/config"
 )
 
-// replayLine is one captured upstream report: t_ms is relative to the
-// segment's first report, gen is the upstream connection generation, and
-// payload is the decoded report JSON.
+// replayLine is one captured printer report: t_ms is relative to the
+// segment's first report, and payload is the decoded report JSON.
 type replayLine struct {
 	TMS     int64           `json:"t_ms"`
-	Gen     uint64          `json:"gen"`
 	Payload json.RawMessage `json:"payload"`
 }
 
@@ -92,7 +90,7 @@ func (o *replayOracle) observe(t *testing.T, raw json.RawMessage) {
 }
 
 // TestReplayKeepsLastReportedValues runs every testdata fixture through
-// Cache.ObserveReport with a test clock at t_ms, and after each line
+// Cache.Observe with a test clock at t_ms, and after each line
 // asserts Job.Name and Session.LayerNum equal the oracle's values.
 func TestReplayKeepsLastReportedValues(t *testing.T) {
 	entries, err := os.ReadDir("testdata")
@@ -115,7 +113,7 @@ func TestReplayKeepsLastReportedValues(t *testing.T) {
 				if i > 0 {
 					now = now.Add(-time.Duration(lines[i-1].TMS) * time.Millisecond)
 				}
-				c.ObserveReport("S1", uint64(i+1), line.Gen, line.Payload)
+				c.Observe("S1", line.Payload)
 				oracle.observe(t, line.Payload)
 				j, s, ok := c.Print("S1")
 				if !ok {
@@ -156,7 +154,7 @@ func TestReplayCancelResend(t *testing.T) {
 		if i > 0 {
 			now = now.Add(-time.Duration(lines[i-1].TMS) * time.Millisecond)
 		}
-		c.ObserveReport("S1", uint64(i+1), line.Gen, line.Payload)
+		c.Observe("S1", line.Payload)
 		jobs[i], sessions[i], _ = c.Print("S1")
 		counts[i] = len(events.Recent("S1"))
 	}

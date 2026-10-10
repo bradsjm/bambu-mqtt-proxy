@@ -35,7 +35,7 @@ func TestAliasRoutingEndToEnd(t *testing.T) {
 		t.Fatalf("alias subscribe granted %#x, want 0", got)
 	}
 	waitFor(t, 5*time.Second, func() bool {
-		return p1.rec.subCount(reportTopic(serial1)) >= 1
+		return p.links.Online(serial1)
 	})
 
 	// (a) A printer report on the real serial reaches the alias subscriber
@@ -57,7 +57,6 @@ func TestAliasRoutingEndToEnd(t *testing.T) {
 		return p1.rec.count(reportTopic(serial1), cmdPayload) == 0 &&
 			p1.rec.count(requestTopic(serial1), cmdPayload) == 1
 	})
-	time.Sleep(300 * time.Millisecond)
 	if got := p1.rec.count(requestTopic(serial1), cmdPayload); got != 1 {
 		t.Fatalf("printer received %d copies of the alias request, want exactly 1", got)
 	}
@@ -75,7 +74,6 @@ func TestAliasRoutingEndToEnd(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("client publishing to the real serial was not disconnected")
 	}
-	time.Sleep(300 * time.Millisecond)
 	if n := p1.rec.count(requestTopic(serial1), deniedPayload); n != 0 {
 		t.Fatalf("real-serial publish reached the printer %d times, want 0", n)
 	}
@@ -87,7 +85,7 @@ func TestAliasRoutingEndToEnd(t *testing.T) {
 		t.Fatalf("wildcard subscribe granted %#x, want 0", got)
 	}
 	waitFor(t, 5*time.Second, func() bool {
-		return p2.rec.subCount(reportTopic(serial2)) >= 1
+		return p.links.Online(serial2)
 	})
 	wildReport := "wild-v1"
 	plainReport := "plain-v1"
@@ -96,7 +94,6 @@ func TestAliasRoutingEndToEnd(t *testing.T) {
 	waitFor(t, 5*time.Second, func() bool {
 		return wild.box.has(aliasedReport, wildReport) && wild.box.has(reportTopic(serial2), plainReport)
 	})
-	time.Sleep(500 * time.Millisecond)
 	wild.box.mu.Lock()
 	aliasCount := wild.box.seen[aliasedReport+"|"+wildReport]
 	serialLeak := wild.box.seen[reportTopic(serial1)+"|"+wildReport]

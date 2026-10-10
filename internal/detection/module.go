@@ -6,17 +6,16 @@ import (
 	"bambu-mqtt-proxy/internal/module"
 )
 
-// Module declares the detection engine's lifecycle and report interest.
-// Call after SetBlocked and before Start.
+// Module declares the detection engine's lifecycle. Call after SetBlocked
+// and before Start.
 func (e *Engine) Module() module.Module {
 	m := module.Module{
-		Name:         "detection",
-		Start:        e.Start,
-		Stop:         e.Close,
-		NeedsReports: e.blocked == "",
-		State:        e.DetectionStatus,
-		FleetValues:  e.fleetValues,
-		StatusValue:  func() any { return e.DetectionMap() },
+		Name:        "detection",
+		Start:       e.Start,
+		Stop:        e.Close,
+		State:       e.DetectionStatus,
+		FleetValues: e.fleetValues,
+		StatusValue: func() any { return e.DetectionMap() },
 	}
 	if e.blocked == "" {
 		m.MCP = e.registerMCP

@@ -48,8 +48,6 @@ func livePair(gen uint64, layer int) (telemetry.SessionView, telemetry.JobView) 
 		Complete:     true,
 		SessionGen:   gen,
 		Epoch:        gen + 1,
-		StateGen:     gen + 2,
-		ObsGen:       gen + 3,
 		ObsAt:        time.Unix(1700000000+int64(gen)*10, 0).UTC().Round(0),
 		LayerNum:     &layer,
 		LayerThisJob: true,

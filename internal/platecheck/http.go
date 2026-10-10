@@ -144,7 +144,7 @@ func (s *Service) handleSnapshots(w http.ResponseWriter, r *http.Request) {
 		code := ""
 		if !supportedCamera(p) {
 			printer.Status, code = "unsupported", "unsupported_camera"
-		} else if !s.commands.Connected(p.Serial) {
+		} else if !s.commands.Online(p.Serial) {
 			printer.Status, code = "offline", "printer_offline"
 		}
 		start.Printers = append(start.Printers, printer)

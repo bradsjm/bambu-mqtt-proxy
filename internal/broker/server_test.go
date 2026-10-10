@@ -8,8 +8,8 @@ import (
 	"testing"
 
 	"bambu-mqtt-proxy/internal/config"
+	"bambu-mqtt-proxy/internal/printer"
 	"bambu-mqtt-proxy/internal/routing"
-	"bambu-mqtt-proxy/internal/upstream"
 )
 
 // freePort reserves an ephemeral port and releases it for the test bind.
@@ -45,11 +45,11 @@ func TestNewListenerFailureReleasesPortAndInjector(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	inject := NewInjector(logger)
-	pool := upstream.NewPool(cfg.Printers, inject, cfg.Behavior, logger)
-	t.Cleanup(pool.Stop)
+	links := printer.New(cfg.Printers, logger, nil, nil)
+	t.Cleanup(links.Close)
 	table := routing.NewTable([]string{cfg.Printers[0].Serial}, nil)
 
-	srv, err := New(cfg, table, pool, inject, logger)
+	srv, err := New(cfg, table, links, inject, logger)
 	if err == nil {
 		_ = srv.Close()
 		t.Fatal("duplicate listener accepted")
@@ -69,7 +69,7 @@ func TestNewListenerFailureReleasesPortAndInjector(t *testing.T) {
 	// A retry with only the valid listener binds it and attaches the
 	// injector only after success.
 	cfg.Listen = cfg.Listen[:1]
-	srv2, err := New(cfg, table, pool, inject, logger)
+	srv2, err := New(cfg, table, links, inject, logger)
 	if err != nil {
 		t.Fatalf("retry after failed New: %v", err)
 	}
@@ -91,10 +91,10 @@ func TestCloseOnServingServerKeepsWorking(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	inject := NewInjector(logger)
-	pool := upstream.NewPool(cfg.Printers, inject, cfg.Behavior, logger)
-	t.Cleanup(pool.Stop)
+	links := printer.New(cfg.Printers, logger, nil, nil)
+	t.Cleanup(links.Close)
 
-	srv, err := New(cfg, routing.NewTable([]string{cfg.Printers[0].Serial}, nil), pool, inject, logger)
+	srv, err := New(cfg, routing.NewTable([]string{cfg.Printers[0].Serial}, nil), links, inject, logger)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

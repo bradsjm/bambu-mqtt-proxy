@@ -11,8 +11,8 @@
 //   - merged printer state and print sessions (*telemetry.Cache),
 //   - camera frames (*camera.Manager; nil while cameras are disabled),
 //   - user-style printer commands through the allow-listed control service
-//     (*control.Service), or generation-guarded commands
-//     (*upstream.Pool) for autonomous actions taken on observed evidence,
+//     (*control.Service), or printer commands (*printer.Links) for
+//     autonomous actions taken on observed evidence,
 //   - the recent activity log (*activity.Log) for recording events.
 //
 // Modules never publish raw MQTT and never change forwarded payloads.
@@ -40,9 +40,6 @@ type Module struct {
 	// and before the cameras and upstream connections the module reads.
 	// Read hooks below must stay safe to call after Stop.
 	Stop func()
-	// NeedsReports asks the core to hold one report interest per printer
-	// while the proxy runs, so telemetry stays live without MQTT clients.
-	NeedsReports bool
 	// ObserveActivity receives every newly recorded activity entry. It runs
 	// on report processing paths and must not block.
 	ObserveActivity func(serial string, e activity.Entry)

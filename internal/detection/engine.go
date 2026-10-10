@@ -1,9 +1,9 @@
 // Detection engine for the optional OctoEverywhere Gadget integration: one
 // worker goroutine per configured printer schedules frame inspections during
-// active prints, acts on pause suggestions under live-connection and
-// generation guards, and publishes display status for the HTTP endpoints.
-// One request is in flight per printer by construction: each worker runs its
-// loop serially and never holds locks across network calls.
+// active prints, acts on pause suggestions while the printer is online, and
+// publishes display status for the HTTP endpoints. One request is in flight
+// per printer by construction: each worker runs its loop serially and never
+// holds locks across network calls.
 package detection
 
 import (
@@ -181,20 +181,16 @@ type sessionSource interface {
 	Session(serial string) (telemetry.SessionView, bool)
 }
 
-// PrinterControl sends guarded upstream print commands; each action must fail
-// rather than act on a connection older than generation.
+// PrinterControl sends printer commands and reports printer liveness. *printer.Links satisfies it.
 type PrinterControl interface {
-	PausePrint(serial string, generation uint64) error
-	SetSpeedProfile(serial string, generation uint64, profile int) error
-	SetChamberLight(serial string, generation uint64, on bool) error
-}
-
-// GenerationSource reports the printer's current upstream connection
-// generation; every reconnect or loss changes the value. Connected reports
-// whether the upstream connection is live.
-type GenerationSource interface {
-	Generation(serial string) uint64
-	Connected(serial string) bool
+	// Pause sends one pause command.
+	Pause(serial string) error
+	// Speed sends one speed-profile command.
+	Speed(serial string, level int) error
+	// Light sends one chamber-light command.
+	Light(serial string, on bool) error
+	// Online reports whether the printer is connected and subscribed.
+	Online(serial string) bool
 }
 
 // gadgetClient is the API surface the engine uses; *Client implements it.
@@ -208,8 +204,8 @@ type Engine struct {
 	client   gadgetClient
 	frames   FrameSource
 	sessions sessionSource
+	// control supplies plain commands and printer connectivity.
 	control  PrinterControl
-	gens     GenerationSource
 	log      *slog.Logger
 	activity *activity.Log // optional recent-event log
 
@@ -244,7 +240,7 @@ type Engine struct {
 
 // New builds the engine; Start spawns the workers.
 func New(printers []config.Printer, client gadgetClient, frames FrameSource,
-	sessions sessionSource, control PrinterControl, gens GenerationSource, log *slog.Logger) *Engine {
+	sessions sessionSource, link PrinterControl, log *slog.Logger) *Engine {
 	if log != nil {
 		log = log.With("origin", "detection")
 	}
@@ -257,8 +253,7 @@ func New(printers []config.Printer, client gadgetClient, frames FrameSource,
 		client:          client,
 		frames:          frames,
 		sessions:        sessions,
-		control:         control,
-		gens:            gens,
+		control:         link,
 		log:             log,
 		specs:           specs,
 		now:             time.Now,
@@ -405,10 +400,10 @@ type worker struct {
 	workGen     uint64 // bumped on every override change
 	workCtx     context.Context
 	workCancel  context.CancelFunc
-	// lightGen is the session generation whose chamber light auto-on was
+	// lightDone is the session generation whose chamber light auto-on was
 	// attempted or found unnecessary because the light was already on.
 	// Guarded by mu.
-	lightGen uint64
+	lightDone uint64
 
 	// Loop state, owned by the worker goroutine only.
 	lastSeq       uint64
@@ -453,7 +448,6 @@ type worker struct {
 	speedAttempted  bool
 	speedPrior      *int
 	speedPrintGen   uint64
-	speedCommandGen uint64
 	speedCommandObs uint64
 	speedAckObs     uint64
 	speedPending    bool
@@ -473,14 +467,13 @@ func newWorker(e *Engine, serial string) *worker {
 // diagnosticAttrs returns concise engine state for info and warning events.
 func (w *worker) diagnosticAttrs() []any {
 	now := w.e.now()
-	attrs := []any{"connection_generation", w.e.gens.Generation(w.serial)}
+	attrs := []any{"online", w.e.control.Online(w.serial)}
 	if w.e.sessions != nil {
 		if snap, ok := w.e.sessions.Session(w.serial); ok {
 			attrs = append(attrs,
 				"print_state", snap.State,
 				"session_generation", snap.SessionGen,
 				"session_epoch", snap.Epoch,
-				"telemetry_generation", snap.ObsGen,
 				"telemetry_age_ms", now.Sub(snap.ObsAt).Milliseconds())
 			if snap.LayerNum != nil {
 				attrs = append(attrs, "layer", *snap.LayerNum)
@@ -569,7 +562,7 @@ func (w *worker) setEnabled(enabled bool, sessionID string) (any, error) {
 		if had {
 			w.workGen++
 			// Re-enabled AI can make one new light-on attempt.
-			w.lightGen = 0
+			w.lightDone = 0
 		}
 		w.mu.Unlock()
 		w.controlMu.Unlock()
@@ -818,24 +811,23 @@ func (w *worker) step(ctx context.Context) time.Duration {
 // retried; the user can switch the light on.
 func (w *worker) ensureLight(snap telemetry.SessionView) {
 	w.mu.Lock()
-	if snap.SessionGen == 0 || w.lightGen == snap.SessionGen {
+	if snap.SessionGen == 0 || w.lightDone == snap.SessionGen {
 		w.mu.Unlock()
 		return
 	}
 	if snap.ChamberLight == "on" {
-		w.lightGen = snap.SessionGen
+		w.lightDone = snap.SessionGen
 		w.mu.Unlock()
 		return
 	}
 	w.mu.Unlock()
-	gen := w.e.gens.Generation(w.serial)
-	if !w.e.gens.Connected(w.serial) {
+	if !w.e.control.Online(w.serial) {
 		return
 	}
 	w.mu.Lock()
-	w.lightGen = snap.SessionGen
+	w.lightDone = snap.SessionGen
 	w.mu.Unlock()
-	if err := w.e.control.SetChamberLight(w.serial, gen, true); err != nil {
+	if err := w.e.control.Light(w.serial, true); err != nil {
 		w.log.Warn("chamber light command failed", append(w.diagnosticAttrs(), "error", err)...)
 		return
 	}
@@ -993,15 +985,14 @@ func (w *worker) onRunning(ctx context.Context, snap telemetry.SessionView) time
 	w.guardPauseOnRunning()
 
 	now := w.e.now()
-	freshAuthorized := w.authorized(snap, w.e.gens.Generation(w.serial))
+	freshAuthorized := w.authorized(snap)
 
-	// Authorization gate: a disconnected printer or an old transport
-	// generation is rejected here, before the camera hold or any request, so
-	// a print waiting for a live connection never takes the camera. It
-	// precedes the layer gate so a disconnected RUNNING can never present
-	// the neutral first-layer wait, with or without a layer. inspect keeps
-	// its own recheck as the defense for the race between this gate and the
-	// capture.
+	// Authorization gate: an offline printer is rejected here, before the
+	// camera hold or any request, so a print waiting for a live connection
+	// never takes the camera. It precedes the layer gate so a disconnected
+	// RUNNING can never present the neutral first-layer wait, with or
+	// without a layer. inspect keeps its own recheck as the defense for
+	// the race between this gate and the capture.
 	if !freshAuthorized {
 		if w.log.Enabled(context.Background(), slog.LevelDebug) {
 			w.log.Debug("detection inspection deferred", append(w.diagnosticAttrs(),
@@ -1098,18 +1089,17 @@ func (w *worker) onRunning(ctx context.Context, snap telemetry.SessionView) time
 
 // gadgetRequestContext attaches correlation and inspection details to one API request.
 func (w *worker) gadgetRequestContext(ctx context.Context, action string, snap telemetry.SessionView,
-	gen uint64, frame *Frame, layer *int) (context.Context, requestLogContext) {
+	frame *Frame, layer *int) (context.Context, requestLogContext) {
 	now := w.e.now()
 	detail := requestLogContext{
-		requestID:            fmt.Sprintf("detect-%s-%s-%d-%d-%d-%d", w.serial, action, snap.SessionGen, snap.Epoch, gen, w.lastSeq),
-		action:               action,
-		serial:               w.serial,
-		inspectionReason:     "scheduled_inspection",
-		printState:           snap.State,
-		sessionGeneration:    snap.SessionGen,
-		sessionEpoch:         snap.Epoch,
-		connectionGeneration: gen,
-		layer:                copyLayer(layer),
+		requestID:         fmt.Sprintf("detect-%s-%s-%d-%d-%d", w.serial, action, snap.SessionGen, snap.Epoch, w.lastSeq),
+		action:            action,
+		serial:            w.serial,
+		inspectionReason:  "scheduled_inspection",
+		printState:        snap.State,
+		sessionGeneration: snap.SessionGen,
+		sessionEpoch:      snap.Epoch,
+		layer:             copyLayer(layer),
 	}
 	w.mu.Lock()
 	if !w.haveSession {
@@ -1242,17 +1232,14 @@ func (w *worker) guardPauseOnRunning() {
 // camera wait and both API calls run on the cancellable work context, so a
 // control change aborts the attempt instead of letting it finish unnoticed.
 func (w *worker) inspect(ctx context.Context, snap telemetry.SessionView) time.Duration {
-	gen := w.e.gens.Generation(w.serial)
-	if !w.authorized(snap, gen) {
-		// Disconnected or older-generation telemetry: a disconnected
-		// printer's cached RUNNING must never authorize an action.
+	if !w.authorized(snap) {
+		// An offline printer's cached RUNNING must never authorize an action.
 		if w.log.Enabled(context.Background(), slog.LevelDebug) {
 			w.log.Debug("detection inspection deferred", append(w.diagnosticAttrs(),
 				"operation", "process", "reason", "telemetry_not_authorized",
 				"inspection_session_generation", snap.SessionGen,
 				"inspection_session_epoch", snap.Epoch,
-				"inspection_connection_generation", gen,
-				"inspection_connected", w.e.gens.Connected(w.serial),
+				"inspection_online", w.e.control.Online(w.serial),
 				"inspection_state", snap.State)...)
 		}
 		return w.degrade(ReasonAwaitingTelemetry, "printer disconnected", w.e.kStalePoll, false)
@@ -1310,28 +1297,22 @@ func (w *worker) inspect(ctx context.Context, snap telemetry.SessionView) time.D
 		layer = cur.CurrentLayer()
 	}
 	// Capture-time recheck: the world moved while the camera waited. The
-	// frame may only upload against the print and connection it was
-	// captured for: the pool generation must still match the generation
-	// captured at entry (command transport protection: a reconnect must not
-	// ride a restated state), the current view must keep the same print
-	// session and epoch, the full entry authorization must still hold for
-	// the current view — authorized covers a live connection on the
-	// captured generation with RUNNING — and the layer the frame captured
-	// must be known and positive. onResult would discard such a result
-	// anyway; catching it here also keeps the request from happening.
+	// frame may only upload against the print it was captured for: the
+	// current view must keep the same print session and epoch, the full
+	// entry authorization must still hold for the current view, and the
+	// layer the frame captured must be known and positive. onResult would
+	// discard such a result anyway; catching it here also keeps the
+	// request from happening.
 	if !ok ||
-		w.e.gens.Generation(w.serial) != gen ||
 		cur.Epoch != snap.Epoch || cur.SessionGen != snap.SessionGen ||
-		!w.authorized(cur, gen) ||
+		!w.authorized(cur) ||
 		layerValue(layer) <= 0 {
 		if w.log.Enabled(context.Background(), slog.LevelDebug) {
 			w.log.Debug("detection inspection deferred", append(w.diagnosticAttrs(),
 				"operation", "process", "reason", "print_changed_during_capture",
 				"inspection_epoch", snap.Epoch, "current_epoch", cur.Epoch,
 				"current_session_generation", cur.SessionGen,
-				"current_connection_generation", w.e.gens.Generation(w.serial),
-				"captured_connection_generation", gen,
-				"current_connected", w.e.gens.Connected(w.serial),
+				"current_online", w.e.control.Online(w.serial),
 				"current_layer", layerValue(layer))...)
 		}
 		return w.degrade(ReasonAwaitingTelemetry, "print changed during camera capture", w.e.kStalePoll, false)
@@ -1343,7 +1324,7 @@ func (w *worker) inspect(ctx context.Context, snap telemetry.SessionView) time.D
 
 	if !w.hasSession() {
 		rctx, cancel := context.WithTimeout(wctx, requestTimeout)
-		rctx, detail := w.gadgetRequestContext(rctx, "create_context", snap, gen, &frame, layer)
+		rctx, detail := w.gadgetRequestContext(rctx, "create_context", snap, &frame, layer)
 		started := time.Now()
 		session, err := w.e.client.CreateContext(rctx)
 		cancel()
@@ -1368,7 +1349,6 @@ func (w *worker) inspect(ctx context.Context, snap telemetry.SessionView) time.D
 		w.mu.Unlock()
 		w.log.Info("gadget context created", "operation", "create",
 			"session_generation", snap.SessionGen,
-			"connection_generation", gen,
 			"frame_sequence", frame.Seq,
 			"inspection_reason", detail.inspectionReason,
 			"duration_ms", time.Since(started).Milliseconds())
@@ -1377,7 +1357,7 @@ func (w *worker) inspect(ctx context.Context, snap telemetry.SessionView) time.D
 
 	url := w.sessionURL()
 	rctx, cancel := context.WithTimeout(wctx, requestTimeout)
-	rctx, detail := w.gadgetRequestContext(rctx, "process", snap, gen, &frame, layer)
+	rctx, detail := w.gadgetRequestContext(rctx, "process", snap, &frame, layer)
 	w.publish(func(s *Status) { s.Processing = true })
 	started := time.Now()
 	res, err := w.e.client.Process(rctx, url, frame.JPEG)
@@ -1416,7 +1396,7 @@ func (w *worker) inspect(ctx context.Context, snap telemetry.SessionView) time.D
 	// The session ended or changed while the request was in flight: onResult
 	// discards the stale result, but valid response timing still paces this
 	// same print context.
-	accepted := w.onResult(snap, gen, frame, res, layer, startGen)
+	accepted := w.onResult(snap, frame, res, layer, startGen)
 	delay := w.scheduleResponse(res.Intervals)
 	if w.log.Enabled(context.Background(), slog.LevelDebug) {
 		w.log.Debug("gadget response cadence scheduled", append(w.responseCadenceAttrs(delay),
@@ -1438,7 +1418,7 @@ func (w *worker) responseCadenceAttrs(delay time.Duration) []any {
 	}
 	return []any{
 		"session_generation", w.sessionGen,
-		"connection_generation", w.e.gens.Generation(w.serial),
+		"online", w.e.control.Online(w.serial),
 		"using_fallback", w.useFallback,
 		"cadence_source", source,
 		"provider_minimum_interval_seconds", w.latestIntervals.Minimum,
@@ -1576,9 +1556,9 @@ func (w *worker) intensiveLocked(now time.Time) bool {
 
 // authorized reports whether the printer's live connection authorizes
 // action for this printer right now. Printer data is usable while the
-// upstream connection is live; report gaps never gate authorization.
-func (w *worker) authorized(snap telemetry.SessionView, gen uint64) bool {
-	return gen != 0 && w.e.gens.Connected(w.serial) && w.e.gens.Generation(w.serial) == gen && isRunning(snap.State)
+// printer link is online; report gaps never gate authorization.
+func (w *worker) authorized(snap telemetry.SessionView) bool {
+	return w.e.control.Online(w.serial) && isRunning(snap.State)
 }
 
 // resetSpeedState drops every profile decision tied to one print.
@@ -1587,7 +1567,6 @@ func (w *worker) resetSpeedState(sessionGen uint64) {
 	w.speedAttempted = false
 	w.speedPrior = nil
 	w.speedPrintGen = sessionGen
-	w.speedCommandGen = 0
 	w.speedCommandObs = 0
 	w.speedAckObs = 0
 	w.speedPending = false
@@ -1603,19 +1582,19 @@ func (w *worker) ensureSpeedSession(snap telemetry.SessionView) {
 }
 
 // freshSpeed reports a profile reported for an active print while the
-// upstream connection is live.
-func (w *worker) freshSpeed(snap telemetry.SessionView, gen uint64) bool {
-	return gen != 0 && w.e.gens.Connected(w.serial) && snap.Active && snap.SessionGen != 0 && snap.SpeedProfile != nil
+// printer link is online.
+func (w *worker) freshSpeed(snap telemetry.SessionView) bool {
+	return w.e.control.Online(w.serial) && snap.Active && snap.SessionGen != 0 && snap.SpeedProfile != nil
 }
 
 // speedAuthorized rechecks the same print, state, connection, and result
 // freshness required for a printer action, plus a current speed report.
-func (w *worker) speedAuthorized(snap telemetry.SessionView, gen uint64, frame Frame) (telemetry.SessionView, bool) {
-	if !w.pauseAuthorized(snap, gen, frame) {
+func (w *worker) speedAuthorized(snap telemetry.SessionView, frame Frame) (telemetry.SessionView, bool) {
+	if !w.pauseAuthorized(snap, frame) {
 		return telemetry.SessionView{}, false
 	}
 	current, ok := w.e.sessions.Session(w.serial)
-	if !ok || !w.freshSpeed(current, gen) || current.Epoch != snap.Epoch {
+	if !ok || !w.freshSpeed(current) || current.Epoch != snap.Epoch {
 		return telemetry.SessionView{}, false
 	}
 	return current, true
@@ -1633,24 +1612,15 @@ func (w *worker) reconcileSpeed(snap telemetry.SessionView) {
 		return
 	}
 	snap = current
-	gen := w.e.gens.Generation(w.serial)
-	if !w.freshSpeed(snap, gen) {
+	if !w.freshSpeed(snap) {
 		return
 	}
 	profile := *snap.SpeedProfile
-	if w.speedPending {
-		if gen != w.speedCommandGen {
-			w.relinquishSpeed("upstream connection changed before confirmation")
-			return
-		}
-		if snap.SpeedObs > w.speedCommandObs {
-			if profile == 1 {
-				w.speedPending = false
-				w.speedOwned = true
-				w.speedAckObs = snap.SpeedObs
-				w.log.Info("warning speed override confirmed", "profile", 1)
-			}
-		}
+	if w.speedPending && snap.SpeedObs > w.speedCommandObs && profile == 1 {
+		w.speedPending = false
+		w.speedOwned = true
+		w.speedAckObs = snap.SpeedObs
+		w.log.Info("warning speed override confirmed", "profile", 1)
 	}
 	if w.speedOwned && snap.SpeedObs > w.speedAckObs && profile != 1 {
 		w.relinquishSpeed("printer reported a manual profile change")
@@ -1662,14 +1632,13 @@ func (w *worker) reconcileSpeed(snap telemetry.SessionView) {
 	w.mu.Lock()
 	pausePending := w.pauseState == PausePending
 	w.mu.Unlock()
-	if pausePending || w.speedPrior == nil || w.speedPrintGen != snap.SessionGen ||
-		gen == 0 || !w.e.gens.Connected(w.serial) || w.e.gens.Generation(w.serial) != gen {
+	if pausePending || w.speedPrior == nil || w.speedPrintGen != snap.SessionGen || !w.e.control.Online(w.serial) {
 		return
 	}
 	prior := *w.speedPrior
-	if err := w.e.control.SetSpeedProfile(w.serial, gen, prior); err != nil {
+	if err := w.e.control.Speed(w.serial, prior); err != nil {
 		w.log.Warn("warning speed restore failed; not retrying", "reason",
-			"guarded print-speed command was rejected; check LAN control and the current printer connection")
+			"print-speed command was rejected; check LAN control and the current printer connection")
 	} else {
 		w.log.Info("warning speed profile restored", "profile", prior)
 	}
@@ -1689,7 +1658,7 @@ func (w *worker) relinquishSpeed(reason string) {
 // applyWarningSpeed starts or clears a warning episode and issues at most
 // one Silent command in that episode. Pause suggestions take precedence.
 // The caller holds controlMu after accepting the result.
-func (w *worker) applyWarningSpeed(snap telemetry.SessionView, gen uint64, frame Frame, res Result) {
+func (w *worker) applyWarningSpeed(snap telemetry.SessionView, frame Frame, res Result) {
 	w.ensureSpeedSession(snap)
 	if res.WarningSuggested {
 		if !w.warningEpisode {
@@ -1713,7 +1682,7 @@ func (w *worker) applyWarningSpeed(snap telemetry.SessionView, gen uint64, frame
 			w.speedAttempted = true
 			return
 		}
-		current, ok := w.speedAuthorized(snap, gen, frame)
+		current, ok := w.speedAuthorized(snap, frame)
 		if !ok {
 			return
 		}
@@ -1725,12 +1694,11 @@ func (w *worker) applyWarningSpeed(snap telemetry.SessionView, gen uint64, frame
 		}
 		w.speedPrior = &profile
 		w.speedPrintGen = current.SessionGen
-		w.speedCommandGen = gen
 		w.speedCommandObs = current.SpeedObs
-		if err := w.e.control.SetSpeedProfile(w.serial, gen, 1); err != nil {
+		if err := w.e.control.Speed(w.serial, 1); err != nil {
 			w.speedPrior = nil
 			w.log.Warn("warning speed override failed; not retrying this warning episode", "reason",
-				"guarded print-speed command was rejected; check LAN control and the current printer connection")
+				"print-speed command was rejected; check LAN control and the current printer connection")
 			return
 		}
 		w.speedPending = true
@@ -1779,11 +1747,11 @@ func (w *worker) sessionURL() string {
 // the latch, speed ownership, or the published analysis. A discarded
 // response still counts as transport success, so the temporary-failure
 // counter resets. It returns false when the result was discarded.
-func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, res Result, layer *int, workGen uint64) bool {
+func (w *worker) onResult(snap telemetry.SessionView, frame Frame, res Result, layer *int, workGen uint64) bool {
 	if current, ok := w.e.sessions.Session(w.serial); !ok || !current.Active || current.Epoch != snap.Epoch {
 		w.log.Info("inspection result discarded; print session changed during upload",
 			"operation", "process", "session_generation", snap.SessionGen,
-			"session_epoch", snap.Epoch, "connection_generation", gen,
+			"session_epoch", snap.Epoch,
 			"frame_sequence", frame.Seq, "reason", "print_session_changed")
 		return false
 	}
@@ -1799,7 +1767,7 @@ func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, r
 		w.controlMu.Unlock()
 		w.log.Info("inspection result discarded; detection availability changed during upload",
 			"operation", "process", "session_generation", snap.SessionGen,
-			"session_epoch", snap.Epoch, "connection_generation", gen,
+			"session_epoch", snap.Epoch,
 			"frame_sequence", frame.Seq, "reason", "detection_availability_changed")
 		return false
 	}
@@ -1809,7 +1777,7 @@ func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, r
 		w.controlMu.Unlock()
 		w.log.Info("inspection result discarded; print session changed during upload",
 			"operation", "process", "session_generation", snap.SessionGen,
-			"session_epoch", snap.Epoch, "connection_generation", gen,
+			"session_epoch", snap.Epoch,
 			"frame_sequence", frame.Seq, "reason", "print_session_changed")
 		return false
 	}
@@ -1818,14 +1786,14 @@ func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, r
 	// risk counters, clear counters, the degraded condition, resultAt, the
 	// pause latch, and speed ownership untouched; only the transport
 	// success resets tempAttempts.
-	if reason := w.pauseAuthorizationReason(snap, gen, frame); reason != "" {
+	if reason := w.pauseAuthorizationReason(snap, frame); reason != "" {
 		w.mu.Lock()
 		w.tempAttempts = 0
 		w.mu.Unlock()
 		w.controlMu.Unlock()
 		w.log.Info("inspection result discarded; evidence rejected",
 			"operation", "process", "session_generation", snap.SessionGen,
-			"session_epoch", snap.Epoch, "connection_generation", gen,
+			"session_epoch", snap.Epoch,
 			"frame_sequence", frame.Seq, "reason", reason)
 		return false
 	}
@@ -1871,38 +1839,38 @@ func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, r
 	attempted := false
 	authorizationReason := "pause_not_suggested"
 	if pauseWanted {
-		authorizationReason = w.pauseAuthorizationReason(snap, gen, frame)
+		authorizationReason = w.pauseAuthorizationReason(snap, frame)
 		pauseAuthorized = authorizationReason == ""
 	} else if res.PauseSuggested {
 		authorizationReason = "pause_latched_until_clear"
 	}
 	if pauseWanted {
 		if pauseAuthorized {
-			err := w.e.control.PausePrint(w.serial, gen)
+			err := w.e.control.Pause(w.serial)
 			attempted = true
 			if err != nil {
-				// Guarded and final: never retried, never replayed.
+				// Final: never retried, never replayed.
 				pauseState = PauseUnconfirmed
 				reason = ReasonPauseFailed
 				message = "pause command failed: " + err.Error()
 				w.log.Warn("pause command rejected", "operation", "pause",
 					"session_generation", snap.SessionGen, "session_epoch", snap.Epoch,
-					"connection_generation", gen, "frame_sequence", frame.Seq,
+					"frame_sequence", frame.Seq,
 					"quality", res.PrintQuality, "error", err.Error())
 			} else {
 				pauseState = PausePending
 				message = "pause sent; waiting for printer confirmation"
 				w.log.Warn("pause command published", "operation", "pause",
 					"session_generation", snap.SessionGen, "session_epoch", snap.Epoch,
-					"connection_generation", gen, "frame_sequence", frame.Seq,
+					"frame_sequence", frame.Seq,
 					"quality", res.PrintQuality)
 			}
 		} else {
 			// The print changed while the request was in flight (PAUSE to
-			// RUNNING, a reconnect, or a disconnect): discard the result.
+			// RUNNING or a disconnect): discard the result.
 			w.log.Info("pause suggestion discarded; print state changed during inspection",
 				"operation", "pause", "session_generation", snap.SessionGen,
-				"session_epoch", snap.Epoch, "connection_generation", gen,
+				"session_epoch", snap.Epoch,
 				"frame_sequence", frame.Seq, "reason", authorizationReason)
 		}
 	}
@@ -1920,7 +1888,7 @@ func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, r
 	if w.log.Enabled(context.Background(), slog.LevelDebug) {
 		w.log.Debug("gadget action evaluated", "operation", "process",
 			"decision", decision, "session_generation", snap.SessionGen,
-			"session_epoch", snap.Epoch, "connection_generation", gen,
+			"session_epoch", snap.Epoch,
 			"frame_sequence", frame.Seq,
 			"frame_age_ms", w.e.now().Sub(frame.Captured).Milliseconds(),
 			"print_quality", res.PrintQuality,
@@ -1954,7 +1922,7 @@ func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, r
 	}
 	w.resultAt = w.e.now()
 	w.mu.Unlock()
-	w.applyWarningSpeed(snap, gen, frame, res)
+	w.applyWarningSpeed(snap, frame, res)
 	w.controlMu.Unlock()
 
 	w.publish(func(s *Status) {
@@ -1991,8 +1959,8 @@ func (w *worker) onResult(snap telemetry.SessionView, gen uint64, frame Frame, r
 
 // pauseAuthorized re-validates every action precondition after the upload
 // returns: same session epoch (so a PAUSE to RUNNING transition during the
-// in-flight request cancels the pause), still running on a live connection
-// at the same connection generation, and a still-recent frame.
+// in-flight request cancels the pause), still running on a live connection,
+// and a still-recent frame.
 func layerValue(layer *int) int {
 	if layer == nil {
 		return 0
@@ -2000,7 +1968,7 @@ func layerValue(layer *int) int {
 	return *layer
 }
 
-func (w *worker) pauseAuthorizationReason(snap telemetry.SessionView, gen uint64, frame Frame) string {
+func (w *worker) pauseAuthorizationReason(snap telemetry.SessionView, frame Frame) string {
 	if w.e.now().Sub(frame.Captured) > w.e.kResultValidity {
 		return "inspection_frame_expired"
 	}
@@ -2008,25 +1976,20 @@ func (w *worker) pauseAuthorizationReason(snap telemetry.SessionView, gen uint64
 	if !ok || !current.Active {
 		return "no_active_print_session"
 	}
-	nowGen := w.e.gens.Generation(w.serial)
 	switch {
 	case current.Epoch != snap.Epoch:
 		return "print_session_changed"
 	case !isRunning(current.State):
 		return "printer_not_running"
-	case nowGen != gen || gen == 0:
-		// Command transport protection: the connection changed after the
-		// captured generation was read.
-		return "connection_generation_changed"
-	case !w.e.gens.Connected(w.serial):
+	case !w.e.control.Online(w.serial):
 		return "printer_disconnected"
 	default:
 		return ""
 	}
 }
 
-func (w *worker) pauseAuthorized(snap telemetry.SessionView, gen uint64, frame Frame) bool {
-	return w.pauseAuthorizationReason(snap, gen, frame) == ""
+func (w *worker) pauseAuthorized(snap telemetry.SessionView, frame Frame) bool {
+	return w.pauseAuthorizationReason(snap, frame) == ""
 }
 
 // handleFailure classifies an API or transport failure: terminal account

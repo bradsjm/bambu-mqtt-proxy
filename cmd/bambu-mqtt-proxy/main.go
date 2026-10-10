@@ -33,10 +33,10 @@ import (
 	"bambu-mqtt-proxy/internal/pandabreath"
 	"bambu-mqtt-proxy/internal/pandapwr"
 	"bambu-mqtt-proxy/internal/platecheck"
+	"bambu-mqtt-proxy/internal/printer"
 	"bambu-mqtt-proxy/internal/routing"
 	"bambu-mqtt-proxy/internal/safety"
 	"bambu-mqtt-proxy/internal/telemetry"
-	"bambu-mqtt-proxy/internal/upstream"
 )
 
 func main() {
@@ -112,21 +112,20 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	}
 	table := routing.NewTable(serials, aliases)
 	inject := broker.NewInjector(logger)
-	pool := upstream.NewPool(cfg.Printers, inject, cfg.Behavior, logger)
 	activities := activity.New(cfg.Printers)
-	pool.SetConnectivityObserver(func(serial string, connected bool, err error) {
-		if connected {
-			activities.Record(serial, "connected", activity.Info, "Printer connected")
-			return
-		}
-		activities.Record(serial, "disconnected", activity.Warning, "Printer connection lost, reconnecting")
-	})
-	// Telemetry observes upstream reports without changing forwarding. The
-	// wrapper stamps each report with its per-connection delivery order and
-	// the connection generation it arrived on, read before the merge, so
-	// detection can never treat a pre-reconnect observation as current.
 	state := telemetry.NewCache(cfg.Printers, logger)
 	state.SetActivity(activities)
+	links := printer.New(cfg.Printers, logger, func(serial, topic string, payload []byte) {
+		inject.PublishDownstream(topic, payload)
+		state.Observe(serial, payload)
+	}, func(serial string, online bool) {
+		state.SetConnected(map[string]bool{serial: online})
+		if online {
+			activities.Record(serial, "connected", activity.Info, "Printer connected")
+		} else {
+			activities.Record(serial, "disconnected", activity.Warning, "Printer connection lost, reconnecting")
+		}
+	})
 	// Panda Breath accessory chamber readings: one read-only WebSocket per
 	// printer configured with a panda_breath address, for models whose
 	// reports carry no usable chamber sensor. The wall and MCP project the
@@ -147,10 +146,7 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	}
 	// Printer controls: the only allow-listed path from the camera wall and
 	// MCP to printer commands. No heater or temperature command exists.
-	controls := control.New(pool, state, activities)
-	pool.SetObserver(func(serial string, seq, gen uint64, payload []byte) {
-		state.ObserveReport(serial, seq, gen, payload)
-	})
+	controls := control.New(links, state, activities)
 	// Printer job preview: one best-effort FTPS retrieval of the current
 	// print's sliced 3MF render and metadata per settled job, shared by the
 	// camera wall and MCP. It serves through the shared HTTP listener and
@@ -159,7 +155,7 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	// leave the consumer side truly nil.
 	var previews *jobpreview.Service
 	if cfg.HTTP.Port > 0 && (cfg.CameraEnabled() || cfg.MCPEnabled()) {
-		previews = jobpreview.New(cfg.Printers, state, pool, logger)
+		previews = jobpreview.New(cfg.Printers, state, links, logger)
 		previews.SetActivity(activities)
 	}
 
@@ -178,7 +174,7 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		} else {
 			cameras = camera.NewManager(cfg.Printers, logger)
 		}
-		renderer = camera.NewStatusRenderer(cameras, state, pool)
+		renderer = camera.NewStatusRenderer(cameras, state, links)
 		renderer.SetActivity(activities)
 		renderer.SetControl(controls)
 	}
@@ -195,11 +191,11 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	if detectionSettings.On() {
 		client := detection.NewGadgetClient(detectionSettings.Key())
 		if !cfg.CameraEnabled() {
-			detector = detection.New(cfg.Printers, client, detection.IdleFrames{}, state, pool, pool, logger)
+			detector = detection.New(cfg.Printers, client, detection.IdleFrames{}, state, links, logger)
 			detector.SetBlocked(detection.ReasonCameraDisabled)
 			logger.Warn("detection blocked: the camera feature is disabled")
 		} else {
-			detector = detection.New(cfg.Printers, client, detection.CameraFrames(cameras), state, pool, pool, logger)
+			detector = detection.New(cfg.Printers, client, detection.CameraFrames(cameras), state, links, logger)
 			logger.Info("octoeverywhere detection enabled")
 		}
 		detector.SetActivity(activities)
@@ -217,11 +213,11 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 			client = platecheck.NewClient(plateSettings, logger)
 		}
 		if !cfg.CameraEnabled() {
-			plates = platecheck.New(cfg.Printers, plateSettings, client, platecheck.IdleFrames{}, state, pool, logger)
+			plates = platecheck.New(cfg.Printers, plateSettings, client, platecheck.IdleFrames{}, state, links, logger)
 			plates.SetBlocked(platecheck.ReasonCameraDisabled)
 			logger.Warn("plate check blocked: the camera feature is disabled")
 		} else {
-			plates = platecheck.New(cfg.Printers, plateSettings, client, platecheck.CameraFrames(cameras), state, pool, logger)
+			plates = platecheck.New(cfg.Printers, plateSettings, client, platecheck.CameraFrames(cameras), state, links, logger)
 		}
 		plates.SetActivity(activities)
 	}
@@ -230,7 +226,7 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	firstLayers := firstlayer.New(cfg.Printers, state, activities)
 	// Optional Pushover print notifications. The notifier registers as an
 	// activity observer before the broker serves, so entries recorded
-	// during startup reach it; upstream connections are lazy.
+	// during startup reach it.
 	var notifier *notification.Service
 	notificationSettings, err := notification.SettingsOf(cfg)
 	if err != nil {
@@ -249,7 +245,7 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		return nil, fmt.Errorf("safety settings: %w", err)
 	}
 	if safetySettings.Enabled {
-		safe = safety.New(cfg.Printers, state, pool, activities, notificationSettings, logger)
+		safe = safety.New(cfg.Printers, state, links, activities, notificationSettings, logger)
 	}
 
 	// Optional modules start in order: notifications, job preview, Panda
@@ -316,8 +312,7 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		deps := mcpserver.Deps{
 			Printers:     cfg.Printers,
 			State:        state,
-			Connectivity: pool,
-			Generations:  pool,
+			Connectivity: links,
 			Activity:     activities,
 			Control:      controls,
 			Modules:      mods,
@@ -329,7 +324,7 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		mcpsrv = mcpserver.New(deps)
 	}
 
-	srv, err := broker.New(cfg, table, pool, inject, logger)
+	srv, err := broker.New(cfg, table, links, inject, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -337,7 +332,7 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	// Serve is non-blocking: it starts listeners and the event loop, then
 	// returns. Block on signals instead.
 	if err := srv.Serve(); err != nil {
-		pool.Stop()
+		links.Close()
 		_ = srv.Close()
 		return nil, fmt.Errorf("broker: %w", err)
 	}
@@ -347,8 +342,8 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	// MCP and HTTP stop first, then started modules stop in reverse order:
 	// safety, first-layer completion, plate check, detection, Panda PWR,
 	// Panda Breath, job preview, notifications. Their consumers end before
-	// the modules and the cameras and pool they read. The raw listener
-	// stops next, before camera captures, the pool, and the broker.
+	// the modules and the cameras and links they read. The raw listener
+	// stops next, before camera captures, the links, and the broker.
 	// Modules whose Start never ran must not receive Stop.
 	var httpSrv *httpsrv.Server
 	var raw *camera.RawServer
@@ -376,7 +371,7 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		if cameras != nil {
 			cameras.Close()
 		}
-		pool.Stop()
+		links.Close()
 		_ = srv.Close()
 	}()
 
@@ -393,23 +388,13 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		logger.Info("raw camera endpoint serving", "port", camera.Port)
 	}
 
-	// Start modules in declaration order only after the broker serves, the
-	// teardown is installed, and the raw camera listener is ready.
-	needsReports := (cfg.CameraEnabled() && cfg.HTTP.Port > 0) || cfg.MCPEnabled()
+	// Start printer links at boot before modules, without waiting for printers.
+	links.Start()
+	// Start modules after the broker and camera listener are ready.
 	for _, mod := range mods {
 		if mod.Start != nil {
 			mod.Start()
 			started = append(started, mod)
-			needsReports = needsReports || mod.NeedsReports
-		}
-	}
-
-	// Hold one report interest per printer when the camera wall, MCP, or a
-	// started module consumes live state. Async interest survives offline
-	// printers and is restored by the supervisor on each reconnect.
-	if needsReports {
-		for _, p := range cfg.Printers {
-			pool.SubscribeAsync(p.Serial, fmt.Sprintf("device/%s/report", p.Serial))
 		}
 	}
 
@@ -422,7 +407,7 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 				sections[mod.Name] = mod.StatusValue
 			}
 		}
-		health.Routes(httpSrv.Mux(), pool, sections)
+		health.Routes(httpSrv.Mux(), links, sections)
 		store.Register(httpSrv.Mux())
 		if mcpsrv != nil {
 			mcpsrv.Register(httpSrv.Mux())
@@ -457,10 +442,10 @@ func serveSetup(sigCtx context.Context, cfg *config.Config, path string, store *
 		return nil, fmt.Errorf("no printers configured in %q, and HTTP is disabled (http.port: 0); "+
 			"add printers on the configuration page", path)
 	}
-	pool := upstream.NewPool(nil, nil, cfg.Behavior, logger)
-	defer pool.Stop()
+	links := printer.New(nil, logger, nil, nil)
+	defer links.Close()
 	httpSrv := httpsrv.New(cfg.HTTP.Port, logger)
-	health.Routes(httpSrv.Mux(), pool, nil)
+	health.Routes(httpSrv.Mux(), links, nil)
 	store.Register(httpSrv.Mux())
 	httpSrv.Mux().Handle("GET /{$}", http.RedirectHandler("/config", http.StatusFound))
 	if err := httpSrv.Start(); err != nil {

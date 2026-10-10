@@ -11,7 +11,7 @@ import (
 	"bambu-mqtt-proxy/internal/telemetry"
 )
 
-// cacheReport builds one upstream report payload from key/value pairs.
+// cacheReport builds one printer report payload from key/value pairs.
 func cacheReport(t *testing.T, kv map[string]any) []byte {
 	t.Helper()
 	raw, err := json.Marshal(map[string]any{"print": kv})
@@ -23,9 +23,9 @@ func cacheReport(t *testing.T, kv map[string]any) []byte {
 
 // TestCacheSourceJobGenerationAdvancesWithoutNewSession is a regression for
 // the session-only provenance finding, run against a real telemetry.Cache:
-// a changed positive gcode_start_time on the same connection and the same
-// project/task/name cookie advances Job.Generation while SessionGen and
-// Epoch stay unchanged. The scenario:
+// a changed positive gcode_start_time on the same project/task/name cookie
+// advances Job.Generation while SessionGen and Epoch stay unchanged. The
+// scenario:
 //
 //  1. Job A starts at layer 1 and the service arms on the A pair (job 1,
 //     session 1).
@@ -49,7 +49,7 @@ func TestCacheSourceJobGenerationAdvancesWithoutNewSession(t *testing.T) {
 	var session printSession
 
 	// Job A starts on the bed and reports its first layer.
-	cache.ObserveReport("S1", 1, 5, cacheReport(t, map[string]any{
+	cache.Observe("S1", cacheReport(t, map[string]any{
 		"gcode_state": "RUNNING", "project_id": 1, "task_id": 2, "subtask_name": "a.3mf",
 		"gcode_start_time": 1000.0, "layer_num": 1.0, "mc_percent": 5.0,
 	}))
@@ -70,7 +70,7 @@ func TestCacheSourceJobGenerationAdvancesWithoutNewSession(t *testing.T) {
 	}
 
 	// Job A reaches layer 2: the service records with A's job evidence.
-	cache.ObserveReport("S1", 2, 5, cacheReport(t, map[string]any{
+	cache.Observe("S1", cacheReport(t, map[string]any{
 		"layer_num": 2.0, "mc_percent": 6.0,
 	}))
 	obsA, ok := svc.sample("S1", &session)
@@ -83,9 +83,9 @@ func TestCacheSourceJobGenerationAdvancesWithoutNewSession(t *testing.T) {
 	}
 	log.RecordObserved("S1", "first_layer_complete", activity.Info, "First layer complete", obsA)
 
-	// A new job arrives inside the same session: same connection, same
+	// A new job arrives inside the same session: same
 	// project/task/name cookie, only gcode_start_time changes.
-	cache.ObserveReport("S1", 3, 5, cacheReport(t, map[string]any{
+	cache.Observe("S1", cacheReport(t, map[string]any{
 		"gcode_start_time": 2000.0, "mc_percent": 7.0,
 	}))
 	jobB, _ := cache.Job("S1")
@@ -104,7 +104,7 @@ func TestCacheSourceJobGenerationAdvancesWithoutNewSession(t *testing.T) {
 	}
 
 	// Job B is far past layer 1: still no evidence, and no second event.
-	cache.ObserveReport("S1", 4, 5, cacheReport(t, map[string]any{
+	cache.Observe("S1", cacheReport(t, map[string]any{
 		"layer_num": 3.0, "mc_percent": 8.0,
 	}))
 	if _, ok := svc.sample("S1", &session); ok {
@@ -116,13 +116,13 @@ func TestCacheSourceJobGenerationAdvancesWithoutNewSession(t *testing.T) {
 
 	// Job B observes layer 1 and then layer 2 under the unchanged session
 	// identity and records its own event.
-	cache.ObserveReport("S1", 5, 5, cacheReport(t, map[string]any{
+	cache.Observe("S1", cacheReport(t, map[string]any{
 		"layer_num": 1.0, "mc_percent": 9.0,
 	}))
 	if _, ok := svc.sample("S1", &session); ok {
 		t.Fatal("arming sample for job B returned evidence")
 	}
-	cache.ObserveReport("S1", 6, 5, cacheReport(t, map[string]any{
+	cache.Observe("S1", cacheReport(t, map[string]any{
 		"layer_num": 2.0, "mc_percent": 10.0,
 	}))
 	obsB, ok := svc.sample("S1", &session)
@@ -175,7 +175,7 @@ func TestCacheSourceStickyLayerCannotArmReplacementJob(t *testing.T) {
 	var session printSession
 
 	// Job A starts on the bed and reports its first layer.
-	cache.ObserveReport("S1", 1, 5, cacheReport(t, map[string]any{
+	cache.Observe("S1", cacheReport(t, map[string]any{
 		"gcode_state": "RUNNING", "project_id": 1, "task_id": 2, "subtask_name": "a.3mf",
 		"gcode_start_time": 1000.0, "layer_num": 1.0, "mc_percent": 5.0,
 	}))
@@ -197,7 +197,7 @@ func TestCacheSourceStickyLayerCannotArmReplacementJob(t *testing.T) {
 
 	// The same-cookie boundary: only gcode_start_time changes, and the
 	// report carries no layer_num.
-	cache.ObserveReport("S1", 2, 5, cacheReport(t, map[string]any{
+	cache.Observe("S1", cacheReport(t, map[string]any{
 		"gcode_start_time": 2000.0, "mc_percent": 7.0,
 	}))
 	jobB, _ := cache.Job("S1")
@@ -228,7 +228,7 @@ func TestCacheSourceStickyLayerCannotArmReplacementJob(t *testing.T) {
 	}
 
 	// Job B reports RUNNING at layer 3 without ever observing layer 1.
-	cache.ObserveReport("S1", 3, 5, cacheReport(t, map[string]any{
+	cache.Observe("S1", cacheReport(t, map[string]any{
 		"gcode_state": "RUNNING", "layer_num": 3.0, "mc_percent": 8.0,
 	}))
 	sessionB3, _ := cache.Session("S1")
@@ -265,7 +265,7 @@ func TestCacheSourceReplacementJobRereportsOwnLayerAndCompletes(t *testing.T) {
 	var session printSession
 
 	// Job A arms on its first layer.
-	cache.ObserveReport("S1", 1, 5, cacheReport(t, map[string]any{
+	cache.Observe("S1", cacheReport(t, map[string]any{
 		"gcode_state": "RUNNING", "project_id": 1, "task_id": 2, "subtask_name": "a.3mf",
 		"gcode_start_time": 1000.0, "layer_num": 1.0, "mc_percent": 5.0,
 	}))
@@ -275,7 +275,7 @@ func TestCacheSourceReplacementJobRereportsOwnLayerAndCompletes(t *testing.T) {
 	sessionA, _ := cache.Session("S1")
 
 	// The metadata-only boundary: gcode_start_time alone.
-	cache.ObserveReport("S1", 2, 5, cacheReport(t, map[string]any{
+	cache.Observe("S1", cacheReport(t, map[string]any{
 		"gcode_start_time": 2000.0,
 	}))
 	jobB, _ := cache.Job("S1")
@@ -306,7 +306,7 @@ func TestCacheSourceReplacementJobRereportsOwnLayerAndCompletes(t *testing.T) {
 	}
 
 	// Job B reports its own layer 1 inside its own generation and arms.
-	cache.ObserveReport("S1", 3, 5, cacheReport(t, map[string]any{
+	cache.Observe("S1", cacheReport(t, map[string]any{
 		"layer_num": 1.0, "mc_percent": 9.0,
 	}))
 	sessionB1, _ := cache.Session("S1")
@@ -321,7 +321,7 @@ func TestCacheSourceReplacementJobRereportsOwnLayerAndCompletes(t *testing.T) {
 	}
 
 	// Job B reaches layer 2 and records its own event exactly once.
-	cache.ObserveReport("S1", 4, 5, cacheReport(t, map[string]any{
+	cache.Observe("S1", cacheReport(t, map[string]any{
 		"layer_num": 2.0, "mc_percent": 10.0,
 	}))
 	obsB, ok := svc.sample("S1", &session)

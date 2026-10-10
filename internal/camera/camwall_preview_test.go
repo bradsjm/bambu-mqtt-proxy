@@ -82,11 +82,11 @@ func statusTiles(t *testing.T, r *StatusRenderer) []Tile {
 	return payload.Printers
 }
 
-// observeReport merges one upstream report into the cache the way the pool
-// observer does, on transport generation 7.
-func observeReport(t *testing.T, state *telemetry.Cache, seq uint64, payload string) {
+// observeReport merges one printer report into the cache the way the link
+// observer does.
+func observeReport(t *testing.T, state *telemetry.Cache, payload string) {
 	t.Helper()
-	state.ObserveReport("01S00C351100139", seq, 7, []byte(payload))
+	state.Observe("01S00C351100139", []byte(payload))
 }
 
 // TestTilesNoPreviewModuleWithoutModuleState requires the nil-module path:
@@ -152,7 +152,7 @@ func TestPreviewStateFollowsLiveProjection(t *testing.T) {
 		return st
 	}
 
-	observeReport(t, state, 1, `{"print":{"gcode_state":"RUNNING","subtask_name":"benchy.3mf"}}`)
+	observeReport(t, state, `{"print":{"gcode_state":"RUNNING","subtask_name":"benchy.3mf"}}`)
 	st := decode()
 	if st.JobPreview.Status != jobpreview.StatusPending || !st.JobPreview.Current || st.JobPreview.JobName != "benchy.3mf" {
 		t.Fatalf("active view = %+v, want pending current benchy.3mf", st.JobPreview)
@@ -166,7 +166,7 @@ func TestPreviewStateFollowsLiveProjection(t *testing.T) {
 
 	// The job ends without any attempt: the projection switches to
 	// unavailable and stops claiming current.
-	observeReport(t, state, 2, `{"print":{"gcode_state":"FINISH"}}`)
+	observeReport(t, state, `{"print":{"gcode_state":"FINISH"}}`)
 	st = decode()
 	if st.JobPreview.Status != jobpreview.StatusUnavailable || st.JobPreview.Current || st.JobPreview.Reason != "" {
 		t.Fatalf("finished view = %+v, want unavailable without reason and not current", st.JobPreview)
@@ -178,7 +178,7 @@ func TestPreviewStateFollowsLiveProjection(t *testing.T) {
 // .job_metadata, with job_metadata null before an archive is accepted.
 func TestStatusPayloadCarriesPreviewModuleState(t *testing.T) {
 	renderer, state, _ := newPreviewRenderer(t, true)
-	observeReport(t, state, 1, `{"print":{"gcode_state":"RUNNING","subtask_name":"benchy.3mf"}}`)
+	observeReport(t, state, `{"print":{"gcode_state":"RUNNING","subtask_name":"benchy.3mf"}}`)
 
 	var doc struct {
 		Printers []struct {

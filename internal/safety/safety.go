@@ -96,19 +96,20 @@ var modelLimits = map[string]limits{
 	"X2D":    {370, 135, 80},
 }
 
-// defaultLimits apply to unknown models: the most permissive model limits.
+// defaultLimits apply to unknown models with the most permissive model limits.
 var defaultLimits = limits{370, 135, 80}
 
 // StateSource reads merged printer state. *telemetry.Cache satisfies it.
 type StateSource interface {
 	State(serial string) (telemetry.State, bool)
-	Session(serial string) (telemetry.SessionView, bool)
 }
 
-// Commander sends guarded stop commands. *upstream.Pool satisfies it.
+// Commander sends stop commands and reports printer liveness. *printer.Links satisfies it.
 type Commander interface {
-	Generation(serial string) uint64
-	StopPrint(serial string, generation uint64) error
+	// Online reports whether the printer is connected and subscribed.
+	Online(serial string) bool
+	// Stop sends one stop command.
+	Stop(serial string) error
 }
 
 // Service checks every printer's temperatures once per second and responds
@@ -151,10 +152,9 @@ func New(printers []config.Printer, state StateSource, cmd Commander, act *activ
 	}
 }
 
-// Module declares the service lifecycle. NeedsReports keeps temperatures
-// live while no MQTT client is connected.
+// Module declares the service lifecycle.
 func (s *Service) Module() module.Module {
-	return module.Module{Name: "safety", Start: s.Start, Stop: s.Stop, NeedsReports: true}
+	return module.Module{Name: "safety", Start: s.Start, Stop: s.Stop}
 }
 
 // Start launches the check loop. The core calls it once.
@@ -188,17 +188,15 @@ func (s *Service) loop() {
 }
 
 // check compares one printer's cached temperatures with its limits while
-// the printer is connected and has reported on the current connection. The
-// latch holds through disconnects and clears only when a connected
-// printer's readings are all below the limits, so a cached over-limit value
-// trips only if the printer reported it and no check has seen it yet.
+// the printer is online. The latch clears only when an online printer's
+// readings are all below the limits, so a cached over-limit value trips
+// only if the printer is still connected and no check has seen it yet.
 func (s *Service) check(p config.Printer) {
-	gen := s.cmd.Generation(p.Serial)
-	st, ok := s.state.State(p.Serial)
-	if !ok {
+	if !s.cmd.Online(p.Serial) {
 		return
 	}
-	if sv, _ := s.state.Session(p.Serial); gen == 0 || sv.ObsGen != gen {
+	st, ok := s.state.State(p.Serial)
+	if !ok {
 		return
 	}
 	probe, value, limit, over := overLimit(st)
@@ -264,7 +262,7 @@ func (s *Service) respond(p config.Printer, probe string, value, limit float64) 
 
 	lines := []string{reason}
 	for _, q := range s.printers {
-		if err := s.cmd.StopPrint(q.Serial, s.cmd.Generation(q.Serial)); err != nil {
+		if err := s.cmd.Stop(q.Serial); err != nil {
 			s.log.Error("safety stop failed", "serial", q.Serial, "error", err)
 			lines = append(lines, "Stop NOT sent to "+q.Serial+": "+err.Error())
 			continue

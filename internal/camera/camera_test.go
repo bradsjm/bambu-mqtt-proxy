@@ -25,12 +25,11 @@ import (
 	"bambu-mqtt-proxy/internal/telemetry"
 )
 
-// testConnectivity is an empty upstream-status source for route tests.
+// testConnectivity is an empty link-status source for route tests.
 type testConnectivity struct{}
 
 // Status returns no connected printers for route tests.
-func (testConnectivity) Status() map[string]bool  { return map[string]bool{} }
-func (testConnectivity) Generation(string) uint64 { return 0 }
+func (testConnectivity) Status() map[string]bool { return map[string]bool{} }
 
 // discardLogger keeps test output quiet.
 func discardLogger() *slog.Logger {
@@ -624,25 +623,24 @@ func TestFrameValidation(t *testing.T) {
 // fakeCommander accepts every command for a connected S1.
 type fakeCommander struct{ sent []string }
 
-func (f *fakeCommander) Status() map[string]bool  { return map[string]bool{"S1": true} }
-func (f *fakeCommander) Generation(string) uint64 { return 1 }
-func (f *fakeCommander) PausePrint(string, uint64) error {
+func (f *fakeCommander) Online(string) bool { return true }
+func (f *fakeCommander) Pause(string) error {
 	f.sent = append(f.sent, "pause")
 	return nil
 }
-func (f *fakeCommander) ResumePrint(string, uint64) error {
+func (f *fakeCommander) Resume(string) error {
 	f.sent = append(f.sent, "resume")
 	return nil
 }
-func (f *fakeCommander) StopPrint(string, uint64) error {
+func (f *fakeCommander) Stop(string) error {
 	f.sent = append(f.sent, "stop")
 	return nil
 }
-func (f *fakeCommander) SetSpeedProfile(string, uint64, int) error {
+func (f *fakeCommander) Speed(string, int) error {
 	f.sent = append(f.sent, "speed")
 	return nil
 }
-func (f *fakeCommander) SetChamberLight(string, uint64, bool) error {
+func (f *fakeCommander) Light(string, bool) error {
 	f.sent = append(f.sent, "light")
 	return nil
 }
@@ -674,13 +672,13 @@ func TestControlEndpoint(t *testing.T) {
 	if w := post(`{"action":"stop","temp":200}`, nil); w.Code != 400 {
 		t.Fatalf("unknown field = %d", w.Code)
 	}
-	if w := post(`{"action":"pause"}`, nil); w.Code != 409 {
-		t.Fatalf("pause on idle = %d", w.Code)
+	if w := post(`{"action":"pause"}`, nil); w.Code != 200 {
+		t.Fatalf("pause on idle = %d, want the printer to decide", w.Code)
 	}
 	if w := post(`{"action":"stop"}`, map[string]string{"Sec-Fetch-Site": "cross-site", "Origin": "https://evil.example"}); w.Code != 403 {
 		t.Fatalf("cross-site = %d", w.Code)
 	}
-	if len(cmd.sent) != 1 {
-		t.Fatalf("sent = %v, want only the first stop", cmd.sent)
+	if len(cmd.sent) != 2 {
+		t.Fatalf("sent = %v, want the stop and the pause", cmd.sent)
 	}
 }

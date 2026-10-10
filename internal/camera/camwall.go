@@ -166,11 +166,10 @@ func (r *StatusRenderer) SetModules(mods []module.Module) error {
 	return nil
 }
 
-// connectivitySource reports upstream MQTT connectivity per serial, so the
-// camera wall can distinguish an idle printer from a disconnected one.
+// connectivitySource reports printer link state per serial, so the camera
+// wall can distinguish an idle printer from a disconnected one.
 type connectivitySource interface {
 	Status() map[string]bool
-	Generation(serial string) uint64
 }
 
 // Tiles merges telemetry and camera state for every configured printer,
@@ -183,7 +182,7 @@ func (r *StatusRenderer) Tiles() []Tile {
 	for _, st := range states {
 		sv, _ := r.state.Session(st.Serial)
 		t := Tile{
-			View:         printerview.Build(st, sv, st.Connected, r.status.Generation(st.Serial), time.Now()),
+			View:         printerview.Build(st, sv, st.Connected, time.Now()),
 			CameraOK:     r.cameras.WebSupported(st.Serial),
 			CameraReason: r.cameras.WebUnavailableReason(st.Serial),
 			Controls:     []string{},
@@ -367,8 +366,6 @@ func (r *StatusRenderer) handleControl(w http.ResponseWriter, req *http.Request)
 			code = http.StatusNotFound
 		case errors.Is(err, control.ErrInvalidRequest):
 			code = http.StatusBadRequest
-		case errors.Is(err, control.ErrNotAvailable):
-			code = http.StatusConflict
 		case errors.Is(err, control.ErrNotConnected):
 			code = http.StatusServiceUnavailable
 		case errors.Is(err, control.ErrSendFailed):

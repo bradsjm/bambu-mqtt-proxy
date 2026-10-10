@@ -21,7 +21,7 @@ func TestFirstLayerPauseConfirmationRequiresSameJobPause(t *testing.T) {
 			for range 3 {
 				f.report("RUNNING", new(2))
 				f.step()
-				if layerStatus(f).Pause != "pending" || len(f.commands.pauses) != 1 {
+				if layerStatus(f).Pause != "pending" || f.commands.pauses != 1 {
 					t.Fatal("RUNNING aborted wait or replayed")
 				}
 			}
@@ -41,7 +41,7 @@ func TestFirstLayerPauseConfirmationRequiresSameJobPause(t *testing.T) {
 			f.report("RUNNING", new(2))
 			f.hint("first_layer_complete")
 			f.step()
-			if len(f.commands.pauses) != 1 || f.client.layerCalls != 1 {
+			if f.commands.pauses != 1 || f.client.layerCalls != 1 {
 				t.Fatal("resume replayed phase")
 			}
 		})
@@ -49,16 +49,15 @@ func TestFirstLayerPauseConfirmationRequiresSameJobPause(t *testing.T) {
 }
 
 func TestFirstLayerConfirmationIsStateBased(t *testing.T) {
-	// Stale stamps and generation counters never block confirmation:
-	// any same-job PAUSE/PAUSED inside the deadline confirms, including
-	// an HMS-driven pause the proxy did not cause.
+	// Stale stamps never block confirmation: any same-job PAUSE/PAUSED
+	// inside the deadline confirms, including an HMS-driven pause the
+	// proxy did not cause.
 	f := newLayerFixture(t)
 	f.hint("first_layer_complete")
 	f.step()
 	f.report("PAUSE", new(2))
 	f.state.edit(func(j *telemetry.JobView, v *telemetry.SessionView) {
 		v.ObsAt = time.Time{}
-		v.ObsGen++
 	})
 	f.step()
 	if layerStatus(f).Pause != "confirmed" || f.w.layerPending != nil || !f.hasEvent("platecheck_layer1_pause_confirmed") {
@@ -90,20 +89,19 @@ func TestFirstLayerPauseIdentityInvalidation(t *testing.T) {
 			f.step()
 			tc.change(f)
 			f.step()
-			if layerStatus(f).Pause != "unconfirmed" || f.w.layerPending != nil || len(f.commands.pauses) != 1 {
+			if layerStatus(f).Pause != "unconfirmed" || f.w.layerPending != nil || f.commands.pauses != 1 {
 				t.Fatalf("invalidation %+v", layerStatus(f))
 			}
 		})
 	}
-	// A reconnect or a pause/resume cycle that returns to RUNNING keeps
+	// An offline flap or a pause/resume cycle that returns to RUNNING keeps
 	// the wait open: only a same-job terminal report or a job
 	// replacement ends it early.
 	for _, tc := range []struct {
 		name   string
 		change func(*fixture)
 	}{
-		{"reconnect", func(f *fixture) { f.commands.reconnect() }},
-		{"offline", func(f *fixture) { f.commands.offline = map[string]bool{"01S1": true} }},
+		{"offline flap", func(f *fixture) { f.commands.offline = map[string]bool{"01S1": true}; f.commands.offline = nil }},
 		{"session", func(f *fixture) { f.state.v.SessionGen++ }},
 		{"session epoch", func(f *fixture) { f.state.v.Epoch++ }},
 		{"pause resume before confirmation", func(f *fixture) { f.report("PAUSE", new(2)); f.report("RUNNING", new(2)) }},
@@ -114,7 +112,7 @@ func TestFirstLayerPauseIdentityInvalidation(t *testing.T) {
 			f.step()
 			tc.change(f)
 			f.step()
-			if layerStatus(f).Pause != "pending" || f.w.layerPending == nil || len(f.commands.pauses) != 1 {
+			if layerStatus(f).Pause != "pending" || f.w.layerPending == nil || f.commands.pauses != 1 {
 				t.Fatalf("wait closed early: %+v", layerStatus(f))
 			}
 		})
@@ -148,7 +146,7 @@ func TestFirstLayerPauseDeadlineNoReplay(t *testing.T) {
 			f.report("RUNNING", new(2))
 			f.hint("first_layer_complete")
 			f.step()
-			if len(f.commands.pauses) != 1 || f.client.layerCalls != 1 {
+			if f.commands.pauses != 1 || f.client.layerCalls != 1 {
 				t.Fatal("deadline/resume replay")
 			}
 		})
@@ -245,7 +243,7 @@ func TestFirstLayerCloseCancelsCaptureAndEvaluation(t *testing.T) {
 			f.s.Start()
 			<-entered
 			f.s.Close()
-			if len(f.commands.pauses) != 0 || layerStatus(f).State != "error" {
+			if f.commands.pauses != 0 || layerStatus(f).State != "error" {
 				t.Fatal("close failed to cancel network phase")
 			}
 		})
@@ -276,7 +274,7 @@ func TestFirstLayerCloseEndsPendingConfirmation(t *testing.T) {
 	f.s.kPoll = time.Hour
 	f.s.Start()
 	f.s.Close()
-	if layerStatus(f).Pause != "unconfirmed" || f.w.layerPending != nil || len(f.commands.pauses) != 1 {
+	if layerStatus(f).Pause != "unconfirmed" || f.w.layerPending != nil || f.commands.pauses != 1 {
 		t.Fatal("shutdown left an unbounded confirmation or replayed command")
 	}
 }

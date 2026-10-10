@@ -20,10 +20,7 @@ type ControlService interface {
 }
 
 // Control tool error codes.
-const (
-	errInvalidState        = "invalid_state"
-	errUpstreamUnavailable = "upstream_unavailable"
-)
+const errUpstreamUnavailable = "upstream_unavailable"
 
 // mcpOrigin names this surface in the activity log.
 const mcpOrigin = "MCP"
@@ -129,8 +126,6 @@ func (s *Server) doControl(serial string, req control.Request) (*mcp.CallToolRes
 		switch {
 		case errors.Is(err, control.ErrUnknownPrinter):
 			code = module.CodeUnknownSerial
-		case errors.Is(err, control.ErrNotAvailable):
-			code = errInvalidState
 		case errors.Is(err, control.ErrNotConnected):
 			code = errUpstreamUnavailable
 		}

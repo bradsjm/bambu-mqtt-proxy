@@ -4,6 +4,7 @@ package integration_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -19,7 +20,6 @@ import (
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	mochi "github.com/mochi-mqtt/server/v2"
-	"github.com/mochi-mqtt/server/v2/hooks/auth"
 	"github.com/mochi-mqtt/server/v2/listeners"
 	"github.com/mochi-mqtt/server/v2/packets"
 
@@ -27,9 +27,9 @@ import (
 	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/health"
 	"bambu-mqtt-proxy/internal/httpsrv"
+	"bambu-mqtt-proxy/internal/printer"
 	"bambu-mqtt-proxy/internal/routing"
 	"bambu-mqtt-proxy/internal/tlsutil"
-	"bambu-mqtt-proxy/internal/upstream"
 )
 
 const (
@@ -38,16 +38,15 @@ const (
 	serial2    = "01P00A000000002"
 )
 
-// recorder is a fake-printer hook that records publishes to request topics
-// and the proxy's upstream subscription lifecycle.
+// recorder captures the fake printer's MQTT traffic and subscription grants.
 type recorder struct {
 	mochi.HookBase
 	mu        sync.Mutex
 	seen      map[string]recItem
 	subs      map[string]int
-	unsubs    map[string]int
 	subEvents []subEvent
-	onWarmup  func() // optional full-state response to a warmup pushall
+	refuse    bool
+	connects  int
 }
 
 // subEvent records one upstream SUBSCRIBE with its requested QoS.
@@ -56,57 +55,64 @@ type subEvent struct {
 	qos    byte
 }
 
-// recItem is one recorded request payload.
+// recItem records the count and MQTT flags of a request payload.
 type recItem struct {
 	count  int
 	retain bool
+	qos    byte
 }
 
 // ID returns the hook ID.
 func (r *recorder) ID() string { return "recorder" }
 
-// Provides declares the implemented hook points.
+// Provides declares the fake printer's authentication, ACL, and recording hooks.
 func (r *recorder) Provides(k byte) bool {
-	return bytes.Contains([]byte{mochi.OnPublish, mochi.OnSubscribed, mochi.OnUnsubscribed}, []byte{k})
+	return bytes.Contains([]byte{mochi.OnConnectAuthenticate, mochi.OnConnect, mochi.OnACLCheck, mochi.OnPublish, mochi.OnSubscribed}, []byte{k})
 }
 
-// OnPublish records request-topic publishes and passes them through. A warmup
-// pushall additionally triggers the responder, modeling a printer that pushes
-// full state only on request.
+// OnConnectAuthenticate accepts the proxy's fake-printer connection.
+func (r *recorder) OnConnectAuthenticate(_ *mochi.Client, _ packets.Packet) bool { return true }
+
+// OnConnect records accepted connection attempts.
+func (r *recorder) OnConnect(_ *mochi.Client, _ packets.Packet) error {
+	r.mu.Lock()
+	r.connects++
+	r.mu.Unlock()
+	signalObservation()
+	return nil
+}
+
+// OnACLCheck can refuse report subscriptions without closing the connection.
+func (r *recorder) OnACLCheck(_ *mochi.Client, _ string, write bool) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return write || !r.refuse
+}
+
+// OnPublish records the byte-exact request and its flags.
 func (r *recorder) OnPublish(_ *mochi.Client, pk packets.Packet) (packets.Packet, error) {
 	if strings.HasSuffix(pk.TopicName, "/request") {
 		r.mu.Lock()
 		key := pk.TopicName + "|" + string(pk.Payload)
 		item := r.seen[key]
 		item.count++
-		item.retain = pk.FixedHeader.Retain
+		item.retain, item.qos = pk.FixedHeader.Retain, pk.FixedHeader.Qos
 		r.seen[key] = item
-		respond := r.onWarmup
 		r.mu.Unlock()
-		if string(pk.Payload) == config.DefaultWarmupPushall && respond != nil {
-			go respond()
-		}
+		signalObservation()
 	}
 	return pk, nil
 }
 
-// OnSubscribed counts the proxy's upstream subscriptions per filter.
+// OnSubscribed records every attempt, including a refused subscription.
 func (r *recorder) OnSubscribed(_ *mochi.Client, pk packets.Packet, _ []byte) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	for _, f := range pk.Filters {
 		r.subs[f.Filter]++
 		r.subEvents = append(r.subEvents, subEvent{filter: f.Filter, qos: f.Qos})
 	}
-}
-
-// OnUnsubscribed counts the proxy's upstream unsubscribe removals per filter.
-func (r *recorder) OnUnsubscribed(_ *mochi.Client, pk packets.Packet) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, f := range pk.Filters {
-		r.unsubs[f.Filter]++
-	}
+	r.mu.Unlock()
+	signalObservation()
 }
 
 // count returns how many times topic+payload was recorded.
@@ -123,40 +129,6 @@ func (r *recorder) retainFlag(topic, payload string) bool {
 	return r.seen[topic+"|"+payload].retain
 }
 
-// subCount reports how often the proxy subscribed filter upstream.
-func (r *recorder) subCount(filter string) int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.subs[filter]
-}
-
-// unsubCount reports how often the proxy removed filter upstream.
-func (r *recorder) unsubCount(filter string) int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.unsubs[filter]
-}
-
-// lastSubQos reports the QoS of the most recent upstream subscribe for
-// filter; ok is false when the proxy never subscribed it.
-func (r *recorder) lastSubQos(filter string) (byte, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for i := len(r.subEvents) - 1; i >= 0; i-- {
-		if r.subEvents[i].filter == filter {
-			return r.subEvents[i].qos, true
-		}
-	}
-	return 0, false
-}
-
-// setWarmupResponder installs the callback fired for every warmup pushall.
-func (r *recorder) setWarmupResponder(fn func()) {
-	r.mu.Lock()
-	r.onWarmup = fn
-	r.mu.Unlock()
-}
-
 // fakePrinter is a stand-in Bambu printer: a mochi broker with TLS on a fixed
 // port that records requests and can publish reports.
 type fakePrinter struct {
@@ -167,20 +139,13 @@ type fakePrinter struct {
 }
 
 // newFakePrinter starts a fake printer listening on port with TLS.
-func newFakePrinter(t *testing.T, port int) *fakePrinter {
+func newFakePrinter(t *testing.T, port int, refuse ...bool) *fakePrinter {
 	t.Helper()
-	srv := mochi.New(&mochi.Options{InlineClient: true})
+	srv := mochi.New(&mochi.Options{InlineClient: true, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	// The real printer's ESP32 broker supports nothing above QoS 0: SUBACK
 	// grants 0 and inbound publishes are downgraded to 0.
 	srv.Options.Capabilities.MaximumQos = 0
-	if err := srv.AddHook(new(auth.AllowHook), nil); err != nil {
-		t.Fatalf("printer auth hook: %v", err)
-	}
-	rec := &recorder{
-		seen:   make(map[string]recItem),
-		subs:   make(map[string]int),
-		unsubs: make(map[string]int),
-	}
+	rec := &recorder{seen: make(map[string]recItem), subs: make(map[string]int), refuse: len(refuse) > 0 && refuse[0]}
 	if err := srv.AddHook(rec, nil); err != nil {
 		t.Fatalf("printer recorder hook: %v", err)
 	}
@@ -201,7 +166,9 @@ func newFakePrinter(t *testing.T, port int) *fakePrinter {
 	if err := srv.AddListener(listeners.NewTCP(lc)); err != nil {
 		t.Fatalf("printer listener: %v", err)
 	}
-	go func() { _ = srv.Serve() }()
+	if err := srv.Serve(); err != nil {
+		t.Fatalf("printer serve: %v", err)
+	}
 	fp := &fakePrinter{srv: srv, rec: rec, port: port}
 	t.Cleanup(fp.stop)
 	return fp
@@ -211,14 +178,6 @@ func newFakePrinter(t *testing.T, port int) *fakePrinter {
 // idempotent).
 func (f *fakePrinter) stop() {
 	f.stopOnce.Do(func() { _ = f.srv.Close() })
-}
-
-// respondToWarmup makes the fake printer answer each warmup pushall with a
-// full-state report on topic, the way a P1 pushes full state only on pushall.
-func (f *fakePrinter) respondToWarmup(topic, payload string) {
-	f.rec.setWarmupResponder(func() {
-		_ = f.srv.Publish(topic, []byte(payload), false, 0)
-	})
 }
 
 // publish pushes a report as if from the printer.
@@ -244,13 +203,19 @@ func printerSpec(port int, serial string) config.Printer {
 // proxy is a running proxy instance for tests.
 type proxy struct {
 	srv        *broker.Server
-	pool       *upstream.Pool
+	links      *printer.Links
 	port       int
+	logs       *testLogs
 	healthPort int
 }
 
-// startProxy builds and serves the proxy in-process with fast test timing.
+// startProxy builds and serves the proxy with always-on printer links.
 func startProxy(t *testing.T, printers []config.Printer) *proxy {
+	return startProxyAuth(t, config.AuthModePrinter, printers)
+}
+
+// startProxyAuth serves a proxy with the selected authentication policy.
+func startProxyAuth(t *testing.T, mode string, printers []config.Printer) *proxy {
 	t.Helper()
 	port := freePort(t)
 	dir := t.TempDir()
@@ -261,19 +226,17 @@ func startProxy(t *testing.T, printers []config.Printer) *proxy {
 			CertFile: filepath.Join(dir, "proxy.crt"),
 			KeyFile:  filepath.Join(dir, "proxy.key"),
 		}},
-		Auth:     config.Auth{Mode: config.AuthModePrinter},
+		Auth:     config.Auth{Mode: mode},
 		Printers: printers,
 	}
 	cfg.ApplyDefaults()
-	cfg.Behavior.UpstreamConnectTimeoutSeconds = 2
-	cfg.Behavior.UpstreamBackoffInitialSeconds = 1
-	cfg.Behavior.UpstreamBackoffMaxSeconds = 2
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("proxy config: %v", err)
 	}
 	healthPort := freePort(t)
 
-	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	logs := &testLogs{seen: make(map[string]int), online: make(map[string][]bool)}
+	logger := slog.New(logs)
 	serials := make([]string, 0, len(printers))
 	aliases := make(map[string]string, len(printers))
 	for _, p := range printers {
@@ -284,23 +247,33 @@ func startProxy(t *testing.T, printers []config.Printer) *proxy {
 	}
 	table := routing.NewTable(serials, aliases)
 	inject := broker.NewInjector(logger)
-	pool := upstream.NewPool(printers, inject, cfg.Behavior, logger)
-	srv, err := broker.New(cfg, table, pool, inject, logger)
+	links := printer.New(printers, logger, func(_ string, topic string, payload []byte) {
+		inject.PublishDownstream(topic, payload)
+	}, func(serial string, online bool) {
+		logs.mu.Lock()
+		logs.online[serial] = append(logs.online[serial], online)
+		logs.mu.Unlock()
+		signalObservation()
+	})
+	srv, err := broker.New(cfg, table, links, inject, logger)
 	if err != nil {
 		t.Fatalf("proxy: %v", err)
 	}
-	go func() { _ = srv.Serve() }()
+	if err := srv.Serve(); err != nil {
+		t.Fatalf("proxy serve: %v", err)
+	}
+	links.Start()
 	httpSrv := httpsrv.New(healthPort, logger)
-	health.Routes(httpSrv.Mux(), pool, nil)
+	health.Routes(httpSrv.Mux(), links, nil)
 	if err := httpSrv.Start(); err != nil {
 		t.Fatalf("http server: %v", err)
 	}
 	t.Cleanup(func() {
 		httpSrv.Stop()
-		pool.Stop()
+		links.Close()
 		_ = srv.Close()
 	})
-	return &proxy{srv: srv, pool: pool, port: port, healthPort: healthPort}
+	return &proxy{srv: srv, links: links, port: port, healthPort: healthPort, logs: logs}
 }
 
 // testClient is a downstream MQTT client plus captured messages.
@@ -321,6 +294,7 @@ func (b *msgBox) record(topic string, payload []byte) {
 	b.mu.Lock()
 	b.seen[topic+"|"+string(payload)]++
 	b.mu.Unlock()
+	signalObservation()
 }
 
 // has reports whether topic|payload was received.
@@ -344,7 +318,7 @@ func connect(t *testing.T, p *proxy, id, user, pass string, autoReconnect bool) 
 		SetTLSConfig(&tls.Config{InsecureSkipVerify: true}).
 		SetConnectTimeout(5 * time.Second).
 		SetAutoReconnect(autoReconnect).
-		SetOrderMatters(false).
+		SetOrderMatters(true).
 		SetConnectionLostHandler(func(mqtt.Client, error) {
 			select {
 			case lost <- struct{}{}:
@@ -386,17 +360,70 @@ func (c *testClient) publish(t *testing.T, topic, payload string, qos byte, reta
 	}
 }
 
-// waitFor polls fn until true or the timeout elapses.
+// observations wakes bounded waits whenever MQTT traffic or link status changes.
+var observations = struct {
+	sync.Mutex
+	changed chan struct{}
+}{changed: make(chan struct{})}
+
+// signalObservation broadcasts a newly observed network event.
+func signalObservation() {
+	observations.Lock()
+	close(observations.changed)
+	observations.changed = make(chan struct{})
+	observations.Unlock()
+}
+
+// waitFor waits for observable events until fn is true or the deadline expires.
 func waitFor(t *testing.T, timeout time.Duration, fn func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		observations.Lock()
+		changed := observations.changed
+		observations.Unlock()
 		if fn() {
 			return
 		}
-		time.Sleep(25 * time.Millisecond)
+		select {
+		case <-changed:
+		case <-timer.C:
+			t.Fatalf("condition not met within %s", timeout)
+		}
 	}
-	t.Fatalf("condition not met within %s", timeout)
+}
+
+// testLogs records lifecycle messages as bounded-wait observations.
+type testLogs struct {
+	mu     sync.Mutex
+	seen   map[string]int
+	online map[string][]bool
+}
+
+// Enabled enables diagnostic lifecycle observations.
+func (*testLogs) Enabled(context.Context, slog.Level) bool { return true }
+
+// Handle records the message without storing credentials or packet contents.
+func (l *testLogs) Handle(_ context.Context, record slog.Record) error {
+	l.mu.Lock()
+	l.seen[record.Message]++
+	l.mu.Unlock()
+	signalObservation()
+	return nil
+}
+
+// WithAttrs keeps message-only observations for child loggers.
+func (l *testLogs) WithAttrs([]slog.Attr) slog.Handler { return l }
+
+// WithGroup keeps message-only observations for grouped loggers.
+func (l *testLogs) WithGroup(string) slog.Handler { return l }
+
+// count reports the observed count of a lifecycle message.
+func (l *testLogs) count(message string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.seen[message]
 }
 
 // freePort reserves an ephemeral port for the test.
@@ -449,240 +476,6 @@ func TestSubscribeUnknownSerialDenied(t *testing.T) {
 	}
 }
 
-func TestMergedSubscriptionWarmupAndFanout(t *testing.T) {
-	p1 := newFakePrinter(t, freePort(t))
-	p := startProxy(t, []config.Printer{printerSpec(p1.port, serial1)})
-	cA := connect(t, p, "cA", "bblp", accessCode, true)
-	cB := connect(t, p, "cB", "bblp", accessCode, true)
-
-	if got := cA.subscribe(t, reportTopic(serial1), 1); got != 0 {
-		t.Fatalf("granted qos %#x, want 0 (broker caps at the printer's QoS 0)", got)
-	}
-	if got := cB.subscribe(t, reportTopic(serial1), 1); got != 0 {
-		t.Fatalf("granted qos %#x, want 0 (broker caps at the printer's QoS 0)", got)
-	}
-
-	// The upstream connect warms at least once, and the second subscriber
-	// joining an already-connected printer warms again. At a fresh connect
-	// the restore pass and the first interest can both subscribe and warm;
-	// those wire duplicates are idempotent, so only lower bounds hold: both
-	// interests share one merged upstream subscription.
-	waitFor(t, 5*time.Second, func() bool {
-		return p1.rec.count(requestTopic(serial1), warmupPayload()) >= 2
-	})
-	waitFor(t, 5*time.Second, func() bool {
-		return p1.rec.subCount(reportTopic(serial1)) >= 1
-	})
-
-	p1.publish(t, reportTopic(serial1), "state-v1")
-	waitFor(t, 5*time.Second, func() bool {
-		return cA.box.has(reportTopic(serial1), "state-v1") && cB.box.has(reportTopic(serial1), "state-v1")
-	})
-}
-
-// TestRepeatedSubscribeDoesNotLeakRefcount pins refcount neutrality: a
-// repeated SUBSCRIBE for a held filter adds no upstream interest and
-// re-requests no warmup, and the client's disconnect removes the single
-// interest instead of leaking a refcount.
-func TestRepeatedSubscribeDoesNotLeakRefcount(t *testing.T) {
-	p1 := newFakePrinter(t, freePort(t))
-	p := startProxy(t, []config.Printer{printerSpec(p1.port, serial1)})
-	c := connect(t, p, "c1", "bblp", accessCode, true)
-	filter := reportTopic(serial1)
-
-	if got := c.subscribe(t, filter, 1); got != 0 {
-		t.Fatalf("granted qos %#x, want 0 (broker caps at the printer's QoS 0)", got)
-	}
-	// Let the connect-time subscribe and warmup burst settle, then record
-	// the baseline (a fresh connect may subscribe and warm idempotently
-	// more than once).
-	waitFor(t, 5*time.Second, func() bool {
-		return p1.rec.subCount(filter) >= 1 &&
-			p1.rec.count(requestTopic(serial1), warmupPayload()) >= 1
-	})
-	time.Sleep(300 * time.Millisecond)
-	baselineSubs := p1.rec.subCount(filter)
-	baselineWarmups := p1.rec.count(requestTopic(serial1), warmupPayload())
-
-	// The same client subscribes to the same filter again.
-	if got := c.subscribe(t, filter, 1); got != 0 {
-		t.Fatalf("granted qos %#x, want 0 (broker caps at the printer's QoS 0)", got)
-	}
-	time.Sleep(500 * time.Millisecond) // duplicate-merge window
-	if got := p1.rec.subCount(filter); got != baselineSubs {
-		t.Fatalf("repeated subscribe changed upstream subscriptions to %d, baseline %d", got, baselineSubs)
-	}
-	if got := p1.rec.count(requestTopic(serial1), warmupPayload()); got != baselineWarmups {
-		t.Fatalf("repeated subscribe changed warmups to %d, baseline %d", got, baselineWarmups)
-	}
-
-	// Disconnect releases the interest: the proxy unsubscribes upstream.
-	c.cl.Disconnect(100)
-	waitFor(t, 5*time.Second, func() bool {
-		return p1.rec.unsubCount(filter) == 1
-	})
-}
-
-// TestPublishOnlyReachesPrinterOnceWithNoReportInterest pins the publish-only
-// path: with no downstream report interest the first request engages the
-// supervisor, reaches the printer exactly once, and no upstream subscription
-// is ever created.
-func TestPublishOnlyReachesPrinterOnceWithNoReportInterest(t *testing.T) {
-	p1 := newFakePrinter(t, freePort(t))
-	p := startProxy(t, []config.Printer{printerSpec(p1.port, serial1)})
-	c := connect(t, p, "c1", "bblp", accessCode, true)
-
-	payload := `{"print":{"sequence_id":"1","command":"pause"}}`
-	c.publish(t, requestTopic(serial1), payload, 0, false)
-	waitFor(t, 5*time.Second, func() bool {
-		return p1.rec.count(requestTopic(serial1), payload) == 1
-	})
-	time.Sleep(300 * time.Millisecond) // no duplicate delivery window
-	if got := p1.rec.count(requestTopic(serial1), payload); got != 1 {
-		t.Fatalf("printer received %d copies of the publish-only request, want exactly 1", got)
-	}
-	if got := p1.rec.subCount(reportTopic(serial1)); got != 0 {
-		t.Fatalf("upstream report subscriptions with no report interest = %d, want 0", got)
-	}
-}
-
-// TestOfflineRequestNotReplayed pins the drop-don't-queue contract: a request
-// published while the printer is unreachable is dropped and never reaches the
-// printer, not at the first connection and not after an outage recovery.
-func TestOfflineRequestNotReplayed(t *testing.T) {
-	port := freePort(t) // nothing listens yet: the printer is offline
-	p := startProxy(t, []config.Printer{printerSpec(port, serial1)})
-	c := connect(t, p, "c1", "bblp", accessCode, true)
-
-	offline := `{"print":{"sequence_id":"2","command":"resume"}}`
-	c.publish(t, requestTopic(serial1), offline, 0, false)
-	// Let the publish's connect budget (2s) elapse while nothing listens, so
-	// the request is resolved as dropped before the printer can exist. A
-	// printer that binds inside the budget may legitimately receive it.
-	time.Sleep(3 * time.Second)
-
-	p1 := newFakePrinter(t, port)
-	// A bound port is not a recovered upstream: wait for the proxy's
-	// supervisor to re-establish connectivity before sending the request
-	// exactly once.
-	waitFor(t, 15*time.Second, func() bool {
-		return p.pool.Status()[serial1]
-	})
-	online := `{"print":{"sequence_id":"3","command":"resume"}}`
-	c.publish(t, requestTopic(serial1), online, 0, false)
-	waitFor(t, 10*time.Second, func() bool {
-		return p1.rec.count(requestTopic(serial1), online) == 1
-	})
-	time.Sleep(300 * time.Millisecond) // replay window after the connection is live
-	if got := p1.rec.count(requestTopic(serial1), offline); got != 0 {
-		t.Fatalf("offline request was replayed %d times after the first connect, want 0", got)
-	}
-
-	// The same contract across an outage: a request published while the
-	// printer is down is dropped, and recovery does not replay it.
-	p1.stop()
-	offline2 := `{"print":{"sequence_id":"4","command":"resume"}}`
-	c.publish(t, requestTopic(serial1), offline2, 0, false)
-	time.Sleep(3 * time.Second) // the outage budget must pass while the port is dead
-	p2 := newFakePrinter(t, port)
-	// Same gate for the recovery phase: connectivity, not a listening port.
-	waitFor(t, 15*time.Second, func() bool {
-		return p.pool.Status()[serial1]
-	})
-	online2 := `{"print":{"sequence_id":"5","command":"resume"}}`
-	c.publish(t, requestTopic(serial1), online2, 0, false)
-	waitFor(t, 15*time.Second, func() bool {
-		return p2.rec.count(requestTopic(serial1), online2) == 1
-	})
-	time.Sleep(300 * time.Millisecond)
-	if got := p2.rec.count(requestTopic(serial1), offline2); got != 0 {
-		t.Fatalf("outage request was replayed %d times after recovery, want 0", got)
-	}
-}
-
-// TestQoS0UpstreamStaysConnectedAndDelivers pins the QoS 0 regression: the
-// fake printer broker grants only QoS 0, like the real ESP32 broker. The
-// proxy's upstream SUBSCRIBE requests QoS 0 and accepts the 0 grant, so the
-// internal report interest plus a downstream subscriber keep one stable
-// upstream connection, and a printer report reaches the downstream client.
-func TestQoS0UpstreamStaysConnectedAndDelivers(t *testing.T) {
-	p1 := newFakePrinter(t, freePort(t))
-	p := startProxy(t, []config.Printer{printerSpec(p1.port, serial1)})
-	filter := reportTopic(serial1)
-
-	// The internal report interest engages the supervisor without waiting.
-	p.pool.SubscribeAsync(serial1, filter)
-
-	// A downstream client joins; the proxy caps the grant at QoS 0 even
-	// though the client asks for QoS 1.
-	c := connect(t, p, "c1", "bblp", accessCode, true)
-	if got := c.subscribe(t, filter, 1); got != 0 {
-		t.Fatalf("granted qos %#x, want 0 (broker caps at the printer's QoS 0)", got)
-	}
-	waitFor(t, 5*time.Second, func() bool {
-		qos, ok := p1.rec.lastSubQos(filter)
-		return p1.rec.subCount(filter) >= 1 && ok && qos == 0
-	})
-
-	// One stable upstream connection: the generation never advances and the
-	// wire subscription is not re-established over the watch window. The old
-	// lower-grant-refused behavior reconnected in a tight loop here.
-	time.Sleep(300 * time.Millisecond) // let the initial subscribe burst settle
-	gen := p.pool.Generation(serial1)
-	if !p.pool.Status()[serial1] {
-		t.Fatal("upstream not connected")
-	}
-	subs := p1.rec.subCount(filter)
-	time.Sleep(1500 * time.Millisecond)
-	if got := p.pool.Generation(serial1); got != gen {
-		t.Fatalf("upstream generation advanced %d -> %d; the connection is reconnecting", gen, got)
-	}
-	if got := p1.rec.subCount(filter); got != subs {
-		t.Fatalf("upstream subscribes grew %d -> %d; the connection is reconnecting", subs, got)
-	}
-
-	// A printer report reaches the downstream subscriber.
-	p1.publish(t, filter, "qos0-end-to-end")
-	waitFor(t, 5*time.Second, func() bool {
-		return c.box.has(filter, "qos0-end-to-end")
-	})
-}
-
-// TestLateSubscriberReceivesFullState models P1 pushall semantics: the fake
-// printer answers each warmup with the full-state report. A subscriber that
-// joins late on an already-connected printer must trigger its own warmup and
-// receive full state.
-func TestLateSubscriberReceivesFullState(t *testing.T) {
-	p1 := newFakePrinter(t, freePort(t))
-	p1.respondToWarmup(reportTopic(serial1), "full-state-v1")
-	p := startProxy(t, []config.Printer{printerSpec(p1.port, serial1)})
-
-	cA := connect(t, p, "cA", "bblp", accessCode, true)
-	if got := cA.subscribe(t, reportTopic(serial1), 1); got != 0 {
-		t.Fatalf("granted qos %#x, want 0 (broker caps at the printer's QoS 0)", got)
-	}
-	waitFor(t, 5*time.Second, func() bool {
-		return cA.box.has(reportTopic(serial1), "full-state-v1")
-	})
-	baselineWarmups := p1.rec.count(requestTopic(serial1), warmupPayload())
-
-	// The late joiner missed the first full state: its new interest on the
-	// connected printer requests warmup once the report subscription is
-	// ready, and the printer's full-state response reaches it.
-	cB := connect(t, p, "cB", "bblp", accessCode, true)
-	if got := cB.subscribe(t, reportTopic(serial1), 1); got != 0 {
-		t.Fatalf("granted qos %#x, want 0 (broker caps at the printer's QoS 0)", got)
-	}
-	waitFor(t, 5*time.Second, func() bool {
-		return cB.box.has(reportTopic(serial1), "full-state-v1")
-	})
-	// The late joiner's own interest requested the warmup that delivered
-	// its full state.
-	waitFor(t, 5*time.Second, func() bool {
-		return p1.rec.count(requestTopic(serial1), warmupPayload()) > baselineWarmups
-	})
-}
-
 func TestRequestForwardedOnceAndNeverFannedOut(t *testing.T) {
 	p1 := newFakePrinter(t, freePort(t))
 	p := startProxy(t, []config.Printer{printerSpec(p1.port, serial1)})
@@ -695,17 +488,22 @@ func TestRequestForwardedOnceAndNeverFannedOut(t *testing.T) {
 	if got := cB.subscribe(t, requestTopic(serial1), 1); got >= 0x80 {
 		t.Fatalf("subscribe to request topic granted %#x, want 0 (broker caps at the printer's QoS 0)", got)
 	}
+	if got := cB.subscribe(t, reportTopic(serial1), 0); got != 0 {
+		t.Fatalf("report barrier subscription: %#x", got)
+	}
 
+	waitFor(t, 5*time.Second, func() bool { return p.links.Online(serial1) })
 	payload := `{"print":{"sequence_id":"7","command":"pause"}}`
 	cA.publish(t, requestTopic(serial1), payload, 0, false)
 
 	waitFor(t, 5*time.Second, func() bool {
 		return p1.rec.count(requestTopic(serial1), payload) == 1
 	})
-	time.Sleep(500 * time.Millisecond) // no duplicate delivery window
-	if got := p1.rec.count(requestTopic(serial1), payload); got != 1 {
-		t.Fatalf("printer received %d copies of request, want exactly 1", got)
-	}
+	// A subsequent report is a downstream delivery barrier.
+	p1.publish(t, reportTopic(serial1), "after-request")
+	waitFor(t, 5*time.Second, func() bool {
+		return cA.box.has(reportTopic(serial1), "after-request") && cB.box.has(reportTopic(serial1), "after-request")
+	})
 	if cB.box.has(requestTopic(serial1), payload) {
 		t.Fatal("request fanned out to another downstream client; must not")
 	}
@@ -718,6 +516,7 @@ func TestRetainStripped(t *testing.T) {
 	if got := c.subscribe(t, reportTopic(serial1), 1); got != 0 {
 		t.Fatalf("granted qos %#x, want 0 (broker caps at the printer's QoS 0)", got)
 	}
+	waitFor(t, 5*time.Second, func() bool { return p.links.Online(serial1) })
 
 	payload := `{"retained":"probe"}`
 	c.publish(t, requestTopic(serial1), payload, 0, true)
@@ -738,6 +537,7 @@ func TestWildcardFansBothPrinters(t *testing.T) {
 	if got := c.subscribe(t, "device/+/report", 1); got >= 0x80 {
 		t.Fatalf("wildcard subscribe granted %#x, want 0 (broker caps at the printer's QoS 0)", got)
 	}
+	waitFor(t, 5*time.Second, func() bool { return p.links.Online(serial1) && p.links.Online(serial2) })
 	p1.publish(t, reportTopic(serial1), "r1")
 	p2.publish(t, reportTopic(serial2), "r2")
 	waitFor(t, 5*time.Second, func() bool {
@@ -782,50 +582,10 @@ func TestSameIDTakeover(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("old session with same client ID was not taken over")
 	}
+	waitFor(t, 5*time.Second, func() bool { return p.links.Online(serial1) })
 	p1.publish(t, reportTopic(serial1), "after-takeover")
 	waitFor(t, 5*time.Second, func() bool {
 		return c2.box.has(reportTopic(serial1), "after-takeover")
-	})
-}
-
-func TestOutageLifecycle(t *testing.T) {
-	port := freePort(t)
-	p1 := newFakePrinter(t, port)
-	p := startProxy(t, []config.Printer{printerSpec(port, serial1)})
-	c := connect(t, p, "c1", "bblp", accessCode, true)
-
-	if got := c.subscribe(t, reportTopic(serial1), 1); got != 0 {
-		t.Fatalf("granted qos %#x, want 0 (broker caps at the printer's QoS 0)", got)
-	}
-	// The connect warms at least once; the restore pass and the first
-	// interest can both warm idempotently, so only the lower bound holds.
-	waitFor(t, 5*time.Second, func() bool {
-		return p1.rec.count(requestTopic(serial1), warmupPayload()) >= 1
-	})
-	p1.publish(t, reportTopic(serial1), "before-outage")
-	waitFor(t, 5*time.Second, func() bool {
-		return c.box.has(reportTopic(serial1), "before-outage")
-	})
-
-	// Printer goes offline. Wildcard subscribes must be refused (gate), the
-	// exact subscriber stays registered locally.
-	p1.stop()
-	time.Sleep(300 * time.Millisecond)
-
-	guest := connect(t, p, "guest", "bblp", accessCode, true)
-	if got := guest.subscribe(t, "device/+/report", 1); got != 0x80 {
-		t.Fatalf("wildcard subscribe during outage granted %#x, want 0x80", got)
-	}
-
-	// Printer returns on the same port: proxy reconnects, resubscribes the
-	// merged set, sends warmup — no client action.
-	p2 := newFakePrinter(t, port)
-	waitFor(t, 10*time.Second, func() bool {
-		return p2.rec.count(requestTopic(serial1), warmupPayload()) >= 1
-	})
-	p2.publish(t, reportTopic(serial1), "after-recovery")
-	waitFor(t, 5*time.Second, func() bool {
-		return c.box.has(reportTopic(serial1), "after-recovery")
 	})
 }
 
@@ -838,7 +598,7 @@ func TestHealthEndpoints(t *testing.T) {
 		Upstreams map[string]bool `json:"upstreams"`
 	}
 	decode := func(path string, out any) int {
-		resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d%s", p.healthPort, path))
+		resp, err := (&http.Client{Timeout: 5 * time.Second}).Get(fmt.Sprintf("http://127.0.0.1:%d%s", p.healthPort, path))
 		if err != nil {
 			t.Fatalf("GET %s: %v", path, err)
 		}
@@ -849,24 +609,13 @@ func TestHealthEndpoints(t *testing.T) {
 		return resp.StatusCode
 	}
 
-	// Before any subscriber: process healthy, upstream not yet engaged.
+	// Health remains independent of printer availability.
 	if code := decode("/livez", nil); code != 200 {
 		t.Fatalf("/livez = %d, want 200", code)
 	}
-	if code := decode("/status", &live); code != 200 || live.Upstreams[serial1] {
-		t.Fatalf("/status before subscribe = %d %+v, want 200 with unengaged upstream", code, live)
-	}
+	waitFor(t, 5*time.Second, func() bool { return p.links.Online(serial1) })
 
-	c := connect(t, p, "c1", "bblp", accessCode, true)
-	if got := c.subscribe(t, reportTopic(serial1), 1); got != 0 {
-		t.Fatalf("granted qos %#x, want 0 (broker caps at the printer's QoS 0)", got)
+	if code := decode("/status", &live); code != 200 || !live.Upstreams[serial1] {
+		t.Fatalf("/status = %d %+v, want online printer", code, live)
 	}
-	p1.publish(t, reportTopic(serial1), "health-probe")
-	waitFor(t, 5*time.Second, func() bool {
-		return c.box.has(reportTopic(serial1), "health-probe")
-	})
-	waitFor(t, 5*time.Second, func() bool {
-		live.Upstreams = nil
-		return decode("/status", &live) == 200 && live.Upstreams[serial1]
-	})
 }

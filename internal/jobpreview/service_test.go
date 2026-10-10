@@ -22,8 +22,8 @@ import (
 
 	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/config"
+	"bambu-mqtt-proxy/internal/printer"
 	"bambu-mqtt-proxy/internal/telemetry"
-	"bambu-mqtt-proxy/internal/upstream"
 )
 
 // testClock is the injected scheduler clock.
@@ -227,8 +227,8 @@ func reserveSlot(svc *Service) {
 	svc.mu.Unlock()
 }
 
-func TestUpstreamPoolSatisfiesConnectivity(t *testing.T) {
-	var c Connectivity = (*upstream.Pool)(nil)
+func TestPrinterLinksSatisfyConnectivity(t *testing.T) {
+	var c Connectivity = (*printer.Links)(nil)
 	_ = c
 }
 
@@ -1351,7 +1351,7 @@ func TestRealCacheSchedulerFlow(t *testing.T) {
 		return raw
 	}
 
-	cache.ObserveReport("S1", 1, 1, report(map[string]any{
+	cache.Observe("S1", report(map[string]any{
 		"gcode_state": "PREPARE", "subtask_name": "Job One",
 	}))
 	res, ok := svc.Lookup("S1", false)
@@ -1362,7 +1362,7 @@ func TestRealCacheSchedulerFlow(t *testing.T) {
 		t.Fatalf("reason = %q, want waiting_for_print", res.Preview.Reason)
 	}
 
-	cache.ObserveReport("S1", 2, 1, report(map[string]any{"gcode_state": "RUNNING"}))
+	cache.Observe("S1", report(map[string]any{"gcode_state": "RUNNING"}))
 	svc.step(time.Now())
 	await(t, started)
 	svc.wg.Wait()
@@ -1372,13 +1372,13 @@ func TestRealCacheSchedulerFlow(t *testing.T) {
 
 	// A metadata-only delta never cancels and never re-admits before the
 	// retry time: the projection names the backoff.
-	cache.ObserveReport("S1", 3, 1, report(map[string]any{"gcode_file": "other.3mf"}))
+	cache.Observe("S1", report(map[string]any{"gcode_file": "other.3mf"}))
 	res, _ = svc.Lookup("S1", false)
 	if res.Preview.Status != StatusPending || res.Preview.Reason != reasonRetryWait {
 		t.Fatalf("view after metadata delta = %+v, want pending retry_wait", res.Preview)
 	}
 
-	cache.ObserveReport("S1", 4, 1, report(map[string]any{"gcode_state": "FINISH"}))
+	cache.Observe("S1", report(map[string]any{"gcode_state": "FINISH"}))
 	res, _ = svc.Lookup("S1", false)
 	if res.Preview.Status != StatusUnavailable || res.Preview.Current {
 		t.Fatalf("projection after finish = %+v, want unavailable", res.Preview)

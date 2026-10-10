@@ -41,12 +41,12 @@ func TestFirstLayerIndependentConsumptionAndImmutableStatus(t *testing.T) {
 	f.hint("first_layer_complete")
 	f.hint("first_layer_complete")
 	f.step()
-	if f.client.layerCalls != 1 || len(f.commands.pauses) != 1 || layerStatus(f).Pause != "pending" || f.client.calls != 0 || !f.hasEvent("platecheck_layer1_pause_sent") {
+	if f.client.layerCalls != 1 || f.commands.pauses != 1 || layerStatus(f).Pause != "pending" || f.client.calls != 0 || !f.hasEvent("platecheck_layer1_pause_sent") {
 		t.Fatalf("independent layer state %+v", layerStatus(f))
 	}
 	f.hint("first_layer_complete")
 	f.step()
-	if f.client.layerCalls != 1 || len(f.commands.pauses) != 1 {
+	if f.client.layerCalls != 1 || f.commands.pauses != 1 {
 		t.Fatal("duplicate replay")
 	}
 	v := f.s.moduleState("01S1").(ModuleState)
@@ -78,7 +78,7 @@ func TestFirstLayerDisabledAndStartupStopSuppression(t *testing.T) {
 	f.s.settings.FirstLayer.Enabled = new(false)
 	f.hint("first_layer_complete")
 	f.step()
-	if f.client.layerCalls != 0 || len(f.commands.pauses) != 0 {
+	if f.client.layerCalls != 0 || f.commands.pauses != 0 {
 		t.Fatal("disabled phase evaluated")
 	}
 	f = newFixture(t, "PREPARE")
@@ -92,7 +92,7 @@ func TestFirstLayerDisabledAndStartupStopSuppression(t *testing.T) {
 	f.hint("first_layer_complete")
 	f.w.pending = nil
 	f.step()
-	if f.client.layerCalls != 0 || len(f.commands.pauses) != 0 || layerStatus(f).State != "skipped" || layerStatus(f).Reason != "startup_stopped" {
+	if f.client.layerCalls != 0 || f.commands.pauses != 0 || layerStatus(f).State != "skipped" || layerStatus(f).Reason != "startup_stopped" {
 		t.Fatalf("startup stop attempt did not suppress later phase: %+v", layerStatus(f))
 	}
 	found := false
@@ -107,7 +107,7 @@ func TestFirstLayerDisabledAndStartupStopSuppression(t *testing.T) {
 }
 
 func TestFirstLayerAdmissionWaitsSkipsAndIgnoresStamps(t *testing.T) {
-	// Stale stamps and off-connection generations never block admission.
+	// Stale stamps never block admission.
 	for _, tc := range []struct {
 		name   string
 		change func(*fixture)
@@ -115,16 +115,13 @@ func TestFirstLayerAdmissionWaitsSkipsAndIgnoresStamps(t *testing.T) {
 		{"zero session", func(f *fixture) { f.state.v.ObsAt = time.Time{} }},
 		{"stale session", func(f *fixture) { f.state.v.ObsAt = f.clock.now().Add(-16 * time.Second) }},
 		{"future session", func(f *fixture) { f.state.v.ObsAt = f.clock.now().Add(time.Second) }},
-		{"old session connection", func(f *fixture) { f.state.v.ObsGen = 2 }},
-		{"old session state connection", func(f *fixture) { f.state.v.StateGen = 2 }},
-		{"reconnect", func(f *fixture) { f.commands.reconnect() }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newLayerFixture(t)
 			tc.change(f)
 			f.hint("first_layer_complete")
 			f.step()
-			if f.client.layerCalls != 1 || len(f.commands.pauses) != 1 {
+			if f.client.layerCalls != 1 || f.commands.pauses != 1 {
 				t.Fatal("fresh authorization inputs rejected")
 			}
 		})
@@ -170,7 +167,7 @@ func TestFirstLayerAdmissionWaitsSkipsAndIgnoresStamps(t *testing.T) {
 	}
 	f.report("RUNNING", new(2))
 	f.step()
-	if f.client.layerCalls != 1 || len(f.commands.pauses) != 1 {
+	if f.client.layerCalls != 1 || f.commands.pauses != 1 {
 		t.Fatal("resume did not admit the waiting hint")
 	}
 	f = newLayerFixture(t)
@@ -226,10 +223,10 @@ func TestFirstLayerEventProvenanceValidation(t *testing.T) {
 			}
 			f.s.ObserveActivity("01S1", activity.Entry{Kind: "first_layer_complete", Time: f.clock.now(), Observation: observation})
 			f.step()
-			if f.w.layerHint != nil || f.w.layerProcessed != 0 || captures != 0 || f.client.layerCalls != 0 || len(f.commands.pauses) != 0 {
+			if f.w.layerHint != nil || f.w.layerProcessed != 0 || captures != 0 || f.client.layerCalls != 0 || f.commands.pauses != 0 {
 				t.Fatal("invalid provenance queued, consumed, captured, uploaded, or paused")
 			}
-			if layerStatus(f).State != "idle" || f.hasEvent("platecheck_layer1_skipped") || len(f.commands.lights) != 0 {
+			if layerStatus(f).State != "idle" || f.hasEvent("platecheck_layer1_skipped") || f.commands.lights != 0 {
 				t.Fatal("invalid provenance invented lifecycle")
 			}
 		})
@@ -260,7 +257,7 @@ func TestFirstLayerStaleEventCannotBindSwitchedJob(t *testing.T) {
 	})
 	f.s.ObserveActivity("01S1", activity.Entry{Kind: "first_layer_complete", Time: f.clock.now(), Observation: observation})
 	f.step()
-	if f.w.layerHint != nil || f.w.layerProcessed != 0 || captures != 0 || f.client.layerCalls != 0 || len(f.commands.pauses) != 0 || len(f.commands.lights) != 0 {
+	if f.w.layerHint != nil || f.w.layerProcessed != 0 || captures != 0 || f.client.layerCalls != 0 || f.commands.pauses != 0 || f.commands.lights != 0 {
 		t.Fatal("stale event bound, consumed, captured, uploaded, or paused the replaced job")
 	}
 	if layerStatus(f).State != "idle" || f.hasEvent("platecheck_layer1_skipped") {
@@ -269,7 +266,7 @@ func TestFirstLayerStaleEventCannotBindSwitchedJob(t *testing.T) {
 	// The current job keeps its own admission; the rejected event consumed nothing.
 	f.hint("first_layer_complete")
 	f.step()
-	if f.client.layerCalls != 1 || len(f.commands.pauses) != 1 || layerStatus(f).Pause != "pending" {
+	if f.client.layerCalls != 1 || f.commands.pauses != 1 || layerStatus(f).Pause != "pending" {
 		t.Fatal("current job lost its own admission")
 	}
 }
@@ -292,7 +289,7 @@ func TestFirstLayerChangesAcrossNetworkBoundariesFailOpen(t *testing.T) {
 			f.state.edit(func(j *telemetry.JobView, v *telemetry.SessionView) { v.SessionGen++ })
 		}, true},
 		{"session epoch", func(f *fixture) { f.state.edit(func(j *telemetry.JobView, v *telemetry.SessionView) { v.Epoch++ }) }, true},
-		{"reconnect", func(f *fixture) { f.commands.reconnect() }, true},
+		{"offline flap", func(f *fixture) { f.commands.offline = map[string]bool{"01S1": true}; f.commands.offline = nil }, true},
 		{"pause resume", func(f *fixture) { f.report("PAUSE", new(2)); f.report("RUNNING", new(2)) }, true},
 		{"stale session", func(f *fixture) { f.state.v.ObsAt = f.clock.now().Add(-16 * time.Second) }, true},
 		{"budget", func(f *fixture) { f.clock.advance(26 * time.Second); f.report("RUNNING", new(2)) }, false},
@@ -331,7 +328,7 @@ func TestFirstLayerChangesAcrossNetworkBoundariesFailOpen(t *testing.T) {
 				f.hint("first_layer_complete")
 				f.step()
 				if !tc.acted {
-					if len(f.commands.pauses) != 0 || layerStatus(f).State != "skipped" {
+					if f.commands.pauses != 0 || layerStatus(f).State != "skipped" {
 						t.Fatalf("changed evidence acted: %+v", layerStatus(f))
 					}
 					if (stage == "first capture" || stage == "second capture") && f.client.layerCalls != 0 {
@@ -339,7 +336,7 @@ func TestFirstLayerChangesAcrossNetworkBoundariesFailOpen(t *testing.T) {
 					}
 					return
 				}
-				if len(f.commands.pauses) != 1 {
+				if f.commands.pauses != 1 {
 					t.Fatalf("unchanged authorization inputs revoked: %+v", layerStatus(f))
 				}
 			})
@@ -408,7 +405,7 @@ func TestFirstLayerFrameBoundaries(t *testing.T) {
 			})
 			f.hint("first_layer_complete")
 			f.step()
-			if f.client.layerCalls != 0 || len(f.commands.pauses) != 0 {
+			if f.client.layerCalls != 0 || f.commands.pauses != 0 {
 				t.Fatal("invalid frames uploaded or acted")
 			}
 		})
@@ -435,7 +432,7 @@ func TestFirstLayerWarningPassErrorAndPauseFailureEvents(t *testing.T) {
 			f.client.layerResult, f.client.err = tc.result, tc.err
 			f.hint("first_layer_complete")
 			f.step()
-			if len(f.commands.pauses) != 0 || layerStatus(f).State != tc.want || !f.hasEvent(tc.event) {
+			if f.commands.pauses != 0 || layerStatus(f).State != tc.want || !f.hasEvent(tc.event) {
 				t.Fatalf("decision %+v", layerStatus(f))
 			}
 			for _, e := range f.activity.Recent("01S1") {
@@ -462,7 +459,7 @@ func TestFirstLayerWarningPassErrorAndPauseFailureEvents(t *testing.T) {
 	}
 	f.hint("first_layer_complete")
 	f.step()
-	if len(f.commands.pauses) != 1 {
+	if f.commands.pauses != 1 {
 		t.Fatal("failed send retried")
 	}
 }
@@ -561,7 +558,7 @@ func TestFirstLayerAdmissionBudgetStartsAtStep(t *testing.T) {
 		return base.Capture(ctx, serial, after)
 	})
 	f.step()
-	if captures != 2 || f.client.layerCalls != 1 || len(f.commands.pauses) != 1 {
+	if captures != 2 || f.client.layerCalls != 1 || f.commands.pauses != 1 {
 		t.Fatal("valid queued hint did not complete within its step budget")
 	}
 }
@@ -594,7 +591,7 @@ func TestFirstLayerReplacementDuringAdmissionConsumesNothingStale(t *testing.T) 
 	}
 	f.state.printHook = nil
 	f.step()
-	if f.w.layerProcessed != 0 || captures != 0 || f.client.layerCalls != 0 || len(f.commands.pauses) != 0 || len(f.commands.lights) != 0 {
+	if f.w.layerProcessed != 0 || captures != 0 || f.client.layerCalls != 0 || f.commands.pauses != 0 || f.commands.lights != 0 {
 		t.Fatal("rejected source consumed, captured, uploaded, or acted on")
 	}
 	if layerStatus(f).State != "idle" || f.hasEvent("platecheck_layer1_skipped") {
@@ -602,7 +599,7 @@ func TestFirstLayerReplacementDuringAdmissionConsumesNothingStale(t *testing.T) 
 	}
 	f.hint("first_layer_complete")
 	f.step()
-	if captures != 2 || f.client.layerCalls != 1 || len(f.commands.pauses) != 1 {
+	if captures != 2 || f.client.layerCalls != 1 || f.commands.pauses != 1 {
 		t.Fatal("rejected source consumed the fresh current job")
 	}
 }
@@ -613,7 +610,7 @@ func TestFirstLayerReplacementDuringAdmissionConsumesNothingStale(t *testing.T) 
 func newRealCacheFixture(t *testing.T, state *telemetry.Cache) *fixture {
 	t.Helper()
 	client := &fakeDecision{layerResult: LayerResult{PAssessable: .9, PTangled: .9}}
-	commands := &fakeCommands{gen: 1}
+	commands := &fakeCommands{}
 	data := testJPEG(t)
 	seq := uint64(0)
 	frames := frameFunc(func(_ context.Context, _ string, after time.Time) (Frame, error) {
@@ -658,11 +655,9 @@ func TestFirstLayerSameCookieStartTimeReplacementCannotBindNewJob(t *testing.T) 
 		return base.Capture(ctx, serial, after)
 	})
 	// Print A runs at layer 2 under identity 1-2-a.gcode.
-	seq := uint64(0)
 	report := func(started int64) {
-		seq++
 		payload := `{"print":{"gcode_state":"RUNNING","project_id":1,"task_id":2,"subtask_name":"a.gcode","gcode_start_time":` + strconv.FormatInt(started, 10) + `,"layer_num":2}}`
-		c.ObserveReport("01S1", seq, 1, []byte(payload))
+		c.Observe("01S1", []byte(payload))
 	}
 	report(1000000000)
 	sessionA, _ := c.Session("01S1")
@@ -686,7 +681,7 @@ func TestFirstLayerSameCookieStartTimeReplacementCannotBindNewJob(t *testing.T) 
 	// Deliver A's saved event: it must bind nothing and leave B unconsumed.
 	f.s.ObserveActivity("01S1", activity.Entry{Kind: "first_layer_complete", Time: sessionA.ObsAt, Observation: observation})
 	f.step()
-	if f.w.layerHint != nil || f.w.layerProcessed != 0 || captures != 0 || f.client.layerCalls != 0 || len(f.commands.pauses) != 0 || len(f.commands.lights) != 0 {
+	if f.w.layerHint != nil || f.w.layerProcessed != 0 || captures != 0 || f.client.layerCalls != 0 || f.commands.pauses != 0 || f.commands.lights != 0 {
 		t.Fatal("A's stale event bound, consumed, captured, uploaded, lighted, or paused print B")
 	}
 	if layerStatus(f).State != "idle" || f.hasEvent("platecheck_layer1_skipped") {
@@ -696,8 +691,8 @@ func TestFirstLayerSameCookieStartTimeReplacementCannotBindNewJob(t *testing.T) 
 	// session identity that could not carry A's event.
 	f.s.ObserveActivity("01S1", activity.Entry{Kind: "first_layer_complete", Time: sessionB.ObsAt, Observation: cacheEvidence(c, "01S1")})
 	f.step()
-	if captures != 2 || f.client.layerCalls != 1 || len(f.commands.pauses) != 1 || layerStatus(f).Pause != "pending" || !f.hasEvent("platecheck_layer1_pause_sent") {
-		t.Fatalf("print B lost or duplicated its own admission: captures=%d calls=%d pauses=%d pause=%+v", captures, f.client.layerCalls, len(f.commands.pauses), layerStatus(f))
+	if captures != 2 || f.client.layerCalls != 1 || f.commands.pauses != 1 || layerStatus(f).Pause != "pending" || !f.hasEvent("platecheck_layer1_pause_sent") {
+		t.Fatalf("print B lost or duplicated its own admission: captures=%d calls=%d pauses=%d pause=%+v", captures, f.client.layerCalls, f.commands.pauses, layerStatus(f))
 	}
 	if f.w.layerHint != nil || f.w.layerProcessed != jobB.Generation {
 		t.Fatal("print B admission was not consumed exactly once")

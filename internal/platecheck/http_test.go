@@ -110,7 +110,7 @@ func TestSnapshotRowsConfiguredOrderFailureContinuationAndNoControlEffects(t *te
 		clock.advance(time.Millisecond)
 		return Frame{JPEG: data, Seq: 7, Captured: clock.now(), Width: 8, Height: 6}, nil
 	})
-	commands := &fakeCommands{gen: 1}
+	commands := &fakeCommands{}
 	client := &fakeDecision{result: Result{PClear: .127, POccupied: 1 - .127, PAssessable: .962, Model: "clef"}}
 	s := New(printers, testSettings(), client, frames, nil, commands, nil)
 	s.now = clock.now
@@ -147,7 +147,7 @@ func TestSnapshotRowsConfiguredOrderFailureContinuationAndNoControlEffects(t *te
 			}
 		}
 	}
-	if commands.count() != 0 || len(commands.lights) != 0 || !reflect.DeepEqual(before, s.statusMap()) {
+	if commands.count() != 0 || commands.lights != 0 || !reflect.DeepEqual(before, s.statusMap()) {
 		t.Fatal("diagnostics changed controls/status")
 	}
 	for _, p := range printers {
