@@ -148,124 +148,7 @@ func TestPlatecheckAbsentWhenCamerasOff(t *testing.T) {
 	})
 }
 
-// TestPlatecheckRouteAfterReload pins that a saved configuration serves the
-// diagnostics route again on the fresh camera manager instead of retaining
-// the previous binding.
-func TestPlatecheckRouteAfterReload(t *testing.T) {
-	platecheckContractCleanEnv(t)
-	httpPort := freePort(t)
-	listenPort := freePort(t)
-	path := filepath.Join(t.TempDir(), "config.yaml")
-	fixture := fmt.Sprintf(`listen:
-  - port: %d
-    tls: false
-printers:
-  - serial: %q
-    model: P1S
-    address: "127.0.0.1:1"
-    password: "00008888"
-http:
-  port: %d
-camera:
-  enabled: true
-platecheck:
-  enabled: true
-  provider: %s
-  endpoint: %q
-  api_key: contract-dummy-key
-log:
-  level: error
-`, listenPort, platecheckContractSerial, httpPort, platecheck.ProviderCustom, platecheckContractEndpoint)
-	if err := os.WriteFile(path, []byte(fixture), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	// Like reload_stream_test.go, the serve loop must not run in parallel
-	// with other fixtures: cameras bind the fixed raw camera port 6000.
-	ctx, cancel := context.WithCancel(context.Background())
-	serving := make(chan error, 1)
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case err := <-serving:
-			if err != nil {
-				t.Errorf("serve loop: %v", err)
-			}
-		case <-time.After(15 * time.Second):
-			t.Error("serve loop did not stop within 15 seconds")
-		}
-	})
-	store := configui.NewStore(path)
-	go func() {
-		for {
-			next, err := serveOnce(ctx, path, "error", store)
-			if err != nil || next == nil {
-				serving <- err
-				return
-			}
-		}
-	}()
-	base := fmt.Sprintf("http://127.0.0.1:%d", httpPort)
-	waitFor(t, 15*time.Second, func() bool { return probeOK(base + "/livez") })
-
-	// Save the unchanged view through the real endpoint to trigger reload.
-	// The body is the raw config member, like the page sends it, with the
-	// redacted printer access code supplied again.
-	getResp, err := http.Get(base + "/config/api")
-	if err != nil {
-		t.Fatalf("GET /config/api: %v", err)
-	}
-	var doc struct {
-		Config json.RawMessage `json:"config"`
-	}
-	if err := json.NewDecoder(getResp.Body).Decode(&doc); err != nil {
-		t.Fatalf("decode /config/api: %v", err)
-	}
-	getResp.Body.Close()
-	var cfg map[string]any
-	if err := json.Unmarshal(doc.Config, &cfg); err != nil {
-		t.Fatalf("decode config member: %v", err)
-	}
-	printers, ok := cfg["printers"].([]any)
-	if !ok || len(printers) != 1 {
-		t.Fatalf("config printers = %#v, want one printer", cfg["printers"])
-	}
-	printer := printers[0].(map[string]any)
-	printer["access_code"] = "00008888"
-	body, err := json.Marshal(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	putReq, err := http.NewRequest(http.MethodPut, base+"/config/api", strings.NewReader(string(body)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	putReq.Header.Set("Content-Type", "application/json")
-	putResp, err := http.DefaultClient.Do(putReq)
-	if err != nil {
-		t.Fatalf("PUT /config/api: %v", err)
-	}
-	putBody, _ := io.ReadAll(putResp.Body)
-	putResp.Body.Close()
-	if putResp.StatusCode != http.StatusOK {
-		t.Fatalf("PUT /config/api = %d, body: %s", putResp.StatusCode, putBody)
-	}
-
-	// The next /livez answer is the restarted server; the diagnostics route
-	// must serve from the fresh camera binding.
-	waitFor(t, 15*time.Second, func() bool { return probeOK(base + "/livez") })
-	code, raw := platecheckContractRequest(t, http.MethodPost, base+"/platecheck/snapshots",
-		fmt.Sprintf(`{"enabled":true,"provider":"custom","endpoint":%q,"model":"clef","stop_confidence":0.5}`, platecheckContractEndpoint),
-		"same-origin")
-	if code != http.StatusOK {
-		t.Fatalf("snapshots after reload = %d %s, want 200", code, raw)
-	}
-	payload := platecheckContractEvents(t, raw)[0]
-	if payload["dry_run"] != true {
-		t.Fatalf("after-reload dry_run = %#v, want true", payload["dry_run"])
-	}
-}
-
-// platecheckContractServe starts one full serveOnce with the camera feature
+// platecheckContractServe starts one full serve with the camera feature
 // and, when enabled, the plate-check section credentials. Like
 // detectionContractServe, it must not run in parallel with other fixtures.
 func platecheckContractServe(t *testing.T, feature, cameras bool) string {
@@ -294,23 +177,7 @@ camera:
 	if err := os.WriteFile(path, []byte(fixture), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		_, err := serveOnce(ctx, path, "error", configui.NewStore(path))
-		done <- err
-	}()
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Errorf("serveOnce: %v", err)
-			}
-		case <-time.After(15 * time.Second):
-			t.Error("serveOnce did not stop within 15 seconds")
-		}
-	})
+	serveInProcess(t, path)
 	base := fmt.Sprintf("http://127.0.0.1:%d", port)
 	waitFor(t, 15*time.Second, func() bool { return probeOK(base + "/livez") })
 	return base

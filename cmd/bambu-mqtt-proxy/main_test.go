@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"bambu-mqtt-proxy/internal/config"
+	"bambu-mqtt-proxy/internal/configui"
 	"bambu-mqtt-proxy/internal/detection"
 	"bambu-mqtt-proxy/internal/health"
 	"bambu-mqtt-proxy/internal/printer"
@@ -261,57 +263,49 @@ func freePort(t *testing.T) int {
 	return ln.Addr().(*net.TCPAddr).Port
 }
 
-// getConfigAPI fetches /config/api and returns its decoded payload.
-func getConfigAPI(t *testing.T, url string) map[string]any {
+// startChild starts the test binary as the real proxy on path with its HTTP
+// port set through the environment, and returns its URL and command.
+func startChild(t *testing.T, path string, httpPort int) (string, *exec.Cmd, *bytes.Buffer) {
 	t.Helper()
-	doc, ok := tryGetConfigAPI(url)
-	if !ok {
-		t.Fatal("GET /config/api failed")
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("test binary: %v", err)
 	}
-	return doc
+	cmd := exec.Command(exe, "-config", path)
+	cmd.Env = append(bmbpxFreeEnv(), childEnv+"=1", config.EnvHTTPPort+"="+strconv.Itoa(httpPort), config.EnvLogLevel+"=error")
+	out := &bytes.Buffer{}
+	cmd.Stdout, cmd.Stderr = out, out
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start child: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	return "http://127.0.0.1:" + strconv.Itoa(httpPort), cmd, out
 }
 
-// tryGetConfigAPI fetches /config/api, reporting failure instead of dying so
-// waitFor can poll through the restart window when the endpoint is down.
-func tryGetConfigAPI(url string) (map[string]any, bool) {
-	resp, err := http.Get(url + "/config/api")
+// getConfigAPI fetches /config/api once.
+func getConfigAPI(url string) (map[string]any, bool) {
+	resp, err := (&http.Client{Timeout: 2 * time.Second}).Get(url + "/config/api")
 	if err != nil {
 		return nil, false
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, false
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, false
-	}
 	var doc map[string]any
-	if err := json.Unmarshal(body, &doc); err != nil {
+	if resp.StatusCode != http.StatusOK || json.NewDecoder(resp.Body).Decode(&doc) != nil {
 		return nil, false
 	}
 	return doc, true
 }
 
-// TestConfigApplyStartupFailureRestoresPreviousConfig saves a config whose
-// MQTT listener port is already held, then requires run() to keep the
-// previous file bytes, report the apply failure on the page, and resume
-// serving from the restored configuration.
-func TestConfigApplyStartupFailureRestoresPreviousConfig(t *testing.T) {
-	httpPort := freePort(t)
-	listenPort := freePort(t)
-	victimPort := freePort(t)
-	// Held for the whole test: the saved config must fail to bind it.
-	victim, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", victimPort))
-	if err != nil {
-		t.Fatalf("hold victim port: %v", err)
-	}
-	defer victim.Close()
-
-	dir := t.TempDir()
-	configPath := filepath.Join(dir, "bambu-mqtt-proxy.yaml")
-	original := fmt.Sprintf(`printers:
-  - serial: "01P00A123456789"
+// writeChildConfig writes a one-printer config with unreachable upstream and
+// an MQTT listener on a free port.
+func writeChildConfig(t *testing.T, serial string, listenPort int) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "bambu-mqtt-proxy.yaml")
+	doc := fmt.Sprintf(`printers:
+  - serial: %q
     address: "127.0.0.1:1"
     tls: true
     insecure_skip_verify: true
@@ -319,70 +313,41 @@ func TestConfigApplyStartupFailureRestoresPreviousConfig(t *testing.T) {
 listen:
   - port: %d
     tls: false
-auth:
-  mode: printer
-http:
-  port: %d
 camera:
   enabled: false
 log:
   level: error
-`, listenPort, httpPort)
-	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+`, serial, listenPort)
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	return path
+}
 
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatalf("test binary: %v", err)
-	}
-	cmd := exec.Command(exe, "-config", configPath)
-	cmd.Env = append(bmbpxFreeEnv(), childEnv+"=1")
-	var out bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &out, &out
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start child: %v", err)
-	}
-	stopped := false
-	t.Cleanup(func() {
-		if !stopped {
-			_ = cmd.Process.Signal(syscall.SIGTERM)
-			_ = cmd.Wait()
-		}
-	})
-
-	url := "http://127.0.0.1:" + strconv.Itoa(httpPort)
+// TestSaveRestartsProcessWithNewConfig starts the real binary, saves a new
+// printer list through the HTTP API, and requires the same process to
+// re-exec and serve the new list.
+func TestSaveRestartsProcessWithNewConfig(t *testing.T) {
+	const oldSerial, newSerial = "01S00CRESTARTOLD1", "01S00CRESTARTNEW2"
+	httpPort := freePort(t)
+	path := writeChildConfig(t, oldSerial, freePort(t))
+	url, cmd, out := startChild(t, path, httpPort)
 	waitFor(t, 10*time.Second, func() bool { return probeOK(url + "/livez") })
-
-	// Save the same printers but move the listener onto the held port. The
-	// blank access code plus previous_serial reuses the stored code.
-	doc := getConfigAPI(t, url)
-	view, ok := doc["config"].(map[string]any)
+	doc, ok := getConfigAPI(url)
 	if !ok {
-		t.Fatalf("config payload shape: %v", doc)
+		t.Fatalf("GET /config/api failed; output:\n%s", out)
 	}
-	printers, ok := view["printers"].([]any)
-	if !ok || len(printers) == 0 {
-		t.Fatalf("printers payload shape: %v", view)
-	}
-	printer := printers[0].(map[string]any)
-	printer["previous_serial"] = printer["serial"]
-	printer["access_code"] = ""
-	listen, ok := view["listen"].([]any)
-	if !ok || len(listen) == 0 {
-		t.Fatalf("listen payload shape: %v", view)
-	}
-	listen[0].(map[string]any)["port"] = float64(victimPort)
+	started := doc["meta"].(map[string]any)["started"]
+	view := doc["config"].(map[string]any)
+	view["printers"] = []any{map[string]any{"serial": newSerial, "address": "127.0.0.1:1", "tls": true,
+		"insecure_skip_verify": true, "username": "bblp", "access_code": "new-code"}}
 	body, err := json.Marshal(view)
 	if err != nil {
 		t.Fatal(err)
 	}
-	req, err := http.NewRequest(http.MethodPut, url+"/config/api", bytes.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
+	req, _ := http.NewRequest(http.MethodPut, url+"/config/api", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	res, err := http.DefaultClient.Do(req)
+	res, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
 	if err != nil {
 		t.Fatalf("PUT /config/api: %v", err)
 	}
@@ -392,40 +357,50 @@ log:
 		t.Fatalf("PUT /config/api = %d: %s", res.StatusCode, resBody)
 	}
 
-	// The restart fails, the page reports it, and service resumes from the
-	// restored file with a fresh generation.
-	waitFor(t, 15*time.Second, func() bool {
-		doc, ok := tryGetConfigAPI(url)
-		if !ok {
-			return false
-		}
-		meta, _ := doc["meta"].(map[string]any)
-		errMsg, _ := meta["apply_error"].(string)
-		return errMsg != ""
+	waitFor(t, 20*time.Second, func() bool {
+		doc, ok := getConfigAPI(url)
+		return ok && doc["meta"].(map[string]any)["started"] != started
 	})
-	waitFor(t, 10*time.Second, func() bool { return probeOK(url + "/livez") })
-	var meta map[string]any
-	waitFor(t, 10*time.Second, func() bool {
-		doc, ok := tryGetConfigAPI(url)
-		if !ok {
-			return false
-		}
-		meta, _ = doc["meta"].(map[string]any)
-		gen, _ := meta["generation"].(float64)
-		return gen >= 2
-	})
-	if meta == nil {
-		t.Fatal("resumed service never recorded a new apply generation")
+	var status struct {
+		Upstreams map[string]bool `json:"upstreams"`
 	}
-	restored, err := os.ReadFile(configPath)
+	decodeStatus(t, url, &status)
+	if _, ok := status.Upstreams[newSerial]; !ok || len(status.Upstreams) != 1 {
+		t.Fatalf("upstreams = %v, want only %s; output:\n%s", status.Upstreams, newSerial, out)
+	}
+	stopped := false
+	terminate(t, cmd, out, &stopped)
+}
+
+// TestStartupFailureServesConfigPageWithError starts the binary with an MQTT
+// port that is already held and requires health and /config to serve with
+// the error shown, while /status is absent.
+func TestStartupFailureServesConfigPageWithError(t *testing.T) {
+	held, err := net.Listen("tcp", ":0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(restored) != original {
-		t.Fatalf("config file was not restored byte-for-byte:\n%s", restored)
-	}
+	defer held.Close()
+	httpPort := freePort(t)
+	path := writeChildConfig(t, "01S00CSTARTUPFAIL", held.Addr().(*net.TCPAddr).Port)
+	url, cmd, out := startChild(t, path, httpPort)
 
-	terminate(t, cmd, &out, &stopped)
+	var startupErr string
+	waitFor(t, 15*time.Second, func() bool {
+		doc, ok := getConfigAPI(url)
+		if ok {
+			startupErr, _ = doc["meta"].(map[string]any)["startup_error"].(string)
+		}
+		return startupErr != ""
+	})
+	if !strings.Contains(startupErr, "address already in use") {
+		t.Fatalf("startup_error = %q, want the bind failure", startupErr)
+	}
+	if !probeOK(url + "/livez") {
+		t.Fatal("/livez does not serve in the failure mode")
+	}
+	stopped := false
+	terminate(t, cmd, out, &stopped)
 }
 
 func resolvedDetection(t *testing.T, cfg *config.Config) detection.Settings {
@@ -437,8 +412,7 @@ func resolvedDetection(t *testing.T, cfg *config.Config) detection.Settings {
 	return settings
 }
 
-// TestResolveConfigDetectionKey covers the startup and reload path for the
-// persisted detection section: the YAML key enables on its own, and an
+// TestResolveConfigDetectionKey covers the startup path for the persisted detection section: the YAML key enables on its own, and an
 // explicit enabled: false stays off while its stored key stays usable.
 func TestResolveConfigDetectionKey(t *testing.T) {
 	dir := t.TempDir()
@@ -455,17 +429,13 @@ detection:
 	}
 
 	t.Run("yaml key enables", func(t *testing.T) {
-		// The second resolve mirrors the post-save reload: the same file is
-		// resolved again and must keep enabling detection.
-		for pass := 0; pass < 2; pass++ {
-			cfg, found, err := resolveConfig(path)
-			if err != nil || !found {
-				t.Fatalf("resolveConfig pass %d: found=%v err=%v", pass, found, err)
-			}
-			if !resolvedDetection(t, cfg).On() || resolvedDetection(t, cfg).Key() != "file-key" {
-				t.Fatalf("pass %d: enabled=%v key=%q, want the yaml key in effect",
-					pass, resolvedDetection(t, cfg).On(), resolvedDetection(t, cfg).Key())
-			}
+		cfg, err := resolveConfig(path)
+		if err != nil {
+			t.Fatalf("resolveConfig: %v", err)
+		}
+		if !resolvedDetection(t, cfg).On() || resolvedDetection(t, cfg).Key() != "file-key" {
+			t.Fatalf("enabled=%v key=%q, want the yaml key in effect",
+				resolvedDetection(t, cfg).On(), resolvedDetection(t, cfg).Key())
 		}
 	})
 
@@ -482,7 +452,7 @@ detection:
 		if err := os.WriteFile(offPath, []byte(offDoc), 0o600); err != nil {
 			t.Fatalf("write config: %v", err)
 		}
-		cfg, _, err := resolveConfig(offPath)
+		cfg, err := resolveConfig(offPath)
 		if err != nil {
 			t.Fatalf("resolveConfig: %v", err)
 		}
@@ -493,4 +463,38 @@ detection:
 			t.Fatalf("key = %q, want the stored file key preserved", resolvedDetection(t, cfg).Key())
 		}
 	})
+}
+
+// serveInProcess runs serve for the config file until test cleanup and waits
+// for /livez. The HTTP port comes from the file. Fixtures that use it must
+// not run in parallel: cameras bind the fixed raw camera port 6000.
+func serveInProcess(t *testing.T, path string) {
+	t.Helper()
+	cfg, err := resolveConfig(path)
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	logger, err := newLogger("error")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := serve(ctx, cfg, logger, configui.NewStore(path))
+		done <- err
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("serve: %v", err)
+			}
+		case <-time.After(15 * time.Second):
+			t.Error("serve did not stop within 15 seconds")
+		}
+	})
+	base := fmt.Sprintf("http://127.0.0.1:%d", cfg.HTTP.Port)
+	waitFor(t, 15*time.Second, func() bool { return probeOK(base + "/livez") })
 }

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -21,7 +20,7 @@ import (
 
 const detectionContractSerial = "01S00CDETECT001"
 
-// TestDetectionHTTPContract pins no-report detection across wall JSON, SSE, health, and protected per-print writes.
+// TestDetectionHTTPContract pins no-report detection across wall JSON, health, and protected per-print writes.
 func TestDetectionHTTPContract(t *testing.T) {
 	base := detectionContractServe(t, true, true)
 	// An unreachable printer has no reports: today's idle fixture displays
@@ -36,35 +35,6 @@ func TestDetectionHTTPContract(t *testing.T) {
 	payload := detectionContractObject(t, raw)
 	detectionContractFleet(t, payload)
 	detectionContractState(t, detectionContractTile(t, payload)["detection"], want)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/camera/events", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("SSE status = %d", resp.StatusCode)
-	}
-	reader := bufio.NewReader(resp.Body)
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			t.Fatalf("first SSE event: %v", err)
-		}
-		if strings.HasPrefix(line, "data: ") {
-			event := detectionContractObject(t, []byte(strings.TrimPrefix(line, "data: ")))
-			detectionContractFleet(t, event)
-			detectionContractState(t, detectionContractTile(t, event)["detection"], want)
-			break
-		}
-	}
-	resp.Body.Close()
 
 	_, raw = detectionContractRequest(t, http.MethodGet, base+"/status", "", "")
 	status := detectionContractObject(t, raw)
@@ -207,13 +177,6 @@ listen:
 auth:
     mode: printer
 printers: []
-behavior:
-    warmup_commands:
-        - '{"pushing":{"sequence_id":"0","command":"pushall"}}'
-    upstream_keepalive_seconds: 30
-    upstream_connect_timeout_seconds: 5
-    upstream_backoff_initial_seconds: 1
-    upstream_backoff_max_seconds: 30
 log:
     level: info
 http:
@@ -242,6 +205,8 @@ platecheck:
     first_layer:
         enabled: true
         pause_confidence: 0.7
+safety:
+    enabled: false
 `
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(path, []byte(fixture), 0o600); err != nil {
@@ -319,25 +284,7 @@ camera:
 	if err := os.WriteFile(path, []byte(fixture), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// Like reload_stream_test.go, do not run serveOnce fixtures in parallel:
-	// cameras bind the fixed raw camera port 6000.
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		_, err := serveOnce(ctx, path, "error", configui.NewStore(path))
-		done <- err
-	}()
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Errorf("serveOnce: %v", err)
-			}
-		case <-time.After(15 * time.Second):
-			t.Error("serveOnce did not stop within 15 seconds")
-		}
-	})
+	serveInProcess(t, path)
 	base := fmt.Sprintf("http://127.0.0.1:%d", port)
 	waitFor(t, 15*time.Second, func() bool { return probeOK(base + "/livez") })
 	return base

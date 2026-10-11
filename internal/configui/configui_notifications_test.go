@@ -83,11 +83,7 @@ func TestSaveWithBlankNotificationCredentialsKeepsStored(t *testing.T) {
 	if code, body := put(t, srv, v); code != http.StatusOK {
 		t.Fatalf("save = %d %v", code, body)
 	}
-	select {
-	case <-store.Reloads():
-	default:
-		t.Fatal("save did not request a reload")
-	}
+	requireSaved(t, store)
 	cfg, err := config.Load(path)
 	if err != nil {
 		t.Fatal(err)
@@ -137,8 +133,8 @@ func TestNotificationTestEndpointRejectsInvalid(t *testing.T) {
 				t.Fatalf("test action wrote config: %v", err)
 			}
 			select {
-			case <-store.Reloads():
-				t.Fatal("test action requested a reload")
+			case <-store.Saved():
+				t.Fatal("test action requested a restart")
 			default:
 			}
 		})

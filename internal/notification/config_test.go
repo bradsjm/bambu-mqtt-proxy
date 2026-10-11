@@ -292,8 +292,8 @@ func TestTestHTTPRoute(t *testing.T) {
 				t.Fatalf("test changed file: %q %v", after, err)
 			}
 			select {
-			case <-store.Reloads():
-				t.Fatal("test requested a reload")
+			case <-store.Saved():
+				t.Fatal("test requested a restart")
 			default:
 			}
 		})

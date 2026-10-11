@@ -72,33 +72,22 @@ func TestChamberTemperatureSupported(t *testing.T) {
 	}
 }
 
-// TestPortZeroDisablesHTTP pins the documented contract: an explicit
-// http.port 0 (YAML or env) survives defaults and disables HTTP.
-func TestPortZeroDisablesHTTP(t *testing.T) {
-	cfg := &Config{
-		Listen:   []Listener{{Port: 8883, TLS: false}},
-		HTTP:     HTTP{Port: PortUnset},
-		Printers: []Printer{{Serial: "S", Model: "P1S", Address: "h:8883", Password: "p"}},
-	}
-	t.Setenv(EnvHTTPPort, "0")
-	if err := cfg.ApplyEnv(); err != nil {
-		t.Fatalf("ApplyEnv: %v", err)
+// TestPortZeroMeansUnset pins the port rule: 0 (file or environment) is
+// unset and becomes 8080, the explicit zero stays visible for the warning,
+// and old behavior keys still load.
+func TestPortZeroMeansUnset(t *testing.T) {
+	cfg, err := Parse([]byte("http:\n  port: 0\nbehavior:\n  upstream_keepalive_seconds: 1\n"))
+	if err != nil {
+		t.Fatalf("Parse with a behavior key: %v", err)
 	}
 	cfg.ApplyDefaults()
-	if cfg.HTTP.Port != 0 {
-		t.Fatalf("explicit port 0 became %d; 0 must disable HTTP", cfg.HTTP.Port)
+	if cfg.HTTP.Port != 8080 || !cfg.HTTP.ExplicitZero() {
+		t.Fatalf("port = %d explicit zero = %v, want 8080 and true", cfg.HTTP.Port, cfg.HTTP.ExplicitZero())
 	}
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("Validate: %v", err)
-	}
-}
-
-// TestPortUnsetDefaultsTo8080 covers the no-config default path.
-func TestPortUnsetDefaultsTo8080(t *testing.T) {
-	cfg := &Config{HTTP: HTTP{Port: PortUnset}}
-	cfg.ApplyDefaults()
-	if cfg.HTTP.Port != 8080 {
-		t.Fatalf("unset port = %d, want default 8080", cfg.HTTP.Port)
+	unset := &Config{}
+	unset.ApplyDefaults()
+	if unset.HTTP.Port != 8080 || unset.HTTP.ExplicitZero() {
+		t.Fatalf("unset port = %d explicit zero = %v, want 8080 and false", unset.HTTP.Port, unset.HTTP.ExplicitZero())
 	}
 }
 

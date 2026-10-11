@@ -301,7 +301,7 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
 
   <section aria-labelledby="proxy-h">
     <div class="sec-head"><h2 id="proxy-h">Proxy</h2></div>
-    <p class="sec-lede">How apps connect to the proxy, which extras it serves, and how it keeps printer connections alive.</p>
+    <p class="sec-lede">How apps connect to the proxy and which extras it serves.</p>
     <div class="groups">
       <fieldset class="group">
         <legend>MQTT for your apps</legend>
@@ -327,9 +327,9 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
         <legend>Web and extras</legend>
         <div class="row">
           <div><label for="f-http">HTTP port</label>
-            <span class="hint">Serves this page, health checks, cameras, and MCP. 0 turns HTTP off, including this page.</span>
+            <span class="hint">Serves this page, health checks, cameras, and MCP. Changing it restarts the proxy on the new port. 0 means the default, 8080.</span>
             <span class="env" data-env="http_port" hidden></span></div>
-          <div class="control"><input id="f-http" type="number" min="0" max="65535" required data-field="http_port" data-type="int"></div>
+          <div class="control"><input id="f-http" type="number" min="1" max="65535" required data-field="http_port" data-type="int"></div>
         </div>
         <div class="row">
           <div><label for="f-camera">Cameras</label>
@@ -340,33 +340,6 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
           <div><label for="f-mcp">MCP endpoint</label>
             <span class="hint">Read-only printer state for AI assistants at <code>/mcp</code>. It cannot control printers.</span></div>
           <div class="control"><input id="f-mcp" class="switch" type="checkbox" role="switch" data-field="mcp_enabled"></div>
-        </div>
-      </fieldset>
-
-      <fieldset class="group">
-        <legend>Printer connections</legend>
-        <div class="row">
-          <div><label for="f-keepalive">Keepalive (seconds)</label>
-            <span class="hint">How often the proxy checks that each printer is still there.</span></div>
-          <div class="control"><input id="f-keepalive" type="number" min="1" required data-field="behavior.keepalive_seconds" data-type="int"></div>
-        </div>
-        <div class="row">
-          <div><label for="f-timeout">Connect timeout (seconds)</label>
-            <span class="hint">How long an app waits for a printer that is not connected yet.</span></div>
-          <div class="control"><input id="f-timeout" type="number" min="1" required data-field="behavior.connect_timeout_seconds" data-type="int"></div>
-        </div>
-        <div class="row">
-          <div><span class="label" id="retry-l">Retry delay (seconds)</span>
-            <span class="hint">First and longest wait between attempts to reach an offline printer.</span></div>
-          <div class="control" role="group" aria-labelledby="retry-l">
-            <input type="number" min="1" required aria-label="First retry delay" data-field="behavior.backoff_initial_seconds" data-type="int">
-            <input type="number" min="1" required aria-label="Longest retry delay" data-field="behavior.backoff_max_seconds" data-type="int">
-          </div>
-        </div>
-        <div class="row wide">
-          <div><label for="f-warmup">Warmup commands</label>
-            <span class="hint">Sent to a printer when it connects, one JSON message per line. The default asks for its full state.</span>
-            <textarea id="f-warmup" rows="2" spellcheck="false" data-field="behavior.warmup_commands" data-type="lines" style="margin-top:.6rem"></textarea></div>
         </div>
       </fieldset>
 
@@ -527,6 +500,21 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
       </fieldset>
     </div>
   </section>
+
+  <section aria-labelledby="safety-h">
+    <div class="sec-head"><h2 id="safety-h">Safety</h2></div>
+    <p class="sec-lede">An optional backup to the printer's own thermal protection.</p>
+    <div class="groups">
+      <fieldset class="group" id="safety">
+        <legend>Over-temperature stop</legend>
+        <div class="row">
+          <div><label for="f-safety">Over-temperature stop</label>
+            <span class="hint">When a printer's nozzle, bed, or chamber reaches its model's safety limit, the proxy stops every printer, switches that printer's Panda PWR off when one is set, and sends one Pushover emergency alert. It needs the Pushover credentials above, even while notifications are off.</span></div>
+          <div class="control"><input id="f-safety" class="switch" type="checkbox" role="switch" data-field="safety.enabled"></div>
+        </div>
+      </fieldset>
+    </div>
+  </section>
 </main>
 
 <div class="savebar" id="savebar" data-state="idle" role="status" aria-live="polite">
@@ -645,7 +633,7 @@ function renderFile() {
 function renderNotices() {
   const n = [];
   const note = (html, kind = "") => n.push(`<div class="notice ${kind}"><svg class="ic" aria-hidden="true"><use href="#i-${kind ? "alert" : "info"}"/></svg><p>${html}</p></div>`);
-  if (meta.apply_error) note(`<strong>The last save could not start, so the previous settings were restored.</strong> ${esc(meta.apply_error)}`, "error");
+  if (meta.startup_error) note(`<strong>The proxy could not start with the saved settings, so only this page is running.</strong> ${esc(meta.startup_error)} Fix the setting and save again.`, "error");
   if (meta.file_error) note(`<strong>The config file could not be read.</strong> ${esc(meta.file_error)} Saving replaces it, so re-enter each printer's access code.`, "error");
   if (!meta.file_exists && !meta.file_error) note(`<strong>No config file yet.</strong> Add your printers and save to create <code>${esc(meta.path)}</code>.`);
   $("#notices").innerHTML = n.join("");
@@ -820,11 +808,9 @@ function validateForm() {
   for (const el of document.querySelectorAll("main input[required], main textarea")) {
     if (!el.checkValidity()) { el.reportValidity(); return false; }
   }
-  const bad = cfg.behavior.warmup_commands.findIndex(c => { try { JSON.parse(c); return false; } catch { return true; } });
-  if (bad >= 0) { setBar("error", `Warmup command ${bad + 1} is not valid JSON.`); $("#f-warmup").focus(); return false; }
   const missing = cfg.printers.find(p => !p.access_code && !p.has_access_code);
   if (missing) { setBar("error", `Enter the access code for printer ${missing.serial}.`); return false; }
-  if (cfg.notifications.enabled) {
+  if (cfg.notifications.enabled || cfg.safety?.enabled) {
     const n = cfg.notifications.pushover;
     const blank = (v, has) => !has && !String(v || "").trim();
     if (blank(n.app_token, n.has_app_token)) { setBar("error", "Enter the Pushover app token."); $("#f-pushover-token").focus(); return false; }
@@ -841,7 +827,7 @@ function validateForm() {
 async function save() {
   if (!validateForm()) return;
   plateTest.invalidate();
-  const oldGen = meta.generation;
+  const oldStart = meta.started;
   setBar("busy", "Saving…");
   let res, body;
   try {
@@ -855,7 +841,6 @@ async function save() {
   baseline = snapshot();
 
   const port = Number(location.port || (location.protocol === "https:" ? 443 : 80));
-  if (body.http_port === 0) { setBar("done", "Saved. HTTP is now off, so this page is no longer served."); return; }
   if (body.http_port !== port) {
     setBar("busy", `Saved. Moving to port ${body.http_port}…`);
     const url = new URL(location.href); url.port = String(body.http_port);
@@ -868,9 +853,9 @@ async function save() {
     await new Promise(r => setTimeout(r, 700));
     try {
       const data = await fetch(API, { cache: "no-store" }).then(r => r.ok ? r.json() : null);
-      if (!data || data.meta.generation <= oldGen) continue;
+      if (!data || data.meta.started === oldStart) continue;
       await load();
-      if (data.meta.apply_error) setBar("error", "The new settings could not start. The previous settings are back.");
+      if (data.meta.startup_error) setBar("error", "The new settings could not start. Fix them and save again.");
       else setBar("done", "Saved and applied.");
       return;
     } catch { /* restarting */ }

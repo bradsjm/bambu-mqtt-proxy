@@ -12,10 +12,6 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// DefaultWarmupPushall is the warmup command published upstream when the first
-// downstream subscriber appears for a printer and after each upstream reconnect.
-const DefaultWarmupPushall = `{"pushing":{"sequence_id":"0","command":"pushall"}}`
-
 // Downstream authentication modes.
 const (
 	// AuthModePrinter requires username bblp and a password matching any
@@ -32,7 +28,7 @@ const (
 	// stored file value.
 	EnvLogLevel = "BMBPX_LOG_LEVEL"
 	// EnvHTTPPort overrides http.port: a valid value 0-65535 replaces the
-	// stored file value, and 0 disables the HTTP endpoint.
+	// stored file value, and 0 is treated as unset.
 	EnvHTTPPort = "BMBPX_HTTP_PORT"
 
 	defaultFileName = "bambu-mqtt-proxy.yaml"
@@ -109,32 +105,39 @@ func (p Printer) Setting(key string) string {
 	return strings.TrimSpace(v)
 }
 
-// Behavior holds routing and upstream connection tuning knobs.
-type Behavior struct {
-	WarmupCommands                []string `yaml:"warmup_commands"`
-	UpstreamKeepaliveSeconds      int      `yaml:"upstream_keepalive_seconds"`
-	UpstreamConnectTimeoutSeconds int      `yaml:"upstream_connect_timeout_seconds"`
-	UpstreamBackoffInitialSeconds int      `yaml:"upstream_backoff_initial_seconds"`
-	UpstreamBackoffMaxSeconds     int      `yaml:"upstream_backoff_max_seconds"`
-}
-
 // Log holds logging configuration.
 type Log struct {
 	Level string `yaml:"level"`
 }
 
-// HTTP holds the shared health and camera HTTP endpoint configuration.
+// HTTP holds the shared health, camera, and configuration HTTP endpoint
+// configuration.
 type HTTP struct {
-	// Port serves /livez, /readyz, /status, the camera endpoints and the
-	// camera wall; 0 disables the endpoint. Unset is represented by the
-	// PortUnset sentinel until ApplyDefaults fills in the design default.
+	// Port serves /livez, /readyz, /status, /config, the camera endpoints and
+	// the camera wall. 0 means unset and ApplyDefaults replaces it with 8080.
 	Port int `yaml:"port"`
+	// zero records that the file or environment set the port to 0 explicitly.
+	zero bool
 }
 
-// PortUnset marks an HTTP port that neither the file nor the environment
-// configured; ApplyDefaults replaces it with the design default. An
-// explicit 0 (disable HTTP) survives defaults untouched.
-const PortUnset = -1
+// UnmarshalYAML decodes the port and remembers an explicit 0 for ExplicitZero.
+func (h *HTTP) UnmarshalYAML(n *yaml.Node) error {
+	var raw struct {
+		Port *int `yaml:"port"`
+	}
+	if err := n.Decode(&raw); err != nil {
+		return err
+	}
+	if raw.Port != nil {
+		h.Port = *raw.Port
+		h.zero = *raw.Port == 0
+	}
+	return nil
+}
+
+// ExplicitZero reports whether the configuration set http.port to 0, which
+// ApplyDefaults treats as unset; the caller warns about it.
+func (h HTTP) ExplicitZero() bool { return h.zero }
 
 // Camera holds the camera and camera wall feature configuration.
 type Camera struct {
@@ -157,7 +160,6 @@ type Config struct {
 	Auth   Auth       `yaml:"auth"`
 	// Printers is the upstream printer list.
 	Printers []Printer `yaml:"printers"`
-	Behavior Behavior  `yaml:"behavior"`
 	Log      Log       `yaml:"log"`
 	HTTP     HTTP      `yaml:"http"`
 	Camera   Camera    `yaml:"camera"`
@@ -253,13 +255,8 @@ func (c *Config) CameraEnabled() bool {
 }
 
 // MCPEnabled reports whether the read-only MCP endpoint should be served on
-// the shared HTTP listener. It defaults to on; an explicit false disables
-// it, and it cannot serve without the shared HTTP listener, so http.port 0
-// keeps it off regardless.
+// the shared HTTP listener. It defaults to on; an explicit false disables it.
 func (c *Config) MCPEnabled() bool {
-	if c.HTTP.Port <= 0 {
-		return false
-	}
 	return c.MCP.Enabled == nil || *c.MCP.Enabled
 }
 
@@ -273,10 +270,10 @@ func Load(path string) (*Config, error) {
 	return Parse(raw)
 }
 
-// Parse decodes YAML configuration bytes. An unset http.port stays
-// PortUnset so ApplyDefaults can tell it apart from an explicit 0.
+// Parse decodes YAML configuration bytes. Unknown keys, including the
+// removed behavior section, are ignored.
 func Parse(raw []byte) (*Config, error) {
-	cfg := Config{HTTP: HTTP{Port: PortUnset}}
+	var cfg Config
 	if err := yaml.Unmarshal(raw, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
@@ -297,6 +294,7 @@ func (c *Config) ApplyEnv() error {
 			return fmt.Errorf("%s: invalid port %q", EnvHTTPPort, v)
 		}
 		c.HTTP.Port = n
+		c.HTTP.zero = n == 0
 	}
 	return nil
 }
@@ -307,18 +305,6 @@ func (c *Config) ApplyDefaults() {
 	if c.Auth.Mode == "" {
 		c.Auth.Mode = AuthModePrinter
 	}
-	if len(c.Behavior.WarmupCommands) == 0 {
-		c.Behavior.WarmupCommands = []string{DefaultWarmupPushall}
-	}
-	setIfZero := func(p *int, v int) {
-		if *p == 0 {
-			*p = v
-		}
-	}
-	setIfZero(&c.Behavior.UpstreamKeepaliveSeconds, 30)
-	setIfZero(&c.Behavior.UpstreamConnectTimeoutSeconds, 5)
-	setIfZero(&c.Behavior.UpstreamBackoffInitialSeconds, 1)
-	setIfZero(&c.Behavior.UpstreamBackoffMaxSeconds, 30)
 	if c.Log.Level == "" {
 		c.Log.Level = "info"
 	}
@@ -328,7 +314,7 @@ func (c *Config) ApplyDefaults() {
 	if len(c.Listen) == 0 {
 		c.Listen = []Listener{{Port: defaultListenPort, TLS: true}}
 	}
-	if c.HTTP.Port == PortUnset {
+	if c.HTTP.Port == 0 {
 		c.HTTP.Port = 8080
 	}
 	for i := range c.Printers {
@@ -415,15 +401,8 @@ func (c *Config) Validate() error {
 		}
 		used[p.Alias] = true
 	}
-	if c.Behavior.UpstreamKeepaliveSeconds <= 0 ||
-		c.Behavior.UpstreamConnectTimeoutSeconds <= 0 ||
-		c.Behavior.UpstreamBackoffInitialSeconds <= 0 ||
-		c.Behavior.UpstreamBackoffMaxSeconds < c.Behavior.UpstreamBackoffInitialSeconds {
-		return fmt.Errorf("behavior: upstream timeouts and backoff must be positive with max >= initial")
-	}
-	// PortUnset is valid pre-defaults; explicit 0 disables HTTP.
-	if (c.HTTP.Port < 0 && c.HTTP.Port != PortUnset) || c.HTTP.Port > 65535 {
-		return fmt.Errorf("http: port %d out of range (0 disables)", c.HTTP.Port)
+	if c.HTTP.Port < 1 || c.HTTP.Port > 65535 {
+		return fmt.Errorf("http: port %d out of range", c.HTTP.Port)
 	}
 	return nil
 }

@@ -443,7 +443,7 @@ func freePort(t *testing.T) int {
 }
 
 // warmupPayload is the pushall command the proxy sends upstream.
-func warmupPayload() string { return config.DefaultWarmupPushall }
+func warmupPayload() string { return `{"pushing":{"sequence_id":"0","command":"pushall"}}` }
 
 // requestTopic builds the command topic for a serial.
 func requestTopic(serial string) string { return fmt.Sprintf("device/%s/request", serial) }

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,15 +15,18 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/detection"
 	"bambu-mqtt-proxy/internal/notification"
+	"bambu-mqtt-proxy/internal/safety"
 )
 
 func TestMain(m *testing.M) {
 	config.RegisterSection(detection.ConfigSection)
 	config.RegisterSection(notification.ConfigSection)
+	config.RegisterSection(safety.ConfigSection)
 	os.Exit(m.Run())
 }
 
@@ -60,6 +64,17 @@ func serve(t *testing.T, path string) (*Store, *httptest.Server) {
 	return store, srv
 }
 
+// requireSaved waits a bounded time for the restart signal that follows a
+// successful save's response.
+func requireSaved(t *testing.T, store *Store) {
+	t.Helper()
+	select {
+	case <-store.Saved():
+	case <-time.After(5 * time.Second):
+		t.Fatal("save did not signal a restart")
+	}
+}
+
 func get(t *testing.T, srv *httptest.Server) getResponse {
 	t.Helper()
 	res, err := http.Get(srv.URL + "/config/api")
@@ -90,7 +105,11 @@ func get(t *testing.T, srv *httptest.Server) getResponse {
 	if err := json.Unmarshal(members["notifications"], &n); err != nil {
 		t.Fatal(err)
 	}
-	out.Config.sections = map[string]any{"detection": &d, "notifications": &n}
+	var sf safety.Settings
+	if err := json.Unmarshal(members["safety"], &sf); err != nil {
+		t.Fatal(err)
+	}
+	out.Config.sections = map[string]any{"detection": &d, "notifications": &n, "safety": sf}
 	return out
 }
 
@@ -124,14 +143,7 @@ func TestNoFileServesDefaultsAndSaveCreatesFile(t *testing.T) {
 	if code, body := put(t, srv, v); code != http.StatusOK {
 		t.Fatalf("save = %d %v", code, body)
 	}
-	select {
-	case r := <-store.Reloads():
-		if r.Existed {
-			t.Fatal("reload reports an existing previous file")
-		}
-	default:
-		t.Fatal("save did not request a reload")
-	}
+	requireSaved(t, store)
 	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
@@ -176,10 +188,7 @@ func TestAccessCodesAreNeverReturnedAndKeptWhenBlank(t *testing.T) {
 	if cfg.Printers[0].Password != "secret-code" || cfg.Printers[0].Name != "Garage" {
 		t.Fatalf("printer = %+v", cfg.Printers[0])
 	}
-	r := <-store.Reloads()
-	if !r.Existed || !strings.Contains(string(r.Previous), "secret-code") {
-		t.Fatal("reload lacks the previous file for rollback")
-	}
+	requireSaved(t, store)
 }
 
 func TestStoredCodeIsNotSentToANewAddress(t *testing.T) {
@@ -204,8 +213,7 @@ func TestInvalidConfigIsNotWritten(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "c.yaml")
 	store, srv := serve(t, path)
 	v := get(t, srv).Config
-	v.Behavior.BackoffMaxSeconds = 5
-	v.Behavior.BackoffInitialSeconds = 10
+	v.AuthMode = "bogus"
 	if code, _ := put(t, srv, v); code != http.StatusUnprocessableEntity {
 		t.Fatalf("invalid save = %d, want 422", code)
 	}
@@ -213,33 +221,45 @@ func TestInvalidConfigIsNotWritten(t *testing.T) {
 		t.Fatal("invalid config was written")
 	}
 	select {
-	case <-store.Reloads():
-		t.Fatal("invalid save requested a reload")
+	case <-store.Saved():
+		t.Fatal("invalid save requested a restart")
 	default:
 	}
 }
 
-func TestSaveWhileRestartingConflictsAndApplyReportsFailure(t *testing.T) {
+// TestUnbindablePortIsRejectedBeforeWrite requires a save that moves HTTP to
+// a port the process cannot bind to fail with a clear error, leave the file
+// byte for byte unchanged, and request no restart.
+func TestUnbindablePortIsRejectedBeforeWrite(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "c.yaml")
-	store, srv := serve(t, path)
-	v := get(t, srv).Config
-	if code, _ := put(t, srv, v); code != http.StatusOK {
-		t.Fatal("first save failed")
-	}
-	if code, _ := put(t, srv, v); code != http.StatusConflict {
-		t.Fatalf("second save = %d, want 409", code)
-	}
-	r := <-store.Reloads()
-	store.Failed(os.ErrPermission)
-	if err := store.Restore(r); err != nil {
+	writeConfig(t, path)
+	before, err := os.ReadFile(path)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatal("restore kept a file that did not exist before the save")
+	store, srv := serve(t, path)
+	store.SetHTTPPort(8080)
+	busy, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
 	}
-	store.Applied()
-	if got := get(t, srv).Meta; got.ApplyError == "" || got.Generation != 1 {
-		t.Fatalf("meta = %+v", got)
+	defer busy.Close()
+
+	v := get(t, srv).Config
+	v.Printers[0].PreviousSerial = v.Printers[0].Serial
+	v.HTTPPort = busy.Addr().(*net.TCPAddr).Port
+	code, body := put(t, srv, v)
+	if msg, _ := body["error"].(string); code != http.StatusUnprocessableEntity || !strings.Contains(msg, "cannot be used") {
+		t.Fatalf("save to a busy port = %d %v, want 422 with the bind error", code, body)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("rejected save changed the file: %v", err)
+	}
+	select {
+	case <-store.Saved():
+		t.Fatal("rejected save requested a restart")
+	default:
 	}
 }
 
@@ -317,22 +337,18 @@ func TestRenameFailureRejectsSaveAndKeepsOldBytes(t *testing.T) {
 		t.Fatalf("failed save left temporary files: %v", left)
 	}
 	select {
-	case <-store.Reloads():
-		t.Fatal("failed save requested a reload")
+	case <-store.Saved():
+		t.Fatal("failed save requested a restart")
 	default:
 	}
 
-	// The failed save must leave pending false: the next save is not a 409.
 	store.rename = os.Rename
 	if code, _ := put(t, srv, v); code != http.StatusOK {
 		t.Fatalf("save after rename recovery = %d, want 200", code)
 	}
-	if r := <-store.Reloads(); !r.Existed {
-		t.Fatal("recovered save lacks the previous file for rollback")
-	}
 }
 
-func TestWriteFileReplacesAtomicallyAndRestoreUsesSamePath(t *testing.T) {
+func TestWriteFileReplacesAtomically(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "c.yaml")
 	store := NewStore(path)
 
@@ -362,23 +378,6 @@ func TestWriteFileReplacesAtomicallyAndRestoreUsesSamePath(t *testing.T) {
 	}
 	if left := tempFilesLeft(t, path); len(left) != 0 {
 		t.Fatalf("failed writeFile left temporary files: %v", left)
-	}
-
-	// Restore goes through the same atomic path: a failing rename fails it,
-	// a working rename puts the previous bytes back.
-	if err := store.Restore(Reload{Existed: true, Previous: []byte("restored\n")}); err == nil {
-		t.Fatal("Restore accepted a failing rename")
-	}
-	store.rename = os.Rename
-	if err := store.Restore(Reload{Existed: true, Previous: []byte("restored\n")}); err != nil {
-		t.Fatal(err)
-	}
-	got, err = os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != "restored\n" {
-		t.Fatalf("Restore wrote %q, want the previous bytes", got)
 	}
 }
 
@@ -428,15 +427,6 @@ func getRaw(t *testing.T, srv *httptest.Server) string {
 		t.Fatal(err)
 	}
 	return string(raw)
-}
-
-// drainSave consumes the reload request of one successful save and records
-// the apply so the next save is not a conflict.
-func drainSave(t *testing.T, store *Store) Reload {
-	t.Helper()
-	r := <-store.Reloads()
-	store.Applied()
-	return r
 }
 
 // assertStoredDetection loads the file and requires the stored key plus
@@ -506,16 +496,13 @@ func TestDetectionBlankSaveKeepsStoredKeyAndDisableRetains(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "c.yaml")
 	const stored = "stored-detection-key"
 	writeDetectionConfig(t, path, stored)
-	store, srv := serve(t, path)
+	_, srv := serve(t, path)
 
 	v := get(t, srv).Config
 	v.Printers[0].PreviousSerial = v.Printers[0].Serial
 	v.sections["detection"].(*detectionPage).HasAPIKey = true // incoming flags are ignored on save
 	if code, body := put(t, srv, v); code != http.StatusOK {
 		t.Fatalf("save = %d %v", code, body)
-	}
-	if r := drainSave(t, store); !r.Existed || !strings.Contains(string(r.Previous), stored) {
-		t.Fatal("reload lacks the previous file for rollback")
 	}
 	assertStoredDetection(t, path, stored, true)
 	if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0o600 {
@@ -530,7 +517,6 @@ func TestDetectionBlankSaveKeepsStoredKeyAndDisableRetains(t *testing.T) {
 	if code, body := put(t, srv, v); code != http.StatusOK {
 		t.Fatalf("disable save = %d %v", code, body)
 	}
-	drainSave(t, store)
 	assertStoredDetection(t, path, stored, false)
 
 	// A whitespace-only submission is blank: the stored key survives.
@@ -540,7 +526,6 @@ func TestDetectionBlankSaveKeepsStoredKeyAndDisableRetains(t *testing.T) {
 	if code, body := put(t, srv, v); code != http.StatusOK {
 		t.Fatalf("padded blank save = %d %v", code, body)
 	}
-	drainSave(t, store)
 	assertStoredDetection(t, path, stored, false)
 }
 
@@ -561,8 +546,8 @@ func TestDetectionEnableWithoutKeyIsRejected(t *testing.T) {
 		t.Fatal("rejected save wrote a config file")
 	}
 	select {
-	case <-store.Reloads():
-		t.Fatal("rejected save requested a reload")
+	case <-store.Saved():
+		t.Fatal("rejected save requested a restart")
 	default:
 	}
 
@@ -593,8 +578,8 @@ func TestDetectionEnableWithoutKeyIsRejected(t *testing.T) {
 		t.Fatal("rejected save changed the config file")
 	}
 	select {
-	case <-store.Reloads():
-		t.Fatal("rejected save requested a reload")
+	case <-store.Saved():
+		t.Fatal("rejected save requested a restart")
 	default:
 	}
 }
@@ -729,5 +714,40 @@ func TestPrinterTestDefaultPortAndNormalizedComparisons(t *testing.T) {
 	}
 	if len(cfg.Printers) != 1 || cfg.Printers[0].Password != "secret-code" {
 		t.Fatalf("saved printers = %+v, want the stored access code kept", cfg.Printers)
+	}
+}
+
+// TestSafetySwitchSavesAndKeepsPushoverCheck requires the safety switch to
+// round trip through the page and to refuse enabling safety without stored
+// Pushover credentials.
+func TestSafetySwitchSavesAndKeepsPushoverCheck(t *testing.T) {
+	bare := filepath.Join(t.TempDir(), "bare.yaml")
+	writeConfig(t, bare)
+	_, srv := serve(t, bare)
+	v := get(t, srv).Config
+	v.Printers[0].PreviousSerial = v.Printers[0].Serial
+	v.sections["safety"] = safety.Settings{Enabled: true}
+	if code, body := put(t, srv, v); code != http.StatusUnprocessableEntity {
+		t.Fatalf("safety without Pushover credentials = %d %v, want 422", code, body)
+	}
+
+	path := filepath.Join(t.TempDir(), "c.yaml")
+	writeNotificationsConfig(t, path)
+	_, srv = serve(t, path)
+	v = get(t, srv).Config
+	v.Printers[0].PreviousSerial = v.Printers[0].Serial
+	v.sections["safety"] = safety.Settings{Enabled: true}
+	if code, body := put(t, srv, v); code != http.StatusOK {
+		t.Fatalf("safety with credentials = %d %v, want 200", code, body)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s, err := safety.SettingsOf(cfg); err != nil || !s.Enabled {
+		t.Fatalf("stored safety = %+v, %v, want enabled", s, err)
+	}
+	if !strings.Contains(getRaw(t, srv), `"safety":{"enabled":true}`) {
+		t.Fatal("GET does not report the safety switch")
 	}
 }

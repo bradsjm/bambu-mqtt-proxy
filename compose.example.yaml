@@ -1,5 +1,7 @@
 # Example Docker Compose deployment for bambu-mqtt-proxy.
-# Copy to compose.yaml, fill in your printers, then: docker compose up -d
+# Copy to compose.yaml, then: docker compose up -d
+# Open http://<host>:8080/config, add your printers, and save. The proxy
+# writes ./config/bambu-mqtt-proxy.yaml and restarts itself.
 
 services:
   bambu-mqtt-proxy:
@@ -9,28 +11,14 @@ services:
     ports:
       - "8883:8883" # MQTT (TLS) — point your apps here
       - "6000:6000" # raw camera (TLS) — camera apps authenticate with bblp + the printer's access code
-      - "8080:8080" # HTTP: health + camera endpoints + camera wall
+      - "8080:8080" # HTTP: health, /config, camera endpoints, camera wall
     volumes:
-      # Configuration file: copy config.example.yaml to ./bambu-mqtt-proxy.yaml
-      # and edit the printers section. Delete the cert_file and key_file lines
-      # under listen: the container cannot write ./certs, and the proxy then
-      # generates an in-memory certificate. One printer entry looks like:
-      #   printers:
-      #     - serial: "01P00A123456789"
-      #       name: "Garage P1S" # optional friendly camera wall label; never used for routing
-      #       address: "192.168.1.42:8883"
-      #       tls: true
-      #       insecure_skip_verify: true
-      #       username: "bblp"
-      #       password: "12345678"
-      - ./bambu-mqtt-proxy.yaml:/config/bambu-mqtt-proxy.yaml
+      # Mount the directory, not the file. A save replaces the config file
+      # atomically, and a single-file mount cannot be replaced. The directory
+      # must be writable by the container user. To start from a file, copy
+      # config.example.yaml to ./config/bambu-mqtt-proxy.yaml and edit it.
+      - ./config:/config
     # Only two environment variables exist: BMBPX_HTTP_PORT overrides http.port
     # and BMBPX_LOG_LEVEL overrides log.level in the YAML file. To use one:
     # environment:
     #   BMBPX_LOG_LEVEL: debug
-    # Alternative: configure printers at http://<host>:8080/config instead of
-    # mounting a file. Remove the volume above, then uncomment; saving creates
-    # ./config/bambu-mqtt-proxy.yaml (the directory must be writable by the
-    # container user):
-    # volumes:
-    #   - ./config:/config

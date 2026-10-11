@@ -152,7 +152,7 @@ func TestJobPreviewRouteFollowsFeatureSwitch(t *testing.T) {
 	}
 }
 
-// TestModuleMCPWiring checks the real serveOnce module list in both
+// TestModuleMCPWiring checks the real serve module list in both
 // configurations. Cameras are on with detection, because a blocked
 // detection engine registers no tool. Job preview always runs with MCP as
 // its consumer, so its tool is present in both configurations.

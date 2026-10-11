@@ -1,6 +1,6 @@
 // Package configui serves the /config page and its JSON API. The page edits
-// the YAML config file; saving writes the file and asks the process to
-// restart its services with the new settings. Printer access codes are
+// the YAML config file; saving writes the file atomically and signals the
+// process to restart itself with the new settings. Printer access codes are
 // write-only: the API reports whether a code is stored but never returns it.
 package configui
 
@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -33,70 +34,62 @@ var pageHTML []byte
 const fileHeader = "# bambu-mqtt-proxy configuration, written by the /config page.\n" +
 	"# Comments are not preserved when the page saves this file.\n"
 
-// Reload asks the process to restart its services from the config file. It
-// carries the file content before the save so a config that fails to start
-// can be rolled back.
-type Reload struct {
-	Previous []byte
-	Existed  bool
-}
-
-// Store owns the config file path and the apply status shared across
-// service restarts. One Store lives for the whole process.
+// Store owns the config file path and the state the page reports. One Store
+// lives for the whole process.
 type Store struct {
-	path    string
-	reloads chan Reload
-	rename  func(string, string) error
+	path string
+	// httpPort is the port this process serves; 0 when unknown.
+	httpPort int
+	// started identifies this process to the page, which waits for it to
+	// change after a save.
+	started int64
+	// saved delivers one signal after a save is written and answered.
+	saved  chan struct{}
+	rename func(string, string) error
+	// bind checks that the process can listen on a port; replaced by tests.
+	bind func(port int) error
 	// probePrinter performs the /config printer connection test; replaced
 	// by tests.
 	probePrinter func(context.Context, config.Printer) error
 
 	mu         sync.Mutex
-	generation uint64
-	applyErr   string
-	failure    string
-	pending    bool
+	startupErr string
 }
 
 // NewStore returns a store for the YAML file at path.
 func NewStore(path string) *Store {
 	return &Store{
 		path:         path,
+		started:      time.Now().UnixNano(),
+		saved:        make(chan struct{}, 1),
 		rename:       os.Rename,
-		reloads:      make(chan Reload, 1),
+		bind:         tryBind,
 		probePrinter: probePrinterConn,
 	}
 }
 
-// Reloads delivers one request per successful save.
-func (s *Store) Reloads() <-chan Reload { return s.reloads }
+// SetHTTPPort records the port this process serves. A save that changes it
+// test-binds the new port first; with no port recorded the check is skipped.
+func (s *Store) SetHTTPPort(port int) { s.httpPort = port }
 
-// Applied records that services started from the current file. A failure
-// recorded with Failed since the previous start is reported to the page.
-func (s *Store) Applied() {
+// Saved delivers one signal per successful save, after the response is
+// sent. The caller shuts down and restarts the process.
+func (s *Store) Saved() <-chan struct{} { return s.saved }
+
+// SetStartupError records why the proxy could not start; the page shows it.
+func (s *Store) SetStartupError(err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.generation++
-	s.applyErr, s.failure = s.failure, ""
-	s.pending = false
+	s.startupErr = err.Error()
 }
 
-// Failed records why the most recently saved config could not start.
-func (s *Store) Failed(err error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.failure = err.Error()
-}
-
-// Restore puts the file back the way it was before the save in r.
-func (s *Store) Restore(r Reload) error {
-	if !r.Existed {
-		if err := os.Remove(s.path); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("remove %s: %w", s.path, err)
-		}
-		return nil
+// tryBind listens on the TCP port once and releases it.
+func tryBind(port int) error {
+	ln, err := net.Listen("tcp", net.JoinHostPort("", strconv.Itoa(port)))
+	if err != nil {
+		return err
 	}
-	return s.writeFile(r.Previous)
+	return ln.Close()
 }
 
 // Register adds the configuration page, its API, and test actions.
@@ -130,7 +123,6 @@ type View struct {
 	CameraEnabled   bool                 `json:"camera_enabled"`
 	MCPEnabled      bool                 `json:"mcp_enabled"`
 	LogLevel        string               `json:"log_level"`
-	Behavior        BehaviorView         `json:"behavior"`
 	sections        map[string]any
 }
 
@@ -181,21 +173,14 @@ type ListenerView struct {
 	KeyFile  string `json:"key_file"`
 }
 
-// BehaviorView holds the upstream connection settings.
-type BehaviorView struct {
-	WarmupCommands        []string `json:"warmup_commands"`
-	KeepaliveSeconds      int      `json:"keepalive_seconds"`
-	ConnectTimeoutSeconds int      `json:"connect_timeout_seconds"`
-	BackoffInitialSeconds int      `json:"backoff_initial_seconds"`
-	BackoffMaxSeconds     int      `json:"backoff_max_seconds"`
-}
-
 type meta struct {
 	Path       string `json:"path"`
 	FileExists bool   `json:"file_exists"`
 	FileError  string `json:"file_error,omitempty"`
-	Generation uint64 `json:"generation"`
-	ApplyError string `json:"apply_error,omitempty"`
+	// Started identifies the serving process; it changes on every restart.
+	Started int64 `json:"started"`
+	// StartupError is why the proxy could not start with the saved file.
+	StartupError string `json:"startup_error,omitempty"`
 	// EnvOverrides lists page fields a surviving environment variable
 	// (.env file) overrides. Only http_port and log_level can be overridden.
 	EnvOverrides map[string]string `json:"env_overrides"`
@@ -203,10 +188,10 @@ type meta struct {
 
 func (s *Store) handleGet(w http.ResponseWriter, _ *http.Request) {
 	s.mu.Lock()
-	m := meta{Path: s.path, Generation: s.generation, ApplyError: s.applyErr, EnvOverrides: envOverrides()}
+	m := meta{Path: s.path, Started: s.started, StartupError: s.startupErr, EnvOverrides: envOverrides()}
 	s.mu.Unlock()
 
-	cfg := &config.Config{HTTP: config.HTTP{Port: config.PortUnset}}
+	cfg := &config.Config{}
 	raw, existed, err := readFile(s.path)
 	m.FileExists = existed
 	if err != nil {
@@ -249,10 +234,6 @@ func (s *Store) handlePut(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.pending {
-		writeError(w, http.StatusConflict, "The proxy is still restarting with the last saved settings. Try again in a moment.")
-		return
-	}
 	prev, existed, err := readFile(s.path)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -289,17 +270,26 @@ func (s *Store) handlePut(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, err.Error())
 		return
 	}
+	if port := effective.HTTP.Port; s.httpPort != 0 && port != s.httpPort {
+		if err := s.bind(port); err != nil {
+			writeError(w, http.StatusUnprocessableEntity, fmt.Sprintf("HTTP port %d cannot be used: %v. Nothing was saved.", port, err))
+			return
+		}
+	}
 	if err := s.writeFile(out); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.pending = true
-	s.reloads <- Reload{Previous: prev, Existed: existed}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"saved":     true,
 		"path":      s.path,
 		"http_port": effective.HTTP.Port,
 	})
+	_ = http.NewResponseController(w).Flush()
+	select {
+	case s.saved <- struct{}{}:
+	default:
+	}
 }
 
 // handlePrinterTest performs one bounded MQTT connect with the submitted
@@ -488,13 +478,6 @@ func toView(c *config.Config) View {
 		LogLevel:      c.Log.Level,
 		Printers:      []PrinterView{},
 		Listen:        []ListenerView{},
-		Behavior: BehaviorView{
-			WarmupCommands:        c.Behavior.WarmupCommands,
-			KeepaliveSeconds:      c.Behavior.UpstreamKeepaliveSeconds,
-			ConnectTimeoutSeconds: c.Behavior.UpstreamConnectTimeoutSeconds,
-			BackoffInitialSeconds: c.Behavior.UpstreamBackoffInitialSeconds,
-			BackoffMaxSeconds:     c.Behavior.UpstreamBackoffMaxSeconds,
-		},
 	}
 	v.sections = make(map[string]any)
 	for _, section := range config.Sections() {
@@ -556,17 +539,6 @@ func (v View) toConfig(stored *config.Config) (*config.Config, error) {
 		MCP:      config.MCP{Enabled: &mcp},
 		Log:      config.Log{Level: v.LogLevel},
 		Printers: []config.Printer{},
-		Behavior: config.Behavior{
-			UpstreamKeepaliveSeconds:      v.Behavior.KeepaliveSeconds,
-			UpstreamConnectTimeoutSeconds: v.Behavior.ConnectTimeoutSeconds,
-			UpstreamBackoffInitialSeconds: v.Behavior.BackoffInitialSeconds,
-			UpstreamBackoffMaxSeconds:     v.Behavior.BackoffMaxSeconds,
-		},
-	}
-	for _, cmd := range v.Behavior.WarmupCommands {
-		if cmd = strings.TrimSpace(cmd); cmd != "" {
-			c.Behavior.WarmupCommands = append(c.Behavior.WarmupCommands, cmd)
-		}
 	}
 	for _, l := range v.Listen {
 		c.Listen = append(c.Listen, config.Listener{

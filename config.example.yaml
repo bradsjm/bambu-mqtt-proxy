@@ -1,7 +1,9 @@
 # bambu-mqtt-proxy example configuration.
 # Copy to bambu-mqtt-proxy.yaml and edit the printers section.
 # The YAML file is the configuration; only BMBPX_HTTP_PORT (http.port) and
-# BMBPX_LOG_LEVEL (log.level) override it.
+# BMBPX_LOG_LEVEL (log.level) override it. Every setting is editable on the
+# /config page; saving writes this file and restarts the proxy. A removed
+# `behavior` section in an old file is ignored.
 
 listen:
   # Default: the port every Bambu app expects. TLS with a self-signed
@@ -47,7 +49,8 @@ printers:
   #   password: "87654321"
 
 http:
-  # Shared health + camera HTTP port; 0 disables the HTTP server entirely.
+  # Shared HTTP port for health, /config, the camera wall, and MCP. HTTP is
+  # always on. 0 means unset: the proxy uses 8080 and logs a warning.
   port: 8080
 
 camera:
@@ -57,11 +60,11 @@ camera:
   # enabled: false
 
 mcp:
-  # Read-only MCP (Model Context Protocol) endpoint on the shared HTTP port
-  # at /mcp: observation tools, the per-printer state resource, and
-  # subscriptions. It can read printer state but has no control methods.
-  # On by default; set false to disable, and it is not served when
-  # http.port is 0.
+  # MCP (Model Context Protocol) endpoint on the shared HTTP port at /mcp:
+  # list_printers, get_printer_state, get_camera_snapshot, watch_printer, and
+  # five control tools: pause, resume, stop, chamber light, and speed
+  # profile. It has no heater or temperature control. On by default; set
+  # false to disable.
   # enabled: false
 
 notifications:
@@ -82,16 +85,8 @@ safety:
   # model's safety limit, the proxy stops every printer, switches that
   # printer's Panda PWR off when panda_pwr is set, and sends one Pushover
   # emergency alert. Requires the Pushover credentials above, even while
-  # notifications are disabled. YAML only; /config saves keep this section.
+  # notifications are disabled. Also a switch on the /config page.
   # enabled: true
-
-behavior:
-  warmup_commands:
-    - '{"pushing":{"sequence_id":"0","command":"pushall"}}'
-  upstream_keepalive_seconds: 30
-  upstream_connect_timeout_seconds: 5
-  upstream_backoff_initial_seconds: 1
-  upstream_backoff_max_seconds: 30
 
 log:
   level: info # debug logs per-packet routing decisions

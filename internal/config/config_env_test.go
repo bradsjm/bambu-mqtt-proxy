@@ -99,8 +99,7 @@ var allEnvKeys = []string{
 
 // TestFileConfigSurvivesWithoutEnvDefaults pins the container regression:
 // a mounted YAML keeps its listeners and HTTP port when the image sets no
-// BMBPX_* environment defaults. The disabled-HTTP case matters most: a
-// former image default BMBPX_HTTP_PORT=8080 overrode a mounted http.port 0.
+// BMBPX_* environment defaults.
 func TestFileConfigSurvivesWithoutEnvDefaults(t *testing.T) {
 	unsetEnvForTest(t, allEnvKeys...)
 	cases := []struct {
@@ -126,7 +125,7 @@ printers:
 			wantHTTP: 9090,
 		},
 		{
-			name: "multiple listeners with cert paths and http disabled",
+			name: "multiple listeners with cert paths and port 0 as unset",
 			yamlDoc: `
 listen:
   - port: 8883
@@ -146,7 +145,7 @@ printers:
 				{Port: 8883, TLS: true, CertFile: "/certs/proxy.crt", KeyFile: "/certs/proxy.key"},
 				{Port: 1883},
 			},
-			wantHTTP: 0,
+			wantHTTP: 8080,
 		},
 	}
 	for _, tc := range cases {

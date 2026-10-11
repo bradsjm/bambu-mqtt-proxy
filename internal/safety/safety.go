@@ -24,7 +24,7 @@ import (
 // Settings is the YAML safety section.
 type Settings struct {
 	// Enabled turns the over-temperature stop on.
-	Enabled bool `yaml:"enabled"`
+	Enabled bool `yaml:"enabled" json:"enabled"`
 }
 
 // SettingsOf decodes the safety section without changing the configuration.
@@ -36,7 +36,7 @@ func SettingsOf(c *config.Config) (Settings, error) {
 	return *v.(*Settings), nil
 }
 
-// ConfigSection owns the safety YAML section.
+// ConfigSection owns the safety YAML section and its /config switch.
 var ConfigSection = config.Section{
 	Key: "safety",
 	New: func() any { return &Settings{} },
@@ -54,13 +54,25 @@ var ConfigSection = config.Section{
 		}
 		return nil
 	},
-	Save: func(_ json.RawMessage, stored, out *config.Config) error {
-		if stored == nil {
+	View: func(file *config.Config) any {
+		s, _ := SettingsOf(file)
+		return s
+	},
+	Save: func(raw json.RawMessage, stored, out *config.Config) error {
+		if len(raw) == 0 {
+			// A page without the member keeps the stored switch.
+			if stored != nil {
+				if node, ok := stored.Sections["safety"]; ok {
+					out.SetSection("safety", node)
+				}
+			}
 			return nil
 		}
-		if node, ok := stored.Sections["safety"]; ok {
-			out.SetSection("safety", node)
+		var in Settings
+		if err := json.Unmarshal(raw, &in); err != nil {
+			return fmt.Errorf("The safety settings could not be read: %w", err)
 		}
+		out.SetSection("safety", in)
 		return nil
 	},
 }
