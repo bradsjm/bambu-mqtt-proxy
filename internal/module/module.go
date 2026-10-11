@@ -1,80 +1,27 @@
-// Package module defines how optional, non-core capabilities plug into the
-// proxy. A module is a package that owns one capability (AI failure
-// detection, an accessory sensor, notifications, job previews) and declares
-// its hooks with one Module value. The service wiring constructs each
-// enabled module with the core services it needs, then hands the
-// declarations to the core, which owns lifecycle order, the shared report
-// interest, activity fan-out, display placement, and the members, routes,
-// and MCP tools a module serves under its own name.
-//
-// Core services a module may take at construction, by narrow interface:
-//   - merged printer state and print sessions (*telemetry.Cache),
-//   - camera frames (*camera.Manager; nil while cameras are disabled),
-//   - user-style printer commands through the allow-listed control service
-//     (*control.Service), or printer commands (*printer.Links) for
-//     autonomous actions taken on observed evidence,
-//   - the recent activity log (*activity.Log) for recording events.
-//
-// Modules never publish raw MQTT and never change forwarded payloads.
+// Package module defines optional capabilities and their core-owned lifecycle.
 package module
 
 import (
-	"time"
+	"context"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-
-	"bambu-mqtt-proxy/internal/activity"
 )
 
-// Module declares one module's hooks. Name is required; every other field
-// is optional and nil or false means the module does not use that hook.
+// Module declares one optional capability's hooks.
 type Module struct {
-	// Name is the stable module key, also used as the key of the module's
-	// entry in the camera wall tile "modules" object.
+	// Name is the stable key used by the wall, status, and MCP.
 	Name string
-	// Start launches the module's background work. The core calls it once,
-	// after the MQTT broker serves and the shutdown path is installed.
-	Start func()
-	// Stop ends the module's background work and waits for it. The core
-	// calls it once during shutdown, after the HTTP and MCP consumers stop
-	// and before the cameras and upstream connections the module reads.
-	// Read hooks below must stay safe to call after Stop.
-	Stop func()
-	// ObserveActivity receives every newly recorded activity entry. It runs
-	// on report processing paths and must not block.
-	ObserveActivity func(serial string, e activity.Entry)
-	// ChamberReading supplies an accessory chamber temperature for printers
-	// whose model has no usable chamber sensor. The core uses the first
-	// module that sets it and applies the shared freshness window.
-	ChamberReading func(serial string) (temp float64, at time.Time, ok bool)
-	// Display returns the module's contribution to one printer's camera
-	// wall tile, or nil for nothing. It must be cheap and non-blocking.
-	Display func(serial string) *Display
-	// State returns the module's state for one printer, or nil for nothing.
-	// The core serves the same value as the camera wall tile member named
-	// Name and as state.modules.<Name> in MCP printer state. A value with a
-	// StableKey() any method is compared through that method; any other
-	// value is compared by its JSON. A change sends a camera wall events
-	// update and wakes MCP watch_printer attention watchers, so
-	// continuously aging fields must be rounded, omitted, or excluded by
-	// StableKey. It must be safe for concurrent use and must not block.
+	// Run performs background work until cancellation and returns after cleanup.
+	Run func(ctx context.Context) error
+	// State returns non-blocking per-printer state, optionally with StableKey.
 	State func(serial string) any
-	// FleetValues returns top-level members of the /camera/status and
-	// /camera/events body. Every key equals Name or starts with Name+"_".
-	// nil or empty adds nothing.
-	FleetValues func() map[string]any
-	// StatusValue returns the module's /status member, served under Name.
+	// Display returns non-blocking camera wall badges and panels.
+	Display func(serial string) *Display
+	// StatusValue returns the module's status member.
 	StatusValue func() any
-	// Routes are HTTP handlers on the shared listener, mounted only when the
-	// listener runs. Mount protects every non-GET/HEAD route against
-	// cross-origin browser writes.
+	// Routes contains handlers mounted on the shared listener.
 	Routes []Route
-	// MCP registers the module's MCP tools on the server with mcp.AddTool.
-	// The core calls it once while it builds the server, and only for
-	// modules in the running configuration. Tool names must be unique
-	// across the core and every module: the SDK silently replaces a tool
-	// with the same name. Handlers follow the same concurrency and
-	// after-Stop rules as the read hooks.
+	// MCP registers tools with unique names on the shared server.
 	MCP func(s *mcp.Server)
 }
 

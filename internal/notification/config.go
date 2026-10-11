@@ -14,15 +14,20 @@ import (
 
 // Settings configures optional print alerts sent to one recipient.
 type Settings struct {
-	Enabled  bool     `yaml:"enabled"`
-	Provider string   `yaml:"provider"`
+	// Enabled turns print notifications on.
+	Enabled bool `yaml:"enabled"`
+	// Provider selects the configured delivery provider.
+	Provider string `yaml:"provider"`
+	// Pushover holds Pushover credentials.
 	Pushover Pushover `yaml:"pushover"`
 }
 
 // Pushover holds the Pushover application token and user key.
 type Pushover struct {
+	// AppToken authenticates the application.
 	AppToken string `yaml:"app_token"`
-	UserKey  string `yaml:"user_key"`
+	// UserKey identifies the recipient.
+	UserKey string `yaml:"user_key"`
 }
 
 // Validate rejects unsupported providers and missing enabled credentials.
@@ -61,17 +66,24 @@ func SettingsOf(c *config.Config) (Settings, error) {
 
 // settingsView is the notification page representation with write-only credentials.
 type settingsView struct {
-	Enabled  bool         `json:"enabled"`
-	Provider string       `json:"provider"`
+	// Enabled turns print notifications on.
+	Enabled bool `json:"enabled"`
+	// Provider selects the configured delivery provider.
+	Provider string `json:"provider"`
+	// Pushover holds Pushover credentials.
 	Pushover pushoverView `json:"pushover"`
 }
 
 // pushoverView reports stored credential presence and accepts replacement values.
 type pushoverView struct {
-	HasAppToken bool   `json:"has_app_token"`
-	HasUserKey  bool   `json:"has_user_key"`
-	AppToken    string `json:"app_token,omitempty"`
-	UserKey     string `json:"user_key,omitempty"`
+	// HasAppToken reports a stored application credential.
+	HasAppToken bool `json:"has_app_token"`
+	// HasUserKey reports a stored recipient credential.
+	HasUserKey bool `json:"has_user_key"`
+	// AppToken authenticates the application.
+	AppToken string `json:"app_token,omitempty"`
+	// UserKey identifies the recipient.
+	UserKey string `json:"user_key,omitempty"`
 }
 
 // decodeSettingsView strictly decodes submitted notification page settings.

@@ -68,7 +68,6 @@ type Tile struct {
 // statusPayload is the shared /camera/status and /camera/events body.
 type statusPayload struct {
 	Printers []Tile `json:"printers"`
-	extra    map[string]any
 }
 
 // MarshalJSON adds module-owned tile values to the core tile object.
@@ -79,16 +78,6 @@ func (t Tile) MarshalJSON() ([]byte, error) {
 		return nil, err
 	}
 	return jsonobj.Append(obj, t.extra)
-}
-
-// MarshalJSON adds module-owned fleet members to the core payload.
-func (p statusPayload) MarshalJSON() ([]byte, error) {
-	type corePayload statusPayload
-	obj, err := json.Marshal(corePayload(p))
-	if err != nil {
-		return nil, err
-	}
-	return jsonobj.Append(obj, p.extra)
 }
 
 // tileCoreKeys includes core tile members even when their zero values are omitted.
@@ -213,27 +202,9 @@ func (r *StatusRenderer) Tiles() []Tile {
 	return tiles
 }
 
-// payload assembles the shared status body with module fleet values.
+// payload assembles the shared status body.
 func (r *StatusRenderer) payload(tiles []Tile) statusPayload {
-	p := statusPayload{Printers: tiles}
-	for _, mod := range r.modules {
-		if mod.FleetValues == nil {
-			continue
-		}
-		for key, value := range mod.FleetValues() {
-			if key != mod.Name && !strings.HasPrefix(key, mod.Name+"_") {
-				continue
-			}
-			if key == "printers" {
-				continue
-			}
-			if p.extra == nil {
-				p.extra = make(map[string]any)
-			}
-			p.extra[key] = value
-		}
-	}
-	return p
+	return statusPayload{Printers: tiles}
 }
 
 // changeKey serializes tiles without their continuously aging fields, so

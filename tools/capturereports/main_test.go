@@ -120,7 +120,8 @@ func TestRunWritesOneFilePerNonEmptySegment(t *testing.T) {
 		t.Fatalf("read segment 1: %v", err)
 	}
 	want1 := "{\"t_ms\":0,\"gen\":1,\"payload\":{\"print\":{\"subtask_name\":\"a\\\"b.3mf\"}}}\n" +
-		"{\"t_ms\":3000,\"gen\":1,\"payload\":{\"print\":{\"subtask_name\":\"a\\\\b\"}}}\n"
+		"{\"t_ms\":3000,\"gen\":1,\"payload\":{\"print\":{\"subtask_name\":\"a\\\\b\"}}}\n" +
+		"{\"t_ms\":5000,\"gen\":0,\"payload\":{}}\n"
 	if string(file1) != want1 {
 		t.Fatalf("segment 1 = %q, want %q", file1, want1)
 	}

@@ -202,8 +202,10 @@ func printerSpec(port int, serial string) config.Printer {
 
 // proxy is a running proxy instance for tests.
 type proxy struct {
-	srv        *broker.Server
-	links      *printer.Links
+	srv   *broker.Server
+	links *printer.Links
+	// state holds reports merged after downstream forwarding.
+	state      *printer.Store
 	port       int
 	logs       *testLogs
 	healthPort int
@@ -247,9 +249,12 @@ func startProxyAuth(t *testing.T, mode string, printers []config.Printer) *proxy
 	}
 	table := routing.NewTable(serials, aliases)
 	inject := broker.NewInjector(logger)
-	links := printer.New(printers, logger, func(_ string, topic string, payload []byte) {
+	state := printer.NewStore(printers)
+	links := printer.New(printers, logger, func(serial string, topic string, payload []byte) {
 		inject.PublishDownstream(topic, payload)
+		state.Apply(serial, payload)
 	}, func(serial string, online bool) {
+		state.SetOnline(serial, online)
 		logs.mu.Lock()
 		logs.online[serial] = append(logs.online[serial], online)
 		logs.mu.Unlock()
@@ -273,7 +278,7 @@ func startProxyAuth(t *testing.T, mode string, printers []config.Printer) *proxy
 		links.Close()
 		_ = srv.Close()
 	})
-	return &proxy{srv: srv, links: links, port: port, healthPort: healthPort, logs: logs}
+	return &proxy{srv: srv, links: links, state: state, port: port, healthPort: healthPort, logs: logs}
 }
 
 // testClient is a downstream MQTT client plus captured messages.

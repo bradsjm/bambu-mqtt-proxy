@@ -23,7 +23,6 @@ import (
 	"bambu-mqtt-proxy/internal/configui"
 	"bambu-mqtt-proxy/internal/control"
 	"bambu-mqtt-proxy/internal/detection"
-	"bambu-mqtt-proxy/internal/firstlayer"
 	"bambu-mqtt-proxy/internal/health"
 	"bambu-mqtt-proxy/internal/httpsrv"
 	"bambu-mqtt-proxy/internal/jobpreview"
@@ -36,7 +35,6 @@ import (
 	"bambu-mqtt-proxy/internal/printer"
 	"bambu-mqtt-proxy/internal/routing"
 	"bambu-mqtt-proxy/internal/safety"
-	"bambu-mqtt-proxy/internal/telemetry"
 )
 
 func main() {
@@ -114,20 +112,12 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	inject := broker.NewInjector(logger)
 	activities := activity.New(cfg.Printers)
 	printerStore := printer.NewStore(cfg.Printers)
-	state := telemetry.NewCache(cfg.Printers, logger)
-	state.SetActivity(activities)
+	printerStore.SetActivity(activities)
 	links := printer.New(cfg.Printers, logger, func(serial, topic string, payload []byte) {
 		inject.PublishDownstream(topic, payload)
 		printerStore.Apply(serial, payload)
-		state.Observe(serial, payload)
 	}, func(serial string, online bool) {
 		printerStore.SetOnline(serial, online)
-		state.SetConnected(map[string]bool{serial: online})
-		if online {
-			activities.Record(serial, "connected", activity.Info, "Printer connected")
-		} else {
-			activities.Record(serial, "disconnected", activity.Warning, "Printer connection lost, reconnecting")
-		}
 	})
 	// Panda Breath accessory chamber readings: one read-only WebSocket per
 	// printer configured with a panda_breath address, for models whose
@@ -138,6 +128,7 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	var breath *pandabreath.Store
 	if cfg.HTTP.Port > 0 {
 		breath = pandabreath.New(cfg.Printers, logger)
+		printerStore.SetChamberReader(breath.Chamber)
 	}
 	// Panda PWR smart plug power: one HTTP poll loop per printer
 	// configured with a panda_pwr address, feeding the wall panel and
@@ -158,7 +149,7 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	// leave the consumer side truly nil.
 	var previews *jobpreview.Service
 	if cfg.HTTP.Port > 0 && (cfg.CameraEnabled() || cfg.MCPEnabled()) {
-		previews = jobpreview.New(cfg.Printers, state, links, logger)
+		previews = jobpreview.New(cfg.Printers, printerStore, logger)
 		previews.SetActivity(activities)
 	}
 
@@ -194,11 +185,11 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	if detectionSettings.On() {
 		client := detection.NewGadgetClient(detectionSettings.Key())
 		if !cfg.CameraEnabled() {
-			detector = detection.New(cfg.Printers, client, detection.IdleFrames{}, state, links, logger)
+			detector = detection.New(cfg.Printers, client, detection.IdleFrames{}, printerStore, links, logger)
 			detector.SetBlocked(detection.ReasonCameraDisabled)
 			logger.Warn("detection blocked: the camera feature is disabled")
 		} else {
-			detector = detection.New(cfg.Printers, client, detection.CameraFrames(cameras), state, links, logger)
+			detector = detection.New(cfg.Printers, client, detection.CameraFrames(cameras), printerStore, links, logger)
 			logger.Info("octoeverywhere detection enabled")
 		}
 		detector.SetActivity(activities)
@@ -216,17 +207,14 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 			client = platecheck.NewClient(plateSettings, logger)
 		}
 		if !cfg.CameraEnabled() {
-			plates = platecheck.New(cfg.Printers, plateSettings, client, platecheck.IdleFrames{}, state, links, logger)
+			plates = platecheck.New(cfg.Printers, plateSettings, client, platecheck.IdleFrames{}, printerStore, links, logger)
 			plates.SetBlocked(platecheck.ReasonCameraDisabled)
 			logger.Warn("plate check blocked: the camera feature is disabled")
 		} else {
-			plates = platecheck.New(cfg.Printers, plateSettings, client, platecheck.CameraFrames(cameras), state, links, logger)
+			plates = platecheck.New(cfg.Printers, plateSettings, client, platecheck.CameraFrames(cameras), printerStore, links, logger)
 		}
 		plates.SetActivity(activities)
 	}
-	// First-layer completion observes telemetry that is already live; it
-	// neither holds report interest nor opens a camera connection.
-	firstLayers := firstlayer.New(cfg.Printers, state, activities)
 	// Optional Pushover print notifications. The notifier registers as an
 	// activity observer before the broker serves, so entries recorded
 	// during startup reach it.
@@ -236,7 +224,8 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		return nil, fmt.Errorf("notification settings: %w", err)
 	}
 	if notificationSettings.Enabled {
-		notifier = notification.New(notificationSettings, state, cameras, logger)
+		notifier = notification.New(notificationSettings, cfg.Printers, printerStore, cameras, logger)
+		activities.SetObserver(notifier.Observe)
 	}
 
 	// Optional over-temperature safety stop: the YAML safety section. It
@@ -248,13 +237,14 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		return nil, fmt.Errorf("safety settings: %w", err)
 	}
 	if safetySettings.Enabled {
-		safe = safety.New(cfg.Printers, state, links, activities, notificationSettings, logger)
+		var chamber safety.ChamberSource
+		if breath != nil {
+			chamber = breath
+		}
+		safe = safety.New(cfg.Printers, printerStore, chamber, links, activities, notificationSettings, logger)
 	}
 
-	// Optional modules start in order: notifications, job preview, Panda
-	// Breath, Panda PWR, detection, plate check, first-layer completion,
-	// safety. Wire their shared hooks before the broker can record
-	// activity or deliver reports.
+	// Optional modules retain their configured lifecycle order.
 	var mods []module.Module
 	if notifier != nil {
 		mods = append(mods, notifier.Module())
@@ -274,31 +264,11 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	if plates != nil {
 		mods = append(mods, plates.Module())
 	}
-	mods = append(mods, firstLayers.Module())
 	if safe != nil {
 		mods = append(mods, safe.Module())
 	}
 	if err := module.Check(mods); err != nil {
 		return nil, fmt.Errorf("modules: %w", err)
-	}
-	var chamberSet bool
-	var observers []func(string, activity.Entry)
-	for _, mod := range mods {
-		if mod.ChamberReading != nil && !chamberSet {
-			printerStore.SetChamberReader(mod.ChamberReading)
-			state.SetChamberReader(mod.ChamberReading)
-			chamberSet = true
-		}
-		if mod.ObserveActivity != nil {
-			observers = append(observers, mod.ObserveActivity)
-		}
-	}
-	if len(observers) > 0 {
-		activities.SetObserver(func(serial string, e activity.Entry) {
-			for _, observe := range observers {
-				observe(serial, e)
-			}
-		})
 	}
 	if renderer != nil {
 		if err := renderer.SetModules(mods); err != nil {
@@ -340,17 +310,11 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		return nil, fmt.Errorf("broker: %w", err)
 	}
 
-	// The broker is up. Install the single teardown before starting the raw
-	// camera listener or modules, so later bind failures use the same path.
-	// MCP and HTTP stop first, then started modules stop in reverse order:
-	// safety, first-layer completion, plate check, detection, Panda PWR,
-	// Panda Breath, job preview, notifications. Their consumers end before
-	// the modules and the cameras and links they read. The raw listener
-	// stops next, before camera captures, the links, and the broker.
-	// Modules whose Start never ran must not receive Stop.
+	// Install teardown before starting module goroutines or camera listeners.
 	var httpSrv *httpsrv.Server
 	var raw *camera.RawServer
-	var started []module.Module
+	var cancels []context.CancelFunc
+	var done []chan struct{}
 	defer func() {
 		if sigCtx.Err() != nil {
 			logger.Info("shutting down")
@@ -363,10 +327,11 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		if httpSrv != nil {
 			httpSrv.Stop()
 		}
-		for i := len(started) - 1; i >= 0; i-- {
-			if started[i].Stop != nil {
-				started[i].Stop()
-			}
+		for i := len(cancels) - 1; i >= 0; i-- {
+			cancels[i]()
+		}
+		for i := len(done) - 1; i >= 0; i-- {
+			<-done[i]
 		}
 		if raw != nil {
 			raw.Close()
@@ -395,9 +360,17 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	links.Start()
 	// Start modules after the broker and camera listener are ready.
 	for _, mod := range mods {
-		if mod.Start != nil {
-			mod.Start()
-			started = append(started, mod)
+		if mod.Run != nil {
+			ctx, cancel := context.WithCancel(context.Background())
+			finished := make(chan struct{})
+			cancels = append(cancels, cancel)
+			done = append(done, finished)
+			go func() {
+				defer close(finished)
+				if err := mod.Run(ctx); err != nil && ctx.Err() == nil {
+					logger.Error("module stopped", "module", mod.Name, "error", err)
+				}
+			}()
 		}
 	}
 

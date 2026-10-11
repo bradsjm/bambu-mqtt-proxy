@@ -685,7 +685,7 @@ docker buildx build --platform linux/amd64,linux/arm64 -t bambu-mqtt-proxy .
 container logs:
 
 ```sh
-docker logs bambu-mqtt-proxy 2>&1 | go run ./tools/capturereports -serial <serial> -out internal/telemetry/testdata/live_<serial>_<yyyymmdd>
+docker logs bambu-mqtt-proxy 2>&1 | go run ./tools/capturereports -serial <serial> -out internal/printer/testdata/live_<serial>_<yyyymmdd>
 ```
 
 It keeps the `printer report received` lines for exactly that serial, starts a

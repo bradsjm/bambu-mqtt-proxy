@@ -44,22 +44,6 @@ type Entry struct {
 	AgeSeconds float64 `json:"age_seconds"`
 	// URL optionally links to an event reference.
 	URL string `json:"url,omitempty"`
-
-	// Observation is the source-event evidence for generators that must pin
-	// an entry to the original job that caused it: JobGen identifies the
-	// preview-job generation at event time. It is internal evidence only
-	// and never serialized to HTTP clients.
-	Observation Observation `json:"-"`
-}
-
-// Observation is the source-event evidence attached to entries whose
-// meaning depends on the print that caused them. It carries the job
-// generation copied from the exact coherent job+session snapshot that
-// proved the event, so consumers can reject entries recorded against
-// telemetry that has since switched to another print.
-type Observation struct {
-	// JobGen identifies the job generation at event time.
-	JobGen uint64
 }
 
 // Log holds one ring buffer per configured printer. A nil *Log is valid and
@@ -98,27 +82,19 @@ func New(printers []config.Printer) *Log {
 	return &Log{rings: rings, now: time.Now, nextID: uint64(time.Now().UnixMicro()), changed: make(chan struct{})}
 }
 
-// Record appends one event for serial. Producers that must pin the event
-// to the print session that caused it use RecordObserved instead.
+// Record appends one event for serial.
 func (l *Log) Record(serial, kind, severity, message string) {
-	l.RecordObserved(serial, kind, severity, message, Observation{})
-}
-
-// RecordObserved appends one event for serial with the source-session
-// evidence Observation. It owns the shared append logic: timestamp and ID
-// generation, ring overwrite, and the unlocked observer callback.
-func (l *Log) RecordObserved(serial, kind, severity, message string, observation Observation) {
-	l.record(serial, kind, severity, message, "", observation)
+	l.record(serial, kind, severity, message, "")
 }
 
 // RecordLink appends one event for serial that carries a reference URL, such
-// as an error-code lookup page. It records no source-session evidence.
+// as an error-code lookup page.
 func (l *Log) RecordLink(serial, kind, severity, message, url string) {
-	l.record(serial, kind, severity, message, url, Observation{})
+	l.record(serial, kind, severity, message, url)
 }
 
-// record is the shared append path behind RecordObserved and RecordLink.
-func (l *Log) record(serial, kind, severity, message, url string, observation Observation) {
+// record appends one event, wakes waiters, and calls the observer unlocked.
+func (l *Log) record(serial, kind, severity, message, url string) {
 	if l == nil {
 		return
 	}
@@ -130,13 +106,12 @@ func (l *Log) record(serial, kind, severity, message, url string, observation Ob
 	}
 	l.nextID++
 	e := Entry{
-		ID:          l.nextID,
-		Time:        l.now().UTC().Round(0),
-		Kind:        kind,
-		Severity:    severity,
-		Message:     message,
-		URL:         url,
-		Observation: observation,
+		ID:       l.nextID,
+		Time:     l.now().UTC().Round(0),
+		Kind:     kind,
+		Severity: severity,
+		Message:  message,
+		URL:      url,
 	}
 	if len(r.buf) < Capacity {
 		r.buf = append(r.buf, e)
@@ -148,8 +123,6 @@ func (l *Log) record(serial, kind, severity, message, url string, observation Ob
 	l.changed = make(chan struct{})
 	observer := l.observer
 	l.mu.Unlock()
-	// Report processing calls this method, so the observer runs unlocked
-	// and must not block.
 	if observer != nil {
 		observer(serial, e)
 	}

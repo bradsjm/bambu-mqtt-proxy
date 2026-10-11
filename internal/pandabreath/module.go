@@ -6,13 +6,9 @@ import (
 	"time"
 
 	"bambu-mqtt-proxy/internal/module"
-	"bambu-mqtt-proxy/internal/printer"
 )
 
-// Display tuning. The device reports whole degrees about once a second, so
-// the trend compares spaced samples over a few minutes and needs a rise or
-// fall of at least two degrees: one-degree sensor flicker never reads as a
-// trend.
+// Display tuning.
 const (
 	// sampleEvery is the minimum spacing between kept trend samples.
 	sampleEvery = 10 * time.Second
@@ -20,8 +16,7 @@ const (
 	trendWindow = 3 * time.Minute
 	// trendMinSpan is the shortest sample span that yields a trend.
 	trendMinSpan = 2 * time.Minute
-	// trendMinDelta is the smallest temperature change, in degrees, that
-	// counts as warming or cooling.
+	// trendMinDelta is the smallest temperature change, in degrees, that counts as warming or cooling.
 	trendMinDelta = 2.0
 )
 
@@ -29,11 +24,9 @@ const (
 const (
 	// LinkConnected means the device link is open and its reading is fresh.
 	LinkConnected = "connected"
-	// LinkNoReadings means the device link is open but no fresh reading
-	// has arrived.
+	// LinkNoReadings means the device link is open but no fresh reading has arrived.
 	LinkNoReadings = "no_readings"
-	// LinkOffline means the device link is closed and no fresh reading
-	// exists.
+	// LinkOffline means the device link is closed and no fresh reading exists.
 	LinkOffline = "offline"
 )
 
@@ -47,44 +40,32 @@ const (
 	TrendSteady = "steady"
 )
 
-// ModuleState is one printer's Panda Breath state. The core serves it as
-// the camera wall tile member and as MCP state.modules.pandabreath.
+// ModuleState is one printer's Panda Breath state.
 type ModuleState struct {
 	// Link is LinkConnected, LinkNoReadings, or LinkOffline.
 	Link string `json:"link"`
-	// ChamberC is the device's own chamber reading in degrees Celsius,
-	// present only while the reading is fresh.
+	// ChamberC is the device's own chamber reading in degrees Celsius, present only while the reading is fresh.
 	ChamberC *float64 `json:"chamber_c,omitempty"`
-	// Trend is TrendWarming, TrendCooling, or TrendSteady. It is empty
-	// until the kept samples span trendMinSpan, and while no fresh reading
-	// exists.
+	// Trend is TrendWarming, TrendCooling, or TrendSteady.
 	Trend string `json:"trend,omitempty"`
-	// RateCPerMin is the signed rate of change in degrees Celsius per
-	// minute, rounded to half a degree with a 0.5 floor. It is present
-	// only while Trend is TrendWarming or TrendCooling.
+	// RateCPerMin is the signed rate of change in degrees Celsius per minute, rounded to half a degree with a 0.5 floor.
 	RateCPerMin *float64 `json:"rate_c_per_min,omitempty"`
 }
 
-// StableKey returns the link and the trend only. Chamber temperature and
-// rate steps are value churn: they must not wake MCP watch_printer
-// attention watchers.
+// StableKey returns the link and the trend only.
 func (v ModuleState) StableKey() any { return [2]string{v.Link, v.Trend} }
 
-// Module declares the accessory store's lifecycle, chamber reading hook,
-// camera wall display, and per-printer state.
+// Module declares the accessory store's lifecycle, chamber reading hook, camera wall display, and per-printer state.
 func (s *Store) Module() module.Module {
 	return module.Module{
-		Name:           "pandabreath",
-		Start:          s.Start,
-		Stop:           s.Stop,
-		ChamberReading: s.ChamberReading,
-		Display:        s.Display,
-		State:          s.moduleState,
+		Name:    "pandabreath",
+		Run:     s.Run,
+		Display: s.Display,
+		State:   s.moduleState,
 	}
 }
 
-// moduleState returns the ModuleState for one printer, or nil when the
-// printer has no configured device.
+// moduleState returns the ModuleState for one printer, or nil when the printer has no configured device.
 func (s *Store) moduleState(serial string) any {
 	v, ok := s.snapshot(serial)
 	if !ok {
@@ -93,9 +74,7 @@ func (s *Store) moduleState(serial string) any {
 	return v
 }
 
-// snapshot computes one printer's ModuleState under the store lock. ok is
-// false when the printer has no configured device. Values change only with
-// real changes: the rate is rounded to half a degree per minute.
+// snapshot computes one printer's ModuleState under the store lock. ok is false when the printer has no configured device.
 func (s *Store) snapshot(serial string) (v ModuleState, ok bool) {
 	if !s.configured(serial) {
 		return ModuleState{}, false
@@ -103,7 +82,7 @@ func (s *Store) snapshot(serial string) (v ModuleState, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r, have := s.readings[serial]
-	fresh := have && time.Since(r.at) <= printer.FreshnessWindow
+	fresh := have && time.Since(r.at) <= 15*time.Second
 	switch {
 	case fresh:
 		v.Link = LinkConnected
@@ -134,11 +113,7 @@ func (s *Store) snapshot(serial string) (v ModuleState, ok bool) {
 	return v, true
 }
 
-// Display returns the Panda Breath panel for one printer, or nil when the
-// printer has no configured device. The panel shows the link state, the
-// device's own chamber reading while fresh, and the temperature trend once
-// enough samples exist. A "Chamber warming" overlay badge appears only
-// while the chamber is warming.
+// Display returns the Panda Breath panel for one printer, or nil when the printer has no configured device.
 func (s *Store) Display(serial string) *module.Display {
 	v, ok := s.snapshot(serial)
 	if !ok {
@@ -175,8 +150,7 @@ func (s *Store) Display(serial string) *module.Display {
 	return d
 }
 
-// configured reports whether serial has a Panda Breath address. targets is
-// fixed at construction, so no lock is needed.
+// configured reports whether serial has a Panda Breath address. targets is fixed at construction, so no lock is needed.
 func (s *Store) configured(serial string) bool {
 	for _, t := range s.targets {
 		if t.serial == serial {
@@ -193,9 +167,7 @@ func (s *Store) setConnected(serial string, open bool) {
 	s.mu.Unlock()
 }
 
-// keepSample drops samples older than trendWindow relative to r, then adds
-// r when the newest kept sample is at least sampleEvery old. Trimming on
-// every reading keeps the trend baseline inside the window.
+// keepSample drops samples older than trendWindow relative to r, then adds r when the newest kept sample is at least sampleEvery old.
 func keepSample(h []reading, r reading) []reading {
 	i := 0
 	for i < len(h) && r.at.Sub(h[i].at) > trendWindow {

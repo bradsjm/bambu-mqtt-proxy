@@ -50,13 +50,9 @@ type FirstLayerState struct {
 	PIncomplete *float64 `json:"p_incomplete"`
 }
 
-// Module declares lifecycle, startup and first-layer activity interest, diagnostics, and display hooks.
+// Module declares report-driven workers, diagnostics, and display hooks.
 func (s *Service) Module() module.Module {
-	on := s.settings.On() && s.blocked == ""
-	m := module.Module{Name: "platecheck", Start: s.Start, Stop: s.Close, State: s.moduleState, Display: s.Display, StatusValue: s.statusMap}
-	if on {
-		m.ObserveActivity = s.ObserveActivity
-	}
+	m := module.Module{Name: "platecheck", Run: s.Run, State: s.moduleState, Display: s.Display, StatusValue: s.statusMap}
 	if s.blocked == "" {
 		m.Routes = []module.Route{{Pattern: "POST /platecheck/snapshots", Handler: http.HandlerFunc(s.handleSnapshots)}}
 	}
@@ -87,29 +83,10 @@ func (s *Service) status(serial string) any {
 	v := w.status
 	w.mu.Unlock()
 	// Copy optional scalars so callers cannot mutate shared display values.
-	if v.PClear != nil {
-		v.PClear = new(*v.PClear)
-	}
-	if v.POccupied != nil {
-		v.POccupied = new(*v.POccupied)
-	}
-	if v.PAssessable != nil {
-		v.PAssessable = new(*v.PAssessable)
-	}
-	if v.FirstLayer.PAssessable != nil {
-		v.FirstLayer.PAssessable = new(*v.FirstLayer.PAssessable)
-	}
-	if v.FirstLayer.PTangled != nil {
-		v.FirstLayer.PTangled = new(*v.FirstLayer.PTangled)
-	}
-	if v.FirstLayer.PDetached != nil {
-		v.FirstLayer.PDetached = new(*v.FirstLayer.PDetached)
-	}
-	if v.FirstLayer.PNozzleBlob != nil {
-		v.FirstLayer.PNozzleBlob = new(*v.FirstLayer.PNozzleBlob)
-	}
-	if v.FirstLayer.PIncomplete != nil {
-		v.FirstLayer.PIncomplete = new(*v.FirstLayer.PIncomplete)
+	for _, score := range []**float64{&v.PClear, &v.POccupied, &v.PAssessable, &v.FirstLayer.PAssessable, &v.FirstLayer.PTangled, &v.FirstLayer.PDetached, &v.FirstLayer.PNozzleBlob, &v.FirstLayer.PIncomplete} {
+		if *score != nil {
+			*score = new(**score)
+		}
 	}
 	return v
 }

@@ -37,8 +37,7 @@ func (v ModuleState) StableKey() any { return v.Link }
 func (s *Store) Module() module.Module {
 	return module.Module{
 		Name:    "pandapwr",
-		Start:   s.Start,
-		Stop:    s.Stop,
+		Run:     s.Run,
 		Display: s.Display,
 		State:   s.moduleState,
 	}

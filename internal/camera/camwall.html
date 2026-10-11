@@ -2854,10 +2854,11 @@ function connect() {
     lastOk = Date.now();
     if (failing) announce("Status updates restored.");
     failing = false;
-    const sus = data.detection_suspended === true;
+    const suspended = data.printers.map(detectOf).find(d => d?.suspended);
+    const sus = !!suspended;
     if (sus !== detSuspended) {
       detSuspended = sus;
-      detMessage = typeof data.detection_message === "string" ? data.detection_message.trim() : "";
+      detMessage = suspended?.message?.trim() || "";
       announce(sus
         ? `AI inspection suspended: ${detMessage || "account error"}. It stays off until the proxy restarts.`
         : "AI inspection can run again.");

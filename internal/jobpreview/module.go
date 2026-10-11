@@ -1,82 +1,42 @@
 package jobpreview
 
 import (
-	"net/http"
-
 	"bambu-mqtt-proxy/internal/module"
+	"net/http"
 )
 
-// ModuleState is the per-printer module value for the camera wall tile
-// member and the MCP printer state member under the module name
-// "jobpreview". It carries the shared archived preview of the current
-// print and its accepted archive facts; only display state: never
-// serial-derived credentials or raw configuration.
+// ModuleState carries the wall and MCP archived job members.
 type ModuleState struct {
-	JobPreview  View      `json:"job_preview"`
+	// JobPreview contains thumbnail retrieval state.
+	JobPreview View `json:"job_preview"`
+	// JobMetadata contains sliced job facts.
 	JobMetadata *Metadata `json:"job_metadata"`
 }
 
-// moduleState returns one wall and MCP state value for a printer: a cache-only
-// lookup, falling back to the shared disabled projection when the printer
-// has no accepted preview. It never performs network work, so it stays
-// safe to call while the service is stopped.
+// moduleState returns cache-only wall state.
 func (s *Service) moduleState(serial string) any {
-	res, ok := s.Lookup(serial, false)
+	result, ok := s.Lookup(serial, false)
 	if !ok {
-		res = Disabled()
+		result = Disabled()
 	}
-	return ModuleState{JobPreview: res.Preview, JobMetadata: res.Metadata}
+	return ModuleState{result.Preview, result.Metadata}
 }
 
-// Display returns the preview status panel for one printer, or nil when
-// there is nothing worth showing: the feature is disabled, the print
-// details are ready with no failure attached, or the live projection
-// carries no reason. Otherwise the panel names the exact wait or failure
-// behind the current status. It is a cache-only lookup, safe for
-// concurrent use and after Stop.
+// Display returns the retrieval status panel when details are unavailable.
 func (s *Service) Display(serial string) *module.Display {
-	res, ok := s.Lookup(serial, false)
-	if !ok {
+	result, ok := s.Lookup(serial, false)
+	if !ok || result.Preview.Status == StatusReady || result.Preview.Status == StatusDisabled {
 		return nil
 	}
-	reason := res.Preview.Reason
-	if res.Preview.Status == StatusDisabled || reason == "" {
-		return nil
+	value, tone := "Print details unavailable", "warn"
+	if result.Preview.Status == StatusPending {
+		value, tone = "Downloading print details", "info"
 	}
-	if res.Preview.Status == StatusReady && reason == "" {
-		return nil
-	}
-	tone := "info"
-	if res.Preview.Status == StatusUnavailable || res.Preview.Status == StatusReady {
-		tone = "warn"
-	}
-	return &module.Display{
-		Panel: &module.Panel{
-			Title: "Print details",
-			Level: 3,
-			Rows: []module.Row{{
-				Label: "Status",
-				Value: reasonText(reason),
-				Tone:  tone,
-			}},
-		},
-	}
+	return &module.Display{Panel: &module.Panel{Title: "Print details", Level: 3, Rows: []module.Row{{Label: "Status", Value: value, Tone: tone}}}}
 }
 
-// Module declares the job preview service's module hooks: the per-printer
-// state for the camera wall and MCP, the status panel, the versioned
-// preview image route, and the get_job_preview tool.
+// Module returns preview lifecycle, wall, HTTP, and MCP hooks.
 func (s *Service) Module() module.Module {
-	return module.Module{
-		Name:    "jobpreview",
-		Start:   s.Start,
-		Stop:    s.Close,
-		State:   s.moduleState,
-		Display: s.Display,
-		Routes: []module.Route{{
-			Pattern: previewRoute,
-			Handler: http.HandlerFunc(s.handlePreview),
-		}},
-		MCP: s.registerMCP,
-	}
+	return module.Module{Name: "jobpreview", Run: s.Run, State: s.moduleState, Display: s.Display,
+		Routes: []module.Route{{Pattern: previewRoute, Handler: http.HandlerFunc(s.handlePreview)}}, MCP: s.registerMCP}
 }

@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/config"
 )
 
@@ -23,6 +24,12 @@ type storedPrinter struct {
 
 // Store holds documents and connectivity under one mutex.
 type Store struct {
+	// eventMu preserves report and connectivity dispatch order.
+	eventMu sync.Mutex
+	// subscribers receive events outside the document lock.
+	subscribers []func(Event)
+	// activity records transitions before subscribers receive them.
+	activity *activity.Log
 	// mu protects printer entries and the accessory reader.
 	mu sync.Mutex
 	// printers indexes configured serials.
@@ -46,26 +53,72 @@ func (s *Store) Apply(serial string, payload []byte) {
 	if json.Unmarshal(payload, &delta) != nil || delta == nil {
 		return
 	}
+	s.eventMu.Lock()
+	defer s.eventMu.Unlock()
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	p, ok := s.printers[serial]
 	if !ok {
+		s.mu.Unlock()
 		return
 	}
-	p.doc = mergeDoc(p.doc, delta, true)
+	prev := p.doc
+	p.doc = mergeDoc(prev, delta, true)
 	p.lastReportAt = time.Now()
 	s.printers[serial] = p
+	log, subscribers := s.activity, append([]func(Event){}, s.subscribers...)
+	s.mu.Unlock()
+	transitions := Transitions(prev, p.doc)
+	event := Event{Serial: serial, Prev: prev, Cur: p.doc, Online: p.online}
+	for _, transition := range transitions {
+		log.RecordLink(serial, transition.Kind, transition.Severity, transition.Message, transition.URL)
+		event.Kinds = append(event.Kinds, transition.Kind)
+	}
+	for _, fn := range subscribers {
+		fn(event)
+	}
 }
 
 // SetOnline records link connectivity without clearing the document.
 func (s *Store) SetOnline(serial string, online bool) {
+	s.eventMu.Lock()
+	defer s.eventMu.Unlock()
+	s.mu.Lock()
+	p, ok := s.printers[serial]
+	if !ok || p.online == online {
+		s.mu.Unlock()
+		return
+	}
+	p.online = online
+	s.printers[serial] = p
+	log, subscribers := s.activity, append([]func(Event){}, s.subscribers...)
+	s.mu.Unlock()
+	kind, severity, message := "disconnected", activity.Warning, "Printer connection lost, reconnecting"
+	if online {
+		kind, severity, message = "connected", activity.Info, "Printer connected"
+	}
+	log.Record(serial, kind, severity, message)
+	event := Event{Serial: serial, Prev: p.doc, Cur: p.doc, Online: online, Kinds: []string{kind}}
+	for _, fn := range subscribers {
+		fn(event)
+	}
+}
+
+// Subscribe registers a synchronous, non-blocking report callback at any time.
+// Callbacks must not send printer commands.
+func (s *Store) Subscribe(fn func(Event)) {
+	if fn == nil {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	p, ok := s.printers[serial]
-	if ok {
-		p.online = online
-		s.printers[serial] = p
-	}
+	s.subscribers = append(s.subscribers, fn)
+}
+
+// SetActivity attaches the transition log.
+func (s *Store) SetActivity(log *activity.Log) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.activity = log
 }
 
 // Get returns a read-only published document and connectivity.

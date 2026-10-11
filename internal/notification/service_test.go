@@ -1,50 +1,20 @@
 package notification
 
 import (
-	"context"
-	"io"
-	"log/slog"
-	"strings"
-	"testing"
-	"time"
-
 	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/camera"
 	"bambu-mqtt-proxy/internal/config"
-	"bambu-mqtt-proxy/internal/telemetry"
+	"bambu-mqtt-proxy/internal/printer"
+	"context"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"testing/synctest"
 )
-
-// sentMsg captures one delivery through the fake send seam.
-type sentMsg struct {
-	title string
-	body  string
-	jpeg  []byte
-}
-
-// testPrinters is one named printer shared by the service tests.
-func testPrinters() []config.Printer {
-	return []config.Printer{{Serial: "S1", Name: "Shop"}}
-}
-
-// newTestService builds a service on a fresh telemetry cache whose send
-// seam records into the returned channel; tests override send and
-// snapshot before Start.
-func newTestService(t *testing.T) (*Service, chan sentMsg) {
-	t.Helper()
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	state := telemetry.NewCache(testPrinters(), log)
-	s := New(Settings{
-		Enabled:  true,
-		Provider: "pushover",
-		Pushover: Pushover{AppToken: "app-token", UserKey: "user-key"},
-	}, state, nil, log)
-	sent := make(chan sentMsg, 8)
-	s.send = func(_ context.Context, _ Settings, title, body string, jpeg []byte) error {
-		sent <- sentMsg{title, body, jpeg}
-		return nil
-	}
-	return s, sent
-}
 
 // TestEventSummaryPlatecheckKinds pins the plate-check notification map:
 // the stop lifecycle kinds notify with the recorded message, while routine
@@ -92,7 +62,7 @@ func TestEventSummaryPlatecheckLayer1Kinds(t *testing.T) {
 	}
 }
 
-// TestEventSummaryPrintOutcomeKinds pins the Phase 4 telemetry map: failed
+// TestEventSummaryPrintOutcomeKinds protects print outcome notification summaries: failed
 // and cancelled prints notify with short summaries, errors follow the HMS
 // severity pattern, and cleared alerts stay activity-only.
 func TestEventSummaryPrintOutcomeKinds(t *testing.T) {
@@ -116,72 +86,80 @@ func TestEventSummaryPrintOutcomeKinds(t *testing.T) {
 	}
 }
 
-// TestServiceSendsFinishedPrintWithSnapshot pins the happy path: one
-// message whose title is the printer name, whose body carries the summary
-// and the file line, and whose JPEG comes from the camera seam.
-func TestServiceSendsFinishedPrintWithSnapshot(t *testing.T) {
-	s, sent := newTestService(t)
-	s.state.Observe("S1", []byte(`{"print":{"subtask_name":"benchy.3mf"}}`))
+// TestDelivery protects the activity-to-Pushover request and silent pause contracts.
+func TestDelivery(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			t.Error(err)
+			return
+		}
+		defer r.MultipartForm.RemoveAll()
+		if title := r.FormValue("title"); title != "Shop" {
+			t.Errorf("title = %q", title)
+		}
+		body := r.FormValue("message")
+		for _, text := range []string{"Print failed", "File: benchy.3mf", "0300_8001"} {
+			if !strings.Contains(body, text) {
+				t.Errorf("message %q lacks %q", body, text)
+			}
+		}
+		file, header, err := r.FormFile("attachment")
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer file.Close()
+		jpeg, _ := io.ReadAll(file)
+		if string(jpeg) != "jpeg-bytes" || header.Header.Get("Content-Type") != "image/jpeg" {
+			t.Errorf("attachment = %q", jpeg)
+		}
+		_, _ = w.Write([]byte(`{"status":1}`))
+	}))
+	defer server.Close()
+	old := pushoverURL
+	pushoverURL = server.URL
+	defer func() { pushoverURL = old }()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	state := printer.NewStore([]config.Printer{{Serial: "S1"}})
+	state.Apply("S1", []byte(`{"print":{"subtask_name":"benchy.3mf","print_error":50364417}}`))
+	s := New(Settings{Pushover: Pushover{AppToken: "app", UserKey: "user"}}, []config.Printer{{Serial: "S1", Name: "Shop"}}, state, nil, log)
 	s.snapshot = func(context.Context, string) (*camera.Frame, camera.Status) {
 		return &camera.Frame{JPEG: []byte("jpeg-bytes")}, camera.StatusOK
 	}
-	s.Start()
-	defer s.Close()
-
-	s.Observe("S1", activity.Entry{Kind: "print_finished", Severity: activity.Info, Message: "Print finished"})
-	select {
-	case m := <-sent:
-		if m.title != "Shop" {
-			t.Fatalf("title = %q, want Shop", m.title)
-		}
-		if !strings.Contains(m.body, "Print finished") || !strings.Contains(m.body, "File: benchy.3mf") {
-			t.Fatalf("body = %q", m.body)
-		}
-		if string(m.jpeg) != "jpeg-bytes" {
-			t.Fatalf("jpeg = %q", m.jpeg)
-		}
-	case <-time.After(batchWindow + 3*time.Second):
-		t.Fatal("finished print produced no notification")
+	s.Observe("S1", activity.Entry{Kind: "print_failed"})
+	s.deliverBatch(context.Background(), "S1", []event{<-s.events})
+	if calls.Load() != 1 {
+		t.Fatalf("requests = %d", calls.Load())
+	}
+	state.Apply("S1", []byte(`{"print":{"print_error":0}}`))
+	s.Observe("S1", activity.Entry{Kind: "print_paused"})
+	s.deliverBatch(context.Background(), "S1", []event{<-s.events})
+	if calls.Load() != 1 {
+		t.Fatalf("unqualified pause sent a request")
 	}
 }
 
-// TestServiceSkipsUnqualifiedPause pins that a lone print_paused without
-// an active alert sends nothing.
-func TestServiceSkipsUnqualifiedPause(t *testing.T) {
-	s, sent := newTestService(t)
-	s.Start()
-	defer s.Close()
-
-	s.Observe("S1", activity.Entry{Kind: "print_paused", Severity: activity.Warning, Message: "Print paused"})
-	time.Sleep(batchWindow + 500*time.Millisecond)
-	if n := len(sent); n != 0 {
-		t.Fatalf("unqualified pause sent %d messages", n)
-	}
-}
-
-// TestServiceBatchesPauseWithError pins the window: a pause followed by a
-// printer error inside one batch becomes a single message with both
-// summaries and the active print error alert.
-func TestServiceBatchesPauseWithError(t *testing.T) {
-	s, sent := newTestService(t)
-	s.state.Observe("S1", []byte(`{"print":{"print_error":50348044}}`))
-	s.Start()
-	defer s.Close()
-
-	s.Observe("S1", activity.Entry{Kind: "print_paused", Severity: activity.Warning, Message: "Print paused"})
-	s.Observe("S1", activity.Entry{Kind: "print_error", Severity: activity.Error, Message: "Printer error"})
-	select {
-	case m := <-sent:
-		if !strings.Contains(m.body, "Print paused") || !strings.Contains(m.body, "Printer error") {
-			t.Fatalf("body = %q", m.body)
+// TestFullQueueDrops protects nonblocking activity observation.
+func TestFullQueueDrops(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := New(Settings{}, nil, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		done := make(chan struct{})
+		go func() {
+			for range 17 {
+				s.Observe("S1", activity.Entry{Kind: "print_failed"})
+			}
+			close(done)
+		}()
+		synctest.Wait()
+		select {
+		case <-done:
+		default:
+			t.Fatal("Observe blocked on full queue")
 		}
-		if !strings.Contains(m.body, "0300_400C") {
-			t.Fatalf("body lacks the print error alert: %q", m.body)
+		if len(s.events) != 16 {
+			t.Fatalf("queue length = %d", len(s.events))
 		}
-		if len(sent) != 0 {
-			t.Fatalf("batch produced %d extra messages", len(sent))
-		}
-	case <-time.After(batchWindow + 3*time.Second):
-		t.Fatal("paused-with-error batch produced no notification")
-	}
+	})
 }

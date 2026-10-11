@@ -7,13 +7,10 @@ package detection
 import (
 	"context"
 	"encoding/json"
-	"io"
-	"log/slog"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/module"
 )
 
@@ -158,9 +155,7 @@ func TestSetAIMonitoringSuccessFreshStatus(t *testing.T) {
 func TestSetAIMonitoringModuleRegistration(t *testing.T) {
 	// Module must declare the MCP hook through a valid tool schema; AddTool
 	// panics on a malformed input schema.
-	e := New([]config.Printer{{Serial: "S1", Name: "Shop", Model: "P1S"}},
-		&etClient{}, &etFrames{}, &etSessions{}, &etPauser{},
-		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	e := newEtWorld(t).engine
 	m := e.Module()
 	if m.Name != "detection" || m.MCP == nil || m.State == nil {
 		t.Fatalf("module = %+v", m)

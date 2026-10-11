@@ -87,10 +87,7 @@ func run(in io.Reader, serial, prefix string) (int, error) {
 			hasBase = false
 			lastMs = 0
 		case msg == "printer report received" && attrs["serial"] == serial:
-			gen, err := strconv.ParseUint(attrs["connection_generation"], 10, 64)
-			if err != nil {
-				continue
-			}
+			gen, _ := strconv.ParseUint(attrs["connection_generation"], 10, 64)
 			payload := attrs["payload"]
 			if payload == "" || !json.Valid([]byte(payload)) {
 				continue

@@ -25,7 +25,6 @@ import (
 	"net/url"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -200,39 +199,11 @@ func IsFrameTooLarge(err error) bool {
 // Client calls the Gadget API with the account key. It is safe for
 // concurrent use; the detection engine serializes calls per printer anyway.
 type Client struct {
-	apiKey     string
-	createURL  string
-	http       *http.Client
-	log        *slog.Logger
-	logMu      sync.RWMutex
-	requestSeq atomic.Uint64
-}
-
-// requestLogContextKey identifies Gadget request diagnostics in a context.
-type requestLogContextKey struct{}
-
-// requestLogContext ties one Gadget HTTP request to the printer state and
-// camera frame that caused it. It contains no image bytes or credentials.
-type requestLogContext struct {
-	requestID         string
-	action            string
-	serial            string
-	inspectionReason  string
-	printState        string
-	sessionGeneration uint64
-	sessionEpoch      uint64
-	frameSequence     uint64
-	frameBytes        int
-	layer             *int
-	frameAgeMS        int64
-	retryAttempt      int
-	intensive         bool
-	usingFallback     bool
-}
-
-// withRequestLogContext attaches diagnostic metadata to one Gadget request.
-func withRequestLogContext(ctx context.Context, detail requestLogContext) context.Context {
-	return context.WithValue(ctx, requestLogContextKey{}, detail)
+	apiKey    string
+	createURL string
+	http      *http.Client
+	log       *slog.Logger
+	logMu     sync.RWMutex
 }
 
 // setLogger attaches the engine logger before its workers start.
@@ -249,40 +220,9 @@ func (c *Client) logger() *slog.Logger {
 	return c.log
 }
 
-// requestLogAttrs returns non-secret metadata for one HTTP request. It
-// never includes the URL: its path embeds the context id.
+// requestLogAttrs returns bounded request metadata without context URLs.
 func (c *Client) requestLogAttrs(req *http.Request) []any {
-	detail, _ := req.Context().Value(requestLogContextKey{}).(requestLogContext)
-	action := detail.action
-	if action == "" {
-		action = "request"
-	}
-	attrs := []any{"action", action, "method", req.Method,
-		"request_host", req.URL.Hostname(), "request_content_type", req.Header.Get("Content-Type"),
-		"request_bytes", req.ContentLength}
-	return append(attrs, detail.logAttrs()...)
-}
-
-// logAttrs returns correlation and inspection metadata without context tokens.
-func (d requestLogContext) logAttrs() []any {
-	attrs := []any{
-		"request_id", d.requestID,
-		"printer", d.serial,
-		"inspection_reason", d.inspectionReason,
-		"print_state", d.printState,
-		"session_generation", d.sessionGeneration,
-		"session_epoch", d.sessionEpoch,
-		"frame_sequence", d.frameSequence,
-		"frame_bytes", d.frameBytes,
-		"frame_age_ms", d.frameAgeMS,
-		"retry_attempt", d.retryAttempt,
-		"intensive_inspection", d.intensive,
-		"using_fallback", d.usingFallback,
-	}
-	if d.layer != nil {
-		attrs = append(attrs, "layer", *d.layer)
-	}
-	return attrs
+	return []any{"method", req.Method, "request_host", req.URL.Hostname(), "request_content_type", req.Header.Get("Content-Type"), "request_bytes", req.ContentLength}
 }
 
 // debugResponse logs sanitized response metadata only when debug is
@@ -400,25 +340,6 @@ func decodeJSON(kind string, body []byte, v any) error {
 	return nil
 }
 
-// decodeField parses one known response field without including provider
-// data. A JSON null is treated as absent: required fields are then rejected
-// by their presence checks with the same safe errors, and optional fields
-// keep their missing-value defaults.
-func decodeField[T any](fields map[string]json.RawMessage, name string) (*T, error) {
-	raw, ok := fields[name]
-	if !ok {
-		return nil, nil
-	}
-	if string(bytes.TrimSpace(raw)) == "null" {
-		return nil, nil
-	}
-	var value T
-	if err := json.Unmarshal(raw, &value); err != nil {
-		return nil, &responseValidationError{message: "gadget process response: invalid " + name}
-	}
-	return &value, nil
-}
-
 // CreateContext starts one print context. The response carries the context
 // id plus two complete process URLs; both URLs are validated immediately
 // against the vendor URL policy before the session is returned.
@@ -463,7 +384,7 @@ func (c *Client) CreateContext(ctx context.Context) (Session, error) {
 // satisfy the required contract: PrintQuality within 1..10, both
 // WarningSuggested and PauseSuggested present, and both NextProcessIntervalSec
 // values present and positive. Valid intervals pass through verbatim — the
-// engine applies its protection-first timing policy. FasterInspectionSuggested
+// engine follows Gadget's recommended interval. FasterInspectionSuggested
 // is optional and defaults to false. A validation error may return valid
 // timing intervals with the partial Result, so the engine can retain them.
 func (c *Client) Process(ctx context.Context, url string, jpeg []byte) (Result, error) {
@@ -514,45 +435,33 @@ func (c *Client) Process(ctx context.Context, url string, jpeg []byte) (Result, 
 		*intervals.Minimum <= maxIntervalSeconds && *intervals.Recommended <= maxIntervalSeconds {
 		res.Intervals = IntervalSec{Minimum: *intervals.Minimum, Recommended: *intervals.Recommended}
 	}
-	quality, err := decodeField[int](fields, "PrintQuality")
-	if err != nil {
+	var out struct {
+		// Quality is the required print-quality score.
+		Quality *int `json:"PrintQuality"`
+		// Warning is the required warning flag.
+		Warning *bool `json:"WarningSuggested"`
+		// Pause is the required failure flag.
+		Pause *bool `json:"PauseSuggested"`
+		// Faster is an optional inspection hint.
+		Faster bool `json:"FasterInspectionSuggested"`
+		// Score is optional provider analysis metadata.
+		Score int `json:"Score"`
+	}
+	if err := decodeJSON("process response", raw, &out); err != nil {
 		return res, err
 	}
-	if quality == nil {
+	switch {
+	case out.Quality == nil:
 		return res, &responseValidationError{message: "gadget process response: missing required PrintQuality"}
-	}
-	if *quality < 1 || *quality > 10 {
+	case *out.Quality < 1 || *out.Quality > 10:
 		return res, &responseValidationError{message: "gadget process response: PrintQuality outside 1..10"}
-	}
-	warning, err := decodeField[bool](fields, "WarningSuggested")
-	if err != nil {
-		return res, err
-	}
-	pause, err := decodeField[bool](fields, "PauseSuggested")
-	if err != nil {
-		return res, err
-	}
-	if warning == nil || pause == nil {
+	case out.Warning == nil || out.Pause == nil:
 		return res, &responseValidationError{message: "gadget process response: missing required WarningSuggested or PauseSuggested"}
-	}
-	if res.Intervals.Minimum == 0 || res.Intervals.Recommended == 0 {
+	case res.Intervals.Minimum == 0 || res.Intervals.Recommended == 0:
 		return res, &responseValidationError{message: "gadget process response: invalid NextProcessIntervalSec"}
 	}
-	faster, err := decodeField[bool](fields, "FasterInspectionSuggested")
-	if err != nil {
-		return res, err
-	}
-	score, err := decodeField[int](fields, "Score")
-	if err != nil {
-		return res, err
-	}
-	res.PrintQuality = *quality
-	res.WarningSuggested = *warning
-	res.PauseSuggested = *pause
-	res.FasterInspectionSuggested = faster != nil && *faster
-	if score != nil {
-		res.Score = *score
-	}
+	res.PrintQuality, res.WarningSuggested, res.PauseSuggested = *out.Quality, *out.Warning, *out.Pause
+	res.FasterInspectionSuggested, res.Score = out.Faster, out.Score
 	return res, nil
 }
 
@@ -562,11 +471,6 @@ func (c *Client) Process(ctx context.Context, url string, jpeg []byte) (Result, 
 // carry only fixed classifications and numeric metadata: never the URL,
 // the body, or provider-controlled text.
 func (c *Client) do(req *http.Request) ([]byte, error) {
-	detail, _ := req.Context().Value(requestLogContextKey{}).(requestLogContext)
-	if detail.requestID == "" {
-		detail.requestID = fmt.Sprintf("gadget-%d", c.requestSeq.Add(1))
-		req = req.WithContext(withRequestLogContext(req.Context(), detail))
-	}
 	logger := c.logger()
 	debug := logger != nil && logger.Enabled(req.Context(), slog.LevelDebug)
 	var attrs []any

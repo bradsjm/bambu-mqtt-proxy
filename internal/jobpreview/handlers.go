@@ -1,6 +1,4 @@
-// HTTP cache handlers for the job preview: one route serving the accepted
-// plate PNG from memory. Every read is cache-only — a handler never dials
-// the printer, retries a transfer, or triggers any scheduler work.
+// HTTP cache handlers for the job preview: one route serving the accepted.
 package jobpreview
 
 import (
@@ -9,14 +7,10 @@ import (
 	"net/http"
 )
 
-// previewRoute is the versioned image path shared with stampedResult:
-// GET /camera/{serial}/preview?v=<sha256-hex of the PNG bytes>.
+// previewRoute is the versioned image path shared with stampedResult:.
 const previewRoute = "GET /camera/{serial}/preview"
 
-// handlePreview serves the cached PNG for one serial and version. The
-// version must equal the SHA-256 of the currently cached image: unknown
-// serials, unavailable images, and stale versions all return 404 with no
-// network work and no fallback to an older image.
+// handlePreview serves the cached PNG for one serial and version. The.
 func (s *Service) handlePreview(w http.ResponseWriter, r *http.Request) {
 	serial := r.PathValue("serial")
 	res, ok := s.Lookup(serial, true)

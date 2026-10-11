@@ -1,41 +1,25 @@
 package detection
 
 import (
-	"net/http"
-
 	"bambu-mqtt-proxy/internal/module"
+	"net/http"
 )
 
-// Module declares the detection engine's lifecycle. Call after SetBlocked
-// and before Start.
+// Module declares detection lifecycle, state, and command routes.
 func (e *Engine) Module() module.Module {
-	m := module.Module{
-		Name:        "detection",
-		Start:       e.Start,
-		Stop:        e.Close,
-		State:       e.DetectionStatus,
-		FleetValues: e.fleetValues,
-		StatusValue: func() any { return e.DetectionMap() },
-	}
+	m := module.Module{Name: "detection", Run: e.Run, State: e.DetectionStatus, Display: e.Display, StatusValue: func() any { return e.DetectionMap() }}
 	if e.blocked == "" {
 		m.MCP = e.registerMCP
-		m.Routes = []module.Route{{
-			Pattern: "PUT /detection/{serial}",
-			Handler: http.HandlerFunc(e.handlePut),
-		}}
+		m.Routes = []module.Route{{Pattern: "PUT /detection/{serial}", Handler: http.HandlerFunc(e.handlePut)}}
 	}
 	return m
 }
 
-// fleetValues returns account suspension members only while suspension is active.
-func (e *Engine) fleetValues() map[string]any {
-	suspended, message := e.AccountSuspended()
-	if !suspended {
+// Display contributes an operator warning when detection needs attention.
+func (e *Engine) Display(serial string) *module.Display {
+	st, ok := e.DetectionStatus(serial).(*Status)
+	if !ok || st.Message == "" {
 		return nil
 	}
-	values := map[string]any{"detection_suspended": true}
-	if message != "" {
-		values["detection_message"] = message
-	}
-	return values
+	return &module.Display{Panel: &module.Panel{Title: "AI inspection", Rows: []module.Row{{Label: st.State, Value: st.Message}}}}
 }

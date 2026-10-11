@@ -843,7 +843,8 @@ func TestGadgetDebugLogsSanitized(t *testing.T) {
 			conn.Close()
 		})
 		_, err := client.Process(context.Background(), processURL, jpeg)
-		if err == nil || !isTransportError(err) {
+		var transportErr *TransportError
+		if err == nil || !errors.As(err, &transportErr) {
 			t.Fatalf("err = %v, want a transport read failure", err)
 		}
 		assertNoProviderText(t, logs)
@@ -896,7 +897,8 @@ func TestGadgetDebugLogsSanitized(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		_, err := client.Process(ctx, processURL, jpeg)
-		if err == nil || !isTransportError(err) {
+		var transportErr *TransportError
+		if err == nil || !errors.As(err, &transportErr) {
 			t.Fatalf("err = %v, want a canceled transport error", err)
 		}
 		assertNoProviderText(t, logs)

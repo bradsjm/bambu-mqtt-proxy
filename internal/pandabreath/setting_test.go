@@ -7,8 +7,7 @@ import (
 	"bambu-mqtt-proxy/internal/config"
 )
 
-// TestAddressSettingValidate covers the address validation: host names and
-// host:port pairs are accepted and every scheme form is rejected.
+// TestAddressSettingValidate covers the address validation: host names and host:port pairs are accepted and every scheme form is rejected..
 func TestAddressSettingValidate(t *testing.T) {
 	accept := []string{"panda-breath-blue.iot", "10.0.0.5:8080"}
 	for _, in := range accept {
@@ -24,10 +23,7 @@ func TestAddressSettingValidate(t *testing.T) {
 	}
 }
 
-// TestNewBuildsWebSocketTarget requires New to build ws://<host>/ws from a
-// bare host name, so the observer dials the device path directly. Missing
-// or invalid addresses must produce no target; an invalid address never
-// reaches New because Validate rejects it, but the helper stays constructed.
+// TestNewBuildsWebSocketTarget requires New to build ws://<host>/ws from a bare host name, so the observer dials the device path directly.
 func TestNewBuildsWebSocketTarget(t *testing.T) {
 	printers := []config.Printer{
 		{Serial: "S1", Settings: map[string]any{AddressKey: "panda.local"}},

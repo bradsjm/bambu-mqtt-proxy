@@ -1,11 +1,8 @@
-// Package safety is a best-effort second line of defense behind the
-// printer's own thermal protection. When a printer's nozzle, bed, or
-// chamber temperature reaches its safety limit, the module stops every
-// printer, switches the impacted printer's Panda PWR off when one is
-// configured, and sends one Pushover emergency notification.
+// Package safety is a best-effort second line of defense behind the printer's own thermal protection.
 package safety
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -19,10 +16,9 @@ import (
 	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/module"
 	"bambu-mqtt-proxy/internal/notification"
+	"bambu-mqtt-proxy/internal/pandabreath"
 	"bambu-mqtt-proxy/internal/pandapwr"
-	"bambu-mqtt-proxy/internal/telemetry"
-
-	"gopkg.in/yaml.v3"
+	"bambu-mqtt-proxy/internal/printer"
 )
 
 // Settings is the YAML safety section.
@@ -40,8 +36,7 @@ func SettingsOf(c *config.Config) (Settings, error) {
 	return *v.(*Settings), nil
 }
 
-// ConfigSection owns the safety YAML section. The /config page has no
-// safety form, so a page save keeps the stored section unchanged.
+// ConfigSection owns the safety YAML section.
 var ConfigSection = config.Section{
 	Key: "safety",
 	New: func() any { return &Settings{} },
@@ -64,145 +59,116 @@ var ConfigSection = config.Section{
 			return nil
 		}
 		if node, ok := stored.Sections["safety"]; ok {
-			if out.Sections == nil {
-				out.Sections = make(map[string]yaml.Node)
-			}
-			out.Sections["safety"] = node
+			out.SetSection("safety", node)
 		}
 		return nil
 	},
 }
 
 // limits are the trip temperatures of one printer model in °C.
-type limits struct {
-	nozzle, bed, chamber float64
-}
+type limits [3]float64
 
-// modelLimits maps config.DisplayModel names to trip temperatures: the
-// model's rated maximum plus a margin, so normal printing never trips.
+// modelLimits maps config.DisplayModel names to trip temperatures: the model's rated maximum plus a margin, so normal printing never trips.
 var modelLimits = map[string]limits{
-	"A1MINI": {320, 95, 80},
-	"A1":     {320, 115, 80},
-	"P1P":    {320, 115, 80},
-	"P1S":    {320, 115, 80},
-	"X1":     {320, 125, 80},
-	"X1C":    {320, 125, 80},
-	"P2S":    {320, 125, 80},
-	"X1E":    {340, 135, 80},
-	"H2D":    {370, 135, 80},
-	"H2DPRO": {370, 135, 80},
-	"H2S":    {370, 135, 80},
-	"H2C":    {370, 135, 80},
-	"X2D":    {370, 135, 80},
+	"A1MINI": {320, 95, 80}, "A1": {320, 115, 80}, "P1P": {320, 115, 80}, "P1S": {320, 115, 80},
+	"X1": {320, 125, 80}, "X1C": {320, 125, 80}, "P2S": {320, 125, 80}, "X1E": {340, 135, 80},
 }
 
 // defaultLimits apply to unknown models with the most permissive model limits.
 var defaultLimits = limits{370, 135, 80}
 
-// StateSource reads merged printer state. *telemetry.Cache satisfies it.
+// StateSource reads the core printer document and connectivity.
 type StateSource interface {
-	State(serial string) (telemetry.State, bool)
+	Get(serial string) (printer.Doc, bool, bool)
 }
 
-// Commander sends stop commands and reports printer liveness. *printer.Links satisfies it.
+// ChamberSource reads the retained accessory chamber reading.
+type ChamberSource interface {
+	Chamber(string) (float64, time.Time, bool)
+}
+
+// Commander sends stop commands.
 type Commander interface {
-	// Online reports whether the printer is connected and subscribed.
-	Online(serial string) bool
 	// Stop sends one stop command.
 	Stop(serial string) error
 }
 
-// Service checks every printer's temperatures once per second and responds
-// once per over-limit episode.
+// Service checks every printer's temperatures once per second and responds once per over-limit episode.
 type Service struct {
+	// printers lists the configured fleet.
 	printers []config.Printer
-	state    StateSource
-	cmd      Commander
-	act      *activity.Log
-	notify   notification.Settings
-	log      *slog.Logger
+	// chamber reads accessory temperatures.
+	chamber ChamberSource
+	// state reads printer documents.
+	state StateSource
+	// cmd sends fleet stop commands.
+	cmd Commander
+	// act records safety actions.
+	act *activity.Log
+	// notify holds emergency credentials.
+	notify notification.Settings
+	// log reports safety outcomes.
+	log *slog.Logger
 	// send delivers the emergency notification; tests replace it.
 	send func(ctx context.Context, cfg notification.Settings, title, body string) error
 	// powerOff switches a Panda PWR off; tests replace it.
 	powerOff func(ctx context.Context, address string) error
-
-	// tripped holds printers already handled in the current over-limit
-	// episode. Only the loop goroutine uses it.
+	// tripped holds printers already handled in the current over-limit episode.
 	tripped map[string]bool
-	stop    chan struct{}
-	done    chan struct{}
-	// responses tracks running responses so Stop waits for them.
+	// responses joins emergency work at shutdown.
 	responses sync.WaitGroup
 }
 
 // New builds the safety service for the configured printers.
-func New(printers []config.Printer, state StateSource, cmd Commander, act *activity.Log, notify notification.Settings, log *slog.Logger) *Service {
-	return &Service{
-		printers: printers,
-		state:    state,
-		cmd:      cmd,
-		act:      act,
-		notify:   notify,
-		log:      log,
-		send:     notification.SendEmergency,
-		powerOff: pandapwr.PowerOff,
-		tripped:  make(map[string]bool),
-		stop:     make(chan struct{}),
-		done:     make(chan struct{}),
-	}
+func New(printers []config.Printer, state StateSource, chamber ChamberSource, cmd Commander, act *activity.Log, notify notification.Settings, log *slog.Logger) *Service {
+	return &Service{printers: printers, state: state, chamber: chamber, cmd: cmd, act: act,
+		notify: notify, log: log, send: notification.SendEmergency, powerOff: pandapwr.PowerOff, tripped: make(map[string]bool)}
 }
 
-// Module declares the service lifecycle.
-func (s *Service) Module() module.Module {
-	return module.Module{Name: "safety", Start: s.Start, Stop: s.Stop}
-}
+// Module declares the safety monitor lifecycle.
+func (s *Service) Module() module.Module { return module.Module{Name: "safety", Run: s.Run} }
 
-// Start launches the check loop. The core calls it once.
-func (s *Service) Start() {
-	s.log.Info("safety monitor started", "printers", len(s.printers))
-	go s.loop()
-}
-
-// Stop ends the check loop and waits for running responses to finish.
-func (s *Service) Stop() {
-	close(s.stop)
-	<-s.done
-	s.responses.Wait()
-}
-
-// loop checks every printer once per second, about the printer report rate.
-func (s *Service) loop() {
-	defer close(s.done)
+// Run checks temperatures once per second and waits for responses at shutdown.
+func (s *Service) Run(ctx context.Context) error {
+	defer s.responses.Wait()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-s.stop:
-			return
+		case <-ctx.Done():
+			return nil
 		case <-ticker.C:
 			for _, p := range s.printers {
-				s.check(p)
+				s.check(ctx, p)
 			}
 		}
 	}
 }
 
-// check compares one printer's cached temperatures with its limits while
-// the printer is online. The latch clears only when an online printer's
-// readings are all below the limits, so a cached over-limit value trips
-// only if the printer is still connected and no check has seen it yet.
-func (s *Service) check(p config.Printer) {
-	if !s.cmd.Online(p.Serial) {
+// check compares one printer's cached temperatures with its limits while the printer is online.
+func (s *Service) check(ctx context.Context, p config.Printer) {
+	st, online, ok := s.state.Get(p.Serial)
+	if !ok || !online {
 		return
 	}
-	st, ok := s.state.State(p.Serial)
+	temps, _ := st.Temps()
+	model := config.DisplayModel(p.Model, p.Serial)
+	if !config.ChamberTemperatureSupported(model, p.Serial) {
+		temps.Chamber = nil
+		if s.chamber != nil {
+			if value, _, ok := s.chamber.Chamber(p.Serial); ok {
+				temps.Chamber = &value
+			}
+		}
+	}
+	lim, ok := modelLimits[model]
 	if !ok {
-		return
+		lim = defaultLimits
 	}
-	probe, value, limit, over := overLimit(st)
+	probe, value, limit, over := overLimit(temps, lim)
 	if !over {
-		if s.tripped[p.Serial] {
-			s.log.Info("safety re-armed", "serial", p.Serial)
+		if temps.Nozzle == nil || temps.Bed == nil || (p.Setting(pandabreath.AddressKey) != "" || config.ChamberTemperatureSupported(model, p.Serial)) && temps.Chamber == nil {
+			return
 		}
 		delete(s.tripped, p.Serial)
 		return
@@ -211,70 +177,37 @@ func (s *Service) check(p config.Printer) {
 		return
 	}
 	s.tripped[p.Serial] = true
-	s.responses.Add(1)
-	go func() {
-		defer s.responses.Done()
-		s.respond(p, probe, value, limit)
-	}()
+	s.responses.Go(func() { s.respond(ctx, p, probe, value, limit) })
 }
 
-// overLimit returns the first temperature at or above its limit. The
-// chamber reading is the native sensor on models that have one, otherwise
-// the latest accessory reading. A stale accessory reading keeps its last
-// value, so losing the device never re-arms a tripped printer.
-func overLimit(st telemetry.State) (probe string, value, limit float64, over bool) {
-	model := config.DisplayModel(st.Model, st.Serial)
-	lim, ok := modelLimits[model]
-	if !ok {
-		lim = defaultLimits
-	}
-	chamber := st.AccessoryChamberTemp
-	if config.ChamberTemperatureSupported(model, st.Serial) {
-		chamber = st.ChamberTemp
-	}
-	for _, r := range []struct {
-		probe string
-		value *float64
-		limit float64
-	}{
-		{"Nozzle", st.NozzleTemp, lim.nozzle},
-		{"Bed", st.BedTemp, lim.bed},
-		{"Chamber", chamber, lim.chamber},
-	} {
-		if r.value != nil && *r.value >= r.limit {
-			return r.probe, *r.value, r.limit, true
+// overLimit returns the first temperature at or above its limit.
+func overLimit(temps printer.Temps, lim limits) (probe string, value, limit float64, over bool) {
+	for i, value := range []*float64{temps.Nozzle, temps.Bed, temps.Chamber} {
+		if value != nil && *value >= lim[i] {
+			return []string{"Nozzle", "Bed", "Chamber"}[i], *value, lim[i], true
 		}
 	}
 	return "", 0, 0, false
 }
 
-// respond stops every printer, switches the impacted printer's Panda PWR
-// off when configured, and sends one emergency notification that lists
-// the outcome. Each step is one attempt.
-func (s *Service) respond(p config.Printer, probe string, value, limit float64) {
-	name := p.Name
-	if name == "" {
-		name = p.Serial
-	}
+// respond stops every printer, switches the impacted printer's Panda PWR off when configured, and sends one emergency notification that lists the outcome.
+func (s *Service) respond(parent context.Context, p config.Printer, probe string, value, limit float64) {
+	name := cmp.Or(p.Name, p.Serial)
 	reason := fmt.Sprintf("%s temperature %.0f°C reached the %.0f°C safety limit.", probe, value, limit)
 	s.log.Error("safety limit reached: stopping all printers", "serial", p.Serial, "probe", probe, "value", value, "limit", limit)
 	s.act.Record(p.Serial, "safety_overtemp", activity.Error, reason+" Stopping all printers.")
-
 	lines := []string{reason}
 	for _, q := range s.printers {
 		if err := s.cmd.Stop(q.Serial); err != nil {
 			s.log.Error("safety stop failed", "serial", q.Serial, "error", err)
 			lines = append(lines, "Stop NOT sent to "+q.Serial+": "+err.Error())
-			continue
 		}
-		s.log.Warn("safety stop sent", "serial", q.Serial)
 	}
 	if len(lines) == 1 {
 		lines = append(lines, "Stop sent to all printers.")
 	}
-
 	if addr := p.Setting(pandapwr.AddressKey); addr != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 		err := s.powerOff(ctx, addr)
 		cancel()
 		if err != nil {
@@ -286,12 +219,9 @@ func (s *Service) respond(p config.Printer, probe string, value, limit float64) 
 			lines = append(lines, "Panda PWR power off sent.")
 		}
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 20*time.Second)
 	defer cancel()
 	if err := s.send(ctx, s.notify, "FIRE RISK: "+name, strings.Join(lines, "\n")); err != nil {
 		s.log.Error("safety emergency notification failed", "serial", p.Serial, "error", err)
-		return
 	}
-	s.log.Warn("safety emergency notification sent", "serial", p.Serial)
 }

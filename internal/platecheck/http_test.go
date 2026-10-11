@@ -151,7 +151,7 @@ func TestSnapshotRowsConfiguredOrderFailureContinuationAndNoControlEffects(t *te
 		t.Fatal("diagnostics changed controls/status")
 	}
 	for _, p := range printers {
-		if len(s.activity.Recent(p.Serial)) != 0 || s.workers[p.Serial].processed != 0 {
+		if len(s.activity.Recent(p.Serial)) != 0 || s.workers[p.Serial].pass1Done {
 			t.Fatal("diagnostics changed automatic markers/activity")
 		}
 	}

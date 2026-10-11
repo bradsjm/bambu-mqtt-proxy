@@ -6,55 +6,65 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
-	"sync"
 	"time"
 
 	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/camera"
+	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/hmscodes"
-	"bambu-mqtt-proxy/internal/telemetry"
+	"bambu-mqtt-proxy/internal/printer"
 )
 
-// batchWindow is how long delivery gathers further events after the first
-// one before building one message per printer.
+// batchWindow is how long delivery gathers further events after the first one before building one message per printer.
 const batchWindow = 2 * time.Second
 
 // event is one queued activity entry reduced to what delivery needs.
 // pause marks print_paused entries, which notify only when the printer's
 // final state carries an active alert.
 type event struct {
-	serial  string
+	// serial identifies the affected printer.
+	serial string
+	// summary holds the operator message.
 	summary string
-	pause   bool
+	// pause qualifies a pause against active alerts.
+	pause bool
 }
 
-// Service turns recorded activity into best-effort notifications: dropped
-// queues and failed deliveries are logged, never fatal. One Service runs
-// one delivery goroutine.
-type Service struct {
-	cfg       Settings
-	state     *telemetry.Cache
-	logger    *slog.Logger
-	events    chan event
-	done      chan struct{}
-	cancel    context.CancelFunc
-	closeOnce sync.Once
+// StateSource reads the core printer document.
+type StateSource interface {
+	Get(string) (printer.Doc, bool, bool)
+}
 
-	// send and snapshot are seams for package tests. send defaults to
-	// Send; snapshot is nil without a camera manager.
+// Service turns recorded activity into best-effort notifications: dropped queues and failed deliveries are logged, never fatal.
+type Service struct {
+	// names holds configured notification titles.
+	names map[string]string
+	// cfg holds delivery credentials.
+	cfg Settings
+	// state reads the core printer document.
+	state StateSource
+	// logger reports drops and delivery failures.
+	logger *slog.Logger
+	// events bounds pending activity entries to sixteen.
+	events chan event
+
+	// send and snapshot are seams for package tests. send defaults to Send; snapshot is nil without a camera manager.
 	send func(context.Context, Settings, string, string, []byte) error
 	// snapshot fetches a web-camera frame; nil when cameras are disabled.
 	snapshot func(ctx context.Context, serial string) (*camera.Frame, camera.Status)
 }
 
 // New builds a service for one notification configuration.
-func New(cfg Settings, state *telemetry.Cache, cameras *camera.Manager, logger *slog.Logger) *Service {
+func New(cfg Settings, printers []config.Printer, state StateSource, cameras *camera.Manager, logger *slog.Logger) *Service {
 	s := &Service{
 		cfg:    cfg,
 		state:  state,
 		logger: logger,
-		events: make(chan event, 32),
-		done:   make(chan struct{}),
+		events: make(chan event, 16),
+	}
+	s.names = make(map[string]string, len(printers))
+	for _, p := range printers {
+		s.names[p.Serial] = p.Name
 	}
 	s.send = Send
 	if cameras != nil {
@@ -63,9 +73,7 @@ func New(cfg Settings, state *telemetry.Cache, cameras *camera.Manager, logger *
 	return s
 }
 
-// Observe queues one newly recorded entry. It drops kinds that never
-// notify and never blocks: a full queue logs a warning and loses the
-// event. Report processing calls this method, so it must stay cheap.
+// Observe queues one newly recorded entry.
 func (s *Service) Observe(serial string, e activity.Entry) {
 	summary := eventSummary(e)
 	if summary == "" {
@@ -79,134 +87,109 @@ func (s *Service) Observe(serial string, e activity.Entry) {
 	}
 }
 
-// Start launches the single delivery goroutine. Call once, before Close.
-func (s *Service) Start() {
-	ctx, cancel := context.WithCancel(context.Background())
-	s.cancel = cancel
-	go func() {
-		defer close(s.done)
-		s.loop(ctx)
-	}()
-}
-
-// Close cancels the delivery loop and waits for it once. The event channel
-// is never closed, so Observe stays safe during teardown and drops events
-// when the queue is full.
-func (s *Service) Close() {
-	s.closeOnce.Do(func() {
-		if s.cancel != nil {
-			s.cancel()
-		}
-		<-s.done
-	})
-}
-
-// loop batches arrivals: the first queued event starts a batch, the batch
-// then gathers further events for one window before delivery.
-func (s *Service) loop(ctx context.Context) {
+// Run combines each printer's events in a two-second window and delivers them with one worker.
+func (s *Service) Run(ctx context.Context) error {
+	// pending retains each printer's batch until its own deadline.
+	pending := make(map[string][]event)
+	deadlines := make(map[string]time.Time)
+	timer := time.NewTimer(time.Hour)
+	defer timer.Stop()
+	timer.Stop()
 	for {
-		var first event
-		select {
-		case first = <-s.events:
-		case <-ctx.Done():
-			return
+		var wake <-chan time.Time
+		if len(deadlines) > 0 {
+			var next time.Time
+			for _, at := range deadlines {
+				if next.IsZero() || at.Before(next) {
+					next = at
+				}
+			}
+			timer.Reset(time.Until(next))
+			wake = timer.C
 		}
-		batch := []event{first}
-		timer := time.NewTimer(batchWindow)
-	gather:
-		for {
-			select {
-			case ev := <-s.events:
-				batch = append(batch, ev)
-			case <-timer.C:
-				break gather
-			case <-ctx.Done():
-				timer.Stop()
-				return
+		select {
+		case <-ctx.Done():
+			return nil
+		case ev := <-s.events:
+			if len(pending[ev.serial]) == 0 {
+				deadlines[ev.serial] = time.Now().Add(batchWindow)
+			}
+			// Each summary needs at most one place in a printer's batch.
+			if !slices.Contains(pending[ev.serial], ev) {
+				pending[ev.serial] = append(pending[ev.serial], ev)
+			}
+		case now := <-wake:
+			for serial, at := range deadlines {
+				if !at.After(now) {
+					s.deliverBatch(ctx, serial, pending[serial])
+					delete(pending, serial)
+					delete(deadlines, serial)
+				}
 			}
 		}
 		timer.Stop()
-		s.deliverBatch(ctx, batch)
 	}
 }
 
-// deliverBatch sends at most one message per printer, sorted for
-// deterministic output. Delivery failures are logged and never stop the
-// proxy.
-func (s *Service) deliverBatch(ctx context.Context, batch []event) {
-	grouped := make(map[string][]event)
-	serials := make([]string, 0, len(batch))
-	for _, ev := range batch {
-		if _, seen := grouped[ev.serial]; !seen {
-			serials = append(serials, ev.serial)
-		}
-		grouped[ev.serial] = append(grouped[ev.serial], ev)
+// deliverBatch sends at most one message per printer, sorted for deterministic output.
+func (s *Service) deliverBatch(ctx context.Context, serial string, evs []event) {
+	if ctx.Err() != nil {
+		return
 	}
-	slices.Sort(serials)
+	st, _, known := s.state.Get(serial)
+	alerts := activeAlerts(st, known)
 
-	for _, serial := range serials {
-		if ctx.Err() != nil {
-			return
+	// Distinct summaries in arrival order; an unqualified pause contributes only when the final state carries an alert.
+	summaries := make([]string, 0, len(evs))
+	for _, ev := range evs {
+		if ev.pause && len(alerts) == 0 {
+			continue
 		}
-		evs := grouped[serial]
-		st, known := s.state.State(serial)
-		alerts := activeAlerts(st, known)
+		if !slices.Contains(summaries, ev.summary) {
+			summaries = append(summaries, ev.summary)
+		}
+	}
+	if len(summaries) == 0 {
+		return // A batch holding only an unqualified pause is silent.
+	}
 
-		// Distinct summaries in arrival order; an unqualified pause
-		// contributes only when the final state carries an alert.
-		summaries := make([]string, 0, len(evs))
-		for _, ev := range evs {
-			if ev.pause && len(alerts) == 0 {
-				continue
-			}
-			if !slices.Contains(summaries, ev.summary) {
-				summaries = append(summaries, ev.summary)
-			}
-		}
-		if len(summaries) == 0 {
-			continue // a batch holding only an unqualified pause
-		}
+	title := s.names[serial]
+	if title == "" {
+		title = serial
+	}
+	var b strings.Builder
+	for _, summary := range summaries {
+		b.WriteString(summary)
+		b.WriteString("\n")
+	}
+	if filename, ok := st.JobName(); ok && filename != "" {
+		b.WriteString("File: " + filename + "\n")
+	} else if filename, ok := st.GcodeFile(); ok && filename != "" {
+		b.WriteString("File: " + filename + "\n")
+	}
+	for _, line := range alerts {
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
 
-		title := serial
-		if known && st.Name != "" {
-			title = st.Name
+	var jpeg []byte
+	if s.snapshot != nil {
+		snapCtx, cancelSnap := context.WithTimeout(ctx, 10*time.Second)
+		frame, status := s.snapshot(snapCtx, serial)
+		cancelSnap()
+		if status == camera.StatusOK && frame != nil {
+			jpeg = frame.JPEG
 		}
-		var b strings.Builder
-		for _, summary := range summaries {
-			b.WriteString(summary)
-			b.WriteString("\n")
-		}
-		if known && st.Filename != "" {
-			b.WriteString("File: " + st.Filename + "\n")
-		}
-		for _, line := range alerts {
-			b.WriteString(line)
-			b.WriteString("\n")
-		}
-
-		var jpeg []byte
-		if s.snapshot != nil {
-			snapCtx, cancelSnap := context.WithTimeout(ctx, 10*time.Second)
-			frame, status := s.snapshot(snapCtx, serial)
-			cancelSnap()
-			if status == camera.StatusOK && frame != nil {
-				jpeg = frame.JPEG
-			}
-		}
-		sendCtx, cancelSend := context.WithTimeout(ctx, 20*time.Second)
-		err := s.send(sendCtx, s.cfg, title, b.String(), jpeg)
-		cancelSend()
-		if err != nil {
-			s.logger.Warn("notification delivery failed", "serial", serial, "error", err)
-		}
+	}
+	sendCtx, cancelSend := context.WithTimeout(ctx, 20*time.Second)
+	err := s.send(sendCtx, s.cfg, title, b.String(), jpeg)
+	cancelSend()
+	if err != nil {
+		s.logger.Warn("notification delivery failed", "serial", serial, "error", err)
 	}
 }
 
-// eventSummary maps an activity entry to its notification summary; empty
-// means the kind never notifies. Print pauses and HMS severities qualify
-// further at delivery time. Routine plate-check lifecycle entries (a
-// confirmed first-layer pause, a pass, or a skip) stay in the activity log
-// only.
+// eventSummary maps an activity entry to its notification summary; empty means the kind never notifies.
 func eventSummary(e activity.Entry) string {
 	switch e.Kind {
 	case "print_finished":
@@ -240,19 +223,18 @@ func eventSummary(e activity.Entry) string {
 	}
 }
 
-// activeAlerts renders the printer's current alerts, one line each: the
-// nonzero print error and every HMS alert of severity fatal, serious, or
-// common.
-func activeAlerts(st telemetry.State, known bool) []string {
+// activeAlerts renders the printer's current alerts, one line each: the nonzero print error and every HMS alert of severity fatal, serious, or common.
+func activeAlerts(st printer.Doc, known bool) []string {
 	if !known {
 		return nil
 	}
 	var lines []string
-	if st.PrintError != 0 {
-		code := fmt.Sprintf("%04X_%04X", uint32(st.PrintError)>>16, uint32(st.PrintError)&0xFFFF)
-		lines = append(lines, alertLine(code, hmscodes.PrintError(uint32(st.PrintError))))
+	if printError, _ := st.PrintError(); printError != 0 {
+		code := fmt.Sprintf("%04X_%04X", uint32(printError)>>16, uint32(printError)&0xFFFF)
+		lines = append(lines, alertLine(code, hmscodes.PrintError(uint32(printError))))
 	}
-	for _, a := range st.HMS {
+	alerts, _ := st.HMS()
+	for _, a := range alerts {
 		switch a.Severity() {
 		case "fatal", "serious", "common":
 			lines = append(lines, alertLine(a.ID(), hmscodes.HMS(a.Attr)))
@@ -261,8 +243,7 @@ func activeAlerts(st telemetry.State, known bool) []string {
 	return lines
 }
 
-// alertLine formats one alert as `<code>: <Title> — <Fix>`, omitting empty
-// parts.
+// alertLine formats one alert as `<code>: <Title> — <Fix>`, omitting empty parts.
 func alertLine(code string, info hmscodes.Info) string {
 	line := code
 	if info.Title != "" {
