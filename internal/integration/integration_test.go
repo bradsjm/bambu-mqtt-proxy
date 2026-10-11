@@ -1,5 +1,5 @@
 // Package integration runs the proxy end-to-end against fake Bambu printers
-// built on mochi, asserting the routing and parity contract from DESIGN.md §12.
+// built on mochi, asserting the routing and parity contract of the proxy.
 package integration_test
 
 import (

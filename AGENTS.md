@@ -137,7 +137,6 @@ These rules apply to all code. Fix code that breaks them when you change it.
 ## Important Files
 
 - `README.md` — quick start, configuration summary, endpoints, and developer commands.
-- `DESIGN.md` — protocol background, package boundaries, failure behavior, and verification plan. Check details against source and examples when they affect current behavior.
 - `config.example.yaml` and `compose.example.yaml` — annotated application and container configuration examples.
 - `go.mod` and `go.sum` — Go version and dependency versions.
 - `.github/workflows/ci.yml` — required formatting, vet, and race-test checks.
@@ -152,4 +151,4 @@ The YAML file is the configuration; only `BMBPX_HTTP_PORT` and `BMBPX_LOG_LEVEL`
 
 Tests use Go's standard `testing` package. Unit tests live beside packages; `internal/integration/` runs the proxy against fake TLS MQTT printers. Prefer focused package tests during iteration, then run `go test -race -p 1 ./...` and `go vet ./...` before completion. There is no stated numeric coverage threshold.
 
-Use `DESIGN.md`'s verification plan and existing integration cases for MQTT routing, authentication, and outage behavior. Camera tests use fake camera servers; keep network waits bounded in tests.
+Use the existing integration cases for MQTT routing, authentication, and outage behavior. Camera tests use fake camera servers; keep network waits bounded in tests.

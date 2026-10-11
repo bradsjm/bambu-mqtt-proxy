@@ -144,7 +144,7 @@ it: `BMBPX_HTTP_PORT` overrides `http.port`, and `BMBPX_LOG_LEVEL` overrides
 | Source | Best for |
 |---|---|
 | [`/config`](#configuration-page-config) web page | Adding or editing printers in a browser |
-| YAML file | Full control over listeners, TLS, and optional features — see [`config.example.yaml`](config.example.yaml) and [DESIGN.md §9](DESIGN.md) for the full reference |
+| YAML file | Full control over listeners, TLS, and optional features — see [`config.example.yaml`](config.example.yaml) for the full reference |
 
 ```yaml
 listen:
