@@ -122,16 +122,21 @@ func New(printers []config.Printer, settings Settings, client DecisionClient, fr
 	s := &Service{printers: append([]config.Printer(nil), printers...), settings: settings, client: client, frames: frames, state: state, commands: commands, log: log.With("origin", "platecheck"), workers: make(map[string]*worker), now: time.Now}
 	s.newClient = func(settings Settings, log *slog.Logger) DecisionClient { return NewClient(settings, log) }
 	for _, p := range printers {
-		layerState := "idle"
-		if !settings.FirstLayer.On() {
-			layerState = "disabled"
-		}
-		s.workers[p.Serial] = &worker{s: s, printer: p, events: make(chan printer.Event, 64), status: ModuleState{State: "idle", Cutoff: settings.StopConfidence, FirstLayer: FirstLayerState{State: layerState, Cutoff: settings.FirstLayer.PauseConfidence}}}
+		s.workers[p.Serial] = &worker{s: s, printer: p, events: make(chan printer.Event, 64), status: s.idleStatus()}
 	}
 	if state != nil {
 		state.Subscribe(s.observe)
 	}
 	return s
+}
+
+// idleStatus returns the status of a printer with no checks run for the current print.
+func (s *Service) idleStatus() ModuleState {
+	layerState := "idle"
+	if !s.settings.FirstLayer.On() {
+		layerState = "disabled"
+	}
+	return ModuleState{State: "idle", Cutoff: s.settings.StopConfidence, FirstLayer: FirstLayerState{State: layerState, Cutoff: s.settings.FirstLayer.PauseConfidence}}
 }
 
 // SetActivity attaches the activity log before Run.
@@ -197,7 +202,12 @@ func (w *worker) handle(ctx context.Context, e printer.Event) {
 	started := slices.Contains(e.Kinds, "print_started")
 	initial := slices.Contains(e.Kinds, "state_initial")
 	if preparing && prev != "PREPARE" && prev != "SLICING" || started && prev != "PREPARE" && prev != "SLICING" {
+		// A new print clears every finding and outstanding command from the previous print.
 		w.pass1Done, w.homingSeen, w.homingDone, w.stopSent = false, false, false, false
+		w.pending, w.layerPending = nil, nil
+		w.mu.Lock()
+		w.status = w.s.idleStatus()
+		w.mu.Unlock()
 	}
 	if initial {
 		// Attaching to a print never admits an automatic startup check.
@@ -214,7 +224,8 @@ func (w *worker) handle(ctx context.Context, e printer.Event) {
 		w.check(ctx, false)
 	}
 	if w.homingSeen && w.pass1Done && !w.homingDone && !w.stopSent {
-		if hasLayer && layer > 0 {
+		// PREPARE still reports the previous job's layer_num; only RUNNING resets it.
+		if hasLayer && layer > 0 && state != "PREPARE" && state != "SLICING" {
 			w.homingDone = true
 			w.skipPass("skipped", "print_past_start", true)
 		} else if state == "RUNNING" && hasLayer && layer == 0 {
@@ -232,15 +243,18 @@ func (w *worker) handle(ctx context.Context, e printer.Event) {
 }
 
 // startupReason checks current printer state once at an action boundary.
+// PREPARE and SLICING still carry the previous job's layer_num, so the
+// layer applies only after the printer leaves them.
 func (w *worker) startupReason(doc printer.Doc, online bool) string {
 	state, _ := doc.GcodeState()
-	if layer, ok := doc.Layer(); ok && layer > 0 {
+	preparing := state == "PREPARE" || state == "SLICING"
+	if layer, ok := doc.Layer(); ok && layer > 0 && !preparing {
 		return "print_past_start"
 	}
 	if !online {
 		return "printer_offline"
 	}
-	if state == "PREPARE" || state == "SLICING" {
+	if preparing {
 		return ""
 	}
 	if state == "RUNNING" {

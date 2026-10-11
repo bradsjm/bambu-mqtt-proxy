@@ -419,7 +419,8 @@ never stopped — the panel says `Proxy started after this print began`. Skip an
 failure entries use plain-English reasons (for example `Plate check skipped,
 printer offline, no stop sent, continuing print`); pass 2 entries use the
 check name `Plate check after homing`. A stop sent during PREPARE is repeated
-once when the job first reaches RUNNING.
+once when the job first reaches RUNNING. Each new print job starts with the
+previous job's plate-check and first-layer findings cleared.
 
 ### Startup decision
 

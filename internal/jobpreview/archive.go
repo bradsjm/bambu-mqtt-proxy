@@ -82,19 +82,26 @@ func parseArchive(data []byte, k jobKey) (Result, error) {
 	}
 	files := make(map[string]*zip.File)
 	plates := make(map[int]bool)
+	// sliced holds plates whose G-code the archive carries; a printer-bound 3MF has one.
+	sliced := make(map[int]bool)
 	for _, f := range zr.File {
 		files[f.Name] = f
 		if n := plateNumber(f.Name); n > 0 {
 			plates[n] = true
+			if f.Name == fmt.Sprintf("Metadata/plate_%d.gcode", n) {
+				sliced[n] = true
+			}
 		}
 	}
 	plate := k.Plate
 	if plate <= 0 {
 		plate = plateNumber(k.File)
 	}
-	if plate <= 0 && len(plates) == 1 {
-		for n := range plates {
-			plate = n
+	for _, candidates := range []map[int]bool{sliced, plates} {
+		if plate <= 0 && len(candidates) == 1 {
+			for n := range candidates {
+				plate = n
+			}
 		}
 	}
 	if plate <= 0 {

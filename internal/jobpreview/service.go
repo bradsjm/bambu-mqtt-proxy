@@ -265,9 +265,11 @@ func (s *Service) Run(ctx context.Context) error {
 
 // retrieve retries an archive three times with a fixed interval.
 func (s *Service) retrieve(ctx context.Context, serial string, k jobKey) {
+	var err error
 	for attempt := 1; attempt <= 3; attempt++ {
 		attemptCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
-		result, err := s.fetch(attemptCtx, s.printers[serial], k)
+		var result Result
+		result, err = s.fetch(attemptCtx, s.printers[serial], k)
 		cancel()
 		if ctx.Err() != nil {
 			return
@@ -289,6 +291,7 @@ func (s *Service) retrieve(ctx context.Context, serial string, k jobKey) {
 			s.mu.Unlock()
 			return
 		}
+		s.log.Debug("job preview attempt failed", "serial", serial, "attempt", attempt, "file", k.File, "error", err)
 		if attempt < 3 {
 			timer := time.NewTimer(30 * time.Second)
 			select {
@@ -302,7 +305,7 @@ func (s *Service) retrieve(ctx context.Context, serial string, k jobKey) {
 	s.mu.Lock()
 	delete(s.pending, serial)
 	s.mu.Unlock()
-	s.log.Warn("job preview unavailable", "serial", serial, "attempts", 3)
+	s.log.Warn("job preview unavailable", "serial", serial, "attempts", 3, "error", err)
 	s.activity.Record(serial, "job_preview_unavailable", activity.Warning, "Print details unavailable after three attempts")
 }
 
