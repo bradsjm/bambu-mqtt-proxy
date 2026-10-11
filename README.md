@@ -11,8 +11,8 @@ and every app you point at a printer — Bambu Studio, Home Assistant, xtouch,
 OctoPrint plugins — burns one of those slots. This small, stateless proxy poses
 as the printer: your apps connect to it exactly as they would to the printer
 (same port, `bblp` + access code, self-signed TLS), and it holds **one**
-upstream connection per printer, routed by the serial number in the Bambu
-topic path.
+always-on upstream connection per printer from boot, routed by the serial
+number in the Bambu topic path.
 
 ```
  Bambu Studio   Home Assistant   xtouch   ...        (≈10+ TLS clients)
@@ -30,14 +30,19 @@ topic path.
       P1S :8883        X1 :8883
 ```
 
+Each printer link subscribes once to `device/{serial}/report` on every
+connect, then requests one full state with `pushall`. Reports flow to every
+subscribed client and into the proxy's merged per-printer state, which feeds
+the camera wall, MCP, and the optional modules.
+
 | What you get | Why it matters |
 |---|---|
 | **Apps work unchanged** | Same port 8883, `bblp` username, printer access code, skipped certificate verification; payloads forwarded byte-for-byte (compatible with 2025+ signed-firmware printers). |
-| **Printer connection limits stop mattering** | Any number of clients share one merged subscription per printer. |
+| **Printer connection limits stop mattering** | Any number of clients share one always-on link per printer. |
 | **One endpoint for the whole fleet** | MQTT topics route by serial (`device/{serial}/report`, `device/{serial}/request`); only raw camera connections route by access code instead. |
 | **Optional Pushover notifications** | Print errors, HMS warnings, AI detection alerts, stopped or failed prints, and completions reach one Pushover account, with a camera snapshot when available. |
 | **Optional over-temperature stop** | A backup to the printer's own thermal protection: a nozzle, bed, or chamber reading at its model's safety limit stops every printer, switches that printer's Panda PWR off, and sends a Pushover emergency alert. |
-| **Printer outages ride out** | Capped exponential backoff with jitter, automatic reconnect and resubscribe, and a `pushall` warmup. Late joiners get full state (P1 printers otherwise send deltas only). |
+| **Printer outages ride out** | Automatic reconnect and resubscribe with a `pushall` warmup. A client that joins late sends its own `pushall` when it needs full state (P1 printers otherwise send deltas only). |
 | **Cameras, two ways** | A live multi-printer dashboard wall — P1/A1 cameras natively, X1/P2S/H2-series cameras through bundled FFmpeg — and a printer-compatible raw passthrough on port 6000. |
 | **Optional AI failure detection** | With an OctoEverywhere Gadget key, snapshots from active prints are analyzed and the proxy pauses likely failures. No key, no uploads, no automatic pauses. |
 | **Optional build-plate check** | With a vision provider (Cloudflare or a custom HTTPS endpoint) and key, one fresh snapshot is checked at print startup and the proxy sends `stop` when the plate looks occupied. A built-in first-layer phase then uploads two frames and may pause once for a tangled filament, a detached part, or a nozzle blob. Best effort, fail-open, and off without both. |
@@ -50,8 +55,7 @@ topic path.
 Prerequisites:
 
 1. Enable **LAN Mode** on each printer (Settings → Network → LAN Mode). Current
-   firmware also requires **Developer Mode** for control commands such as pause
-   and warmup.
+   firmware also requires **Developer Mode** for control commands such as pause.
 2. Note each printer's access code and IP address.
 
 ### 1. Start the proxy
@@ -67,20 +71,25 @@ docker run -d --name bambu-mqtt-proxy -p 8883:8883 -p 6000:6000 -p 8080:8080 \
 Open `http://<host>:8080/config`, add your printers, and choose **Save and
 apply**. No config file is needed to start: until a printer is configured the
 proxy serves only the HTTP health and configuration endpoints, and saving
-creates `/config/bambu-mqtt-proxy.yaml`. Prefer a bind mount? Use
-`-v $(pwd)/config:/config`; add `:ro` to lock the configuration — saving then
-fails and leaves the running settings unchanged.
+creates `/config/bambu-mqtt-proxy.yaml` and restarts the proxy with the new
+settings. Prefer a bind mount? Use `-v $(pwd)/config:/config`; add `:ro` to
+lock the configuration — saving then fails and leaves the running settings
+unchanged.
 
 **Docker, with a configuration file**
 
+Copy [`config.example.yaml`](config.example.yaml) to `./config/bambu-mqtt-proxy.yaml`,
+fill in your printers, and mount the directory:
+
 ```sh
+mkdir -p config
+cp config.example.yaml config/bambu-mqtt-proxy.yaml   # then fill in your printers
 docker run -d --name bambu-mqtt-proxy -p 8883:8883 -p 6000:6000 -p 8080:8080 \
-  -v ./bambu-mqtt-proxy.yaml:/config/bambu-mqtt-proxy.yaml \
+  -v ./config:/config \
   ghcr.io/bradsjm/bambu-mqtt-proxy:latest
 ```
 
-The mounted YAML file lists the printers. One entry looks like this (see
-[`config.example.yaml`](config.example.yaml) for a full annotated example):
+One printer entry looks like this:
 
 ```yaml
 printers:
@@ -95,6 +104,8 @@ printers:
 
 MQTT always routes by serial, or by the optional `alias` when one is set (see
 [Configuration](#configuration)); the `name` label only decorates the camera wall.
+Mount the config directory, not the file: a save replaces the file atomically,
+and a single-file mount cannot be replaced.
 
 **Docker Compose**
 
@@ -132,8 +143,8 @@ it: `BMBPX_HTTP_PORT` overrides `http.port`, and `BMBPX_LOG_LEVEL` overrides
 
 | Source | Best for |
 |---|---|
-| [`/config`](#configuration-page-config) web page | Adding or editing printers in a browser; saving applies changes without a container restart |
-| YAML file | Full control over listeners, TLS, and behavior tuning — see [`config.example.yaml`](config.example.yaml) and [DESIGN.md §9](DESIGN.md) for the full reference |
+| [`/config`](#configuration-page-config) web page | Adding or editing printers in a browser |
+| YAML file | Full control over listeners, TLS, and optional features — see [`config.example.yaml`](config.example.yaml) and [DESIGN.md §9](DESIGN.md) for the full reference |
 
 ```yaml
 listen:
@@ -158,11 +169,8 @@ printers:
     insecure_skip_verify: true
     username: "bblp"
     password: "87654321"
-behavior:
-  warmup_commands:
-    - '{"pushing":{"sequence_id":"0","command":"pushall"}}'
 http:
-  port: 8080                         # 0 disables the HTTP server entirely
+  port: 8080                         # 0 means unset: the proxy uses 8080 and logs a warning
 camera:
   enabled: true                      # false removes camera routes, the camera wall, and the raw camera listener on port 6000
 mcp:
@@ -173,14 +181,16 @@ notifications:
   pushover:
     app_token: ""                    # from pushover.net
     user_key: ""
+safety:
+  enabled: false                     # optional over-temperature stop; also a switch on /config
 log:
   level: info
 ```
 
 | Environment variable | Default | Meaning |
 |---|---|---|
-| `BMBPX_LOG_LEVEL` | *(unset)* | A non-empty value overrides `log.level`: `info` logs client and upstream state, subscriptions, retries, and backoff delays; `debug` adds per-packet request routing |
-| `BMBPX_HTTP_PORT` | *(unset)* | A value from 0 to 65535 overrides `http.port`: the shared health, camera, and MCP HTTP port; `0` disables HTTP (the raw camera listener on 6000 keeps serving while cameras are enabled) |
+| `BMBPX_LOG_LEVEL` | *(unset)* | A non-empty value overrides `log.level`: `info` logs client and upstream state, subscriptions, and retries; `debug` adds per-packet request routing |
+| `BMBPX_HTTP_PORT` | *(unset)* | A value from 0 to 65535 overrides `http.port`: the shared health, camera, and MCP HTTP port; `0` means unset (8080) |
 
 An optional per-printer `alias` is a replacement serial seen only by
 downstream MQTT clients, so a printer can be swapped without reconfiguring
@@ -197,28 +207,25 @@ real serial.
 
 ## HTTP endpoints
 
-Health, camera, and MCP endpoints share one listener (port 8080 by default).
-When cameras are disabled only the health endpoints (and `/mcp`, unless
-disabled) are served; with `http.port: 0` no HTTP server starts at all. The
-raw camera endpoint is separate: it listens on TLS port 6000 whenever cameras
-are enabled — including with `http.port: 0` — and never starts when they are
-disabled.
+Health, camera, and MCP endpoints share one listener, always on (port 8080 by
+default). When cameras are disabled only the health, `/config`, activity, and
+MCP endpoints (unless disabled) are served.
 
 | Endpoint | Purpose |
 |---|---|
-| `/` | Redirects to `/config` until a printer is configured, then to `/camwall` (no redirect while cameras are disabled) |
+| `/` | Redirects to `/config` in setup mode, otherwise to `/camwall` |
 | `/livez`, `/readyz` | `200 ok` once serving (printer state deliberately excluded — clients stay connected while printers recover) |
-| `/status` | JSON: `{"status":"ok","upstreams":{"<serial>":true\|false}}`, plus a `detection` map per printer when AI detection is enabled and a `platecheck` state, covering the startup result and the first-layer phase, when the camera feature is on |
+| `/status` | JSON: `{"status":"ok","upstreams":{"<serial>":true\|false}}`, plus `detection` and `platecheck` sections when those modules run |
 | `POST /platecheck/snapshots` | Plate-check dry run used by the `/config` page: checks one fresh snapshot per online, camera-capable printer in parallel and streams the exact images and scores as NDJSON (`start`, one `result` per printer, `done`). Offline printers are skipped. Sends no printer command. Covers the startup check only, not the first-layer phase. Mounted when cameras are on |
 | `/activity`, `/activity/{serial}` | Up to 50 recent per-printer events (in memory; cleared when the proxy restarts); alert and error entries can carry a `url` with an error-code lookup link |
 | `/camera/{serial}/snapshot` | Single JPEG frame (P1/A1 native; X1/P2S/H2-series converted server-side with FFmpeg) |
 | `/camera/{serial}/stream` | Live multipart MJPEG stream (same model support as the snapshot) |
-| `/camera/status` | Display state for every printer (no credentials) |
-| `/camera/events` | The same display state as server-sent events: on connect, on change, and at least every 10 s |
+| `/camera/{serial}/preview` | Archived plate render of the running print, fetched once per job over FTPS |
+| `/camera/status` | Display state for every printer (no credentials), polled by the wall every second |
 | `/camwall` | Multi-printer camera wall dashboard |
-| `/config`, `/config/api` | Browser configuration page and its JSON API (`GET` never returns access codes; `PUT` saves and applies) |
+| `/config`, `/config/api` | Browser configuration page and its JSON API (`GET` never returns access codes; `PUT` saves and restarts the proxy) |
 | `/favicon.ico`, `/apple-touch-icon.png` | Browser-tab, bookmark, and home-screen icons |
-| `/mcp` | Model Context Protocol endpoint (off with `mcp.enabled: false` or `http.port: 0`) |
+| `/mcp` | Model Context Protocol endpoint (off with `mcp.enabled: false`) |
 | `/control/{serial}` | Printer control from the camera wall: `POST` `{"action":"light\|pause\|resume\|speed\|stop"}` (see below) |
 
 ### Camera wall
@@ -238,8 +245,7 @@ Open `http://<host>:8080/camwall`.
   `on` is required for `light`; `profile` is required for `speed`. Responses:
   `200` `{"serial":"...","action":"...","sent":true}`; `400` invalid body,
   unknown action, missing `on`, or bad profile; `404` unknown printer;
-  `409` the action is not available in the printer's current state; `502`
-  the command could not be sent; `503` the printer is not connected. Errors
+  `502` the command could not be sent; `503` the printer is not connected. Errors
   return `{"error":"..."}`. There is no authentication and no confirmation;
   stop is the emergency stop and sends immediately.
 
@@ -256,7 +262,7 @@ Open `http://<host>:8080/camwall`.
   reference. The log is held in memory and starts empty after each proxy
   restart.
 - **Fleet chips** in the top bar count printers per state and double as
-  filters; **needs attention** collects failed, paused, stale, and
+  filters; **needs attention** collects failed, paused, and
   serious-alert printers, plus detection warnings or pause attempts when the
   Gadget integration is on.
 - **Layout** — click a camera to focus it full-width; drag the grip (or use
@@ -274,13 +280,12 @@ Open `http://<host>:8080/camwall`.
   screen wake lock; `?maxLive=` and `?interval=` override stored stream
   settings. Browsers grant wake locks only on HTTPS or `localhost`, and over
   plain HTTP they allow about six connections per host, shared by live
-  streams, snapshots, and the status stream.
-- **State source** — the wall subscribes to `/camera/events`; report-derived
-  state appears when the proxy receives printer reports, such as when an MQTT
-  client or the wall itself holds a report subscription. Liveness is the
-  upstream MQTT connection state (`freshness.fresh`): a connected printer
-  stays live through report gaps, and `freshness.last_report_age_seconds` is
-  diagnostic only. A disconnected printer shows as stale.
+  streams and snapshots.
+- **State source** — the wall polls `/camera/status` every second while
+  visible. Liveness is the upstream MQTT connection state
+  (`freshness.fresh`): a connected printer stays live through report gaps,
+  and `freshness.last_report_age_seconds` is diagnostic only. A disconnected
+  printer shows as offline.
 - **Stateless privacy** — camera and camera-wall endpoints are unauthenticated
   by design: anyone who can reach the HTTP port can view cameras and
   telemetry. The state endpoints never include credentials.
@@ -327,7 +332,7 @@ contains `chamber_temper`.
   printer's native JPEG frame flow unchanged.
 - Serves the chamber-protocol models (P1/A1) only; X1/P2S/H2-series cameras
   are not proxied on this port.
-- Starts with the camera feature — even with `http.port: 0` — and a port or
+- Starts with the camera feature, and a port or
   certificate failure fails startup with a wrapped error.
 - The access code is the routing key, so printers need unique access codes for
   raw camera clients to reach the right printer (see [Quick start](#2-point-your-apps-at-the-proxy)).
@@ -335,22 +340,20 @@ contains `chamber_temper`.
 ### MCP endpoint (`/mcp`)
 
 On by default; disable with `mcp.enabled: false`. MCP protocol
-2026-07-28 over Streamable HTTP:
+2026-07-28 over Streamable HTTP, tools only:
 
 - **Core read-only tools** — `list_printers`, `get_printer_state`,
-  `get_camera_snapshot`, and `watch_printer`.
+  `get_camera_snapshot`, and `watch_printer` (long-polls the activity log:
+  pass `after_id` from the previous answer, and the call returns newer
+  entries with the current state).
 - **Core control tools** — `pause_print`, `resume_print`, `stop_print` (a
   destructive emergency stop with no confirmation), `set_chamber_light`,
   and `set_speed_profile`.
 - **Module tools**, served by their modules when those modules run:
   `set_ai_monitoring` with the Gadget AI detection (which also needs the
-  camera feature), and `get_job_preview` with the job preview feature, which
-  downloads the running print's 3MF over FTPS: admission is immediate on the
-  first RUNNING tick, up to 3 attempts per job generation with 30 s × attempt
-  retries for `not_found`/`timeout`/`transport`, a 10-minute cap with a
-  30-second idle stall timeout, and a `Print details` wall panel naming the
-  `View.Reason` while pending or unavailable.
-- **Printer state** — `get_printer_state` returns
+  camera feature), and `get_job_preview` with the job preview feature. The
+  endpoint has no resources, subscriptions, revisions, or cursors.
+- **Printer state** — `get_printer_state` and `watch_printer` return
   `state.modules.<name>` per running module (for example
   `state.modules.jobpreview` with the archived job preview,
   `state.modules.pandabreath` with the device `link`, its fresh
@@ -358,13 +361,6 @@ On by default; disable with `mcp.enabled: false`. MCP protocol
   `state.modules.pandapwr` with the device `link` and its fresh
   `power_w` in watts; Panda PWR has no MCP tool), so
   one tool stays current whatever capabilities are enabled.
-- `watch_printer` emits one event when a module's state changes: kind
-  `module_changed` with a `module` field naming the module. A Panda PWR
-  `link` change emits the event; value churn such as a Panda Breath
-  temperature step or a Panda PWR power change does not count as a
-  change.
-- **Resource** — `bambu://printers/{serial}/state`, a typed live state
-  projection that clients can subscribe to.
 - The endpoint never learns printer credentials; control commands go through
   the same allow-listed command service as the camera wall.
 
@@ -372,10 +368,13 @@ On by default; disable with `mcp.enabled: false`. MCP protocol
 
 - Edits the YAML config file (the `-config` path, default
   `bambu-mqtt-proxy.yaml`). Saving validates the settings, writes the file
-  (mode `0600`, created along with its directory when missing), and restarts
-  every service in-process; MQTT clients reconnect as they would after a
-  printer reboot. If the saved settings fail to start (for example a port
-  already in use), the previous file is restored and the page shows the error.
+  (created along with its directory when missing), then restarts the proxy
+  process with the new settings; MQTT clients reconnect as they would after a
+  proxy restart, and the page waits for the new process. Saving requires a
+  writable directory mount — a single-file bind mount cannot be replaced
+  atomically, so the save fails with the remedy. If the saved settings fail
+  to start (for example a port already in use), only health and `/config`
+  serve, with the error shown on the page.
 - Never displays or returns access codes: a blank code keeps the stored one,
   and changing a printer's address requires entering its code again.
 - Edits each printer's optional `alias`. A Generate button fills a
@@ -387,6 +386,7 @@ On by default; disable with `mcp.enabled: false`. MCP protocol
   they are never displayed or returned, a blank field keeps the stored
   value, and **Send test notification** sends one test message without
   saving.
+- Toggles the over-temperature safety stop in the Safety section.
 
 ## Build-plate check (optional)
 
@@ -408,21 +408,18 @@ For each new print job, the startup check runs in two passes. Pass 1 checks at
 PREPARE (or at RUNNING layer 0), when the bed may still sit lowered and out of
 camera view. Pass 2 checks again after the toolhead homes: once the printer
 has reported stage (`stg_cur`) 13 or 14 during the job, it checks at RUNNING
-layer 0. Bed leveling (stage
-1) is not a trigger, because leveling is optional per job. Each pass waits for
-a fresh camera frame, may turn the chamber light on, uploads that one JPEG to
-the endpoint, and sends `stop` only when the model is sure the view is usable
-(assessable at least 0.8) and the occupied probability is above
-`stop_confidence`. The startup check does not pause or resume prints during
-startup. Every failure, unclear image, or missing camera lets the print
-continue. Admission comes from the activity log: `print_started` and
-`print_preparing` entries carry the job generation, and a print already
-underway when the proxy attaches (`JobView.StartObserved` false) is never
-stopped — the panel says `Proxy started after this print began`. Skip and
+layer 0. Bed leveling (stage 1) is not a trigger, because leveling is optional
+per job. Each pass waits for a fresh camera frame, may turn the chamber light
+on, uploads that one JPEG to the endpoint, and sends `stop` only when the
+model is sure the view is usable (assessable at least 0.8) and the occupied
+probability is above `stop_confidence`. The startup check does not pause or
+resume prints during startup. Every failure, unclear image, or missing camera
+lets the print continue. A print already underway when the proxy starts is
+never stopped — the panel says `Proxy started after this print began`. Skip and
 failure entries use plain-English reasons (for example `Plate check skipped,
 printer offline, no stop sent, continuing print`); pass 2 entries use the
-check name `Plate check after homing`. A stop sent during PREPARE may be
-repeated once when the job first reaches RUNNING with layer 0.
+check name `Plate check after homing`. A stop sent during PREPARE is repeated
+once when the job first reaches RUNNING.
 
 ### Startup decision
 
@@ -442,15 +439,9 @@ result: the print is never stopped on a failure.
 ### First-layer check
 
 The first-layer phase uses the same provider, credential, and model as the
-startup check. For each print job, once the current job's layer count rises
-from 1 or below to 2 or above while the print is still running, the proxy
-uploads two fresh original JPEGs taken at least 2 seconds apart, in one
-request. What counts as the current job's layer is
-`SessionView.CurrentLayer()`: a positive `layer_num` reported before the
-current job began is unknown, so the previous job's sticky layer can never arm
-the replacement. The `first_layer_complete` activity entry carries the job
-generation it was proved against, so a late event from a replaced print cannot
-check or pause the print that replaced it. The model
+startup check. For each print job, once the layer count rises from 1 or below
+to 2 or above while the print is still running, the proxy uploads two fresh
+original JPEGs taken at least 2 seconds apart, in one request. The model
 answers five questions:
 
 | Question | Effect |
@@ -462,12 +453,11 @@ answers five questions:
 | Is the layer incomplete or material missing? | Warning only. |
 
 With a usable view, any pause-capable probability strictly above
-`pause_confidence` sends one `pause`, then waits up to 30 seconds for the
-printer to confirm it. The proxy sends no second pause and never resumes the
-print. Otherwise, any defect probability above 0.5 records a warning, and a
-check with no such defect passes. An inconclusive view, an error, a timeout, or
-a missing camera fails open: the print continues. The phase checks each job at
-most once.
+`pause_confidence` sends one `pause`. The proxy sends no second pause and
+never resumes the print. Otherwise, any defect probability above 0.5 records
+a warning, and a check with no such defect passes. An inconclusive view, an
+error, a timeout, or a missing camera fails open: the print continues. The
+phase checks each job at most once.
 
 ### Cloudflare free allowance
 
@@ -521,47 +511,38 @@ Detection is configured in the `detection` section of the config file
 ([API documentation](https://docs.octoeverywhere.com/ai-failure-detection-apis/overview/)).
 The stored key never leaves the server: the configuration API reports only
 whether a key exists, a blank value on save keeps the stored key, and the
-config file is written with owner-only permissions (0600). Without an
+config file is written with owner-only permissions. Without an
 explicit `enabled`, detection follows the key: it runs when a key is
 configured and stays off otherwise. `enabled: false` disables the feature
 even when a key exists, and enabling without any key fails validation. The
 key cannot be removed from the page — use the switch. There is no usage
 bookkeeping; the proxy stays stateless.
 
-While a print is
-active on a
-camera-capable printer, the proxy uploads the current camera snapshot to the
-Gadget service at a policy-selected pace, based on the minimum and recommended
-intervals the service returns, and receives a print-quality score (1–10) plus
-warning and pause recommendations:
+While a print is active on a camera-capable printer, the proxy uploads the
+current camera snapshot to the Gadget service at the pace the service directs
+and receives a print-quality score (1–10) plus warning and pause
+recommendations:
 
-- Warnings surface per printer as a `detection` object on `/camera/status`,
-  `/camera/events`, and `/status`; each object's `state` — starting, idle,
-  monitoring, attention, paused, degraded, unsupported, or blocked — shows at
+- Warnings surface per printer as a `detection` object on `/camera/status`
+  and `/status`; each object's `state` — starting, idle, monitoring,
+  attention, paused, degraded, unsupported, blocked, or disabled — shows at
   a glance what detection is doing for that printer.
-- A fresh warning result can set a reported Standard, Sport, or Ludicrous
-  profile to Silent (50%). When the warning clears, the proxy restores the saved
-  profile only while it still owns Silent. It skips unknown or stale profiles
-  and does not overwrite a later profile change made at the printer.
 - A pause recommendation sends a single LAN `pause` command. Each
   recommendation pauses at most once; the proxy never retries a pause and
   never resumes the print.
 - The AI badge on a camera wall tile toggles detection for that printer.
 
 **Consent.** Enabling detection with a key is an explicit opt-in to the
-service: camera
-snapshots leave your LAN for OctoEverywhere's servers, and the proxy can
-temporarily set print speed to Silent and pause prints without asking. Leave
-the key unset to keep every image local and automatic printer controls off.
+service: camera snapshots leave your LAN for OctoEverywhere's servers, and the
+proxy can pause prints without asking. Leave the key unset to keep every image
+local and automatic printer controls off.
 **Eligibility.** Detection rides on the camera pipeline, so it covers exactly
-the camera-capable models (P1P, P1S, A1, A1MINI) and only while telemetry
-shows a print actively running and the upstream connection is live. It requires
-the camera feature (`camera.enabled`): with cameras disabled and a key set,
-nothing runs and every printer's `detection` object reports `blocked`.
-Detection keeps running with `http.port: 0`; only its status endpoints are
-then absent. The wall text for `awaiting_fresh_telemetry` is `waiting for
-printer data`: it means waiting for the current layer or a live connection,
-not a 15 s report-age timer.
+the camera-capable models (P1P, P1S, A1, A1MINI) and only while the printer
+reports a print actively running and the upstream connection is live. It
+requires the camera feature (`camera.enabled`): with cameras disabled and a
+key set, nothing runs and every printer's `detection` object reports
+`blocked`. The wall text for `awaiting_reports` is `awaiting printer
+reports`: it means waiting for printer data, not a timer.
 
 **Allowance.** Enforcement lives entirely on OctoEverywhere's side. Each
 account includes 90,000 free inspection calls per monthly billing period —
@@ -574,11 +555,9 @@ Only**, so inspections stop at the allowance instead of incurring charges.
 **Failures and limits.**
 
 - Network errors, timeouts, server errors, and rate limits degrade detection
-  and retry with capped backoff, never affecting printing or camera serving.
-  A degraded condition is recorded as `AI inspection interrupted, <reason>` in
-  the activity log only after it has lasted 30 s; brief gaps that recover
-  sooner stay silent, and recovery records `AI inspection resumed, monitoring
-  print` only when an interruption was recorded.
+  and retry at the service-directed pace, never affecting printing or camera
+  serving. The first failure records `AI inspection interrupted, <reason>` in
+  the activity log, and recovery records `AI inspection recovered`.
 - Invalid or disabled keys, billing failures, IP restrictions, and exhausted
   free allowances suspend detection until restart; account errors suspend it
   across all printers. Logs show safe, structured reasons, not provider error
@@ -586,9 +565,8 @@ Only**, so inspections stop at the allowance instead of incurring charges.
 - Monitoring is per-print and advisory — these are heuristics, not a guarantee
   of failure detection. Pausing needs a printer that accepts LAN commands
   (Developer Mode on 2025+ signed firmware, as for any client).
-- Results, policy timing, and speed ownership stay in memory; a restart clears
-  every status and context. The proxy then cannot restore a Silent profile it
-  set before the restart.
+- Results and policy timing stay in memory; a restart clears
+  every status and context.
 
 ## Pushover notifications (optional)
 
@@ -599,10 +577,10 @@ block) to send print alerts to one [Pushover](https://pushover.net/) account.
   before it finishes; printer errors and HMS warnings; AI detection warnings
   and AI pause attempts, including failed or unconfirmed ones; a build-plate
   check that requests a startup stop, or a first-layer warning or pause
-  attempt, including failed or unconfirmed first-layer pauses; and a pause that
-  leaves an active printer alert. Starts, resumes, reconnects, cleared alerts,
-  and routine plate-check entries (first-layer passes, confirmed pauses, and
-  skips) do not notify.
+  attempt, including failed or unconfirmed first-layer pauses; the first layer
+  completing; and a pause that leaves an active printer alert. Starts,
+  resumes, reconnects, cleared alerts, and routine plate-check entries
+  (first-layer passes, confirmed pauses, and skips) do not notify.
 - **What arrives** — events within 2 seconds group into one message per
   printer: the event summaries, the running file, and each active alert with
   its error code and suggested fix. The title is the printer's name or
@@ -619,9 +597,10 @@ block) to send print alerts to one [Pushover](https://pushover.net/) account.
 
 ## Over-temperature safety stop (optional)
 
-Set `safety.enabled: true` in the YAML file to add a best-effort backup to the
-printer's own thermal protection. It needs the Pushover app token and user key
-in the `notifications` section, even while ordinary notifications are off.
+Turn on the Safety switch on `/config` (or set `safety.enabled: true` in the
+YAML file) to add a best-effort backup to the printer's own thermal
+protection. It needs the Pushover app token and user key in the
+`notifications` section, even while ordinary notifications are off.
 
 - **What trips** — the proxy checks every connected printer once per second.
   A nozzle, bed, or chamber reading at or above the model's limit trips. The
@@ -648,6 +627,16 @@ in the `notifications` section, even while ordinary notifications are off.
   fire that does not raise these temperatures goes unseen. Keep a smoke
   detector.
 
+## Breaking changes
+
+- MCP: the `bambu://printers/{serial}/state` resource and subscriptions are
+  gone, as are `watch_printer` modes (`attention`, `progress`), revisions,
+  and cursors. Tools only; `watch_printer` takes `after_id`.
+- Config: the `behavior` section is gone; old keys load but are ignored.
+- Config: `http.port: 0` no longer disables HTTP. It means unset: the proxy
+  serves HTTP on 8080 and logs a warning.
+- HTTP: `/camera/events` is removed. Poll `/camera/status`.
+
 ## Security notes
 
 - Runs as a non-root user in the container. The config file contains printer
@@ -663,12 +652,12 @@ in the `notifications` section, even while ordinary notifications are off.
   `POST /control/{serial}` and the MCP control tools can also pause, resume,
   change speed, toggle the chamber light, and **emergency-stop** prints
   without login; heater and temperature commands are never exposed. Browser
-  requests from other sites are rejected. Set `mcp.enabled: false`, mount the config
-  file read-only, or set `http.port: 0` to narrow the surface.
+  requests from other sites are rejected. Set `mcp.enabled: false` or mount
+  the config directory read-only to narrow the surface.
 - The raw camera endpoint on port 6000 authenticates with `bblp` plus a
   configured printer access code; the code selects the printer.
 - The OctoEverywhere key is a secret: the configuration API never returns it
-  and the config file stores it with owner-only permissions (0600) — share
+  and the config file stores it with owner-only permissions — share
   the account with caution, because the key authorizes external snapshot
   uploads and automatic pauses, and usage is billed per OctoEverywhere
   account, not per proxy.
@@ -691,7 +680,7 @@ docker logs bambu-mqtt-proxy 2>&1 | go run ./tools/capturereports -serial <seria
 It keeps the `printer report received` lines for exactly that serial, starts a
 new segment at each `mochi mqtt server started` line, and writes one
 `<prefix>_<n>.jsonl` file per non-empty segment (`t_ms`, connection `gen`,
-`payload` per line), which `go test -race -run Replay ./internal/telemetry/`
+`payload` per line), which `go test -race -run Replay ./internal/printer/`
 replays.
 
 ## License

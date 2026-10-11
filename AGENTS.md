@@ -2,48 +2,46 @@
 
 ## Project Overview
 
-`bambu-mqtt-proxy` is a stateless Go proxy for Bambu Lab printers. Many MQTT clients connect to one downstream endpoint, and the proxy routes each printer's traffic by serial number while keeping one upstream MQTT connection per configured printer. A shared HTTP service provides health and optional P1/A1 camera endpoints.
+`bambu-mqtt-proxy` is a stateless Go proxy for Bambu Lab printers. Many MQTT clients connect to one downstream endpoint, and the proxy routes each printer's traffic by serial number while keeping one always-on upstream MQTT link per configured printer from boot. A shared HTTP service provides health, the camera wall, the `/config` page, and the MCP endpoint.
 
 ## Architecture & Data Flow
 
-`cmd/bambu-mqtt-proxy/main.go` loads the YAML configuration, applies the `BMBPX_HTTP_PORT` and `BMBPX_LOG_LEVEL` overrides and defaults, validates configuration, wires services, and handles shutdown signals. MQTT reports flow from the per-printer connections through the broker to downstream subscribers. Client requests flow through broker ACL and routing hooks to the matching printer; payloads pass through unchanged.
+`cmd/bambu-mqtt-proxy/main.go` loads the YAML configuration, applies the `BMBPX_HTTP_PORT` and `BMBPX_LOG_LEVEL` overrides and defaults, validates configuration, wires services, and handles shutdown signals. `internal/printer` owns the always-on links and the merged per-printer report documents. MQTT reports flow from the per-printer links through the broker injector to downstream subscribers, and through the store to the wall, control, MCP, and modules. Client requests flow through broker ACL and routing hooks to the matching printer; payloads pass through unchanged.
 
 - `internal/config` owns config parsing, defaults, environment overrides, and validation.
-- `internal/broker` adapts the mochi MQTT server and its hooks. `internal/routing` resolves topic filters against configured serials and optional downstream aliases.
-- `internal/upstream` owns lazy per-printer connections, merged subscriptions, reconnects, and warmup commands.
-- `internal/telemetry` observes reports without changing forwarding. `internal/camera` owns camera capture and endpoints. `internal/health` and `internal/httpsrv` provide the shared HTTP service.
+- `internal/broker` adapts the mochi MQTT server, its bridge hook, and the downstream injector. `internal/routing` resolves topic filters against configured serials and optional downstream aliases.
+- `internal/printer` owns the always-on links, the merged report documents, and the print-event derivation.
+- `internal/camera` owns camera capture, the wall, and endpoints. `internal/activity` owns the per-printer event log. `internal/control` is the allow-listed command path. `internal/health` and `internal/httpsrv` provide the shared HTTP service.
 - `internal/module` defines the module contract. Every optional capability is a module; follow the Module Pattern section below.
 
-Keep dependencies explicit at constructors and preserve package ownership. The broker injector is attached after construction to break its callback cycle with the upstream pool.
+Keep dependencies explicit at constructors and preserve package ownership. `run` re-executes the binary after the `/config` page saves; a startup failure serves only health and `/config` with the error.
 
 ## Module Pattern
 
-The core is the MQTT proxy path (config, broker, routing, upstream), telemetry, cameras, the activity log, and the control service. The core also includes the shared HTTP listener, health, and the MCP endpoint with its core tools. The camera wall and `/config` page shells are core too. Every other capability is a module. The current modules are `notification`, `jobpreview`, `pandabreath`, `pandapwr`, `detection`, `platecheck`, `firstlayer`, and `safety`.
+The core is the MQTT proxy path (config, broker, routing, printer), cameras, the activity log, and the control service. The core also includes the shared HTTP listener, health, and the MCP endpoint with its core tools. The camera wall and `/config` page shells are core too. Every other capability is a module. The current modules are `notification`, `jobpreview`, `pandabreath`, `pandapwr`, `detection`, `platecheck`, and `safety`.
 
 ### Add a capability
 
 1. Create one package `internal/<name>`. Use `<name>` as the module `Name`.
 2. Give its constructor only the narrow core services that it needs:
-   - telemetry and camera frames
+   - the printer store (documents, `View`, `Subscribe`), the activity log, and camera frames
    - `control.Service` for user commands
-   - the generation-guarded `upstream.Pool` commands for autonomous actions
-   - the activity log
-3. Construct it in `serveOnce` only when the capability is enabled.
+   - `printer.Links` for autonomous commands through a narrow `Pause`/`Stop`/`Light`-style interface
+3. Construct it in `serve` only when the capability is enabled.
 4. Return its hooks from a `Module() module.Module` method. Set only the hooks that it uses.
-5. Append it to the module list in `serveOnce`. The core starts modules in list order and stops them in reverse order.
+5. Append it to the module list in `serve`. The core runs modules with cancellable contexts in list order and cancels them in reverse order.
 
 | Hook | Use it for |
 | --- | --- |
-| `Start`, `Stop` | Background work. `Stop` waits until the work ends. |
-| `NeedsReports` | Live telemetry without MQTT clients. |
-| `ObserveActivity` | Reactions to recorded activity entries. |
-| `ChamberReading` | An accessory chamber temperature. |
-| `Display` | Camera wall badges over the image, or a titled details panel. |
+| `Name` | Stable key used by the wall, status, and MCP. |
+| `Run` | Background work until cancellation. |
 | `State` | Per-printer state. The core serves it as the wall tile member `<name>` and as MCP `state.modules.<name>`. |
-| `FleetValues` | Top-level `/camera/status` members named `<name>` or `<name>_*`. |
+| `Display` | Camera wall badges over the image, or a titled details panel. |
 | `StatusValue` | The `/status` member `<name>`. |
 | `Routes` | HTTP handlers. `module.Mount` protects the write routes. |
 | `MCP` | MCP tools, registered with `mcp.AddTool`. |
+
+Subscribe to `printer.Store` for report events. Keep the callback synchronous and non-blocking: queue work to `Run`, and never send printer commands from the callback.
 
 ### Configuration
 
@@ -62,9 +60,8 @@ The core is the MQTT proxy path (config, broker, routing, upstream), telemetry, 
 
 ### Rules
 
-- Modules MUST NOT publish raw MQTT or change forwarded payloads. Send user commands through `control.Service`. Send autonomous commands through the generation-guarded pool methods.
-- Keep `State`, `Display`, and tool handlers safe for concurrent use, non-blocking, and free of network work. Keep them safe after `Stop`.
-- Keep `State` and `Display` values stable between real changes. Round or omit aging fields, or implement `StableKey() any` on the `State` value. Otherwise every sample updates the wall and wakes `watch_printer`.
+- Modules MUST NOT publish raw MQTT or change forwarded payloads. Send user commands through `control.Service`. Send autonomous commands through the narrow printer-link interfaces.
+- Keep `State`, `Display`, and tool handlers safe for concurrent use, non-blocking, and free of network work. The wall polls `/camera/status` every second, so values may change on every poll.
 - Start every route pattern with an HTTP method.
 - Do not add capability-specific fields, imports, or branches to core packages. If the contract cannot express a need, extend the contract generically for all modules.
 - Add module markup to `camwall.html` or `config.html` only when `Display` or `config.PrinterSetting` cannot express it. The detection AI controls and the config section forms are such cases.
@@ -83,12 +80,12 @@ The `notification` module maps activity kinds that other modules record (`ai_*`,
 
 The upstream device is a printer with a bare-bones ESP32 MQTT broker, not a general-purpose messaging service.
 
-- Use QoS 0 for every subscription and publish on both proxy hops, including warmups and controls.
+- Use QoS 0 for every subscription and publish on both proxy hops, including the connect `pushall` and controls.
 - Do not propose or add QoS 1/2 support, QoS negotiation, upgrade tracking, configurable QoS, or message replay queues.
 - Each printer has one serial number and one fixed upstream subscription: `device/{serial}/report`.
-- Represent upstream subscription state with one interest count and one subscribed flag for the current transport. Do not propose or add multiple upstream subscriptions per printer, filter maps, or generic per-filter reconciliation.
-- Keep wildcard routing and overlapping client-filter ownership on the downstream side. These interests share the printer's single report subscription.
-- Send one warmup batch when the upstream report subscription is established. Keep full-state requests for genuinely late subscribers; do not duplicate startup warmups.
+- Each printer keeps one always-on link from boot. On every connect, subscribe once to the report topic, then send one `pushall`. A refused report subscription keeps the printer offline and retries the SUBSCRIBE every 10 s on the same connection.
+- The proxy sends no `pushall` per downstream subscriber. Late-joining clients send their own `pushall` when they need full state.
+- `Send` returns `ErrOffline` when the printer is not connected and subscribed. Commands are `Pause`, `Resume`, `Stop`, `Light`, and `Speed`.
 - Preserve byte-exact payload forwarding, one upstream socket per printer, bounded reconnects, and correct shutdown. QoS 0 does not remove MQTT subscription acknowledgements or proxy-side concurrency requirements.
 - Configure fake printer brokers for QoS 0 only. Verify that startup stays connected and reports reach downstream clients.
 - A printer's optional `alias` replaces its serial on the downstream side only; `internal/routing` maps it, and upstream topics and payloads never change.
@@ -98,8 +95,9 @@ The upstream device is a printer with a bare-bones ESP32 MQTT broker, not a gene
 | Path | Purpose |
 | --- | --- |
 | `cmd/bambu-mqtt-proxy/` | Application entry point and service wiring |
-| `internal/` | Core packages (config, broker, routing, upstream, telemetry, camera, HTTP, health, MCP, TLS) and one package per module (`detection`, `platecheck`, `jobpreview`, `pandabreath`, `pandapwr`, `notification`, `firstlayer`, `safety`) |
+| `internal/` | Core packages (config, broker, routing, printer, camera, activity, control, HTTP, health, MCP, TLS) and one package per module (`detection`, `jobpreview`, `notification`, `pandabreath`, `pandapwr`, `platecheck`, `safety`) |
 | `internal/integration/` | End-to-end tests with fake printers and MQTT clients |
+| `tools/capturereports` | Report replay fixture extractor (`internal/printer/testdata`) |
 | `.github/workflows/` | CI checks and multi-architecture image publishing |
 
 ## Development Commands
@@ -145,4 +143,4 @@ The YAML file is the configuration; only `BMBPX_HTTP_PORT` and `BMBPX_LOG_LEVEL`
 
 Tests use Go's standard `testing` package. Unit tests live beside packages; `internal/integration/` runs the proxy against fake TLS MQTT printers. Prefer focused package tests during iteration, then run `go test -race -p 1 ./...` and `go vet ./...` before completion. There is no stated numeric coverage threshold.
 
-Use `DESIGN.md`'s verification plan and existing integration cases for MQTT routing, authentication, subscription merging, warmup, and outage behavior. Camera tests use fake camera servers; keep network waits bounded in tests.
+Use `DESIGN.md`'s verification plan and existing integration cases for MQTT routing, authentication, and outage behavior. Camera tests use fake camera servers; keep network waits bounded in tests.
