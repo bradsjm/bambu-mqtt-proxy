@@ -82,7 +82,9 @@ func (d Doc) AMS() ([]AMSUnit, bool) {
 	list, ok := obj["ams"].([]any)
 	out := make([]AMSUnit, 0, len(list))
 	selected, haveSelection := intField(obj, "tray_now")
-	bits, haveBits := intField(obj, "tray_exist_bits")
+	hexBits, _ := obj["tray_exist_bits"].(string) // Bambu reports this mask as a hex string.
+	bits, bitsErr := strconv.ParseUint(hexBits, 16, 64)
+	haveBits := bitsErr == nil
 	for _, item := range list {
 		unit, _ := item.(map[string]any)
 		id, valid := intField(unit, "id")

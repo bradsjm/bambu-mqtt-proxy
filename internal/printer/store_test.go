@@ -120,3 +120,20 @@ func TestAccessoryChamber(t *testing.T) {
 		}
 	}
 }
+
+// TestAMSExistBitsHex protects occupancy across AMS units: Bambu sends the mask in hex.
+func TestAMSExistBitsHex(t *testing.T) {
+	unit := func(id string) map[string]any { return map[string]any{"id": id, "tray": []any{}} }
+	doc := Doc{"print": map[string]any{"ams": map[string]any{"tray_exist_bits": "11", "ams": []any{unit("0"), unit("1")}}}}
+	units, _ := doc.AMS()
+	var got []bool
+	for _, u := range units {
+		for _, s := range u.Slots {
+			got = append(got, *s.Loaded)
+		}
+	}
+	want := []bool{true, false, false, false, true, false, false, false}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("loaded slots %v, want %v", got, want)
+	}
+}
