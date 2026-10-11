@@ -125,6 +125,45 @@ CI runs the formatting check, `go vet ./...`, and `go test -race -p 1 ./...` on 
 
 **Browser Support:** The camera wall targets current evergreen browsers (latest Chrome, Edge, Firefox, and Safari, including iOS Safari). Use current web platform features natively without polyfills or legacy fallbacks. APIs a browser gates on context, such as Screen Wake Lock (secure origins only) or Fullscreen (unavailable on iPhone), must be feature-detected and degrade by hiding or disabling the control.
 
+## User Information and Diagnostic Logging
+
+These rules apply to all code and all output. The output includes the camera wall, the `/config` page, activity entries, notifications, MCP tool output, HTTP error responses, and logs. These rules take precedence over any local habit or existing code pattern. Existing code that breaks them is a defect: fix it when you touch that path, and never copy it.
+
+### User-facing information
+
+Every message a user sees MUST let a person understand the situation without reading logs or source code.
+
+- State what happened, the specific cause, the effect on the print or the feature, and what the proxy does next. When the user can act, state what to do.
+- Show the real values behind a decision, with units, next to the threshold or setting they were compared with. Example: `Image clarity 65%, needs 70%`, not `Inconclusive`.
+- Name the setting that controls a behavior with the label it has on the `/config` page.
+- MUST NOT use a generic outcome in place of a cause: `failed`, `error`, `inconclusive`, `unavailable`, `interrupted`, `unknown`, or `something went wrong`. Use such a word only together with the specific cause.
+- MUST NOT show internal identifiers, field names, error-type tokens, or code jargon (for example `p_assessable`, `OE_UNKNOWN`, `api_retrying`) as the explanation. Translate them into plain words. Show a provider code or HTTP status only next to that translation.
+- Show percentages as whole percentages. Add decimals only when the rounded value would read as equal to the threshold that it is compared with. Do not show raw 0–1 fractions.
+- Report a state change only when it is real. MUST NOT announce `recovered`, `passed`, or `connected` after a single success while the failures continue. When a failure repeats, show one ongoing condition. Include its cause, the number of failures, and how long it has lasted. Report recovery only after the condition stays clear for a documented period or number of successes.
+- Keep one name for each concept on every surface: the wall, `/config`, activity, notifications, MCP, and the docs.
+
+### Diagnostic logging
+
+Logs MUST let a maintainer find the cause of a problem from the log output alone.
+
+- Every WARN and ERROR line MUST identify the operation, the target, the actual cause, and the next action. The target is a printer serial, host, or file. The next action is a retry delay, a fallback, or a stop. Include the attempt number, duration, and timeout when they apply. Do not move the cause to a DEBUG-only line.
+- Log the underlying error text (`"error", err`) and the provider's error type, HTTP status, and error message. MUST NOT replace an error with a fixed generic category such as `request failed`. A classification field is allowed only in addition to the real error.
+- Log each decision at DEBUG with its inputs, thresholds, and result. A maintainer MUST be able to reconstruct a print from the log afterward.
+- Log through `slog` attributes, not string concatenation, so that the handler escapes untrusted text. Bound the size of untrusted text, such as response bodies, instead of dropping it.
+
+### Secrets: the only redaction
+
+- Redact only credentials: printer access codes, passwords, API keys, and bearer tokens. In URLs, redact user info, token query parameters, and path segments that grant access. Replace only the secret value, and keep the host, path, status, and error text.
+- MUST NOT remove error messages, hostnames, ports, status codes, timings, provider error text, or file names. Security or tidiness is not a reason to remove them.
+- MUST NOT write tests that forbid ordinary diagnostic words (for example `refused`, `reset`, `EOF`, `timeout`, or a hostname) in logs or messages. Tests MAY assert that a known secret value never appears.
+
+### Completion check
+
+Before you finish a change that adds or alters a message or a log line, check both conditions:
+
+1. A user who reads only the UI or activity text knows what happened, why, and what happens next.
+2. A maintainer who reads only WARN and ERROR lines knows the cause and the target of each failure.
+
 ## Important Files
 
 - `README.md` — quick start, configuration summary, endpoints, and developer commands.
