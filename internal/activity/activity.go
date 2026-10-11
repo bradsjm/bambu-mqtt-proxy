@@ -8,6 +8,7 @@ package activity
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
@@ -49,7 +50,7 @@ type Entry struct {
 // Log holds one ring buffer per configured printer. A nil *Log is valid and
 // records nothing, so producers need no feature checks.
 type Log struct {
-	// mu guards IDs, rings, and the observer.
+	// mu guards IDs, rings, the observer, and the logger.
 	mu sync.Mutex
 	// nextID contains the last assigned event ID.
 	nextID uint64
@@ -59,6 +60,8 @@ type Log struct {
 	now func() time.Time
 	// observer receives newly recorded entries without the lock.
 	observer func(string, Entry)
+	// logger writes a debug line per recorded entry.
+	logger *slog.Logger
 	// changed wakes all waiters when an entry is recorded.
 	changed chan struct{}
 }
@@ -122,10 +125,19 @@ func (l *Log) record(serial, kind, severity, message, url string) {
 	close(l.changed)
 	l.changed = make(chan struct{})
 	observer := l.observer
+	logger := l.logger
 	l.mu.Unlock()
 	if observer != nil {
 		observer(serial, e)
 	}
+	if logger == nil {
+		return
+	}
+	if e.URL != "" {
+		logger.Debug("activity recorded", "serial", serial, "kind", e.Kind, "severity", e.Severity, "message", e.Message, "id", e.ID, "url", e.URL)
+		return
+	}
+	logger.Debug("activity recorded", "serial", serial, "kind", e.Kind, "severity", e.Severity, "message", e.Message, "id", e.ID)
 }
 
 // SetObserver registers a non-blocking callback for newly recorded entries.
@@ -137,6 +149,17 @@ func (l *Log) SetObserver(fn func(serial string, e Entry)) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.observer = fn
+}
+
+// SetLogger stores the debug sink for recorded entries.
+// A nil logger clears the sink; a nil log ignores the call.
+func (l *Log) SetLogger(logger *slog.Logger) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.logger = logger
 }
 
 // Recent returns serial's entries newest first, with ages filled in. Unknown

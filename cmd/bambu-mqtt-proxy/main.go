@@ -121,6 +121,7 @@ func serve(sigCtx context.Context, cfg *config.Config, logger *slog.Logger, stor
 	table := routing.NewTable(serials, aliases)
 	inject := broker.NewInjector(logger)
 	activities := activity.New(cfg.Printers)
+	activities.SetLogger(logger)
 	printerStore := printer.NewStore(cfg.Printers)
 	printerStore.SetActivity(activities)
 	links := printer.New(cfg.Printers, logger, func(serial, topic string, payload []byte) {

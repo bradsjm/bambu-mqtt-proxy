@@ -61,9 +61,11 @@ func fetchAddress(ctx context.Context, address string, p config.Printer, k jobKe
 	if err := conn.Login(p.Username, p.Password); err != nil {
 		return Result{}, err
 	}
+	probes := 0
 	for _, dir := range []string{"/cache", "/"} {
 		for _, name := range candidates(k) {
 			remote := path.Join(dir, name)
+			probes++
 			size, err := conn.FileSize(remote)
 			if err != nil {
 				continue
@@ -88,6 +90,8 @@ func fetchAddress(ctx context.Context, address string, p config.Printer, k jobKe
 			}
 			result, err := parseArchive(data, k)
 			result.ArchiveBytes = len(data)
+			result.RemotePath = remote
+			result.Probes = probes
 			return result, err
 		}
 	}

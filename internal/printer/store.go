@@ -68,7 +68,7 @@ func (s *Store) Apply(serial string, payload []byte) {
 	log, subscribers := s.activity, append([]func(Event){}, s.subscribers...)
 	s.mu.Unlock()
 	transitions := Transitions(prev, p.doc)
-	event := Event{Serial: serial, Prev: prev, Cur: p.doc, Online: p.online}
+	event := Event{Serial: serial, Prev: prev, Cur: p.doc, Online: p.online, NewJob: NewJob(prev, p.doc)}
 	for _, transition := range transitions {
 		log.RecordLink(serial, transition.Kind, transition.Severity, transition.Message, transition.URL)
 		event.Kinds = append(event.Kinds, transition.Kind)

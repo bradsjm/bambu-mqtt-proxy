@@ -189,7 +189,7 @@ log:
 
 | Environment variable | Default | Meaning |
 |---|---|---|
-| `BMBPX_LOG_LEVEL` | *(unset)* | A non-empty value overrides `log.level`: `info` logs client and upstream state, subscriptions, and retries; `debug` adds per-packet request routing |
+| `BMBPX_LOG_LEVEL` | *(unset)* | A non-empty value overrides `log.level`: `info` logs client and upstream state, subscriptions, and retries; `debug` adds per-packet request routing, raw printer reports, every activity entry, and each plate-check, first-layer, AI detection, and job-preview (3MF) decision with scores, timings, and outcome |
 | `BMBPX_HTTP_PORT` | *(unset)* | A value from 0 to 65535 overrides `http.port`: the shared health, camera, and MCP HTTP port; `0` means unset (8080) |
 
 An optional per-printer `alias` is a replacement serial seen only by

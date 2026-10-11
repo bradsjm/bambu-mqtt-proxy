@@ -41,7 +41,7 @@ The core is the MQTT proxy path (config, broker, routing, printer), cameras, the
 | `Routes` | HTTP handlers. `module.Mount` protects the write routes. |
 | `MCP` | MCP tools, registered with `mcp.AddTool`. |
 
-Subscribe to `printer.Store` for report events. Keep the callback synchronous and non-blocking: queue work to `Run`, and never send printer commands from the callback.
+Subscribe to `printer.Store` for report events. Keep the callback synchronous and non-blocking: queue work to `Run`, and never send printer commands from the callback. Use `Event.NewJob` to detect the start of a new print; do not derive your own rule from `gcode_state` or event kinds.
 
 ### Configuration
 

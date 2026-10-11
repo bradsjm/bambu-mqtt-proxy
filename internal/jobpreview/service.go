@@ -48,6 +48,10 @@ type Result struct {
 	PNG []byte `json:"-"`
 	// ArchiveBytes is the downloaded 3MF size, kept for diagnostics.
 	ArchiveBytes int `json:"-"`
+	// RemotePath is the matched printer archive path, kept for diagnostics.
+	RemotePath string `json:"-"`
+	// Probes counts probed candidate archive paths, kept for diagnostics.
+	Probes int `json:"-"`
 }
 
 // Disabled returns the disabled preview projection.
@@ -252,22 +256,34 @@ func (s *Service) Run(ctx context.Context) error {
 		case e := <-s.events:
 			k := key(e.Cur)
 			if old, ok := keys[e.Serial]; ok && old.archive() != k.archive() {
+				s.log.Debug("job preview fetch cancelled", "serial", e.Serial, "old_file", old.File, "file", k.File)
 				cancels[e.Serial]()
 				delete(keys, e.Serial)
 			}
-			// A job begins at its first prepare or, without one, at RUNNING.
-			prevState, _ := e.Prev.GcodeState()
-			newJob := (slices.Contains(e.Kinds, "print_preparing") || slices.Contains(e.Kinds, "print_started")) && prevState != "PREPARE" && prevState != "SLICING"
-			trigger := newJob || (slices.Contains(e.Kinds, "state_initial") && active(e.Cur)) || (key(e.Prev).archive() != k.archive() && active(e.Cur))
-			if !trigger {
+			newJob := e.NewJob
+			stateInitial := slices.Contains(e.Kinds, "state_initial") && active(e.Cur)
+			selectorChange := key(e.Prev).archive() != k.archive() && active(e.Cur)
+			trigger := ""
+			switch {
+			case newJob:
+				trigger = "new_job"
+			case stateInitial:
+				trigger = "state_initial"
+			case selectorChange:
+				trigger = "selector_change"
+			}
+			if trigger == "" {
 				continue
 			}
 			s.mu.Lock()
 			ongoing, fetching := s.pending[e.Serial]
 			s.mu.Unlock()
 			if fetching && ongoing.archive() == k.archive() {
+				s.log.Debug("job preview fetch already pending", "serial", e.Serial, "trigger", trigger, "file", k.File)
 				continue
 			}
+			gcodeState, _ := e.Cur.GcodeState()
+			s.log.Debug("job preview fetch started", "serial", e.Serial, "trigger", trigger, "job_name", k.Name, "file", k.File, "plate", k.Plate, "gcode_state", gcodeState)
 			workerCtx, cancel := context.WithCancel(ctx)
 			cancels[e.Serial], keys[e.Serial] = cancel, k
 			s.mu.Lock()
@@ -293,6 +309,7 @@ func (s *Service) retrieve(ctx context.Context, serial string, k jobKey) {
 		}
 		d, _, _ := s.state.Get(serial)
 		if key(d).archive() != k.archive() {
+			s.log.Debug("job preview fetch discarded", "serial", serial, "attempt", attempt, "file", k.File, "succeeded", err == nil)
 			return
 		}
 		if err == nil {
@@ -300,7 +317,7 @@ func (s *Service) retrieve(ctx context.Context, serial string, k jobKey) {
 			if result.Metadata != nil && result.Metadata.Plate != nil {
 				plate = result.Metadata.Plate.Index
 			}
-			s.log.Debug("job preview retrieved", "serial", serial, "attempt", attempt, "file", k.File, "plate", plate, "archive_bytes", result.ArchiveBytes, "duration_ms", time.Since(started).Milliseconds())
+			s.log.Debug("job preview retrieved", "serial", serial, "attempt", attempt, "file", k.File, "plate", plate, "archive_bytes", result.ArchiveBytes, "remote_path", result.RemotePath, "probes", result.Probes, "duration_ms", time.Since(started).Milliseconds())
 			at := time.Now().UTC().Format(time.RFC3339Nano)
 			result.Preview = View{Status: StatusReady, JobName: k.Name, Current: true, RetrievedAt: &at}
 			if len(result.PNG) > 0 {
@@ -315,7 +332,9 @@ func (s *Service) retrieve(ctx context.Context, serial string, k jobKey) {
 		}
 		s.log.Debug("job preview attempt failed", "serial", serial, "attempt", attempt, "file", k.File, "error", err)
 		if attempt < 3 {
-			timer := time.NewTimer(30 * time.Second)
+			wait := 30 * time.Second
+			s.log.Debug("job preview retry waiting", "serial", serial, "attempt", attempt, "file", k.File, "retry_in_ms", wait.Milliseconds())
+			timer := time.NewTimer(wait)
 			select {
 			case <-ctx.Done():
 				timer.Stop()

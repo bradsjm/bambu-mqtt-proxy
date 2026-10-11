@@ -20,6 +20,8 @@ type Event struct {
 	Online bool
 	// Kinds contains transition kinds in table order.
 	Kinds []string
+	// NewJob marks the first event of a new print job; see NewJob.
+	NewJob bool
 }
 
 // Transition is one user-facing change derived from printer reports.
@@ -32,6 +34,26 @@ type Transition struct {
 	Message string
 	// URL links to an optional error reference.
 	URL string
+}
+
+// NewJob reports whether cur begins a new print job: the first PREPARE or
+// SLICING, or RUNNING with no PREPARE or SLICING before it. A resume from
+// pause and the first state ever seen (state_initial) never begin a job.
+// It is the only new-job rule; modules read Event.NewJob instead of
+// deriving their own.
+func NewJob(prev, cur Doc) bool {
+	before, seen := prev.GcodeState()
+	state, current := cur.GcodeState()
+	if !seen || !current || state == before || before == "PREPARE" || before == "SLICING" {
+		return false
+	}
+	switch state {
+	case "PREPARE", "SLICING":
+		return true
+	case "RUNNING":
+		return before != "PAUSE" && before != "PAUSED"
+	}
+	return false
 }
 
 // Transitions derives ordered activity entries from immutable documents.

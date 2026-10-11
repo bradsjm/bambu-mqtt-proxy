@@ -152,7 +152,7 @@ func newFixture(t *testing.T, state string) *fixture {
 func (f *fixture) event(state string, layer, stage int, kinds ...string) {
 	prev := f.state.doc
 	f.state.doc = reportDoc(state, layer, stage)
-	f.state.subscribe(printer.Event{Serial: "01S1", Prev: prev, Cur: f.state.doc, Online: true, Kinds: kinds})
+	f.state.subscribe(printer.Event{Serial: "01S1", Prev: prev, Cur: f.state.doc, Online: true, Kinds: kinds, NewJob: printer.NewJob(prev, f.state.doc)})
 	f.w.handle(context.Background(), <-f.w.events)
 }
 func (f *fixture) status() string { return f.s.moduleState("01S1").(ModuleState).State }

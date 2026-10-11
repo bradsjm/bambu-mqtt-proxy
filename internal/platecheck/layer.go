@@ -14,10 +14,14 @@ import (
 func (w *worker) checkLayer(parent context.Context) {
 	ctx, cancel := context.WithTimeout(context.WithValue(parent, operationKey{}, operations.Add(1)), 25*time.Second)
 	defer cancel()
+	operation := operationOf(ctx)
+	started := time.Now()
 	doc, online, _ := w.s.state.Get(w.printer.Serial)
 	state, _ := doc.GcodeState()
+	layer, hasLayer := doc.Layer()
 	if !online || state != "RUNNING" {
-		w.layerSkip("skipped", "print_paused", operationOf(ctx))
+		w.layerSkip("skipped", "print_paused", operation)
+		w.logLayerOutcome(operation, "skipped", "print_paused", nil, state, layer, hasLayer, nil, time.Since(started).Milliseconds())
 		return
 	}
 	w.setLayerStatus("checking", "", nil)
@@ -28,13 +32,17 @@ func (w *worker) checkLayer(parent context.Context) {
 		}
 	}
 	images := make([][]byte, 0, 2)
+	captured := make([]Frame, 0, 2)
 	for range 2 {
 		frame, err := w.s.frames.Capture(ctx, w.printer.Serial, boundary)
 		if err != nil {
-			w.layerSkip("error", errorCategory(err), operationOf(ctx))
+			reason := errorCategory(err)
+			w.layerSkip("error", reason, operation)
+			w.logLayerOutcome(operation, "error", reason, nil, state, layer, hasLayer, capturedOrNil(captured), time.Since(started).Milliseconds())
 			return
 		}
 		images = append(images, frame.JPEG)
+		captured = append(captured, frame)
 		boundary = frame.Captured.Add(2 * time.Second)
 	}
 	result, err := w.s.client.EvaluateFirstLayer(ctx, images, config.DisplayModel(w.printer.Model, w.printer.Serial))
@@ -43,39 +51,51 @@ func (w *worker) checkLayer(parent context.Context) {
 		if err != nil {
 			reason = errorCategory(err)
 		}
-		w.layerSkip("error", reason, operationOf(ctx))
+		w.layerSkip("error", reason, operation)
+		w.logLayerOutcome(operation, "error", reason, nil, state, layer, hasLayer, captured, time.Since(started).Milliseconds())
 		return
 	}
 	decision := classifyLayer(result, w.s.settings.FirstLayer.PauseConfidence)
 	w.setLayerStatus(decision, "", &result)
 	switch decision {
 	case "inconclusive":
-		w.layerEvent("platecheck_layer1_skipped", activity.Info, "First-layer view inconclusive, continuing print", operationOf(ctx))
+		w.layerEvent("platecheck_layer1_skipped", activity.Info, "First-layer view inconclusive, continuing print", operation)
+		w.logLayerOutcome(operation, decision, "", &result, state, layer, hasLayer, captured, time.Since(started).Milliseconds())
 	case "warning":
-		w.layerEvent("platecheck_layer1_warning", activity.Warning, "Possible first-layer problem: "+layerIssues(result, .5, true)+", continuing print", operationOf(ctx))
+		w.layerEvent("platecheck_layer1_warning", activity.Warning, "Possible first-layer problem: "+layerIssues(result, .5, true)+", continuing print", operation)
+		w.logLayerOutcome(operation, decision, "", &result, state, layer, hasLayer, captured, time.Since(started).Milliseconds())
 	case "passed":
-		w.layerEvent("platecheck_layer1_passed", activity.Info, "First-layer check passed, continuing print", operationOf(ctx))
+		w.layerEvent("platecheck_layer1_passed", activity.Info, "First-layer check passed, continuing print", operation)
+		w.logLayerOutcome(operation, decision, "", &result, state, layer, hasLayer, captured, time.Since(started).Milliseconds())
 	case "pause":
 		doc, online, _ = w.s.state.Get(w.printer.Serial)
 		state, _ = doc.GcodeState()
+		layer, hasLayer = doc.Layer()
 		if !online || state != "RUNNING" {
-			w.layerSkip("skipped", "print_paused", operationOf(ctx))
+			w.layerSkip("skipped", "print_paused", operation)
+			w.logLayerOutcome(operation, "skipped", "print_paused", nil, state, layer, hasLayer, captured, time.Since(started).Milliseconds())
 			return
 		}
 		if ctx.Err() != nil {
-			w.layerSkip("error", errorCategory(ctx.Err()), operationOf(ctx))
+			reason := errorCategory(ctx.Err())
+			w.layerSkip("error", reason, operation)
+			w.logLayerOutcome(operation, "error", reason, nil, state, layer, hasLayer, captured, time.Since(started).Milliseconds())
 			return
 		}
 		issues := layerIssues(result, w.s.settings.FirstLayer.PauseConfidence, false)
-		layer, _ := doc.Layer()
-		if err := w.s.commands.Pause(w.printer.Serial); err != nil {
+		pauseErr := w.s.commands.Pause(w.printer.Serial)
+		if pauseErr != nil {
 			w.setLayerPause("failed")
-			w.layerEvent("platecheck_layer1_pause_failed", activity.Error, "First-layer pause command failed: "+issues+", check the printer", operationOf(ctx))
+			w.layerEvent("platecheck_layer1_pause_failed", activity.Error, "First-layer pause command failed: "+issues+", check the printer", operation)
+			w.logLayerPause(operation, &result, state, layer, hasLayer, true, 0)
+			w.logLayerOutcome(operation, decision, "", &result, state, layer, hasLayer, captured, time.Since(started).Milliseconds())
 			return
 		}
 		w.layerPending = &pendingCommand{layer: layer}
 		w.setLayerPause("pending")
-		w.layerEvent("platecheck_layer1_pause_sent", activity.Error, "Possible first-layer failure: "+issues+", pause sent", operationOf(ctx))
+		w.layerEvent("platecheck_layer1_pause_sent", activity.Error, "Possible first-layer failure: "+issues+", pause sent", operation)
+		w.logLayerPause(operation, &result, state, layer, hasLayer, false, layer)
+		w.logLayerOutcome(operation, decision, "", &result, state, layer, hasLayer, captured, time.Since(started).Milliseconds())
 	}
 }
 
@@ -146,4 +166,45 @@ func (w *worker) layerEvent(kind, severity, message string, operation uint64) {
 		level = slog.LevelError
 	}
 	w.s.log.Log(context.Background(), level, "First-layer check activity", "event", kind, "operation", operation, "serial", w.printer.Serial)
+}
+
+// capturedOrNil keeps empty frame slices out of outcome logs.
+func capturedOrNil(frames []Frame) []Frame {
+	if len(frames) == 0 {
+		return nil
+	}
+	return frames
+}
+
+// logLayerOutcome records one debug line for a first-layer decision.
+func (w *worker) logLayerOutcome(operation uint64, decision, reason string, result *LayerResult, state string, layer int, hasLayer bool, frames []Frame, durationMs int64) {
+	attrs := []any{"serial", w.printer.Serial, "operation", operation, "decision", decision, "reason", reason, "cutoff", w.s.settings.FirstLayer.PauseConfidence, "gcode_state", state}
+	if result != nil {
+		attrs = append(attrs, "p_assessable", result.PAssessable, "p_tangled", result.PTangled, "p_detached", result.PDetached, "p_nozzle_blob", result.PNozzleBlob, "p_incomplete", result.PIncomplete)
+	}
+	if hasLayer {
+		attrs = append(attrs, "layer", layer)
+	}
+	for i, frame := range frames {
+		suffix := "_1"
+		if i > 0 {
+			suffix = "_2"
+		}
+		attrs = append(attrs, "frame_seq"+suffix, frame.Seq, "frame_age_ms"+suffix, w.s.now().Sub(frame.Captured).Milliseconds())
+	}
+	attrs = append(attrs, "duration_ms", durationMs)
+	w.s.log.Debug("First-layer check outcome", attrs...)
+}
+
+// logLayerPause records the first-layer pause command result.
+func (w *worker) logLayerPause(operation uint64, result *LayerResult, state string, layer int, hasLayer, failed bool, pendingLayer int) {
+	attrs := []any{"serial", w.printer.Serial, "operation", operation, "decision", "pause", "error", failed, "pending_layer", pendingLayer}
+	if result != nil {
+		attrs = append(attrs, "p_assessable", result.PAssessable, "p_tangled", result.PTangled, "p_detached", result.PDetached, "p_nozzle_blob", result.PNozzleBlob, "p_incomplete", result.PIncomplete)
+	}
+	attrs = append(attrs, "cutoff", w.s.settings.FirstLayer.PauseConfidence, "gcode_state", state)
+	if hasLayer {
+		attrs = append(attrs, "layer", layer)
+	}
+	w.s.log.Debug("First-layer check pause command sent", attrs...)
 }

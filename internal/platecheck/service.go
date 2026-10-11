@@ -201,22 +201,28 @@ func (w *worker) handle(ctx context.Context, e printer.Event) {
 	preparing := slices.Contains(e.Kinds, "print_preparing")
 	started := slices.Contains(e.Kinds, "print_started")
 	initial := slices.Contains(e.Kinds, "state_initial")
-	if preparing && prev != "PREPARE" && prev != "SLICING" || started && prev != "PREPARE" && prev != "SLICING" {
+	if e.NewJob {
 		// A new print clears every finding and outstanding command from the previous print.
 		w.pass1Done, w.homingSeen, w.homingDone, w.stopSent = false, false, false, false
 		w.pending, w.layerPending = nil, nil
 		w.mu.Lock()
 		w.status = w.s.idleStatus()
 		w.mu.Unlock()
+		w.s.log.Debug("Plate-check new print reset", "serial", e.Serial, "gcode_state", state, "prev_gcode_state", prev)
 	}
 	if initial {
 		// Attaching to a print never admits an automatic startup check.
 		w.pass1Done, w.homingDone = true, true
-		if state == "RUNNING" || state == "PREPARE" || state == "SLICING" || state == "PAUSE" || state == "PAUSED" {
+		skipped := state == "RUNNING" || state == "PREPARE" || state == "SLICING" || state == "PAUSE" || state == "PAUSED"
+		if skipped {
 			w.setStatusWithReasonPass("skipped", nil, "start_not_observed", false)
 		}
+		w.s.log.Debug("Plate-check initial attach", "serial", e.Serial, "gcode_state", state, "start_not_observed", skipped)
 	}
 	if stage, ok := e.Cur.Stage(); ok && (stage == 13 || stage == 14) {
+		if !w.homingSeen {
+			w.s.log.Debug("Plate-check homing stage seen", "serial", e.Serial, "stage", stage)
+		}
 		w.homingSeen = true
 	}
 	if (preparing || started) && !w.pass1Done {
@@ -228,6 +234,7 @@ func (w *worker) handle(ctx context.Context, e printer.Event) {
 		if hasLayer && layer > 0 && state != "PREPARE" && state != "SLICING" {
 			w.homingDone = true
 			w.skipPass("skipped", "print_past_start", true)
+			w.logStartupOutcome(0, "homing", "skipped", "print_past_start", nil, state, layer, hasLayer, false, nil, 0)
 		} else if state == "RUNNING" && hasLayer && layer == 0 {
 			w.homingDone = true
 			w.check(ctx, true)
@@ -236,6 +243,7 @@ func (w *worker) handle(ctx context.Context, e printer.Event) {
 	if slices.Contains(e.Kinds, "first_layer_complete") && w.s.settings.FirstLayer.On() {
 		if w.stopSent {
 			w.layerSkip("skipped", "startup_stopped", 0)
+			w.logLayerOutcome(0, "skipped", "startup_stopped", nil, state, layer, hasLayer, nil, 0)
 		} else {
 			w.checkLayer(ctx)
 		}
@@ -270,23 +278,37 @@ func (w *worker) startupReason(doc printer.Doc, online bool) string {
 func (w *worker) check(parent context.Context, homing bool) {
 	ctx, cancel := context.WithTimeout(context.WithValue(parent, operationKey{}, operations.Add(1)), 25*time.Second)
 	defer cancel()
+	operation := operationOf(ctx)
+	pass := "startup"
+	if homing {
+		pass = "homing"
+	}
+	started := time.Now()
 	doc, online, _ := w.s.state.Get(w.printer.Serial)
+	state, _ := doc.GcodeState()
+	layer, hasLayer := doc.Layer()
 	if reason := w.startupReason(doc, online); reason != "" {
 		w.skipPass("skipped", reason, homing)
+		w.logStartupOutcome(operation, pass, "skipped", reason, nil, state, layer, hasLayer, false, nil, time.Since(started).Milliseconds())
 		return
 	}
 	w.setStatusWithReasonPass("checking", nil, "", homing)
 	boundary := w.s.now()
+	chamberLightSent := false
 	if light, _ := doc.ChamberLight(); light == "off" {
 		if w.s.commands.Light(w.printer.Serial, true) == nil {
+			chamberLightSent = true
 			boundary = w.s.now()
 		}
 	}
 	frame, err := w.s.frames.Capture(ctx, w.printer.Serial, boundary)
 	if err != nil {
-		w.skipPass("error", errorCategory(err), homing)
+		reason := errorCategory(err)
+		w.skipPass("error", reason, homing)
+		w.logStartupOutcome(operation, pass, "error", reason, nil, state, layer, hasLayer, chamberLightSent, nil, time.Since(started).Milliseconds())
 		return
 	}
+	captured := &frame
 	result, err := w.s.client.Evaluate(ctx, frame.JPEG, config.DisplayModel(w.printer.Model, w.printer.Serial))
 	if err != nil || !validResult(result) {
 		reason := "bad_response"
@@ -294,6 +316,7 @@ func (w *worker) check(parent context.Context, homing bool) {
 			reason = errorCategory(err)
 		}
 		w.skipPass("error", reason, homing)
+		w.logStartupOutcome(operation, pass, "error", reason, nil, state, layer, hasLayer, chamberLightSent, captured, time.Since(started).Milliseconds())
 		return
 	}
 	decision := classify(result, w.s.settings.StopConfidence)
@@ -301,31 +324,50 @@ func (w *worker) check(parent context.Context, homing bool) {
 	switch decision {
 	case "inconclusive":
 		w.s.activity.Record(w.printer.Serial, "platecheck_skipped", activity.Info, checkName(homing)+" view inconclusive, continuing print")
+		w.logStartupOutcome(operation, pass, decision, "", &result, state, layer, hasLayer, chamberLightSent, captured, time.Since(started).Milliseconds())
 	case "clear", "below_threshold":
 		w.s.activity.Record(w.printer.Serial, "platecheck_passed", activity.Info, checkName(homing)+" passed, continuing print")
+		w.logStartupOutcome(operation, pass, decision, "", &result, state, layer, hasLayer, chamberLightSent, captured, time.Since(started).Milliseconds())
 	case "would_stop":
 		doc, online, _ = w.s.state.Get(w.printer.Serial)
+		state, _ = doc.GcodeState()
+		layer, hasLayer = doc.Layer()
 		if reason := w.startupReason(doc, online); reason != "" {
 			w.skipPass("skipped", reason, homing)
+			w.logStartupOutcome(operation, pass, "skipped", reason, nil, state, layer, hasLayer, chamberLightSent, captured, time.Since(started).Milliseconds())
 			return
 		}
 		if ctx.Err() != nil {
-			w.skipPass("error", errorCategory(ctx.Err()), homing)
+			reason := errorCategory(ctx.Err())
+			w.skipPass("error", reason, homing)
+			w.logStartupOutcome(operation, pass, "error", reason, nil, state, layer, hasLayer, chamberLightSent, captured, time.Since(started).Milliseconds())
 			return
 		}
-		layer, _ := doc.Layer()
-		state, _ := doc.GcodeState()
 		w.stopSent = true
 		w.pending = &pendingCommand{layer: layer, prepare: state == "PREPARE"}
-		w.sendStop()
+		w.sendStop(operation, decision, &result, state, layer, hasLayer)
+		w.logStartupOutcome(operation, pass, decision, "", &result, state, layer, hasLayer, chamberLightSent, captured, time.Since(started).Milliseconds())
 	}
 }
 
 // sendStop sends one command without report waits.
-func (w *worker) sendStop() {
+func (w *worker) sendStop(operation uint64, decision string, result *Result, state string, layer int, hasLayer bool) {
 	err := w.s.commands.Stop(w.printer.Serial)
 	w.setStatusKeepingScores("stop_requested")
 	w.s.activity.Record(w.printer.Serial, "platecheck_stop_requested", activity.Warning, "Plate looks occupied, stopping print")
+	pendingLayer, pendingPrepare := 0, false
+	if w.pending != nil {
+		pendingLayer, pendingPrepare = w.pending.layer, w.pending.prepare
+	}
+	attrs := []any{"serial", w.printer.Serial, "operation", operation, "decision", decision, "error", err != nil, "pending_layer", pendingLayer, "pending_prepare", pendingPrepare}
+	if result != nil {
+		attrs = append(attrs, "p_clear", result.PClear, "p_occupied", result.POccupied, "p_assessable", result.PAssessable)
+	}
+	attrs = append(attrs, "cutoff", w.s.settings.StopConfidence, "gcode_state", state)
+	if hasLayer {
+		attrs = append(attrs, "layer", layer)
+	}
+	w.s.log.Debug("Plate-check stop command sent", attrs...)
 	if err != nil {
 		w.setStatusKeepingScores("stop_failed")
 		w.s.activity.Record(w.printer.Serial, "platecheck_stop_failed", activity.Error, "Plate-check stop command failed, check the printer")
@@ -344,16 +386,21 @@ func (w *worker) resolve(e printer.Event) {
 			w.setStatusKeepingScores("stopped")
 			w.s.activity.Record(w.printer.Serial, "platecheck_stopped", activity.Info, "Print stopped after plate-check stop request, clear the plate before resending")
 			w.pending = nil
+			w.s.log.Debug("Plate-check stop resolved", "serial", e.Serial, "outcome", "stopped", "gcode_state", state, "prev_gcode_state", prev)
 		} else {
 			if p.prepare && prev == "PREPARE" && state == "RUNNING" {
 				p.prepare = false
 				doc, _, _ := w.s.state.Get(w.printer.Serial)
 				p.layer, _ = doc.Layer()
-				w.sendStop()
+				resendLayer, resendHasLayer := doc.Layer()
+				resendState, _ := doc.GcodeState()
+				w.sendStop(0, "would_stop", nil, resendState, resendLayer, resendHasLayer)
+				w.s.log.Debug("Plate-check stop resolved", "serial", e.Serial, "outcome", "resent", "gcode_state", state, "prev_gcode_state", prev, "pending_layer", p.layer)
 			} else if state == "RUNNING" && ok && layer > p.layer {
 				w.setStatusKeepingScores("stop_unconfirmed")
 				w.s.activity.Record(w.printer.Serial, "platecheck_stop_unconfirmed", activity.Error, "Plate-check stop not confirmed, check the printer")
 				w.pending = nil
+				w.s.log.Debug("Plate-check stop resolved", "serial", e.Serial, "outcome", "unconfirmed", "gcode_state", state, "prev_gcode_state", prev, "layer", layer, "pending_layer", p.layer)
 			}
 		}
 	}
@@ -362,10 +409,12 @@ func (w *worker) resolve(e printer.Event) {
 			w.setLayerPause("confirmed")
 			w.layerEvent("platecheck_layer1_pause_confirmed", activity.Warning, "Printer reports paused after first-layer pause request, check the first layer before resuming", 0)
 			w.layerPending = nil
+			w.s.log.Debug("First-layer check pause resolved", "serial", e.Serial, "outcome", "confirmed", "gcode_state", state, "prev_gcode_state", prev)
 		} else if state == "RUNNING" && ok && layer > p.layer {
 			w.setLayerPause("unconfirmed")
 			w.layerEvent("platecheck_layer1_pause_unconfirmed", activity.Error, "First-layer pause not confirmed, check the printer", 0)
 			w.layerPending = nil
+			w.s.log.Debug("First-layer check pause resolved", "serial", e.Serial, "outcome", "unconfirmed", "gcode_state", state, "prev_gcode_state", prev, "layer", layer, "pending_layer", p.layer)
 		}
 	}
 }
@@ -411,4 +460,20 @@ func (w *worker) setStatusKeepingScores(state string) {
 // validResult checks probabilities at the vision boundary.
 func validResult(r Result) bool {
 	return validAnswer(answer{Type: "noul", Noul: &r.PClear}) && validAnswer(answer{Type: "noul", Noul: &r.POccupied}) && validAnswer(answer{Type: "noul", Noul: &r.PAssessable}) && r.POccupied == 1-r.PClear
+}
+
+// logStartupOutcome records one debug line for a startup pass decision.
+func (w *worker) logStartupOutcome(operation uint64, pass, decision, reason string, result *Result, state string, layer int, hasLayer, chamberLightSent bool, frame *Frame, durationMs int64) {
+	attrs := []any{"serial", w.printer.Serial, "operation", operation, "pass", pass, "decision", decision, "reason", reason, "cutoff", w.s.settings.StopConfidence, "gcode_state", state, "chamber_light_sent", chamberLightSent}
+	if result != nil {
+		attrs = append(attrs, "p_clear", result.PClear, "p_occupied", result.POccupied, "p_assessable", result.PAssessable)
+	}
+	if hasLayer {
+		attrs = append(attrs, "layer", layer)
+	}
+	if frame != nil {
+		attrs = append(attrs, "frame_seq", frame.Seq, "frame_age_ms", w.s.now().Sub(frame.Captured).Milliseconds())
+	}
+	attrs = append(attrs, "duration_ms", durationMs)
+	w.s.log.Debug("Plate-check outcome", attrs...)
 }

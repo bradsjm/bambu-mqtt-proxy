@@ -3,6 +3,7 @@ package detection
 import (
 	"context"
 	"errors"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -55,15 +56,15 @@ type worker struct {
 
 // apply processes a report under mu without sending a command.
 func (w *worker) apply(ev printer.Event) {
-	for _, kind := range ev.Kinds {
-		if kind == "print_started" || kind == "state_initial" && active(ev.Cur) {
-			w.counter++
-			w.disabled, w.latched, w.lightDone = false, false, false
-			w.pauseLayer = nil
-			w.st = Status{State: StateMonitoring, PauseState: PauseNone, Enabled: true}
-			w.due, w.resultAt = time.Time{}, time.Time{}
-			w.degraded = false
-		}
+	if reason := sessionResetReason(ev); reason != "" {
+		w.counter++
+		w.disabled, w.latched, w.lightDone = false, false, false
+		w.pauseLayer = nil
+		w.st = Status{State: StateMonitoring, PauseState: PauseNone, Enabled: true}
+		w.due, w.resultAt = time.Time{}, time.Time{}
+		w.degraded = false
+		state, _ := ev.Cur.GcodeState()
+		w.e.log.Debug("detection session reset", "serial", w.serial, "reason", reason, "counter", w.counter, "gcode_state", state)
 	}
 	w.doc, w.online = ev.Cur, ev.Online
 	if !active(w.doc) {
@@ -92,6 +93,21 @@ func (w *worker) apply(ev printer.Event) {
 		default:
 			w.e.log.Warn("detection outcome queue full; dropping outcome", "serial", w.serial, "kind", kind)
 		}
+	}
+}
+
+// sessionResetReason reports why an event starts a new detection session.
+// Attaching to a print that is still preparing also starts one, because its
+// later RUNNING report is not a new job and would otherwise leave no session.
+func sessionResetReason(ev printer.Event) string {
+	state, _ := ev.Cur.GcodeState()
+	switch {
+	case ev.NewJob:
+		return "new_job"
+	case slices.Contains(ev.Kinds, "state_initial") && (active(ev.Cur) || state == "PREPARE" || state == "SLICING"):
+		return "state_initial"
+	default:
+		return ""
 	}
 }
 
@@ -240,8 +256,10 @@ func (w *worker) run(ctx context.Context) {
 		if fallback && gadget.FallbackURL != "" {
 			url = gadget.FallbackURL
 		}
+		started := time.Now()
 		res, err := w.e.client.Process(workCtx, url, frame.JPEG)
 		cancel()
+		w.e.log.Debug("detection inspection completed", "serial", w.serial, "counter", counter, "frame_seq", frame.Seq, "duration_ms", time.Since(started).Milliseconds(), "failed", err != nil)
 		if err != nil {
 			w.fail(counter, ReasonAPIRetrying, "Gadget inspection failed", err, res.Intervals.Recommended)
 			continue
@@ -282,10 +300,41 @@ func (w *worker) fail(counter uint64, reason, message string, err error, recomme
 	}
 	w.due = time.Now().Add(delay)
 	w.mu.Unlock()
+	attrs := []any{"serial", w.serial, "counter", counter, "reason", reason, "retry_in_ms", delay.Milliseconds()}
+	attrs = append(attrs, safeErrorAttrs(err)...)
+	w.e.log.Debug("detection inspection failed", attrs...)
 	if first {
 		w.e.activity.Record(w.serial, "ai_degraded", activity.Warning, "AI inspection interrupted, "+message)
 		w.e.log.Warn("AI inspection interrupted", "serial", w.serial, "reason", reason)
 	}
+}
+
+// safeErrorAttrs renders only error detail the client tests prove safe.
+func safeErrorAttrs(err error) []any {
+	if err == nil {
+		return nil
+	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		return []any{"error_type", apiErr.Type, "http_status", apiErr.Status}
+	}
+	var transportErr *TransportError
+	if errors.As(err, &transportErr) {
+		return []any{"error_class", transportErr.Error()}
+	}
+	var validationErr *responseValidationError
+	if errors.As(err, &validationErr) {
+		return []any{"error_class", validationErr.Error()}
+	}
+	var requestErr *localRequestError
+	if errors.As(err, &requestErr) {
+		return []any{"error_class", requestErr.Error()}
+	}
+	var tooLarge *frameTooLargeError
+	if errors.As(err, &tooLarge) {
+		return []any{"error_class", tooLarge.Error()}
+	}
+	return []any{"error_class", "unknown"}
 }
 
 // accept discards another print's result and pauses at most once per print.
@@ -295,7 +344,15 @@ func (w *worker) accept(counter uint64, doc printer.Doc, res Result) {
 	w.mu.Lock()
 	if counter != w.counter || w.disabled || !active(w.doc) {
 		w.st.Processing = false
+		cause := "inactive"
+		switch {
+		case counter != w.counter:
+			cause = "stale_counter"
+		case w.disabled:
+			cause = "disabled"
+		}
 		w.mu.Unlock()
+		w.e.log.Debug("detection result discarded", "serial", w.serial, "counter", counter, "cause", cause)
 		return
 	}
 	recovered, warning := w.degraded, !w.st.Warning && res.WarningSuggested
@@ -306,8 +363,10 @@ func (w *worker) accept(counter uint64, doc printer.Doc, res Result) {
 	if res.WarningSuggested {
 		w.st.State = StateAttention
 	}
+	attrs := []any{"serial", w.serial, "counter", counter, "print_quality", res.PrintQuality, "warning_suggested", res.WarningSuggested, "pause_suggested", res.PauseSuggested, "faster_inspection_suggested", res.FasterInspectionSuggested, "recommended_interval_s", res.Intervals.Recommended}
 	if layer, ok := doc.Layer(); ok {
 		w.st.LastInspectedLayer = new(layer)
+		attrs = append(attrs, "layer", layer)
 	}
 	w.resultAt = time.Now()
 	w.due = w.resultAt.Add(time.Duration(res.Intervals.Recommended) * time.Second)
@@ -320,7 +379,9 @@ func (w *worker) accept(counter uint64, doc printer.Doc, res Result) {
 		}
 		w.st.PauseState, w.st.State, w.st.Message = PausePending, StateAttention, "pause sent; waiting for printer confirmation"
 	}
+	attrs = append(attrs, "pause_sent", pause)
 	w.mu.Unlock()
+	w.e.log.Debug("detection result accepted", attrs...)
 	if recovered {
 		w.e.activity.Record(w.serial, "ai_recovered", activity.Info, "AI inspection recovered")
 	}
@@ -337,6 +398,8 @@ func (w *worker) accept(counter uint64, doc printer.Doc, res Result) {
 			w.mu.Unlock()
 			w.e.activity.Record(w.serial, "ai_pause_unconfirmed", activity.Warning, "AI pause command could not be sent")
 			w.e.log.Warn("AI pause command failed", "serial", w.serial)
+		} else {
+			w.e.log.Debug("detection pause sent", "serial", w.serial, "counter", counter)
 		}
 	}
 }
@@ -354,9 +417,13 @@ func (w *worker) autoLight(counter uint64) {
 		send = mode != "on"
 	}
 	w.mu.Unlock()
+	lightErr := false
 	if send {
 		if err := w.e.control.Light(w.serial, true); err == nil {
 			w.e.activity.Record(w.serial, "ai_light_on", activity.Info, "Chamber light turned on for AI inspection")
+		} else {
+			lightErr = true
 		}
 	}
+	w.e.log.Debug("detection auto light", "serial", w.serial, "counter", counter, "light_sent", send, "light_error", lightErr)
 }

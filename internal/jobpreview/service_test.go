@@ -95,7 +95,7 @@ func (s *testState) report(d printer.Doc, kinds ...string) {
 	prev := s.doc
 	s.doc = d
 	s.mu.Unlock()
-	s.subscriber(printer.Event{Serial: "S1", Prev: prev, Cur: d, Online: true, Kinds: kinds})
+	s.subscriber(printer.Event{Serial: "S1", Prev: prev, Cur: d, Online: true, Kinds: kinds, NewJob: printer.NewJob(prev, d)})
 }
 
 // jobDoc creates a printer report with an archive key.
