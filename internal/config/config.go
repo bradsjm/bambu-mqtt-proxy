@@ -146,10 +146,9 @@ type Camera struct {
 	Enabled *bool `yaml:"enabled"`
 }
 
-// MCP holds the Model Context Protocol endpoint configuration. The endpoint
-// serves only read-only tools and resources on the shared HTTP listener; it
-// never exposes printer control. Enabled defaults to on: nil means enabled,
-// and an explicit false disables the endpoint.
+// MCP holds the Model Context Protocol endpoint configuration on the shared
+// HTTP listener. Enabled defaults to on: nil means enabled, and an explicit
+// false disables the endpoint.
 type MCP struct {
 	Enabled *bool `yaml:"enabled"`
 }

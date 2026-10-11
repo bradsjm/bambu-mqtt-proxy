@@ -55,8 +55,7 @@ http:
 
 camera:
   # Enabled by default; false removes the camera routes, the camera wall,
-  # the camera wall's own MQTT report subscriptions, and the raw camera
-  # listener on port 6000.
+  # and the raw camera listener on port 6000.
   # enabled: false
 
 mcp:

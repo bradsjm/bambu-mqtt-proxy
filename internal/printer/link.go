@@ -122,6 +122,7 @@ func (l *link) connected(client mqtt.Client) {
 
 // report delivers the printer's bytes directly to the non-blocking observer.
 func (l *link) report(_ mqtt.Client, message mqtt.Message) {
+	l.log.Debug("printer report received", "topic", message.Topic(), "payload", string(message.Payload()))
 	if l.onReport != nil {
 		l.onReport(l.serial, message.Topic(), message.Payload())
 	}
