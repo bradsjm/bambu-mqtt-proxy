@@ -1,11 +1,9 @@
-// The camera wall: /camera/status JSON, the /camera/events server-sent
-// event stream of the same payload, and the embedded /camwall page. The page
+// The camera wall: /camera/status JSON and the embedded /camwall page. The page
 // composes camera images and telemetry in the browser; raw JPEG and MJPEG
 // responses never carry status data.
 package camera
 
 import (
-	"bytes"
 	_ "embed"
 	"encoding/json"
 	"errors"
@@ -36,15 +34,6 @@ var (
 	appleTouchIconPNG []byte
 )
 
-// eventsInterval is how often /camera/events checks for status changes,
-// coalescing bursts of report deltas into at most one event per interval.
-// eventsKeepalive bounds how long an unchanged status goes unsent, so
-// clients refresh relative ages and notice a dead proxy.
-const (
-	eventsInterval  = time.Second
-	eventsKeepalive = 10 * time.Second
-)
-
 // controlMaxBody bounds printer control request bodies.
 const controlMaxBody = 4 << 10
 
@@ -65,7 +54,7 @@ type Tile struct {
 	extra   map[string]any
 }
 
-// statusPayload is the shared /camera/status and /camera/events body.
+// statusPayload is the /camera/status body.
 type statusPayload struct {
 	Printers []Tile `json:"printers"`
 }
@@ -207,75 +196,7 @@ func (r *StatusRenderer) payload(tiles []Tile) statusPayload {
 	return statusPayload{Printers: tiles}
 }
 
-// changeKey serializes tiles without their continuously aging fields, so
-// only real state changes trigger an event between keepalives.
-func changeKey(tiles []Tile) ([]byte, error) {
-	stable := make([]Tile, len(tiles))
-	for i, t := range tiles {
-		t.Freshness.LastReportAgeSeconds, t.FrameAge, t.FrameSeq = nil, 0, 0
-		t.Activity = append([]activity.Entry(nil), t.Activity...)
-		for j := range t.Activity {
-			t.Activity[j].AgeSeconds = 0
-		}
-		t.extra = make(map[string]any, len(t.extra))
-		for key, value := range tiles[i].extra {
-			if stable, ok := value.(interface{ StableKey() any }); ok {
-				value = stable.StableKey()
-			}
-			t.extra[key] = value
-		}
-		stable[i] = t
-	}
-	return json.Marshal(stable)
-}
-
-// handleEvents streams the status payload as server-sent events: once on
-// connect, then whenever display state changes, and at least every
-// eventsKeepalive. It ends when the client disconnects.
-func (r *StatusRenderer) handleEvents(w http.ResponseWriter, req *http.Request) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
-		return
-	}
-	noStore(w)
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.WriteHeader(http.StatusOK)
-	if _, err := fmt.Fprint(w, "retry: 3000\n\n"); err != nil {
-		return
-	}
-	flusher.Flush()
-
-	ticker := time.NewTicker(eventsInterval)
-	defer ticker.Stop()
-	var lastKey []byte
-	var lastSent time.Time
-	for {
-		tiles := r.Tiles()
-		key, err := changeKey(tiles)
-		if err == nil && (!bytes.Equal(key, lastKey) || time.Since(lastSent) >= eventsKeepalive) {
-			payload, err := json.Marshal(r.payload(tiles))
-			if err != nil {
-				return
-			}
-			// Opportunistic write deadline, as for MJPEG streams: a stalled
-			// client cannot pin this handler forever.
-			_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(2 * eventsKeepalive))
-			if _, err := fmt.Fprintf(w, "data: %s\n\n", payload); err != nil {
-				return
-			}
-			flusher.Flush()
-			lastKey, lastSent = key, time.Now()
-		}
-		select {
-		case <-req.Context().Done():
-			return
-		case <-ticker.C:
-		}
-	}
-}
-
-// RegisterStatus mounts /camera/status, /camera/events, /camwall and the
+// RegisterStatus mounts /camera/status, /camwall and the
 // wall's icons on the shared mux.
 func (r *StatusRenderer) RegisterStatus(mux *http.ServeMux) {
 	mux.HandleFunc("GET /camera/status", func(w http.ResponseWriter, _ *http.Request) {
@@ -283,7 +204,6 @@ func (r *StatusRenderer) RegisterStatus(mux *http.ServeMux) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(r.payload(r.Tiles()))
 	})
-	mux.HandleFunc("GET /camera/events", r.handleEvents)
 	// Printer controls are protected against cross-origin browser writes.
 	protection := http.NewCrossOriginProtection()
 	mux.Handle("POST /control/{serial}", protection.Handler(http.HandlerFunc(r.handleControl)))

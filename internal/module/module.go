@@ -13,7 +13,7 @@ type Module struct {
 	Name string
 	// Run performs background work until cancellation and returns after cleanup.
 	Run func(ctx context.Context) error
-	// State returns non-blocking per-printer state, optionally with StableKey.
+	// State returns non-blocking per-printer state.
 	State func(serial string) any
 	// Display returns non-blocking camera wall badges and panels.
 	Display func(serial string) *Display
@@ -25,10 +25,8 @@ type Module struct {
 	MCP func(s *mcp.Server)
 }
 
-// Display is one module's contribution to one printer tile. Values must be
-// stable between real changes: the camera wall sends an update whenever the
-// serialized display changes, so continuously aging values (ages,
-// countdowns) must be rounded to a coarse step or omitted.
+// Display is one module's contribution to one printer tile. The wall polls
+// /camera/status, so values may change on every poll.
 type Display struct {
 	// Overlay holds short badges drawn over the camera image.
 	Overlay []Badge `json:"overlay,omitempty"`

@@ -16,7 +16,7 @@
   --bg: #0b0d10; --panel: #14181d; --panel-2: #1b2027; --line: #262d36;
   --text: #e6ebf0; --dim: #8d9aa8; --faint: #5b6673;
   --printing: #34d399; --paused: #fbbf24; --preparing: #60a5fa; --finished: #22d3ee;
-  --failed: #f87171; --stale: #a78bfa; --idle: #94a3b8; --waiting: #94a3b8; --offline: #64748b;
+  --failed: #f87171; --idle: #94a3b8; --waiting: #94a3b8; --offline: #64748b;
   --live: #ef4444; --attention: #f87171;
   --heat: #fb923c; --tile-min: 340px;
   /* Thermal stages: one color per stage wherever a temperature appears. */
@@ -68,7 +68,6 @@ button.chip[aria-pressed="true"] .chip-label { color: var(--text); }
           white-space: nowrap; margin-right: .25rem; }
 .health i { width: .55rem; height: .55rem; border-radius: 50%; background: var(--faint); }
 .health[data-health="ok"] i { background: var(--printing); animation: pulse 2s infinite; }
-.health[data-health="stale"] i { background: var(--paused); }
 .health[data-health="down"] { color: var(--failed); }
 .health[data-health="down"] i { background: var(--failed); }
 .icon-btn { display: inline-grid; place-items: center; width: 2.5rem; height: 2.5rem; border-radius: 10px;
@@ -109,10 +108,9 @@ body.kiosk .bar { display: none; }
 .tile[data-state="preparing"] { --accent: var(--preparing); }
 .tile[data-state="finished"] { --accent: var(--finished); }
 .tile[data-state="failed"] { --accent: var(--failed); }
-.tile[data-state="stale"] { --accent: var(--stale); }
 .tile[data-state="waiting"] { --accent: var(--waiting); }
 .tile[data-state="offline"] { --accent: var(--offline); }
-.tile[data-state="failed"], .tile[data-state="paused"], .tile[data-state="stale"] {
+.tile[data-state="failed"], .tile[data-state="paused"] {
   box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 60%, transparent),
               0 0 28px -8px color-mix(in srgb, var(--accent) 70%, transparent); }
 .tile[data-alert="high"] {
@@ -751,16 +749,11 @@ const STORE_KEY = "camwall.v2";
 const LIVE_LIMITS = [1, 16, 4];
 const SNAP_LIMITS = [2, 60, 8];
 const TILE_SIZES = { s: 260, m: 340, l: 460 };
-// An active printer that has not reported for this long is shown as stale.
-const STALE_REPORT_SEC = 120;
-// The server sends at least every 10 s; reconnect if nothing arrives for this long.
-const EVENTS_SILENCE_MS = 30000;
 const STATES = {
   printing: { label: "Printing", icon: "i-play" },
   paused: { label: "Paused", icon: "i-pause" },
   preparing: { label: "Preparing", icon: "i-hourglass" },
   failed: { label: "Failed", icon: "i-alert" },
-  stale: { label: "No recent data", icon: "i-clock-alert" },
   finished: { label: "Finished", icon: "i-check" },
   idle: { label: "Idle", icon: "i-moon" },
   waiting: { label: "Waiting for data", icon: "i-loader" },
@@ -779,7 +772,7 @@ const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)");
 const tiles = new Map();
 let visible = new Set();
 let spotlight = null;
-let lastOk = 0, connectedAt = 0, failing = false, drag = null, source = null;
+let lastOk = 0, failing = false, drag = null, polling = false;
 // Account-level AI suspension arrives on the payload, outside any tile.
 let detSuspended = false, detMessage = "";
 
@@ -830,17 +823,14 @@ function fmtFinish(min) {
 }
 function bucket(p) {
   if (!p.connected) return "offline";
-  const base = {
+  return {
     RUNNING: "printing", PAUSE: "paused", PREPARE: "preparing", SLICING: "preparing",
     FINISH: "finished", FAILED: "failed", "": "waiting",
   }[(p.print_state || "").toUpperCase()] ?? "idle";
-  // Busy printers report constantly; silence while connected means stale data.
-  const busy = base === "printing" || base === "paused" || base === "preparing";
-  return busy && reportAgeOf(p) > STALE_REPORT_SEC ? "stale" : base;
 }
 const reportAgeOf = p => p.freshness?.last_report_age_seconds ?? null;
 const isActive = b => b === "printing" || b === "paused";
-const showsProgress = (b, p) => isActive(b) || b === "finished" || b === "failed" || (b === "stale" && p.progress > 0);
+const showsProgress = (b, p) => isActive(b) || b === "finished" || b === "failed";
 const nameOf = t => t.data.name || `${t.data.model || "Printer"} ${t.serial}`;
 // OctoEverywhere AI failure detection, normalized to the backend contract.
 // The backend adds a `detection` object to a tile only when an API key is
@@ -887,9 +877,7 @@ const detectPauseConfirmed = d => !!d && d.pauseState === "confirmed";
 const DETECT_REASONS = {
   camera_disabled: "camera disabled",
   camera_unsupported: "camera unsupported",
-  awaiting_first_layer: "waiting for first layer",
   awaiting_reports: "awaiting printer reports",
-  awaiting_fresh_telemetry: "waiting for printer data",
   camera_unavailable: "camera unavailable",
   api_retrying: "API retrying",
   pause_unconfirmed: "pause not confirmed by printer",
@@ -930,8 +918,6 @@ function detectBadge(d, b) {
   if (detectPauseConfirmed(d)) return { tone: "warn", label: "Pause confirmed" };
   if (d.warning) return { tone: "warn", label: "AI warning" };
   if (d.suspended) return { tone: "warn", label: "AI off · account" };
-  // The neutral opening wait names itself: calm, and never attention.
-  if (d.reason === "awaiting_first_layer") return { tone: "calm", label: "AI waiting for layer 1" };
   if (d.state === "degraded") {
     return { tone: "warn", label: d.cameraLost || reasonWords(d).startsWith("camera") ? "AI view lost" : "AI retrying" };
   }
@@ -993,7 +979,7 @@ function alertsOf(p) {
 const highAlert = p => alertsOf(p).some(a => (SEVERITY_RANK[a.severity] || 0) >= 3);
 function needsAttention(p) {
   const b = bucket(p);
-  if (b === "failed" || b === "paused" || b === "stale" || highAlert(p)) return true;
+  if (b === "failed" || b === "paused" || highAlert(p)) return true;
   // An AI warning or any pause activity counts; low quality alone does not.
   // Losing oversight of an active print counts too: degradation, camera loss,
   // or account suspension all leave the wall watching blind.
@@ -1001,7 +987,7 @@ function needsAttention(p) {
   if (!d) return false;
   if (d.state === "disabled") return d.pauseState !== "none" || d.suspended;
   if (d.warning || d.pauseState !== "none") return true;
-  const active = b === "printing" || b === "preparing" || b === "stale";
+  const active = b === "printing" || b === "preparing";
   return active && (d.suspended || d.cameraLost || d.state === "degraded");
 }
 function matchesFilter(p) {
@@ -1394,8 +1380,8 @@ function renderModules(t) {
 }
 // Stage slugs arrive as protocol names ("changing_filament"); the wall
 // shows them as words next to the identity. Stage is secondary information:
-// it never replaces the state pill, and an offline or stale printer's last
-// stage may be outdated, so it hides for those states.
+// it never replaces the state pill, and an offline printer's last
+// stage may be outdated, so it hides for that state.
 const stageWords = s => {
   if (typeof s !== "string" || !s) return "";
   const words = s.replaceAll("_", " ");
@@ -1405,7 +1391,7 @@ const stageWords = s => {
 // SVG drawing for every AMS model, with the external spool after a dashed
 // rule in the first strip. Occupancy labels stay honest: "Empty" only for a
 // resolved-empty slot, "Unknown" for a slot the printer never reported or
-// loaded without reported material. Offline and stale printers keep showing
+// loaded without reported material. Offline printers keep showing
 // their last known spools, so the section notes that. Every string from the
 // printer goes through textContent only. Pure rendering: no interaction.
 function renderAMS(t) {
@@ -1415,8 +1401,7 @@ function renderAMS(t) {
   const sensor = typeof p.ext_spool_filament_detected === "boolean" ? p.ext_spool_filament_detected : null;
   const b = bucket(p);
   const note = units.length || ext
-    ? b === "offline" ? "Last known · printer offline"
-      : b === "stale" ? "Last known · no recent data" : ""
+    ? b === "offline" ? "Last known · printer offline" : ""
     : "";
   renderActiveFilament(t, units, ext, b);
   const faults = slotFaults(p);
@@ -1737,7 +1722,7 @@ function offChip(p) {
 // Everything here is advisory archive data: it renders through DOM nodes
 // and textContent only, never becomes an alert, and never replaces the
 // camera or the live job name. The DOM-heavy renders are keyed by the
-// serialized metadata, so routine SSE ticks — ages, temperatures, progress
+// serialized metadata, so routine status polls — ages, temperatures, progress
 // — rebuild nothing and open disclosures stay open.
 const mdText = v => typeof v === "string" ? v.trim() : "";
 const mdNum = v => Number.isFinite(v) ? v : null;
@@ -1857,7 +1842,7 @@ function renderJobArchive(t, md) {
     return false;
   }
   // The box keeps two parts: a head that follows the live job name, and a
-  // keyed body that never rebuilds across routine SSE ticks.
+  // keyed body that never rebuilds across routine status polls.
   const head = document.createElement("p");
   head.className = "ja-title";
   const body = document.createElement("div");
@@ -1983,7 +1968,7 @@ function updateJobArchiveHead(t, md) {
 
 // The plate thumb is a cached, versioned PNG, assigned once per
 // uninterrupted ready episode. A new job/retrieval key or readiness
-// ending (pending, invalidated, new generation) clears the episode's URL
+// ending (pending or unavailable) clears the episode's URL
 // bookkeeping, and a key change also drops the old render immediately so
 // a superseded image is never displayed while a new one loads; a later
 // ready episode may therefore assign the same URL again. Within an
@@ -2106,9 +2091,6 @@ function renderKpi(t, b, pct, progress, remain, reportAge) {
   } else if (b === "failed" && progress) {
     sub.append(bold("", `${pct} %`), " when stopped");
     sub.title = "";
-  } else if (b === "stale" && reportAge != null) {
-    sub.append("no data for ", bold("", fmtAgo(reportAge).replace(" ago", "")));
-    sub.title = "";
   } else if (b === "offline" && reportAge != null) {
     sub.append("seen ", bold("", fmtAgo(reportAge)));
     sub.title = "";
@@ -2142,17 +2124,17 @@ function renderTile(t) {
   r.model.textContent = p.name || p.model || "Printer";
   r.serial.textContent = p.name ? p.model || "" : p.serial;
   // Stage rides in the state pill as a suffix. It hides where it could be
-  // outdated — offline or stale printers may have stopped mid-action, and
+  // outdated — offline printers may have stopped mid-action, and
   // finished or idle printers have ended the print the stage described. A
   // stage that only repeats the state is dropped.
   const stage = stageWords(p.stage);
-  r.stage.hidden = !stage || stage.toLowerCase() === s.label.toLowerCase() || b === "offline" || b === "stale" ||
+  r.stage.hidden = !stage || stage.toLowerCase() === s.label.toLowerCase() || b === "offline" ||
     b === "finished" || b === "idle";
   r.stage.textContent = stage;
   // Line two: the job. It stays through finished, failed, and idle until
   // the next print replaces it, dimmed once the print is no longer running.
   const job = p.job_name || "";
-  const jobLive = isActive(b) || b === "preparing" || b === "stale";
+  const jobLive = isActive(b) || b === "preparing";
   r.jobLine.hidden = !job;
   r.jobLine.classList.toggle("past", !jobLive);
   r.job.textContent = job;
@@ -2168,7 +2150,7 @@ function renderTile(t) {
 
   // Headline metric: progress over layer and time left for jobs. The state
   // pill already names the state, so the headline never repeats it; offline
-  // and stale printers show how old their data is instead.
+  // printers show how old their data is instead.
   const remain = fmtDuration(p.remaining_minutes);
   const reportAge = reportAgeOf(p) != null ? Math.round(reportAgeOf(p)) : null;
   renderKpi(t, b, pct, progress, remain, reportAge);
@@ -2209,7 +2191,7 @@ function renderTile(t) {
   // The AI badge is a real control on an active print: keyboard
   // reachable, with a stable printer-specific name, and aria-pressed
   // carrying the on/off permission. Server state stays authoritative:
-  // repeat clicks wait, and the next SSE update or the toggle's own
+  // repeat clicks wait, and the next status poll or the toggle's own
   // authoritative answer corrects the display everywhere.
   const controllable = !!d && d.sessionId !== "" && !d.suspended &&
     d.state !== "unsupported" && d.state !== "blocked";
@@ -2476,7 +2458,7 @@ function eligible(t) {
 function allocate() {
   const order = [...grid.children].map(el => tiles.get(el.dataset.serial));
   for (const t of order) t.el.hidden = !matchesFilter(t.data);
-  const wantsLive = t => isActive(bucket(t.data)) || bucket(t.data) === "stale" || t.serial === spotlight;
+  const wantsLive = t => isActive(bucket(t.data)) || t.serial === spotlight;
   const live = new Set();
   const spot = spotlight && tiles.get(spotlight);
   if (spot && eligible(spot)) live.add(spot.serial);
@@ -2557,7 +2539,7 @@ function toggleSpotlight(t) {
 
 // Per-print AI toggle: PUT the new permission with the current print's
 // opaque session token. One request per tile at a time — repeat clicks
-// wait — and the server's authoritative answer, mirrored by SSE to every
+// wait — and the server's authoritative answer, mirrored by polling to every
 // open browser, decides what the badge shows next.
 async function toggleDetection(t) {
   const d = detectOf(t.data);
@@ -2576,7 +2558,7 @@ async function toggleDetection(t) {
     if (res.ok) {
       const st = await res.json().catch(() => null);
       if (st && typeof st === "object") {
-        // Apply the authoritative state immediately; SSE confirms it in
+        // Apply the authoritative state immediately; the next poll confirms it in
         // this and every other browser.
         t.data = { ...t.data, detection: st };
       }
@@ -2597,7 +2579,7 @@ async function toggleDetection(t) {
 }
 
 // Printer controls: POST one allow-listed command. One request per tile at a
-// time; the printer's next report, mirrored by SSE, shows the effect.
+// time; the printer's next report, seen on the next poll, shows the effect.
 async function sendControl(t, body) {
   if (t.ctlPending || !body.action) return;
   t.ctlPending = true;
@@ -2790,11 +2772,10 @@ function clearFilter() {
 function renderHealth() {
   const el = document.getElementById("health");
   const age = lastOk ? Math.round((Date.now() - lastOk) / 1000) : 0;
-  const quiet = age * 1000 > EVENTS_SILENCE_MS - 5000;
-  el.dataset.health = failing ? "down" : !lastOk ? "wait" : quiet ? "stale" : "ok";
+  el.dataset.health = failing ? "down" : lastOk ? "ok" : "wait";
   const base = failing
     ? (lastOk ? `Reconnecting · updated ${fmtAgo(age)}` : "Proxy unreachable")
-    : !lastOk ? "Connecting…" : quiet ? `Updated ${fmtAgo(age)}` : "Connected";
+    : lastOk ? "Connected" : "Connecting…";
   document.getElementById("health-text").textContent = detSuspended ? `${base} · AI off` : base;
   el.title = (lastOk ? `Last status update ${new Date(lastOk).toLocaleTimeString()}` : "") +
     (detSuspended && detMessage ? ` · AI: ${detMessage}` : "");
@@ -2834,23 +2815,17 @@ function sync(list) {
   allocate();
 }
 
-// The proxy pushes status over server-sent events: on connect, on every
-// change, and at least every 10 s. EventSource retries on its own; a stream
-// the browser gave up on (non-200 answer) or one gone silent is reopened here.
-function markFailed(reason) {
-  if (!failing) announce(`Lost status updates (${reason}). Showing the last known state.`);
-  failing = true;
-  renderHealth();
-}
-function connect() {
-  if (source || document.hidden) return;
-  const es = new EventSource("/camera/events");
-  source = es;
-  connectedAt = Date.now();
-  es.onmessage = e => {
-    let data;
-    try { data = JSON.parse(e.data); } catch { return; }
-    if (!Array.isArray(data.printers)) return;
+// The wall polls /camera/status once a second while the page is visible,
+// with at most one request in flight. A failed poll marks the proxy offline;
+// the next successful poll restores it.
+async function poll() {
+  if (polling || document.hidden) return;
+  polling = true;
+  try {
+    const res = await fetch("/camera/status", { cache: "no-store" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    if (!Array.isArray(data.printers)) throw new Error("bad payload");
     lastOk = Date.now();
     if (failing) announce("Status updates restored.");
     failing = false;
@@ -2864,19 +2839,13 @@ function connect() {
         : "AI inspection can run again.");
     }
     sync(data.printers);
+  } catch (err) {
+    if (!failing) announce(`Lost status updates (${err.message}). Showing the last known state.`);
+    failing = true;
+  } finally {
+    polling = false;
     renderHealth();
-  };
-  es.onerror = () => {
-    markFailed("connection lost");
-    if (es.readyState === EventSource.CLOSED && source === es) {
-      source = null;
-      setTimeout(connect, 5000);
-    }
-  };
-}
-function disconnect() {
-  source?.close();
-  source = null;
+  }
 }
 
 // Off-screen tiles release their camera connection.
@@ -2985,30 +2954,26 @@ if (document.fullscreenEnabled) {
 addEventListener("keydown", e => {
   if (e.key === "Escape" && spotlight && !drag && !dlg.open) toggleSpotlight(tiles.get(spotlight));
 });
-// A hidden page releases every camera connection and the status stream.
+// A hidden page releases every camera connection and stops polling.
 document.addEventListener("visibilitychange", () => {
-  if (document.hidden) disconnect(); else connect();
+  if (!document.hidden) poll();
   allocate();
   syncWakeLock();
 });
 
-// One-second tick: snapshot cadence, relative-time labels, silent-stream check.
+// One-second tick: status poll, snapshot cadence, relative-time labels.
 setInterval(() => {
   const now = Date.now();
   for (const t of tiles.values()) {
     if (t.feed === "snap" && !t.snap.pending && now - t.snap.requested >= prefs.snapSec * 1000) fetchSnapshot(t);
     renderFeed(t);
   }
-  if (source && now - Math.max(lastOk, connectedAt) > EVENTS_SILENCE_MS) {
-    markFailed("no updates");
-    disconnect();
-    connect();
-  }
+  poll();
   renderHealth();
 }, 1000);
 applySize();
 buildFleet();
-connect();
+poll();
 syncWakeLock();
 </script>
 </body>

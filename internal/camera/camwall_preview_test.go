@@ -80,24 +80,3 @@ func TestPreviewModuleProjection(t *testing.T) {
 		}
 	}
 }
-
-// TestChangeKeyIncludesPreviewModuleState checks that module state participates in wall changes.
-func TestChangeKeyIncludesPreviewModuleState(t *testing.T) {
-	base := Tile{extra: map[string]any{"jobpreview": jobpreview.ModuleState{JobPreview: jobpreview.View{Status: jobpreview.StatusUnavailable}}}}
-	ready := Tile{extra: map[string]any{"jobpreview": jobpreview.ModuleState{JobPreview: jobpreview.View{Status: jobpreview.StatusReady, JobName: "benchy.3mf", Current: true}}}}
-	a, err := changeKey([]Tile{base})
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, err := changeKey([]Tile{ready})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if bytes.Equal(a, b) {
-		t.Fatal("preview change did not change wall key")
-	}
-	again, err := changeKey([]Tile{ready})
-	if err != nil || !bytes.Equal(b, again) {
-		t.Fatalf("unstable wall key: %v", err)
-	}
-}

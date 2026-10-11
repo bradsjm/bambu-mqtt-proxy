@@ -52,9 +52,6 @@ type ModuleState struct {
 	RateCPerMin *float64 `json:"rate_c_per_min,omitempty"`
 }
 
-// StableKey returns the link and the trend only.
-func (v ModuleState) StableKey() any { return [2]string{v.Link, v.Trend} }
-
 // Module declares the accessory store's lifecycle, chamber reading hook, camera wall display, and per-printer state.
 func (s *Store) Module() module.Module {
 	return module.Module{

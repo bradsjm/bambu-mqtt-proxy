@@ -91,9 +91,6 @@ type Status struct {
 	Message string `json:"message,omitempty"`
 }
 
-// StableKey excludes continuously aging display fields.
-func (s Status) StableKey() any { s.AgeSeconds = 0; s.NextCheckSeconds = 0; return s }
-
 // Frame contains an immutable captured JPEG.
 type Frame struct {
 	// JPEG is the image content.

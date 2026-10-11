@@ -2,7 +2,6 @@ package camera
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -315,8 +314,8 @@ func TestCamWallRoutesServeEmbeddedWall(t *testing.T) {
 	if !strings.HasPrefix(wallResp.Header().Get("Content-Type"), "text/html") {
 		t.Errorf("GET /camwall Content-Type = %q", wallResp.Header().Get("Content-Type"))
 	}
-	if !strings.Contains(wallResp.Body.String(), "/camera/events") {
-		t.Fatal("embedded wall does not subscribe to camera status events")
+	if !strings.Contains(wallResp.Body.String(), "/camera/status") {
+		t.Fatal("embedded wall does not poll camera status")
 	}
 	for path, want := range map[string]string{"/favicon.ico": "image/x-icon", "/apple-touch-icon.png": "image/png"} {
 		if !strings.Contains(wallResp.Body.String(), `href="`+path+`"`) {
@@ -382,76 +381,6 @@ func TestCamWallRoutesServeEmbeddedWall(t *testing.T) {
 	}
 	if strings.Contains(w.Body.String(), "secret-test-only") || strings.Contains(w.Body.String(), "another-secret") || strings.Contains(w.Body.String(), "127.0.0.1") {
 		t.Fatal("Cam Wall status leaked credentials or printer address")
-	}
-}
-
-func TestChangeKeyIgnoresActivityAge(t *testing.T) {
-	first := []Tile{{View: printer.View{Serial: "S1"}, Activity: []activity.Entry{{ID: 1, AgeSeconds: 2}}}}
-	second := []Tile{{View: printer.View{Serial: "S1"}, Activity: []activity.Entry{{ID: 1, AgeSeconds: 8}}}}
-	a, err := changeKey(first)
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, err := changeKey(second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(a, b) {
-		t.Fatalf("activity aging changed the SSE key: %s != %s", a, b)
-	}
-	if first[0].Activity[0].AgeSeconds != 2 || second[0].Activity[0].AgeSeconds != 8 {
-		t.Fatal("changeKey mutated its input activity ages")
-	}
-}
-
-// TestCameraEventsStreamsChanges reads the SSE stream: one event on
-// connect, then another after a report changes display state.
-func TestCameraEventsStreamsChanges(t *testing.T) {
-	printers := []config.Printer{{Serial: "01S00C351100139", Address: "127.0.0.1:8883", Password: "secret-test-only"}}
-	state := printer.NewStore(printers)
-	renderer := NewStatusRenderer(NewManager(printers, discardLogger()), state)
-	mux := http.NewServeMux()
-	renderer.RegisterStatus(mux)
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/camera/events", nil)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("GET /camera/events: %v", err)
-	}
-	defer resp.Body.Close()
-	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
-		t.Fatalf("Content-Type = %q", ct)
-	}
-
-	lines := bufio.NewScanner(resp.Body)
-	nextEvent := func() statusPayload {
-		t.Helper()
-		for lines.Scan() {
-			data, ok := strings.CutPrefix(lines.Text(), "data: ")
-			if !ok {
-				continue
-			}
-			var p statusPayload
-			if err := json.Unmarshal([]byte(data), &p); err != nil {
-				t.Fatalf("decode event %q: %v", data, err)
-			}
-			return p
-		}
-		t.Fatalf("stream ended before an event: %v", lines.Err())
-		return statusPayload{}
-	}
-
-	first := nextEvent()
-	if len(first.Printers) != 1 || first.Printers[0].PrintState != nil {
-		t.Fatalf("initial event = %+v", first)
-	}
-	state.Apply("01S00C351100139", []byte(`{"print":{"gcode_state":"RUNNING"}}`))
-	if second := nextEvent(); second.Printers[0].PrintState == nil || *second.Printers[0].PrintState != "RUNNING" {
-		t.Fatalf("change event = %+v", second)
 	}
 }
 

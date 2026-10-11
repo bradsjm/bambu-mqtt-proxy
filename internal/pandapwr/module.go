@@ -28,10 +28,6 @@ type ModuleState struct {
 	PowerW *float64 `json:"power_w,omitempty"`
 }
 
-// StableKey returns the link state only. Watts steps are value churn: they
-// must not wake MCP watch_printer attention watchers.
-func (v ModuleState) StableKey() any { return v.Link }
-
 // Module declares the store's lifecycle and the camera wall panel and
 // per-printer state hooks.
 func (s *Store) Module() module.Module {
@@ -55,8 +51,7 @@ func (s *Store) moduleState(serial string) any {
 
 // snapshot computes one printer's ModuleState under the store lock. ok is
 // false when the printer has no configured device. Watts are rounded to a
-// whole number and excluded from StableKey, so only a link change counts as
-// a state change.
+// whole number.
 func (s *Store) snapshot(serial string) (v ModuleState, ok bool) {
 	if !s.configured(serial) {
 		return ModuleState{}, false
