@@ -4,10 +4,9 @@
 // (docs.octoeverywhere.com, Gadget AI Failure Detection Developer Docs).
 //
 // Security posture: the API key travels only in the X-API-Key header; every
-// request URL is validated to HTTPS on the vendor domain; redirects are
-// never followed; and errors rendered in status remain sanitized. Debug
-// logs carry sanitized metadata and fixed error classifications only: no
-// URLs, no response bodies, and no provider-controlled text.
+// request URL is validated to HTTPS on the vendor domain; and redirects are
+// never followed. The key is never logged; errors and logs carry the
+// underlying error, the HTTP status, and the provider's response text.
 package detection
 
 import (
@@ -20,6 +19,7 @@ import (
 	"log/slog"
 	"math"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/textproto"
 	"net/url"
@@ -77,26 +77,59 @@ type Result struct {
 	Score                     int         `json:"Score"`
 }
 
-// APIError is the common Gadget error body returned on non-2XX responses.
-// It intentionally carries only the status code and the classified error
-// type token: provider details are not parsed, stored in errors, or logged.
+// APIError is a non-2XX Gadget response. Type is the allowlisted error-type
+// token that drives retry, fallback, and suspension decisions;
+// ProviderType and Body keep what the server actually sent, for logs.
 type APIError struct {
-	Type   string
+	// Type is the allowlisted error type, or OE_UNKNOWN.
+	Type string
+	// Status is the HTTP status code.
 	Status int
+	// Host is the Gadget server that answered.
+	Host string
+	// ProviderType is the ErrorType the server sent, bounded, possibly empty.
+	ProviderType string
+	// Body is the bounded response body text, for diagnostics.
+	Body string
 }
 
-// TransportError marks a request or response-body transport failure. Its
-// message is a fixed, sanitized classification and never includes the URL.
+// TransportError is a request or response-body failure before a complete
+// HTTP answer. Err is the underlying error, unchanged.
 type TransportError struct {
-	message string // safe classification shown in logs
+	// Host is the Gadget server the request went to.
+	Host string
+	// Timeout is the client limit, reported when the request timed out.
+	Timeout time.Duration
+	// Err is the underlying error.
+	Err error
 }
 
-// Error returns the sanitized transport classification.
-func (e *TransportError) Error() string { return e.message }
+// Error renders the plain-language reason followed by the underlying error.
+func (e *TransportError) Error() string { return e.Reason() + ": " + e.Err.Error() }
+
+// Unwrap exposes the underlying error.
+func (e *TransportError) Unwrap() error { return e.Err }
+
+// Reason explains the failure in plain words for users, using the
+// innermost error (for example "connection refused").
+func (e *TransportError) Reason() string {
+	var netErr net.Error
+	switch {
+	case errors.Is(e.Err, context.Canceled):
+		return fmt.Sprintf("the request to Gadget server %s was canceled", e.Host)
+	case errors.Is(e.Err, context.DeadlineExceeded) || errors.As(e.Err, &netErr) && netErr.Timeout():
+		return fmt.Sprintf("Gadget server %s did not answer within %s", e.Host, seconds(e.Timeout))
+	}
+	root := e.Err
+	for next := errors.Unwrap(root); next != nil; next = errors.Unwrap(root) {
+		root = next
+	}
+	return fmt.Sprintf("could not reach Gadget server %s: %s", e.Host, root)
+}
 
 // responseValidationError marks a malformed or contract-invalid response.
 type responseValidationError struct {
-	message string // safe validation reason shown in logs
+	message string // specific cause
 }
 
 // Error returns the sanitized response-validation reason.
@@ -110,10 +143,45 @@ type localRequestError struct {
 // Error returns the sanitized local request reason.
 func (e *localRequestError) Error() string { return e.message }
 
-// Error renders the status and the sanitized error type. It never contains
-// credentials, URLs, context ids, or provider detail text.
+// Error renders the server, HTTP status, and error types for logs. It never
+// contains the API key or the request URL path.
 func (e *APIError) Error() string {
-	return fmt.Sprintf("gadget api error: status %d: %s", e.Status, e.Type)
+	provider := e.ProviderType
+	if provider == "" {
+		provider = "none"
+	}
+	return fmt.Sprintf("Gadget server %s returned HTTP %d %s (error type %s, sent %s)", e.Host, e.Status, http.StatusText(e.Status), e.Type, provider)
+}
+
+// Reason explains the error in plain words for users.
+func (e *APIError) Reason() string {
+	status := fmt.Sprintf("HTTP %d %s", e.Status, http.StatusText(e.Status))
+	switch e.Type {
+	case errTypeInvalidKey:
+		return "the Gadget API key is not valid"
+	case errTypeKeyDisabled:
+		return "the Gadget API key is disabled"
+	case errTypePaymentFailed:
+		return "the Gadget account is blocked because a payment failed"
+	case errTypeIPRestricted:
+		return "the Gadget API key does not allow requests from this network address"
+	case errTypeFreeUsageLimit:
+		return "the Gadget free usage allowance is used up"
+	case errTypeInternal:
+		return fmt.Sprintf("Gadget server %s had an internal error (%s)", e.Host, status)
+	case errTypeBackendThrottle:
+		return fmt.Sprintf("Gadget server %s is overloaded and asked the proxy to slow down (%s)", e.Host, status)
+	case errTypeContextRate:
+		return "Gadget received too many checks for this print and asked the proxy to slow down"
+	case errTypeImageDecode:
+		return "Gadget could not read the camera image"
+	case errTypeBadArgs, errTypeArgsParse:
+		return fmt.Sprintf("Gadget rejected the request as invalid (%s)", status)
+	}
+	if e.Status >= 500 {
+		return fmt.Sprintf("Gadget server %s is unavailable (%s)", e.Host, status)
+	}
+	return fmt.Sprintf("Gadget server %s rejected the request (%s)", e.Host, status)
 }
 
 // Terminal account-wide errors suspend detection until restart (official
@@ -134,9 +202,8 @@ const (
 )
 
 // knownErrTypes is the fixed allowlist of provider error-type tokens from
-// the official docs. Any other token — unknown, misspelled, or crafted —
-// maps to errTypeUnknown, so attacker-controlled strings can never reach
-// logs or public status payloads.
+// the official docs. Decisions use only these; any other token maps to
+// errTypeUnknown, and the server's own text stays in ProviderType for logs.
 var knownErrTypes = map[string]bool{
 	errTypeInvalidKey:      true,
 	errTypeKeyDisabled:     true,
@@ -225,11 +292,11 @@ func (c *Client) requestLogAttrs(req *http.Request) []any {
 	return []any{"method", req.Method, "request_host", req.URL.Hostname(), "request_content_type", req.Header.Get("Content-Type"), "request_bytes", req.ContentLength}
 }
 
-// debugResponse logs sanitized response metadata only when debug is
-// enabled: numeric status, duration, sizes, and truncation state. It never
-// logs the body, provider-controlled header text, or raw error strings.
+// debugResponse logs response metadata when debug is enabled: status,
+// duration, sizes, truncation, a read error, and for non-2XX answers the
+// bounded body text.
 func debugResponse(logger *slog.Logger, ctx context.Context, attrs []any, resp *http.Response,
-	body []byte, duration time.Duration, readErr error) {
+	body []byte, bodyText string, duration time.Duration, readErr error) {
 	if logger == nil || !logger.Enabled(ctx, slog.LevelDebug) {
 		return
 	}
@@ -242,38 +309,23 @@ func debugResponse(logger *slog.Logger, ctx context.Context, attrs []any, resp *
 		"response_body_bytes", len(body),
 		"response_body_truncated", truncated)
 	if readErr != nil {
-		attrs = append(attrs, "read_error_class", classifyTransport(readErr, true))
+		attrs = append(attrs, "error", readErr.Error())
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		attrs = append(attrs, "response_body", bodyText)
 	}
 	logger.Debug("Gadget HTTP response received", attrs...)
 }
 
-// Fixed sanitized transport classifications shared by TransportError values
-// and debug logs. They never include URLs, provider text, or underlying
-// error strings.
-const (
-	transportCanceled    = "gadget request canceled"
-	transportTimedOut    = "gadget request timed out"
-	transportFailed      = "gadget request failed"
-	transportReadFailed  = "gadget response read failed"
-	transportCloseFailed = "gadget response close failed"
-)
+// maxLoggedBody bounds response text copied into errors and logs.
+const maxLoggedBody = 512
 
-// classifyTransport maps a transport failure to the fixed sanitized text a
-// TransportError carries, so debug logs reuse the same classification
-// instead of the underlying error string. readFailure selects the
-// response-body class when the error is neither a cancellation nor a
-// timeout.
-func classifyTransport(err error, readFailure bool) string {
-	switch {
-	case errors.Is(err, context.Canceled):
-		return transportCanceled
-	case errors.Is(err, context.DeadlineExceeded):
-		return transportTimedOut
-	case readFailure:
-		return transportReadFailed
-	default:
-		return transportFailed
+// boundedText returns at most maxLoggedBody bytes of valid UTF-8 text.
+func boundedText(s string) string {
+	if len(s) > maxLoggedBody {
+		s = s[:maxLoggedBody]
 	}
+	return strings.ToValidUTF8(s, "?")
 }
 
 // NewGadgetClient builds the client. The key only ever travels in the
@@ -366,10 +418,10 @@ func (c *Client) CreateContext(ctx context.Context) (Session, error) {
 		return Session{}, &responseValidationError{message: "gadget create context response missing fields"}
 	}
 	if err := validVendorURL(out.ProcessRequestURL); err != nil {
-		return Session{}, &responseValidationError{message: "gadget create context response has an invalid primary process url"}
+		return Session{}, &responseValidationError{message: "gadget create context response has an invalid primary process url (" + err.Error() + ")"}
 	}
 	if err := validVendorURL(out.FallbackProcessRequestURL); err != nil {
-		return Session{}, &responseValidationError{message: "gadget create context response has an invalid fallback process url"}
+		return Session{}, &responseValidationError{message: "gadget create context response has an invalid fallback process url (" + err.Error() + ")"}
 	}
 	return Session{
 		ContextID:   out.ContextID,
@@ -466,10 +518,8 @@ func (c *Client) Process(ctx context.Context, url string, jpeg []byte) (Result, 
 }
 
 // do sends one authenticated request and returns the bounded response body.
-// Non-2XX responses become *APIError; redirects are never followed.
-// The returned transport and validation errors stay sanitized. Debug logs
-// carry only fixed classifications and numeric metadata: never the URL,
-// the body, or provider-controlled text.
+// Non-2XX responses become *APIError; transport failures become
+// *TransportError; redirects are never followed.
 func (c *Client) do(req *http.Request) ([]byte, error) {
 	logger := c.logger()
 	debug := logger != nil && logger.Enabled(req.Context(), slog.LevelDebug)
@@ -481,36 +531,40 @@ func (c *Client) do(req *http.Request) ([]byte, error) {
 	started := time.Now()
 	resp, err := c.http.Do(req)
 	if err != nil {
-		class := classifyTransport(err, false)
 		if debug {
 			logger.Debug("Gadget HTTP request failed", append(attrs,
-				"duration_ms", time.Since(started).Milliseconds(), "transport_class", class)...)
+				"duration_ms", time.Since(started).Milliseconds(), "error", err.Error())...)
 		}
-		return nil, &TransportError{message: class}
+		return nil, &TransportError{Host: req.URL.Hostname(), Timeout: c.http.Timeout, Err: err}
 	}
 	defer func() {
 		if closeErr := resp.Body.Close(); closeErr != nil {
 			if debug {
 				logger.Debug("Gadget HTTP response close failed", append(attrs,
-					"http_status", resp.StatusCode, "close_error_class", transportCloseFailed)...)
+					"http_status", resp.StatusCode, "error", closeErr.Error())...)
 			}
 		}
 	}()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
-	if err != nil {
-		debugResponse(logger, req.Context(), attrs, resp, body, time.Since(started), err)
-		return nil, &TransportError{message: "gadget response read failed"}
+	bodyText := ""
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		bodyText = boundedText(string(body))
 	}
-	debugResponse(logger, req.Context(), attrs, resp, body, time.Since(started), nil)
+	if err != nil {
+		debugResponse(logger, req.Context(), attrs, resp, body, bodyText, time.Since(started), err)
+		return nil, &TransportError{Host: req.URL.Hostname(), Timeout: c.http.Timeout, Err: err}
+	}
+	debugResponse(logger, req.Context(), attrs, resp, body, bodyText, time.Since(started), nil)
 	if len(body) > maxResponseBytes {
 		return nil, &responseValidationError{message: "gadget response exceeds the supported size limit"}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		apiErr := &APIError{Type: errTypeUnknown, Status: resp.StatusCode}
+		apiErr := &APIError{Type: errTypeUnknown, Status: resp.StatusCode, Host: req.URL.Hostname(), Body: bodyText}
 		var parsed struct {
 			ErrorType string `json:"ErrorType"`
 		}
 		if json.Unmarshal(body, &parsed) == nil {
+			apiErr.ProviderType = boundedText(parsed.ErrorType)
 			if knownErrTypes[parsed.ErrorType] {
 				apiErr.Type = parsed.ErrorType
 			}

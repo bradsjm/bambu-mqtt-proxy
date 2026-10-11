@@ -879,7 +879,9 @@ const DETECT_REASONS = {
   camera_unsupported: "camera unsupported",
   awaiting_reports: "awaiting printer reports",
   camera_unavailable: "camera unavailable",
-  api_retrying: "API retrying",
+  api_retrying: "retrying Gadget",
+  request_invalid: "Gadget rejected the request",
+  user_disabled: "turned off for this print",
   pause_unconfirmed: "pause not confirmed by printer",
   pause_command_failed: "pause command failed",
 };
@@ -1040,7 +1042,7 @@ function detectFact(d, b) {
   if (d.warning) bits.push("warning suggested");
   if (d.cameraLost) bits.push("camera view lost");
   if (d.faster) bits.push("closer monitoring requested");
-  if (d.fallback) bits.push("fallback URL in use");
+  if (d.fallback) bits.push("using Gadget backup server");
   if (reasonWords(d)) bits.push(reasonWords(d));
   if (d.message) bits.push(d.message);
   return bits.join(" · ");

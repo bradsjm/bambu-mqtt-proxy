@@ -231,25 +231,51 @@ func TestPauseOutcomeFromReports(t *testing.T) {
 	}
 }
 
-func TestFailOpenRecoversOnNextSuccess(t *testing.T) {
+// TestInterruptionRecoversOnlyAfterConsecutiveSuccesses pins one
+// interruption per failure run: a single success between failures is not a
+// recovery, and recovery needs recoverAfter successes in a row.
+func TestInterruptionRecoversOnlyAfterConsecutiveSuccesses(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		w := newEtWorld(t)
 		w.client.process = func(n int) (Result, error) {
-			if n == 1 {
-				return Result{}, &APIError{Type: errTypeBackendThrottle, Status: 429}
+			if n == 1 || n == 3 {
+				return Result{}, &APIError{Type: errTypeBackendThrottle, Status: 429, Host: "gadget-ric2.octoeverywhere.com"}
 			}
 			return Result{Intervals: IntervalSec{1, 20}, PrintQuality: 8}, nil
+		}
+		count := func(kind string) int {
+			n := 0
+			for _, e := range w.activity.Recent("S1") {
+				if e.Kind == kind {
+					n++
+				}
+			}
+			return n
 		}
 		w.startSession(1, 3)
 		w.run(t)
 		synctest.Wait()
-		if w.control.count() != 0 || !hasActivityKind(w.activity.Recent("S1"), "ai_degraded") {
-			t.Fatal("API error was not fail-open")
+		if w.control.count() != 0 || count("ai_degraded") != 1 || !strings.Contains(w.status().Message, "gadget-ric2.octoeverywhere.com is overloaded") {
+			t.Fatalf("first failure: degraded=%d message=%q", count("ai_degraded"), w.status().Message)
 		}
-		time.Sleep(30 * time.Second)
+		time.Sleep(30 * time.Second) // check 2 succeeds
 		synctest.Wait()
-		if !hasActivityKind(w.activity.Recent("S1"), "ai_recovered") {
-			t.Fatal("successful inspection did not recover")
+		time.Sleep(20 * time.Second) // check 3 fails again
+		synctest.Wait()
+		if count("ai_recovered") != 0 || count("ai_degraded") != 1 || !strings.Contains(w.status().Message, "2 failed checks") {
+			t.Fatalf("flapping: recovered=%d degraded=%d message=%q", count("ai_recovered"), count("ai_degraded"), w.status().Message)
+		}
+		for range recoverAfter - 1 { // checks 4 and 5 succeed
+			time.Sleep(30 * time.Second)
+			synctest.Wait()
+		}
+		if count("ai_recovered") != 0 {
+			t.Fatal("recovered before enough consecutive successes")
+		}
+		time.Sleep(20 * time.Second) // check 6 is the third success in a row
+		synctest.Wait()
+		if count("ai_recovered") != 1 {
+			t.Fatalf("not recovered after %d successes: %+v", recoverAfter, w.activity.Recent("S1"))
 		}
 	})
 }

@@ -3,6 +3,7 @@ package detection
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strconv"
 	"sync"
@@ -50,9 +51,19 @@ type worker struct {
 	resultAt time.Time
 	// due is the next recommended inspection time.
 	due time.Time
-	// degraded tracks an interruption episode.
-	degraded bool
+	// troubleSince is when the open interruption began; zero when none is open.
+	troubleSince time.Time
+	// failures counts failed checks in the open interruption.
+	failures int
+	// successes counts consecutive successful checks since the last failure.
+	successes int
+	// lastCause is the plain-language cause of the latest failure.
+	lastCause string
 }
+
+// recoverAfter is the number of consecutive successful checks that ends an
+// interruption. One success between failures is not a recovery.
+const recoverAfter = 3
 
 // apply processes a report under mu without sending a command.
 func (w *worker) apply(ev printer.Event) {
@@ -62,7 +73,7 @@ func (w *worker) apply(ev printer.Event) {
 		w.pauseLayer = nil
 		w.st = Status{State: StateMonitoring, PauseState: PauseNone, Enabled: true}
 		w.due, w.resultAt = time.Time{}, time.Time{}
-		w.degraded = false
+		w.troubleSince, w.failures, w.successes, w.lastCause = time.Time{}, 0, 0, ""
 		state, _ := ev.Cur.GcodeState()
 		w.e.log.Debug("detection session reset", "serial", w.serial, "reason", reason, "counter", w.counter, "gcode_state", state)
 	}
@@ -228,7 +239,7 @@ func (w *worker) run(ctx context.Context) {
 		}
 		if !held {
 			cancel()
-			w.fail(counter, ReasonCameraLost, "camera frames are unavailable", nil, 0)
+			w.fail(counter, ReasonCameraLost, "the camera stream is not available", nil, 0)
 			continue
 		}
 		w.autoLight(counter)
@@ -236,7 +247,7 @@ func (w *worker) run(ctx context.Context) {
 			session, err := w.e.client.CreateContext(workCtx)
 			if err != nil {
 				cancel()
-				w.fail(counter, ReasonAPIRetrying, "Gadget context creation failed", err, 0)
+				w.fail(counter, ReasonAPIRetrying, "could not start a Gadget session: "+describe(err), err, 0)
 				continue
 			}
 			gadget = session
@@ -244,7 +255,7 @@ func (w *worker) run(ctx context.Context) {
 		frame, ok := w.e.frames.WaitFrame(w.serial, workCtx, lastSeq, 15*time.Second)
 		if !ok {
 			cancel()
-			w.fail(counter, ReasonCameraLost, "camera frames are unavailable", nil, 0)
+			w.fail(counter, ReasonCameraLost, "no new camera frame arrived within 15 s", nil, 0)
 			continue
 		}
 		lastSeq = frame.Seq
@@ -261,15 +272,17 @@ func (w *worker) run(ctx context.Context) {
 		cancel()
 		w.e.log.Debug("detection inspection completed", "serial", w.serial, "counter", counter, "frame_seq", frame.Seq, "duration_ms", time.Since(started).Milliseconds(), "failed", err != nil)
 		if err != nil {
-			w.fail(counter, ReasonAPIRetrying, "Gadget inspection failed", err, res.Intervals.Recommended)
+			w.fail(counter, ReasonAPIRetrying, describe(err), err, res.Intervals.Recommended)
 			continue
 		}
 		w.accept(counter, doc, res)
 	}
 }
 
-// fail reports fail-open degradation and schedules a bounded dependency retry.
-func (w *worker) fail(counter uint64, reason, message string, err error, recommended int) {
+// fail records one failed check, keeps the print running, and schedules a
+// retry. Repeated failures extend one interruption instead of starting new
+// ones; cause is the plain-language explanation shown to users.
+func (w *worker) fail(counter uint64, reason, cause string, err error, recommended int) {
 	w.mu.Lock()
 	if counter != w.counter || w.disabled {
 		w.mu.Unlock()
@@ -277,64 +290,94 @@ func (w *worker) fail(counter uint64, reason, message string, err error, recomme
 	}
 	w.st.Processing = false
 	var apiErr *APIError
+	switched := false
 	if errors.As(err, &apiErr) {
 		if apiErr.AccountTerminal() {
 			w.mu.Unlock()
-			w.e.suspend(apiErr.Error())
+			w.e.suspend(apiErr.Reason(), apiErr)
 			return
 		}
 		if apiErr.WorkerTerminal() {
 			reason = ReasonRequestInvalid
 		}
-		if apiErr.SwitchToFallback() {
-			w.st.UsingFallback = true
+		if apiErr.SwitchToFallback() && !w.st.UsingFallback {
+			w.st.UsingFallback, switched = true, true
 		}
 	}
-	first := !w.degraded
-	w.degraded = true
-	w.st.State, w.st.Reason, w.st.Message = StateDegraded, reason, message
-	w.st.CameraLost = reason == ReasonCameraLost
+	now := time.Now()
+	first := w.troubleSince.IsZero()
+	if first {
+		w.troubleSince, w.failures = now, 0
+	}
+	w.failures++
+	w.successes = 0
+	w.lastCause = cause
 	delay := 30 * time.Second
 	if recommended > 0 {
 		delay = time.Duration(recommended) * time.Second
 	}
-	w.due = time.Now().Add(delay)
+	w.due = now.Add(delay)
+	failures, lasted, backup := w.failures, now.Sub(w.troubleSince), w.st.UsingFallback
+	terminal := reason == ReasonRequestInvalid
+	w.st.State, w.st.Reason = StateDegraded, reason
+	w.st.Message = fmt.Sprintf("%s · %s · next try in %s", cause, failedChecks(failures, lasted), seconds(delay))
+	if terminal {
+		w.st.Message = cause + " · AI checks stopped for this print and resume with the next print"
+	}
+	w.st.CameraLost = reason == ReasonCameraLost
 	w.mu.Unlock()
-	attrs := []any{"serial", w.serial, "counter", counter, "reason", reason, "retry_in_ms", delay.Milliseconds()}
-	attrs = append(attrs, safeErrorAttrs(err)...)
-	w.e.log.Debug("detection inspection failed", attrs...)
+	attrs := []any{"serial", w.serial, "counter", counter, "cause", cause, "reason", reason, "failure_count", failures, "interruption_s", int(lasted.Seconds()), "backup_server", backup}
+	if err != nil {
+		attrs = append(attrs, "error", err.Error())
+	}
+	if apiErr != nil && apiErr.Body != "" {
+		attrs = append(attrs, "response_body", apiErr.Body)
+	}
+	if terminal {
+		w.e.log.Error("AI inspection stopped for this print", append(attrs, "next_action", "AI checks resume with the next print")...)
+		w.e.activity.Record(w.serial, "ai_degraded", activity.Error, "AI checks stopped for this print: "+cause+". The print continues without AI checks; they resume with the next print")
+		return
+	}
+	w.e.log.Warn("AI inspection check failed", append(attrs, "retry_in_ms", delay.Milliseconds())...)
 	if first {
-		w.e.activity.Record(w.serial, "ai_degraded", activity.Warning, "AI inspection interrupted, "+message)
-		w.e.log.Warn("AI inspection interrupted", "serial", w.serial, "reason", reason)
+		w.e.activity.Record(w.serial, "ai_degraded", activity.Warning, fmt.Sprintf("AI inspection interrupted: %s. Retrying in %s; the print continues without AI checks until they succeed again", cause, seconds(delay)))
+	}
+	if switched {
+		w.e.log.Info("AI inspection switching to the Gadget backup server", "serial", w.serial, "counter", counter, "error", err.Error())
+		w.e.activity.Record(w.serial, "ai_backup_server", activity.Info, "AI inspection switched to the Gadget backup server because "+cause)
 	}
 }
 
-// safeErrorAttrs renders only error detail the client tests prove safe.
-func safeErrorAttrs(err error) []any {
-	if err == nil {
-		return nil
+// describe returns the plain-language cause of a Gadget request failure.
+func describe(err error) string {
+	var te *TransportError
+	var ae *APIError
+	var ve *responseValidationError
+	switch {
+	case errors.As(err, &te):
+		return te.Reason()
+	case errors.As(err, &ae):
+		return ae.Reason()
+	case errors.As(err, &ve):
+		return "Gadget sent an answer the proxy could not use: " + ve.message
 	}
-	var apiErr *APIError
-	if errors.As(err, &apiErr) {
-		return []any{"error_type", apiErr.Type, "http_status", apiErr.Status}
+	return err.Error()
+}
+
+// failedChecks summarizes an interruption, for example "4 failed checks in 3 min".
+func failedChecks(n int, lasted time.Duration) string {
+	if n == 1 {
+		return "1 failed check"
 	}
-	var transportErr *TransportError
-	if errors.As(err, &transportErr) {
-		return []any{"error_class", transportErr.Error()}
+	if lasted < time.Minute {
+		return fmt.Sprintf("%d failed checks in %s", n, seconds(lasted))
 	}
-	var validationErr *responseValidationError
-	if errors.As(err, &validationErr) {
-		return []any{"error_class", validationErr.Error()}
-	}
-	var requestErr *localRequestError
-	if errors.As(err, &requestErr) {
-		return []any{"error_class", requestErr.Error()}
-	}
-	var tooLarge *frameTooLargeError
-	if errors.As(err, &tooLarge) {
-		return []any{"error_class", tooLarge.Error()}
-	}
-	return []any{"error_class", "unknown"}
+	return fmt.Sprintf("%d failed checks in %d min", n, int(lasted.Round(time.Minute).Minutes()))
+}
+
+// seconds renders a duration as whole seconds, for example "30 s".
+func seconds(d time.Duration) string {
+	return fmt.Sprintf("%d s", int(d.Round(time.Second).Seconds()))
 }
 
 // accept discards another print's result and pauses at most once per print.
@@ -355,10 +398,21 @@ func (w *worker) accept(counter uint64, doc printer.Doc, res Result) {
 		w.e.log.Debug("detection result discarded", "serial", w.serial, "counter", counter, "cause", cause)
 		return
 	}
-	recovered, warning := w.degraded, !w.st.Warning && res.WarningSuggested
-	w.degraded = false
+	warning := !w.st.Warning && res.WarningSuggested
+	recovered := false
+	failures, lasted, lastCause := w.failures, time.Since(w.troubleSince), w.lastCause
+	if !w.troubleSince.IsZero() {
+		w.successes++
+		if w.successes >= recoverAfter {
+			recovered = true
+			w.troubleSince, w.failures, w.successes, w.lastCause = time.Time{}, 0, 0, ""
+		}
+	}
 	w.st.Processing, w.st.CameraLost = false, false
 	w.st.State, w.st.Reason, w.st.Message = StateMonitoring, "", ""
+	if !w.troubleSince.IsZero() {
+		w.st.Message = fmt.Sprintf("Gadget is answering again: %d of %d checks in a row succeeded after %s; last failure: %s", w.successes, recoverAfter, failedChecks(w.failures, time.Since(w.troubleSince)), w.lastCause)
+	}
 	w.st.Quality, w.st.Warning, w.st.FasterInspection = res.PrintQuality, res.WarningSuggested, res.FasterInspectionSuggested
 	if res.WarningSuggested {
 		w.st.State = StateAttention
@@ -383,7 +437,8 @@ func (w *worker) accept(counter uint64, doc printer.Doc, res Result) {
 	w.mu.Unlock()
 	w.e.log.Debug("detection result accepted", attrs...)
 	if recovered {
-		w.e.activity.Record(w.serial, "ai_recovered", activity.Info, "AI inspection recovered")
+		w.e.log.Info("AI inspection recovered", "serial", w.serial, "counter", counter, "failure_count", failures, "interruption_s", int(lasted.Seconds()), "last_cause", lastCause)
+		w.e.activity.Record(w.serial, "ai_recovered", activity.Info, fmt.Sprintf("AI inspection recovered: %d checks in a row succeeded after %s. Last failure: %s", recoverAfter, failedChecks(failures, lasted), lastCause))
 	}
 	if warning {
 		w.e.activity.Record(w.serial, "ai_warning", activity.Warning, "AI inspection found a possible print failure")
@@ -393,11 +448,11 @@ func (w *worker) accept(counter uint64, doc printer.Doc, res Result) {
 		if err := w.e.control.Pause(w.serial); err != nil {
 			w.mu.Lock()
 			if counter == w.counter && w.st.PauseState == PausePending {
-				w.st.PauseState, w.st.Reason, w.st.Message = PauseUnconfirmed, ReasonPauseFailed, "pause command failed"
+				w.st.PauseState, w.st.Reason, w.st.Message = PauseUnconfirmed, ReasonPauseFailed, "pause command could not be sent: "+err.Error()+" · not retried; check the printer and pause it manually"
 			}
 			w.mu.Unlock()
-			w.e.activity.Record(w.serial, "ai_pause_unconfirmed", activity.Warning, "AI pause command could not be sent")
-			w.e.log.Warn("AI pause command failed", "serial", w.serial)
+			w.e.activity.Record(w.serial, "ai_pause_unconfirmed", activity.Warning, "AI inspection asked to pause the print, but the pause command could not be sent: "+err.Error()+". The proxy will not retry; check the printer and pause it manually if needed")
+			w.e.log.Warn("AI pause command failed", "serial", w.serial, "counter", counter, "error", err.Error(), "next_action", "no retry this print; the operator must check and pause the printer")
 		} else {
 			w.e.log.Debug("detection pause sent", "serial", w.serial, "counter", counter)
 		}
@@ -417,13 +472,13 @@ func (w *worker) autoLight(counter uint64) {
 		send = mode != "on"
 	}
 	w.mu.Unlock()
-	lightErr := false
+	var lightErr error
 	if send {
-		if err := w.e.control.Light(w.serial, true); err == nil {
+		if lightErr = w.e.control.Light(w.serial, true); lightErr == nil {
 			w.e.activity.Record(w.serial, "ai_light_on", activity.Info, "Chamber light turned on for AI inspection")
 		} else {
-			lightErr = true
+			w.e.log.Warn("AI inspection could not turn on the chamber light", "serial", w.serial, "counter", counter, "error", lightErr.Error(), "next_action", "inspection continues with the light unchanged; no retry this print")
 		}
 	}
-	w.e.log.Debug("detection auto light", "serial", w.serial, "counter", counter, "light_sent", send, "light_error", lightErr)
+	w.e.log.Debug("detection auto light", "serial", w.serial, "counter", counter, "light_sent", send, "light_failed", lightErr != nil)
 }

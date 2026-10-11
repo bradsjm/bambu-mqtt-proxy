@@ -607,10 +607,22 @@ func TestProcessErrorMapping(t *testing.T) {
 			if !errors.As(err, &apiErr) || apiErr.Type != tc.wantType || apiErr.Status != http.StatusForbidden {
 				t.Fatalf("err = %v, want APIError type %q", err, tc.wantType)
 			}
-			msg := err.Error()
-			for _, secret := range []string{testKey, "TOPSECRET", "ip claimed", "script", "://"} {
-				if strings.Contains(msg, secret) {
-					t.Fatalf("error message leaks %q: %q", secret, msg)
+			// The key never appears; logs keep what the server sent, while the
+			// user-facing reason uses only allowlisted, translated wording.
+			for _, text := range []string{err.Error(), apiErr.Reason(), apiErr.Body} {
+				if strings.Contains(text, testKey) {
+					t.Fatalf("error text contains the API key: %q", text)
+				}
+			}
+			if !strings.Contains(err.Error(), "gadget-regional.octoeverywhere.com") || !strings.Contains(err.Error(), "HTTP 403") {
+				t.Fatalf("error lacks host or status: %q", err.Error())
+			}
+			if apiErr.Body == "" || len(apiErr.Body) > maxLoggedBody {
+				t.Fatalf("body excerpt = %q, want bounded server text", apiErr.Body)
+			}
+			for _, provider := range []string{"TOPSECRET", "script", "OE_"} {
+				if strings.Contains(apiErr.Reason(), provider) {
+					t.Fatalf("user-facing reason contains provider text %q: %q", provider, apiErr.Reason())
 				}
 			}
 			if tc.wantType == "OE_API_KEY_IP_RESTRICTED" && !apiErr.AccountTerminal() {
@@ -655,10 +667,9 @@ func TestResponseSizeBound(t *testing.T) {
 	}
 }
 
-// TestTransportErrorSanitized asserts connection failures never render the
-// request URL (the context path) even though the stdlib wraps them in a
-// url.Error carrying the full URL.
-func TestTransportErrorSanitized(t *testing.T) {
+// TestTransportErrorKeepsCause asserts a connection failure names the host
+// and keeps the real cause, and never contains the API key.
+func TestTransportErrorKeepsCause(t *testing.T) {
 	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	deadURL := dead.URL
 	dead.Close()
@@ -674,30 +685,27 @@ func TestTransportErrorSanitized(t *testing.T) {
 			},
 		},
 	}
-	_, err := client.Process(context.Background(),
-		"https://gadget-regional.octoeverywhere.com/api/gadget/v1/process/"+ctxSecret, []byte{0xFF, 0xD8, 0xFF, 0xD9})
-	if err == nil {
-		t.Fatal("Process = nil error, want transport failure")
-	}
-	msg := err.Error()
-	switch msg {
-	case "gadget request failed", "gadget request timed out", "gadget request canceled":
-	default:
-		t.Fatalf("transport error = %q, want a generic class message", msg)
-	}
-	for _, leak := range []string{ctxSecret, "/api/gadget", "://", "octoeverywhere", "refused", "reset", "EOF"} {
-		if strings.Contains(msg, leak) {
-			t.Fatalf("transport error leaks %q: %q", leak, msg)
+	check := func(t *testing.T, err error, host string) {
+		t.Helper()
+		var te *TransportError
+		if !errors.As(err, &te) {
+			t.Fatalf("err = %v, want a TransportError", err)
+		}
+		if want := "could not reach Gadget server " + host + ": connection refused"; te.Reason() != want {
+			t.Fatalf("reason = %q, want %q", te.Reason(), want)
+		}
+		if !strings.Contains(err.Error(), "connection refused") {
+			t.Fatalf("error drops the underlying cause: %q", err.Error())
+		}
+		if strings.Contains(err.Error(), testKey) {
+			t.Fatalf("error contains the API key: %q", err.Error())
 		}
 	}
-	// The same sanitization applies to context creation.
+	_, err := client.Process(context.Background(),
+		"https://gadget-regional.octoeverywhere.com/api/gadget/v1/process/"+ctxSecret, []byte{0xFF, 0xD8, 0xFF, 0xD9})
+	check(t, err, "gadget-regional.octoeverywhere.com")
 	_, err = client.CreateContext(context.Background())
-	if err == nil {
-		t.Fatal("CreateContext = nil error, want transport failure")
-	}
-	if m := err.Error(); m != "gadget request failed" && m != "gadget request timed out" && m != "gadget request canceled" {
-		t.Fatalf("create transport error = %q, want a generic class message", m)
-	}
+	check(t, err, "gadget-pv1-oeapi.octoeverywhere.com")
 }
 
 // TestProcessNullFieldsAreAbsent pins the null-as-absent rule: a JSON null
@@ -775,29 +783,17 @@ func debugLogClient(t *testing.T, handler http.HandlerFunc) (*Client, *bytes.Buf
 	return client, &logs
 }
 
-// assertNoProviderText fails when the debug log carries any URL context,
-// provider body text, provider-controlled header text, or raw log keys the
-// sanitized format removed.
-func assertNoProviderText(t *testing.T, logs *bytes.Buffer) {
+// assertNoSecrets fails when the debug log carries the API key.
+func assertNoSecrets(t *testing.T, logs *bytes.Buffer) {
 	t.Helper()
-	log := logs.String()
-	for _, leak := range []string{ctxSecret, "://", "/api/gadget"} {
-		if strings.Contains(log, leak) {
-			t.Fatalf("debug log leaks url context %q: %s", leak, log)
-		}
-	}
-	for _, key := range []string{"request_url=", "http_status_line=", "response_content_type=", "response_body=", "response_body_base64=", "read_error=", "close_error=", "transport_error="} {
-		if strings.Contains(log, key) {
-			t.Fatalf("debug log contains removed key %q: %s", key, log)
-		}
+	if strings.Contains(logs.String(), testKey) {
+		t.Fatalf("debug log contains the API key: %s", logs.String())
 	}
 }
 
-// TestGadgetDebugLogsSanitized asserts debug logs for successes, provider
-// error bodies, read failures, transport failures, and canceled requests
-// keep marker secrets, URLs, bodies, and provider-controlled text out while
-// numeric status and duration metadata remain.
-func TestGadgetDebugLogsSanitized(t *testing.T) {
+// TestGadgetDebugLogs asserts debug logs keep secrets out while carrying
+// the metadata and the real cause of each failure.
+func TestGadgetDebugLogs(t *testing.T) {
 	const bodySecret = "TOPSECRETRESPONSE"
 	jpeg := []byte{0xFF, 0xD8, 0xFF, 0xD9}
 	processURL := "https://gadget-regional.octoeverywhere.com/api/gadget/v1/process/" + ctxSecret
@@ -811,7 +807,7 @@ func TestGadgetDebugLogsSanitized(t *testing.T) {
 		if _, err := client.Process(context.Background(), processURL, jpeg); err != nil {
 			t.Fatalf("Process: %v", err)
 		}
-		assertNoProviderText(t, logs)
+		assertNoSecrets(t, logs)
 		if strings.Contains(logs.String(), bodySecret) {
 			t.Fatalf("debug log contains the response body: %s", logs.String())
 		}
@@ -826,7 +822,7 @@ func TestGadgetDebugLogsSanitized(t *testing.T) {
 		}
 	})
 
-	t.Run("read failure keeps a fixed class", func(t *testing.T) {
+	t.Run("read failure logs the underlying error", func(t *testing.T) {
 		client, logs := debugLogClient(t, func(w http.ResponseWriter, _ *http.Request) {
 			hj, ok := w.(http.Hijacker)
 			if !ok {
@@ -847,19 +843,13 @@ func TestGadgetDebugLogsSanitized(t *testing.T) {
 		if err == nil || !errors.As(err, &transportErr) {
 			t.Fatalf("err = %v, want a transport read failure", err)
 		}
-		assertNoProviderText(t, logs)
-		log := logs.String()
-		if !strings.Contains(log, `read_error_class="gadget response read failed"`) {
-			t.Errorf("debug log missing the fixed read class: %s", log)
-		}
-		for _, raw := range []string{"unexpected EOF", "EOF", "reset"} {
-			if strings.Contains(log, raw) {
-				t.Errorf("debug log exposes raw read error text %q: %s", raw, log)
-			}
+		assertNoSecrets(t, logs)
+		if !strings.Contains(logs.String(), `error="unexpected EOF"`) {
+			t.Errorf("debug log missing the read error: %s", logs.String())
 		}
 	})
 
-	t.Run("transport failure keeps a fixed class", func(t *testing.T) {
+	t.Run("transport failure logs the underlying error", func(t *testing.T) {
 		dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 		deadURL := dead.URL
 		dead.Close()
@@ -878,19 +868,14 @@ func TestGadgetDebugLogsSanitized(t *testing.T) {
 		if err == nil {
 			t.Fatal("Process = nil error, want transport failure")
 		}
-		assertNoProviderText(t, &logs)
+		assertNoSecrets(t, &logs)
 		log := logs.String()
-		if !strings.Contains(log, `transport_class="gadget request failed"`) {
-			t.Errorf("debug log missing the fixed transport class: %s", log)
-		}
-		for _, raw := range []string{"refused", "reset", "EOF", "connect:"} {
-			if strings.Contains(log, raw) {
-				t.Errorf("debug log exposes raw transport error text %q: %s", raw, log)
-			}
+		if !strings.Contains(log, "connection refused") {
+			t.Errorf("debug log missing the transport cause: %s", log)
 		}
 	})
 
-	t.Run("canceled request keeps a fixed class", func(t *testing.T) {
+	t.Run("canceled request logs the cause", func(t *testing.T) {
 		client, logs := debugLogClient(t, func(http.ResponseWriter, *http.Request) {
 			t.Error("server must not observe a canceled request")
 		})
@@ -901,9 +886,9 @@ func TestGadgetDebugLogsSanitized(t *testing.T) {
 		if err == nil || !errors.As(err, &transportErr) {
 			t.Fatalf("err = %v, want a canceled transport error", err)
 		}
-		assertNoProviderText(t, logs)
-		if !strings.Contains(logs.String(), `transport_class="gadget request canceled"`) {
-			t.Errorf("debug log missing the canceled class: %s", logs.String())
+		assertNoSecrets(t, logs)
+		if !strings.Contains(logs.String(), "context canceled") {
+			t.Errorf("debug log missing the canceled cause: %s", logs.String())
 		}
 	})
 }

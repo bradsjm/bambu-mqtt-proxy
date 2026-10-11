@@ -211,8 +211,9 @@ func (e *Engine) AccountSuspended() (bool, string) {
 	return e.suspended, e.suspendMsg
 }
 
-// suspend disables account requests until restart.
-func (e *Engine) suspend(message string) {
+// suspend disables account requests until restart. message is the
+// plain-language cause shown to users; err is logged in full.
+func (e *Engine) suspend(message string, err error) {
 	e.mu.Lock()
 	if e.suspended {
 		e.mu.Unlock()
@@ -220,9 +221,14 @@ func (e *Engine) suspend(message string) {
 	}
 	e.suspended, e.suspendMsg = true, message
 	e.mu.Unlock()
-	e.log.Error("detection suspended until restart", "reason", message)
+	attrs := []any{"cause", message, "error", err.Error(), "next_action", "fix the Gadget API key or account, then restart the proxy"}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr.Body != "" {
+		attrs = append(attrs, "response_body", apiErr.Body)
+	}
+	e.log.Error("AI inspection suspended until proxy restart", attrs...)
 	for serial, w := range e.workers {
-		e.activity.Record(serial, "ai_suspended", activity.Error, "AI inspection suspended until proxy restart, "+message)
+		e.activity.Record(serial, "ai_suspended", activity.Error, "AI inspection suspended until proxy restart: "+message+". Fix the Gadget API key or account on the /config page, then restart")
 		w.nudge()
 	}
 }
