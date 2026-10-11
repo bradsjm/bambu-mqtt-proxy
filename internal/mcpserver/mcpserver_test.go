@@ -1,1200 +1,208 @@
 package mcpserver
 
-// Unit tests for the mcpserver package. Wire-level acceptance tests live in
-// acceptance_test.go; this file drives handlers and the sampler directly so
-// revision, change, and lifecycle invariants are checked deterministically.
-//
-// The sampler primes its baseline when the server is constructed. Tests
-// therefore establish their own reference revision after construction and
-// assert on deltas, never on absolute counter values.
-
 import (
 	"context"
 	"encoding/json"
-	"fmt"
-	"strings"
-	"sync"
 	"testing"
 	"time"
 
-	"github.com/modelcontextprotocol/go-sdk/mcp"
-
+	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/camera"
 	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/control"
 	"bambu-mqtt-proxy/internal/module"
-	"bambu-mqtt-proxy/internal/telemetry"
+	"bambu-mqtt-proxy/internal/printer"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// fakeState is a StateSource over mutable maps.
-type fakeState struct {
-	mu       sync.Mutex
-	states   map[string]telemetry.State
-	sessions map[string]telemetry.SessionView
-	// onState, when set, runs after each State read returns, outside the
-	// mutex. Tests arm it to inject a change and a sampler step in the
-	// middle of a read path; it must not touch fakeState itself, because
-	// setSession from the hook would wait on the lock the caller just
-	// released. Reads and writes of the field stay on the test goroutine.
-	onState func(serial string)
-}
+// testControl supplies successful commands or an offline outcome.
+type testControl struct{ offline bool }
 
-func newFakeState(serials ...string) *fakeState {
-	f := &fakeState{
-		states:   make(map[string]telemetry.State),
-		sessions: make(map[string]telemetry.SessionView),
+// Do returns the selected command outcome.
+func (c *testControl) Do(string, string, control.Request) (control.Result, error) {
+	if c.offline {
+		return control.Result{}, control.ErrNotConnected
 	}
-	for _, s := range serials {
-		f.states[s] = telemetry.State{Serial: s}
+	return control.Result{}, nil
+}
+
+// Available supplies display hints without gating commands.
+func (*testControl) Available(string) []string {
+	return []string{"pause", "resume", "stop", "light", "speed"}
+}
+
+// testCamera supplies one current JPEG frame.
+type testCamera struct{ frame *camera.Frame }
+
+// Acquire accepts capture interest.
+func (*testCamera) Acquire(string) (chan struct{}, camera.Status) { return nil, camera.StatusOK }
+
+// Release ends capture interest.
+func (*testCamera) Release(string) {}
+
+// Latest returns the fixture frame.
+func (c *testCamera) Latest(string) *camera.Frame { return c.frame }
+
+// Wait returns no later frame.
+func (*testCamera) Wait(string, context.Context, uint64, time.Duration) *camera.Frame { return nil }
+
+// connectTools connects an SDK client through real in-memory transports.
+func connectTools(t *testing.T, s *Server) *mcp.ClientSession {
+	t.Helper()
+	st, ct := mcp.NewInMemoryTransports()
+	ss, err := s.srv.Connect(context.Background(), st, nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-	return f
-}
-
-func (f *fakeState) State(serial string) (telemetry.State, bool) {
-	f.mu.Lock()
-	st, ok := f.states[serial]
-	f.mu.Unlock()
-	if f.onState != nil {
-		f.onState(serial)
+	t.Cleanup(func() { ss.Close(); s.Close() })
+	cs, err := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "0"}, nil).Connect(context.Background(), ct, nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-	return st, ok
+	t.Cleanup(func() { cs.Close() })
+	return cs
 }
 
-func (f *fakeState) Session(serial string) (telemetry.SessionView, bool) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	sv, ok := f.sessions[serial]
-	return sv, ok
+// callTool calls a tool and requires SDK input and output validation to pass.
+func callTool(t *testing.T, c *mcp.ClientSession, name string, args map[string]any) *mcp.CallToolResult {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	res, err := c.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: args})
+	if err != nil {
+		t.Fatalf("%s: %v", name, err)
+	}
+	return res
 }
 
-func (f *fakeState) Snapshot() []telemetry.State {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	out := make([]telemetry.State, 0, len(f.states))
-	for _, st := range f.states {
-		out = append(out, st)
+// decodeTool decodes the SDK's validated structured output.
+func decodeTool[T any](t *testing.T, res *mcp.CallToolResult) T {
+	t.Helper()
+	raw, err := json.Marshal(res.StructuredContent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out T
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatal(err)
 	}
 	return out
 }
 
-func (f *fakeState) setState(st telemetry.State) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.states[st.Serial] = st
-}
-
-func (f *fakeState) setSession(serial string, sv telemetry.SessionView) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.sessions[serial] = sv
-}
-
-// fakeConn is a StatusSource over a mutable map.
-type fakeConn struct {
-	mu sync.Mutex
-	st map[string]bool
-}
-
-func (f *fakeConn) Status() map[string]bool {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	out := make(map[string]bool, len(f.st))
-	for k, v := range f.st {
-		out[k] = v
-	}
-	return out
-}
-
-func (f *fakeConn) set(serial string, connected bool) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.st[serial] = connected
-}
-
-// fakeCams is a SnapshotSource with balanced Acquire/Release accounting.
-type fakeCams struct {
-	mu       sync.Mutex
-	acquires int
-	releases int
-	frames   map[string]*camera.Frame
-	waits    map[string]*camera.Frame
-	statuses map[string]camera.Status
-}
-
-func newFakeCams() *fakeCams {
-	return &fakeCams{
-		frames:   make(map[string]*camera.Frame),
-		waits:    make(map[string]*camera.Frame),
-		statuses: make(map[string]camera.Status),
-	}
-}
-
-func (f *fakeCams) Acquire(serial string) (chan struct{}, camera.Status) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	st, ok := f.statuses[serial]
-	if !ok {
-		st = camera.StatusOK
-	}
-	if st != camera.StatusOK {
-		// The real Manager registers no consumer interest for a refused
-		// serial, so refused attempts stay out of the acquire/release
-		// balance that Release must close.
-		return nil, st
-	}
-	f.acquires++
-	return make(chan struct{}, 1), st
-}
-
-func (f *fakeCams) Release(serial string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.releases++
-}
-
-func (f *fakeCams) Latest(serial string) *camera.Frame {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.frames[serial]
-}
-
-func (f *fakeCams) Wait(serial string, _ context.Context, after uint64, _ time.Duration) *camera.Frame {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	fm, ok := f.waits[serial]
-	if !ok || fm == nil || fm.Seq <= after {
-		return nil
-	}
-	return fm
-}
-
-func (f *fakeCams) balanced(t *testing.T) {
-	t.Helper()
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.acquires != f.releases {
-		t.Fatalf("camera acquire/release imbalance: %d acquires, %d releases", f.acquires, f.releases)
-	}
-}
-
-// fakeCommander records control commands over the fixture's connectivity
-// fake.
-type fakeCommander struct {
-	*fakeConn
-	mu   sync.Mutex
-	sent []string
-}
-
-func (f *fakeCommander) record(name string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.sent = append(f.sent, name)
-	return nil
-}
-
-func (f *fakeCommander) sentList() []string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]string(nil), f.sent...)
-}
-
-func (f *fakeCommander) Online(serial string) bool { return f.Status()[serial] }
-func (f *fakeCommander) Pause(string) error        { return f.record("pause") }
-func (f *fakeCommander) Resume(string) error       { return f.record("resume") }
-func (f *fakeCommander) Stop(string) error         { return f.record("stop") }
-func (f *fakeCommander) Speed(string, int) error   { return f.record("speed") }
-func (f *fakeCommander) Light(string, bool) error  { return f.record("light") }
-
-// fixture bundles one server with mutable fakes and a fixed clock.
-type fixture struct {
-	srv   *Server
-	cmd   *fakeCommander
-	state *fakeState
-	conn  *fakeConn
-	cams  *fakeCams
-	now   time.Time
-}
-
-// newFixture builds a server over three printers: P001/P002 camera-capable
-// (model P1S), P003 not (model X1C, refused by the camera source). The
-// sampler is NOT started; tests call step explicitly.
-func newFixture(t *testing.T, mods ...module.Module) *fixture {
-	t.Helper()
-	now := time.Now()
-	st := newFakeState("P001", "P002", "P003")
-	cams := newFakeCams()
-	cams.statuses["P003"] = camera.StatusUnsupportedModel
-	f := &fixture{
-		state: st,
-		conn:  &fakeConn{st: map[string]bool{}},
-		cams:  cams,
-		now:   now,
-	}
-	f.cmd = &fakeCommander{fakeConn: f.conn}
-	f.srv = New(Deps{
-		Printers: []config.Printer{
-			{Serial: "P001", Name: "Alpha", Model: "P1S", Address: "secret-a", Password: "pw-a"},
-			{Serial: "P002", Name: "Beta", Model: "P1S", Address: "secret-b", Password: "pw-b"},
-			{Serial: "P003", Name: "Gamma", Model: "X1C", Address: "secret-c", Password: "pw-c"},
-		},
-		State:        st,
-		Connectivity: f.conn,
-		Cameras:      cams,
-		Modules:      mods,
-		Control:      control.New(f.cmd, st, nil),
+// TestToolsValidate checks all core tool outputs and the store/module boundary.
+func TestToolsValidate(t *testing.T) {
+	printers := []config.Printer{{Serial: "01S1", Name: "Printer", Model: "P1S"}}
+	store := printer.NewStore(printers)
+	store.Apply("01S1", []byte(`{"print":{"gcode_state":"RUNNING","mc_percent":42}}`))
+	store.SetOnline("01S1", true)
+	log := activity.New(printers)
+	log.Record("01S1", "print_started", activity.Info, "started")
+	s := New(Deps{Printers: printers, State: store, Activity: log, Control: &testControl{},
+		Cameras: &testCamera{frame: &camera.Frame{Seq: 1, Captured: time.Now(), JPEG: []byte{0xff, 0xd8, 0xff, 0xd9}}},
+		Modules: []module.Module{{Name: "example", State: func(string) any { return map[string]bool{"enabled": true} }}},
 	})
-	f.srv.now = func() time.Time { return now }
-	return f
-}
-
-// step runs one sampler pass at the fixture clock.
-func (f *fixture) step() {
-	f.srv.sampler.step()
-}
-
-// printingSession returns an active RUNNING session with a fresh report.
-func printingSession(serial string, now time.Time, gen uint64, progress float64) telemetry.SessionView {
-	p := progress
-	return telemetry.SessionView{
-		Serial:     serial,
-		Active:     true,
-		State:      "RUNNING",
-		SessionGen: gen,
-		Obs:        3,
-		ObsAt:      now,
-		Progress:   &p,
+	c := connectTools(t, s)
+	list, err := c.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-}
-
-// callWatch invokes the watch handler synchronously.
-func callWatch(t *testing.T, s *Server, in WatchPrinterIn) (WatchPrinterOut, error) {
-	t.Helper()
-	_, out, err := s.toolWatchPrinter(context.Background(), nil, in)
-	return out, err
-}
-
-func TestRevisionTokenRoundTrip(t *testing.T) {
-	r := revision{attention: 3, progress: 11}
-	const epoch = uint32(123456)
-	tok := encodeRevision(epoch, r)
-	gotEpoch, got, ok := decodeRevision(tok)
-	if !ok || gotEpoch != epoch || got != r {
-		t.Fatalf("decode(%q) = (%d, %v, %v)", tok, gotEpoch, got, ok)
+	if len(list.Tools) != 9 {
+		t.Fatalf("tool count = %d, want 9", len(list.Tools))
 	}
-	if strings.Count(tok, ".") != 3 {
-		t.Fatalf("token %q does not have the 4-part epoch form", tok)
-	}
-	if _, _, ok := decodeRevision(encodeRevision(epoch+1, r)); !ok {
-		t.Fatal("valid foreign-epoch token failed to decode")
-	}
-	for _, bad := range []string{
-		// Wrong shape, epoch zero, junk, a counter with a sign, and an
-		// epoch past 32 bits: base36 letters like "x" are legal digits, so
-		// only genuinely malformed tokens belong here.
-		"", "1.1.5", "1.0.1.5", "0.1.2.3", "abc.1.2.3", "1.1.-2.3",
-		"1.zzzzzzzzz.2.3",
-	} {
-		if _, _, ok := decodeRevision(bad); ok {
-			t.Errorf("decodeRevision(%q) accepted an invalid token", bad)
-		}
-	}
-}
-
-func TestSerialFromStateURI(t *testing.T) {
-	if serial, ok := serialFromStateURI("bambu://printers/P001/state"); !ok || serial != "P001" {
-		t.Fatalf("serialFromStateURI good = (%q, %v)", serial, ok)
-	}
-	for _, bad := range []string{
-		"bambu://printers//state", "bambu://printers/P001", "bambu://printers/P001/state/x",
-		"file:///etc/passwd", "bambu://printers/P001/state#frag", "bambu://printers/a/b/state",
-	} {
-		if _, ok := serialFromStateURI(bad); ok {
-			t.Errorf("serialFromStateURI(%q) accepted", bad)
-		}
-	}
-}
-
-func TestCursorRoundTrip(t *testing.T) {
-	tok := encodeCursor("P002")
-	got, ok := decodeCursor(tok)
-	if !ok || got != "P002" {
-		t.Fatalf("decodeCursor = (%q, %v)", got, ok)
-	}
-	if _, ok := decodeCursor("not-a-cursor"); ok {
-		t.Fatal("decodeCursor accepted garbage")
-	}
-}
-
-func TestAttentionEventTransitions(t *testing.T) {
-	base := sample{state: "RUNNING", sessionGen: 1, active: true, connected: true, fresh: true, milestone: 4}
-	set := func(mutate func(*sample)) sample {
-		c := base
-		mutate(&c)
-		return c
-	}
-	cases := []struct {
-		name   string
-		prev   func(*sample)
-		cur    sample
-		want   []string
-		silent bool
+	for _, tc := range []struct {
+		name string
+		args map[string]any
 	}{
-		{"no change", nil, base, nil, true},
-		{"pause", nil, set(func(c *sample) { c.state = "PAUSE" }), []string{kindPrintPaused}, false},
-		// PAUSE and PAUSED are two spellings of one paused state, as in
-		// telemetry: entering the pair emits once; moving between the
-		// aliases is ordinary value churn and stays silent.
-		{"paused from running", nil, set(func(c *sample) { c.state = "PAUSED" }), []string{kindPrintPaused}, false},
-		{"paused follows pause", func(p *sample) { p.state = "PAUSE" },
-			set(func(c *sample) { c.state = "PAUSED" }), nil, true},
-		{"fail", nil, set(func(c *sample) { c.state = "FAILED" }), []string{kindPrintFailed}, false},
-		{"finish", nil, set(func(c *sample) { c.state = "FINISH" }), []string{kindPrintFinished}, false},
-		{"job change during session", nil, set(func(c *sample) { c.sessionGen = 2 }), []string{kindJobChanged}, false},
-		{"new print from idle", func(p *sample) { p.active = false },
-			set(func(c *sample) { c.sessionGen = 2 }), []string{kindPrintStarted}, false},
-		{"connectivity lost", nil, set(func(c *sample) { c.connected = false; c.fresh = false }), []string{kindConnectLost, kindReportsStale}, false},
-		{"connectivity restored", func(p *sample) { p.connected = false; p.fresh = false },
-			set(func(c *sample) { c.connected = true; c.fresh = true }), []string{kindConnectRestored, kindReportsFresh}, false},
-		{"reports stale", nil, set(func(c *sample) { c.fresh = false }), []string{kindReportsStale}, false},
-		{"reports fresh again", func(p *sample) { p.fresh = false },
-			set(func(c *sample) { c.fresh = true }), []string{kindReportsFresh}, false},
-		{"module state", func(p *sample) { p.moduleKeys = []moduleSample{{name: "example"}} }, set(func(c *sample) { c.moduleKeys = []moduleSample{{name: "example", key: "changed"}} }), []string{kindModuleChanged}, false},
-		{"state churn without a notable state", nil, set(func(c *sample) { c.state = "SLICING" }), nil, true},
-		{"stopped", nil, set(func(c *sample) { c.state = "IDLE" }), []string{kindPrintStopped}, false},
-		{"idle from finish", func(p *sample) { p.state = "FINISH" }, set(func(c *sample) { c.state = "IDLE" }), nil, true},
-		{"hms gained", func(p *sample) { p.hmsKey = "HMS_A" }, set(func(c *sample) { c.hmsKey = "HMS_A,HMS_B" }), []string{kindHMSAlert}, false},
-		{"hms cleared", func(p *sample) { p.hmsKey = "HMS_A" }, base, nil, true},
-		{"print error", nil, set(func(c *sample) { c.printError = 0x0300400C }), []string{kindPrintError}, false},
-		{"print error cleared", func(p *sample) { p.printError = 1 }, base, nil, true},
-	}
-	for _, tc := range cases {
-		prev := base
-		if tc.prev != nil {
-			tc.prev(&prev)
-		}
-		events := attentionEvents(prev, tc.cur)
-		if tc.silent {
-			if len(events) != 0 {
-				t.Errorf("%s: got %v, want none", tc.name, events)
+		{"list_printers", map[string]any{}},
+		{"get_printer_state", map[string]any{"serial": "01S1"}},
+		{"get_camera_snapshot", map[string]any{"serial": "01S1"}},
+		{"watch_printer", map[string]any{"serial": "01S1", "timeout_seconds": 0}},
+		{"pause_print", map[string]any{"serial": "01S1"}},
+		{"resume_print", map[string]any{"serial": "01S1"}},
+		{"stop_print", map[string]any{"serial": "01S1"}},
+		{"set_chamber_light", map[string]any{"serial": "01S1", "on": true}},
+		{"set_speed_profile", map[string]any{"serial": "01S1", "profile": "sport"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res := callTool(t, c, tc.name, tc.args)
+			if res.IsError {
+				t.Fatalf("tool error: %+v", res)
 			}
-			continue
-		}
-		if len(events) != len(tc.want) {
-			t.Errorf("%s: events %v, want %d kinds", tc.name, events, len(tc.want))
-			continue
-		}
-		for i, want := range tc.want {
-			if events[i].Kind != want {
-				t.Errorf("%s: event %d = %q, want %q", tc.name, i, events[i].Kind, want)
+			if tc.name == "get_printer_state" {
+				out := decodeTool[GetPrinterStateOut](t, res)
+				if out.State.Progress == nil || *out.State.Progress != 42 || out.State.Modules["example"] == nil {
+					t.Fatalf("state = %+v", out.State)
+				}
 			}
-		}
-	}
-}
-
-func TestSamplerHMSAndStopEvents(t *testing.T) {
-	f := newFixture(t)
-	f.state.setSession("P001", printingSession("P001", f.now, 7, 42))
-	f.step()
-	f.state.setState(telemetry.State{Serial: "P001", HMS: []telemetry.HMSAlert{{Attr: 0x03000100, Code: 0x00010007}}})
-	f.step()
-	if ev := f.srv.sampler.lastEvents("P001"); len(ev) != 1 || ev[0].Kind != kindHMSAlert || !strings.Contains(ev[0].Detail, "HMS_0300_0100_0001_0007") {
-		t.Fatalf("events = %+v, want one hms_alert", ev)
-	}
-	sv := printingSession("P001", f.now, 7, 42)
-	sv.State, sv.Active = "IDLE", false
-	f.state.setSession("P001", sv)
-	f.step()
-	if ev := f.srv.sampler.lastEvents("P001"); len(ev) != 1 || ev[0].Kind != kindPrintStopped {
-		t.Fatalf("events = %+v, want print_stopped", ev)
-	}
-}
-
-func TestSamplerProgressMilestones(t *testing.T) {
-	f := newFixture(t)
-	f.state.setSession("P001", printingSession("P001", f.now, 7, 42))
-	f.step()
-	base := f.srv.sampler.revision("P001")
-
-	// 44% stays inside the 40-bucket: no counter moves.
-	f.state.setSession("P001", printingSession("P001", f.now, 7, 44))
-	f.step()
-	if rev := f.srv.sampler.revision("P001"); rev != base {
-		t.Fatalf("in-bucket progress moved counters: %+v from %+v", rev, base)
-	}
-
-	// 47% enters the 45-bucket: progress counter only.
-	f.state.setSession("P001", printingSession("P001", f.now, 7, 47))
-	f.step()
-	rev := f.srv.sampler.revision("P001")
-	if rev.progress != base.progress+1 || rev.attention != base.attention {
-		t.Fatalf("milestone bump = %+v, base %+v", rev, base)
-	}
-	events := f.srv.sampler.lastEvents("P001")
-	if len(events) != 1 || events[0].Kind != kindProgressStep || events[0].Percent == nil || *events[0].Percent != 45 {
-		t.Fatalf("milestone events = %+v", events)
-	}
-}
-
-func TestSamplerPerModeWakes(t *testing.T) {
-	f := newFixture(t)
-	f.conn.set("P001", true)
-	f.state.setSession("P001", printingSession("P001", f.now, 7, 42))
-	f.step()
-
-	// An attention change wakes attention watchers, and progress watchers
-	// too: progress mode is a superset of attention.
-	_, wakeAtt := f.srv.sampler.watch("P001", "attention")
-	_, wakeProg := f.srv.sampler.watch("P001", "progress")
-	f.conn.set("P001", false)
-	f.step()
-	select {
-	case <-wakeAtt:
-	default:
-		t.Fatal("attention watcher not woken by connectivity loss")
-	}
-	select {
-	case <-wakeProg:
-	default:
-		t.Fatal("progress watcher not woken by attention change")
-	}
-
-	// Progress milestone wakes progress watchers only.
-	_, wakeAtt = f.srv.sampler.watch("P001", "attention")
-	_, wakeProg = f.srv.sampler.watch("P001", "progress")
-	f.state.setSession("P001", printingSession("P001", f.now, 7, 51))
-	f.step()
-	select {
-	case <-wakeProg:
-	default:
-		t.Fatal("progress watcher not woken by milestone")
-	}
-	select {
-	case <-wakeAtt:
-		t.Fatal("attention watcher woken by progress-only change")
-	default:
-	}
-}
-
-func TestSamplerSilentTransitionRefreshesBaseline(t *testing.T) {
-	f := newFixture(t)
-	f.conn.set("P001", true)
-	paused := printingSession("P001", f.now, 7, 42)
-	paused.State = "PAUSE"
-	f.state.setSession("P001", paused)
-	f.step()
-	base := f.srv.sampler.revision("P001")
-
-	// Ordinary resume: silent. No counter moves and no watcher wakes, but
-	// the stored sample must advance to RUNNING.
-	_, wakeAtt := f.srv.sampler.watch("P001", "attention")
-	_, wakeProg := f.srv.sampler.watch("P001", "progress")
-	f.state.setSession("P001", printingSession("P001", f.now, 7, 42))
-	f.step()
-	if rev := f.srv.sampler.revision("P001"); rev != base {
-		t.Fatalf("silent resume moved counters: %+v from %+v", rev, base)
-	}
-	select {
-	case <-wakeAtt:
-		t.Fatal("silent resume woke attention watcher")
-	default:
-	}
-	select {
-	case <-wakeProg:
-		t.Fatal("silent resume woke progress watcher")
-	default:
-	}
-
-	// Pausing again is real attention against the refreshed baseline; a
-	// stale baseline would swallow it.
-	f.state.setSession("P001", paused)
-	f.step()
-	ev := f.srv.sampler.lastEvents("P001")
-	if len(ev) != 1 || ev[0].Kind != kindPrintPaused {
-		t.Fatalf("second pause events = %+v, want print_paused", ev)
-	}
-	if rev := f.srv.sampler.revision("P001"); rev.attention != base.attention+1 {
-		t.Fatalf("second pause attention = %+v, base %+v", rev, base)
-	}
-}
-
-func TestSamplerClearedAlertCanRefire(t *testing.T) {
-	f := newFixture(t)
-	f.conn.set("P001", true)
-	f.state.setSession("P001", printingSession("P001", f.now, 7, 42))
-	f.step()
-	alert := telemetry.HMSAlert{Attr: 0x03000100, Code: 0x00010007}
-	f.state.setState(telemetry.State{Serial: "P001", HMS: []telemetry.HMSAlert{alert}})
-	f.step()
-	if ev := f.srv.sampler.lastEvents("P001"); len(ev) != 1 || ev[0].Kind != kindHMSAlert {
-		t.Fatalf("first alert events = %+v, want hms_alert", ev)
-	}
-	base := f.srv.sampler.revision("P001")
-
-	// Clearing is silent, but the stored sample must lose the alert.
-	f.state.setState(telemetry.State{Serial: "P001"})
-	f.step()
-	if rev := f.srv.sampler.revision("P001"); rev != base {
-		t.Fatalf("silent clear moved counters: %+v from %+v", rev, base)
-	}
-
-	// The same alert returning notifies again against the cleared
-	// baseline.
-	f.state.setState(telemetry.State{Serial: "P001", HMS: []telemetry.HMSAlert{alert}})
-	f.step()
-	if ev := f.srv.sampler.lastEvents("P001"); len(ev) != 1 || ev[0].Kind != kindHMSAlert {
-		t.Fatalf("refired alert events = %+v, want hms_alert", ev)
-	}
-}
-
-func TestWatchTokenExpiryPerMode(t *testing.T) {
-	f := newFixture(t)
-	f.conn.set("P001", true)
-	f.state.setSession("P001", printingSession("P001", f.now, 7, 10))
-	f.step()
-	token := f.srv.token(f.srv.sampler.revision("P001"))
-
-	// A progress-only milestone leaves an attention token valid: the
-	// attention watcher stays asleep.
-	f.state.setSession("P001", printingSession("P001", f.now, 7, 51))
-	f.step()
-	res, err := callWatch(t, f.srv, WatchPrinterIn{
-		Serial: "P001", AfterRevision: token, TimeoutSeconds: 0, Mode: "attention",
-	})
-	if err != nil {
-		t.Fatalf("attention poll after milestone: %v", err)
-	}
-	if res.Changed || res.ResyncRequired {
-		t.Fatalf("milestone expired attention token: %+v", res)
-	}
-
-	// The same milestone expires a progress token.
-	res, err = callWatch(t, f.srv, WatchPrinterIn{
-		Serial: "P001", AfterRevision: token, TimeoutSeconds: 0, Mode: "progress",
-	})
-	if err != nil {
-		t.Fatalf("progress poll after milestone: %v", err)
-	}
-	if res.Changed || !res.ResyncRequired {
-		t.Fatalf("milestone did not expire progress token: %+v", res)
-	}
-
-	// An attention change expires the tokens of both modes.
-	progToken := f.srv.token(f.srv.sampler.revision("P001"))
-	f.conn.set("P001", false)
-	f.step()
-	for _, mode := range []string{"attention", "progress"} {
-		res, err = callWatch(t, f.srv, WatchPrinterIn{
-			Serial: "P001", AfterRevision: progToken, TimeoutSeconds: 0, Mode: mode,
+			if tc.name == "list_printers" {
+				out := decodeTool[ListPrintersOut](t, res)
+				if len(out.Printers) != 1 || out.Printers[0].Serial != "01S1" {
+					t.Fatalf("fleet = %+v", out)
+				}
+			}
 		})
-		if err != nil {
-			t.Fatalf("%s poll after attention bump: %v", mode, err)
-		}
-		if res.Changed || !res.ResyncRequired {
-			t.Fatalf("attention bump did not expire %s token: %+v", mode, res)
-		}
 	}
 }
 
-func TestSamplerRevisionsAreFleetStable(t *testing.T) {
-	f := newFixture(t)
-	f.state.setSession("P001", printingSession("P001", f.now, 7, 10))
-	f.step()
-	before := f.srv.sampler.revision("P001")
-
-	// Parking and leaving must not reset counters: earlier tokens stay
-	// comparable against the live revision.
-	if _, wake := f.srv.sampler.watch("P001", "attention"); wake == nil {
-		t.Fatal("watch returned nil channel")
+// TestToolErrors verifies expected errors remain typed and schema-valid.
+func TestToolErrors(t *testing.T) {
+	printers := []config.Printer{{Serial: "S1"}}
+	c := connectTools(t, New(Deps{Printers: printers, State: printer.NewStore(printers), Control: &testControl{offline: true}}))
+	for _, name := range []string{"get_printer_state", "get_camera_snapshot", "watch_printer", "pause_print", "resume_print", "stop_print", "set_chamber_light", "set_speed_profile"} {
+		args := map[string]any{"serial": "NOPE"}
+		if name == "set_chamber_light" {
+			args["on"] = true
+		}
+		if name == "set_speed_profile" {
+			args["profile"] = "standard"
+		}
+		res := callTool(t, c, name, args)
+		out := decodeTool[struct {
+			Error *module.ToolError `json:"error"`
+		}](t, res)
+		if !res.IsError || out.Error == nil || out.Error.Code != module.CodeUnknownSerial {
+			t.Fatalf("%s: %+v", name, out)
+		}
 	}
-	if got := f.srv.sampler.revision("P001"); got != before {
-		t.Fatalf("parking moved the revision: %+v != %+v", got, before)
-	}
-
-	// A change with nobody parked still moves the counter, so the earlier
-	// token is now detectably stale instead of silently matching.
-	f.state.setSession("P001", printingSession("P001", f.now, 8, 10))
-	f.step()
-	after := f.srv.sampler.revision("P001")
-	if after.attention != before.attention+1 {
-		t.Fatalf("unwatched change not counted: %+v from %+v", after, before)
+	res := callTool(t, c, "pause_print", map[string]any{"serial": "S1"})
+	out := decodeTool[ControlOut](t, res)
+	if !res.IsError || out.Error == nil || out.Error.Code != errUpstreamUnavailable {
+		t.Fatalf("offline output = %+v", out)
 	}
 }
 
-func TestWatchTokenEpochMismatchResyncs(t *testing.T) {
-	fA := newFixture(t)
-	fB := newFixture(t)
-	if fA.srv.epoch == fB.srv.epoch {
-		t.Fatal("distinct servers drew the same epoch")
-	}
-	token := fA.srv.token(fA.srv.sampler.revision("P001"))
-	res, err := callWatch(t, fB.srv, WatchPrinterIn{
-		Serial: "P001", AfterRevision: token, TimeoutSeconds: 0,
-	})
-	if err != nil {
-		t.Fatalf("watch handler error: %v", err)
-	}
-	if res.Error != nil {
-		t.Fatalf("unexpected tool error: %+v", res.Error)
-	}
-	if !res.ResyncRequired {
-		t.Fatalf("foreign-epoch token did not force resync: %+v", res)
-	}
-	// The issuing server accepts its own token.
-	res, err = callWatch(t, fA.srv, WatchPrinterIn{
-		Serial: "P001", AfterRevision: token, TimeoutSeconds: 0,
-	})
-	if err != nil {
-		t.Fatalf("watch handler error: %v", err)
-	}
-	if res.Error != nil || res.ResyncRequired {
-		t.Fatalf("own token rejected: %+v resync=%v", res.Error, res.ResyncRequired)
-	}
-}
-
-func TestWatchPrinterResyncOnStaleOrGarbageToken(t *testing.T) {
-	f := newFixture(t)
-	f.state.setSession("P001", printingSession("P001", f.now, 7, 10))
-	f.step()
-	token := f.srv.token(f.srv.sampler.revision("P001"))
-
-	f.state.setSession("P001", printingSession("P001", f.now, 8, 10))
-	f.step()
-	res, err := callWatch(t, f.srv, WatchPrinterIn{
-		Serial: "P001", AfterRevision: token, TimeoutSeconds: 0,
-	})
-	if err != nil {
-		t.Fatalf("watch handler error: %v", err)
-	}
-	if !res.ResyncRequired || res.Changed {
-		t.Fatalf("stale token: changed=%v resync=%v", res.Changed, res.ResyncRequired)
-	}
-	if res.Revision == token {
-		t.Fatal("resync answer reused the stale token")
-	}
-
-	res, err = callWatch(t, f.srv, WatchPrinterIn{
-		Serial: "P001", AfterRevision: "garbage", TimeoutSeconds: 0,
-	})
-	if err != nil {
-		t.Fatalf("watch handler error: %v", err)
-	}
-	if !res.ResyncRequired {
-		t.Fatalf("garbage token: resync=%v", res.ResyncRequired)
-	}
-}
-
-func TestWatchPrinterChangedFlow(t *testing.T) {
-	f := newFixture(t)
-	f.state.setSession("P001", printingSession("P001", f.now, 7, 10))
-	f.step()
-
-	// The mutation repeats so that a park landing after one bump is still
-	// overtaken by the next; a resync answer (change landed before the
-	// park) is retried with a fresh token.
-	for attempt := 0; attempt < 20; attempt++ {
-		token := f.srv.token(f.srv.sampler.revision("P001"))
-		stop := make(chan struct{})
-		done := make(chan WatchPrinterOut, 1)
-		go func() {
-			defer close(stop)
-			_, out, err := f.srv.toolWatchPrinter(context.Background(), nil, WatchPrinterIn{
-				Serial: "P001", AfterRevision: token, TimeoutSeconds: 2,
-			})
-			if err != nil {
-				t.Errorf("watch handler error: %v", err)
-				return
-			}
-			done <- out
-		}()
-		go func() {
-			ticker := time.NewTicker(5 * time.Millisecond)
-			defer ticker.Stop()
-			flip := false
-			for {
-				select {
-				case <-stop:
-					return
-				case <-ticker.C:
-					flip = !flip
-					f.conn.set("P001", flip)
-					f.step()
-				}
-			}
-		}()
-		var res WatchPrinterOut
-		select {
-		case res = <-done:
-		case <-time.After(5 * time.Second):
-			t.Fatal("watch did not return")
-		}
-		<-stop
-		time.Sleep(10 * time.Millisecond) // let the mutator observe stop
-		if res.Changed {
-			found := false
-			for _, e := range res.Events {
-				if e.Kind == kindConnectLost || e.Kind == kindConnectRestored {
-					found = true
-				}
-			}
-			if !found {
-				t.Fatalf("connectivity event missing: %+v", res.Events)
-			}
-			return
-		}
-		if !res.ResyncRequired {
-			t.Fatalf("no change and no resync: %+v", res)
-		}
-	}
-	t.Fatal("changed flow never observed in 20 attempts")
-}
-
-func TestWatchPrinterUnknownSerial(t *testing.T) {
-	f := newFixture(t)
-	res, err := callWatch(t, f.srv, WatchPrinterIn{Serial: "NOPE", TimeoutSeconds: 0})
-	if err != nil {
-		t.Fatalf("handler error: %v", err)
-	}
-	if res.Error == nil || res.Error.Code != module.CodeUnknownSerial {
-		t.Fatalf("unknown serial: %+v", res.Error)
-	}
-}
-
-func TestWatchTooManyWaits(t *testing.T) {
-	f := newFixture(t)
-	for i := 0; i < maxWaits; i++ {
-		f.srv.waits <- struct{}{}
-	}
-	res, err := callWatch(t, f.srv, WatchPrinterIn{Serial: "P001", TimeoutSeconds: 0})
-	if err != nil {
-		t.Fatalf("handler error: %v", err)
-	}
-	if res.Error == nil || res.Error.Code != errTooManyWaits {
-		t.Fatalf("waits ceiling: %+v", res.Error)
-	}
-}
-
-func TestSubscriptionAccountingAndLimits(t *testing.T) {
-	f := newFixture(t)
-	uri := stateURI("P001")
-	sub := func(u string) error {
-		return f.srv.handleSubscribe(context.Background(),
-			&mcp.SubscribeRequest{Params: &mcp.SubscribeParams{URI: u}})
-	}
-	unsub := func(u string) {
-		_ = f.srv.handleUnsubscribe(context.Background(),
-			&mcp.UnsubscribeRequest{Params: &mcp.UnsubscribeParams{URI: u}})
-	}
-	if err := sub("file:///etc"); err == nil {
-		t.Fatal("foreign URI accepted")
-	}
-	if err := sub(stateURI("NOPE")); err == nil {
-		t.Fatal("unknown serial accepted")
-	}
-	for i := 0; i < maxSubscriptions; i++ {
-		if err := sub(uri); err != nil {
-			t.Fatalf("subscription %d rejected: %v", i+1, err)
-		}
-	}
-	if err := sub(uri); err == nil {
-		t.Fatal("subscription beyond the ceiling accepted")
-	}
-	if !f.srv.subscribed("P001") {
-		t.Fatal("subscribed() false with active subscribers")
-	}
-	for i := 0; i < maxSubscriptions; i++ {
-		unsub(uri)
-	}
-	if f.srv.subscribed("P001") {
-		t.Fatal("subscribed() true after all unsubscribes")
-	}
-	// The ceiling is released: a new subscription fits again.
-	if err := sub(uri); err != nil {
-		t.Fatalf("ceiling not released: %v", err)
-	}
-}
-
-func TestSubscriptionOnlyInterestDrivesNotifications(t *testing.T) {
-	f := newFixture(t)
-	f.conn.set("P001", true)
-	f.state.setSession("P001", printingSession("P001", f.now, 7, 10))
-	f.step()
-	if err := f.srv.handleSubscribe(context.Background(),
-		&mcp.SubscribeRequest{Params: &mcp.SubscribeParams{URI: stateURI("P001")}}); err != nil {
-		t.Fatalf("subscribe: %v", err)
-	}
-	if err := f.srv.handleSubscribe(context.Background(),
-		&mcp.SubscribeRequest{Params: &mcp.SubscribeParams{URI: stateURI("P002")}}); err != nil {
-		t.Fatalf("subscribe: %v", err)
-	}
-
-	// One shared sampler pass notifies exactly the serials with a change
-	// and a subscriber, with no parked watcher anywhere.
-	f.conn.set("P001", false)
-	f.step()
-	queued := map[string]int{}
-	for drained := false; !drained; {
-		select {
-		case serial := <-f.srv.sampler.notfCh:
-			queued[serial]++
-		default:
-			drained = true
-		}
-	}
-	if len(queued) != 1 || queued["P001"] != 1 {
-		t.Fatalf("notification queue = %v, want exactly P001 once", queued)
-	}
-}
-
-func TestCameraSnapshotLifecycle(t *testing.T) {
-	f := newFixture(t)
-	frame := &camera.Frame{JPEG: []byte{0xFF, 0xD8, 0xFF}, Seq: 9, Captured: f.now}
-	f.cams.frames["P001"] = frame
-	f.cams.waits["P001"] = frame
-
-	res, out, err := f.srv.toolGetCameraSnapshot(context.Background(), nil,
-		GetCameraSnapshotIn{Serial: "P001", MaxAgeSeconds: 30})
-	if err != nil {
-		t.Fatalf("snapshot: %v", err)
-	}
-	if res.IsError || out.Error != nil {
-		t.Fatalf("fresh frame rejected: isError=%v err=%+v", res.IsError, out.Error)
-	}
-	if out.FrameSeq != 9 || out.AgeSeconds < 0 {
-		t.Fatalf("metadata: %+v", out)
-	}
-	sawImage := false
-	for _, c := range res.Content {
-		if img, ok := c.(*mcp.ImageContent); ok && img.MIMEType == "image/jpeg" {
-			sawImage = true
-		}
-	}
-	if !sawImage {
-		t.Fatalf("no jpeg content: %+v", res.Content)
-	}
-	f.cams.balanced(t)
-
-	// No frame material at all: explicit stale outcome, still balanced.
-	res, out, _ = f.srv.toolGetCameraSnapshot(context.Background(), nil,
-		GetCameraSnapshotIn{Serial: "P002", MaxAgeSeconds: 5})
-	if !res.IsError || out.Error == nil || out.Error.Code != errStaleImage {
-		t.Fatalf("stale outcome: isError=%v err=%+v", res.IsError, out.Error)
-	}
-	f.cams.balanced(t)
-
-	// Unknown serial and disabled feature stay explicit.
-	_, out, _ = f.srv.toolGetCameraSnapshot(context.Background(), nil,
-		GetCameraSnapshotIn{Serial: "NOPE"})
-	if out.Error == nil || out.Error.Code != module.CodeUnknownSerial {
-		t.Fatalf("unknown serial: %+v", out.Error)
-	}
-	f.cams.balanced(t)
-
-	fOff := newFixture(t)
-	fOff.srv.cams = nil
-	_, out, _ = fOff.srv.toolGetCameraSnapshot(context.Background(), nil,
-		GetCameraSnapshotIn{Serial: "P001"})
-	if out.Error == nil || out.Error.Code != errCameraDisabled {
-		t.Fatalf("disabled camera: %+v", out.Error)
-	}
-
-	// An unsupported model is refused before any capture work.
-	_, out, _ = f.srv.toolGetCameraSnapshot(context.Background(), nil,
-		GetCameraSnapshotIn{Serial: "P003", MaxAgeSeconds: 5})
-	if out.Error == nil || out.Error.Code != errCameraUnsupported {
-		t.Fatalf("unsupported model: %+v", out.Error)
-	}
-	f.cams.balanced(t)
-}
-
-func TestCameraSnapshotCancelledRequest(t *testing.T) {
-	f := newFixture(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	_, out, err := f.srv.toolGetCameraSnapshot(ctx, nil,
-		GetCameraSnapshotIn{Serial: "P001", MaxAgeSeconds: 30})
-	if err != nil {
-		t.Fatalf("handler returned transport error: %v", err)
-	}
-	if out.Error == nil || out.Error.Code != errCameraUnavailable {
-		t.Fatalf("cancelled snapshot: %+v", out.Error)
-	}
-	f.cams.balanced(t)
-}
-
-func TestCameraSnapshotSlotLimit(t *testing.T) {
-	f := newFixture(t)
-	slot := f.srv.snapshotSlot("P001")
-	for i := 0; i < snapshotWaitersPerPrinter; i++ {
-		slot <- struct{}{}
-	}
-	_, out, err := f.srv.toolGetCameraSnapshot(context.Background(), nil,
-		GetCameraSnapshotIn{Serial: "P001", MaxAgeSeconds: 30})
-	if err != nil {
-		t.Fatalf("handler error: %v", err)
-	}
-	if out.Error == nil || out.Error.Code != errCameraUnavailable {
-		t.Fatalf("slot ceiling: %+v", out.Error)
-	}
-	for i := 0; i < snapshotWaitersPerPrinter; i++ {
-		<-slot
-	}
-	f.cams.balanced(t)
-}
-
-func TestPrinterStateFreshnessAcrossReconnect(t *testing.T) {
-	f := newFixture(t)
-	f.conn.set("P001", true)
-	f.state.setSession("P001", printingSession("P001", f.now, 7, 10))
-	f.step() // baseline: connected, so live
-
-	st, ok := f.srv.buildPrinterState("P001", f.now)
-	if !ok || !st.Freshness.Fresh {
-		t.Fatalf("connected: fresh=%v ok=%v", st.Freshness.Fresh, ok)
-	}
-	if st.Freshness.LastReportAgeSeconds == nil {
-		t.Fatalf("diagnostics lost the report age: %+v", st.Freshness)
-	}
-
-	// A disconnect flips liveness off immediately; a reconnect flips it
-	// back on without waiting for another report.
-	f.conn.set("P001", false)
-	st, _ = f.srv.buildPrinterState("P001", f.now)
-	if st.Freshness.Fresh {
-		t.Fatalf("disconnected counted fresh: %+v", st.Freshness)
-	}
-	f.step()
-	events := f.srv.sampler.lastEvents("P001")
-	if len(events) != 2 || events[0].Kind != kindConnectLost || events[1].Kind != kindReportsStale {
-		t.Fatalf("disconnect events = %+v", events)
-	}
-	f.conn.set("P001", true)
-	st, _ = f.srv.buildPrinterState("P001", f.now)
-	if !st.Freshness.Fresh {
-		t.Fatalf("reconnected without a new report counted stale: %+v", st.Freshness)
-	}
-	f.step()
-	events = f.srv.sampler.lastEvents("P001")
-	if len(events) != 2 || events[0].Kind != kindConnectRestored || events[1].Kind != kindReportsFresh {
-		t.Fatalf("reconnect events = %+v", events)
-	}
-}
-
-func TestCameraStateProjection(t *testing.T) {
-	f := newFixture(t)
-	if got := f.srv.cameraState("P003"); got != cameraUnsupported {
-		t.Fatalf("X1C camera state = %q", got)
-	}
-	if got := f.srv.cameraState("P001"); got != cameraOffline {
-		t.Fatalf("frameless camera state = %q", got)
-	}
-	f.cams.frames["P001"] = &camera.Frame{Captured: f.now, Seq: 1}
-	if got := f.srv.cameraState("P001"); got != cameraReady {
-		t.Fatalf("framed camera state = %q", got)
-	}
-	f.srv.cams = nil
-	if got := f.srv.cameraState("P001"); got != cameraDisabled {
-		t.Fatalf("feature-off camera state = %q", got)
-	}
-}
-
-func TestListPrintersPaging(t *testing.T) {
-	f := newFixture(t)
-	_, page1, err := f.srv.toolListPrinters(context.Background(), nil, ListPrintersIn{Limit: 2})
-	if err != nil {
-		t.Fatalf("page 1: %v", err)
-	}
-	if len(page1.Printers) != 2 || page1.NextCursor == "" {
-		t.Fatalf("page 1 = %+v", page1)
-	}
-	if page1.Printers[0].Serial != "P001" || page1.Printers[1].Serial != "P002" {
-		t.Fatalf("page 1 order = %+v", page1.Printers)
-	}
-	_, page2, err := f.srv.toolListPrinters(context.Background(), nil,
-		ListPrintersIn{Limit: 2, Cursor: page1.NextCursor})
-	if err != nil {
-		t.Fatalf("page 2: %v", err)
-	}
-	if len(page2.Printers) != 1 || page2.Printers[0].Serial != "P003" || page2.NextCursor != "" {
-		t.Fatalf("page 2 = %+v", page2)
-	}
-	_, bad, _ := f.srv.toolListPrinters(context.Background(), nil, ListPrintersIn{Cursor: "junk"})
-	if bad.Error == nil || bad.Error.Code != errInvalidCursor {
-		t.Fatalf("bad cursor: %+v", bad.Error)
-	}
-}
-
-func TestPrinterStateUnknownSerial(t *testing.T) {
-	f := newFixture(t)
-	res, out, err := f.srv.toolGetPrinterState(context.Background(), nil, GetPrinterStateIn{Serial: "NOPE"})
-	if err != nil {
-		t.Fatalf("handler error: %v", err)
-	}
-	if !res.IsError || out.Error == nil || out.Error.Code != module.CodeUnknownSerial {
-		t.Fatalf("unknown serial: isError=%v err=%+v", res.IsError, out.Error)
-	}
-}
-
-func TestResourceReaderUnknownSerial(t *testing.T) {
-	f := newFixture(t)
-	_, err := f.srv.readStateResource(context.Background(),
-		&mcp.ReadResourceRequest{Params: &mcp.ReadResourceParams{URI: stateURI("NOPE")}})
-	if err == nil {
-		t.Fatal("unknown serial accepted by the resource reader")
-	}
-}
-
-func TestCredentialStripping(t *testing.T) {
-	f := newFixture(t)
-	for _, info := range f.srv.printers {
-		if rendered := fmt.Sprintf("%+v", info); strings.Contains(rendered, "secret") ||
-			strings.Contains(rendered, "pw-") {
-			t.Fatalf("credentials leaked into inventory: %s", rendered)
-		}
-	}
-	raw := fmt.Sprintf("%+v", f.srv)
-	if strings.Contains(raw, "secret-a") || strings.Contains(raw, "pw-a") {
-		t.Fatal("server state carries credentials")
-	}
-}
-
-// A change landing between the revision capture and the state read must
-// leave the returned token stale. Replaying it then forces resync_required:
-// the change is re-served by a fresh snapshot instead of being silently
-// consumed by a token that already names the newer counter. The injection
-// is deterministic: the fake state source runs the change and a sampler
-// step inside the State read, and every read path under test must capture
-// its revision before that read.
-func TestRevisionTokenCannotConsumeMidReadChange(t *testing.T) {
-	arm := func(t *testing.T, f *fixture) {
-		t.Helper()
-		f.state.onState = func(serial string) {
-			if serial != "P001" {
-				return
-			}
-			f.state.onState = nil
-			f.conn.set("P001", false)
-			f.step()
-		}
-		t.Cleanup(func() { f.state.onState = nil })
-	}
-	// resync replays the token through watch_printer in immediate mode and
-	// demands the forced resync: a stale token must never match.
-	resync := func(t *testing.T, f *fixture, token string) {
-		t.Helper()
-		res, err := callWatch(t, f.srv, WatchPrinterIn{Serial: "P001", AfterRevision: token, TimeoutSeconds: 0})
-		if err != nil {
-			t.Fatalf("watch replay: %v", err)
-		}
-		if res.Error != nil {
-			t.Fatalf("watch replay error: %+v", res.Error)
-		}
-		if !res.ResyncRequired || res.Changed {
-			t.Fatalf("replayed token consumed the mid-read change: changed=%v resync=%v",
-				res.Changed, res.ResyncRequired)
-		}
-	}
-	seed := func(t *testing.T) *fixture {
-		t.Helper()
-		f := newFixture(t)
-		f.conn.set("P001", true)
-		f.state.setSession("P001", printingSession("P001", f.now, 7, 10))
-		f.step()
-		return f
-	}
-
-	t.Run("get_printer_state", func(t *testing.T) {
-		f := seed(t)
-		arm(t, f)
-		_, out, err := f.srv.toolGetPrinterState(context.Background(), nil, GetPrinterStateIn{Serial: "P001"})
-		if err != nil {
-			t.Fatalf("get state: %v", err)
-		}
-		if out.Error != nil {
-			t.Fatalf("get state error: %+v", out.Error)
-		}
-		resync(t, f, out.Revision)
-	})
-
-	t.Run("list_printers", func(t *testing.T) {
-		f := seed(t)
-		arm(t, f)
-		_, page, err := f.srv.toolListPrinters(context.Background(), nil, ListPrintersIn{Limit: maxListLimit})
-		if err != nil {
-			t.Fatalf("list: %v", err)
-		}
-		if page.Error != nil {
-			t.Fatalf("list error: %+v", page.Error)
-		}
-		for _, row := range page.Printers {
-			if row.Serial != "P001" {
-				continue
-			}
-			resync(t, f, row.Revision)
-			return
-		}
-		t.Fatal("P001 row missing from the page")
-	})
-
-	t.Run("watch_printer initial answer", func(t *testing.T) {
-		f := seed(t)
-		arm(t, f)
-		out, err := callWatch(t, f.srv, WatchPrinterIn{Serial: "P001", TimeoutSeconds: 0})
-		if err != nil {
-			t.Fatalf("watch: %v", err)
-		}
-		if out.Error != nil {
-			t.Fatalf("watch error: %+v", out.Error)
-		}
-		resync(t, f, out.Revision)
-	})
-
-	t.Run("state resource read", func(t *testing.T) {
-		f := seed(t)
-		arm(t, f)
-		rr, err := f.srv.readStateResource(context.Background(),
-			&mcp.ReadResourceRequest{Params: &mcp.ReadResourceParams{URI: stateURI("P001")}})
-		if err != nil {
-			t.Fatalf("read resource: %v", err)
-		}
-		var payload struct {
-			Revision string `json:"revision"`
-		}
-		if err := json.Unmarshal([]byte(rr.Contents[0].Text), &payload); err != nil {
-			t.Fatalf("decode resource payload: %v", err)
-		}
-		resync(t, f, payload.Revision)
-	})
-}
-
-func TestModuleSampleJSONKeysAndIsolation(t *testing.T) {
-	value := any(map[string]any{"health": "ready", "count": 1})
-	f := newFixture(t,
-		module.Module{Name: "example", State: func(string) any { return value }},
-		module.Module{Name: "no-state"},
-		module.Module{Name: "empty", State: func(string) any { return nil }},
-	)
-	first := f.srv.sampleNow("P001", f.now)
-	if len(first.moduleKeys) != 2 || first.moduleKeys[0].key != `{"count":1,"health":"ready"}` || first.moduleKeys[1].key != "" {
-		t.Fatalf("JSON keys = %+v", first.moduleKeys)
-	}
-	value = map[string]any{"health": "ready", "count": 2}
-	second := f.srv.sampleNow("P002", f.now)
-	if first.moduleKeys[0].key != `{"count":1,"health":"ready"}` {
-		t.Fatalf("sample keys share backing storage: %+v", first.moduleKeys)
-	}
-	second.connected = true
-	second.fresh = true
-	events := attentionEvents(first, second)
-	if len(events) != 3 || events[0].Kind != kindConnectRestored || events[1].Kind != kindReportsFresh || events[2].Kind != kindModuleChanged || events[2].Module != "example" {
-		t.Fatalf("core/module event order = %+v", events)
-	}
-	value = nil
-	third := f.srv.sampleNow("P001", f.now)
-	events = attentionEvents(first, third)
-	if len(events) != 1 || events[0].Kind != kindModuleChanged || events[0].Module != "example" {
-		t.Fatalf("nil transition = %+v", events)
-	}
-	if got := moduleKey(stableModuleState{Health: "ready", Age: 99}); got != `"ready"` {
-		t.Fatalf("StableKey is not JSON encoded: %q", got)
+// TestWatchAcrossRestart verifies new activity remains readable with an earlier process ID.
+func TestWatchAcrossRestart(t *testing.T) {
+	printers := []config.Printer{{Serial: "S1"}}
+	first := activity.New(printers)
+	first.Record("S1", "print_started", activity.Info, "started")
+	after := first.Recent("S1")[0].ID
+	time.Sleep(time.Millisecond) // The replacement log must be seeded at a later clock time.
+	restarted := activity.New(printers)
+	c := connectTools(t, New(Deps{Printers: printers, State: printer.NewStore(printers), Activity: restarted}))
+	// The SDK call runs concurrently with the new activity producer.
+	type response struct {
+		result *mcp.CallToolResult
+		err    error
+	}
+	result := make(chan response, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() {
+		res, err := c.CallTool(ctx, &mcp.CallToolParams{Name: "watch_printer", Arguments: map[string]any{"serial": "S1", "after_id": after, "timeout_seconds": 1}})
+		result <- response{res, err}
+	}()
+	restarted.Record("S1", "print_paused", activity.Info, "paused")
+	received := <-result
+	if received.err != nil {
+		t.Fatal(received.err)
+	}
+	out := decodeTool[WatchPrinterOut](t, received.result)
+	if len(out.Events) != 1 || out.Events[0].Kind != "print_paused" || out.Events[0].ID <= after || out.AfterID != out.Events[0].ID {
+		t.Fatalf("watch output = %+v", out)
+	}
+	again := decodeTool[WatchPrinterOut](t, callTool(t, c, "watch_printer", map[string]any{"serial": "S1", "after_id": out.AfterID, "timeout_seconds": 0}))
+	if len(again.Events) != 0 || again.AfterID != out.AfterID {
+		t.Fatalf("repeated output = %+v", again)
 	}
 }

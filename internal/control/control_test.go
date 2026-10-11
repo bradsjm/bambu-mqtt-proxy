@@ -2,15 +2,12 @@ package control
 
 import (
 	"errors"
-	"io"
-	"log/slog"
 	"slices"
 	"testing"
 
 	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/printer"
-	"bambu-mqtt-proxy/internal/telemetry"
 )
 
 // fakeCmd is a Commander over a mutable connected flag.
@@ -37,9 +34,9 @@ func (f *fakeCmd) Light(_ string, on bool) error {
 func newService(t *testing.T, state string, connected bool) (*Service, *fakeCmd, *activity.Log) {
 	t.Helper()
 	printers := []config.Printer{{Serial: "S1", Name: "Shop"}}
-	cache := telemetry.NewCache(printers, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	cache := printer.NewStore(printers)
 	if state != "" {
-		cache.Observe("S1", []byte(`{"print":{"gcode_state":"`+state+`"}}`))
+		cache.Apply("S1", []byte(`{"print":{"gcode_state":"`+state+`"}}`))
 	}
 	cmd := &fakeCmd{connected: connected}
 	log := activity.New(printers)

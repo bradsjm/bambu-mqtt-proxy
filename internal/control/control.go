@@ -9,7 +9,6 @@ import (
 
 	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/printer"
-	"bambu-mqtt-proxy/internal/telemetry"
 )
 
 // Control actions.
@@ -54,9 +53,9 @@ type Commander interface {
 }
 
 // StateSource reads merged printer state. It is satisfied by
-// *telemetry.Cache.
+// *printer.Store.
 type StateSource interface {
-	State(serial string) (telemetry.State, bool)
+	Get(serial string) (printer.Doc, bool, bool)
 }
 
 // speedProfiles maps profile names to Bambu spd_lvl values.
@@ -80,12 +79,13 @@ func New(cmd Commander, state StateSource, log *activity.Log) *Service {
 // printer has none. Stop is always listed while connected: it is the
 // emergency stop.
 func (s *Service) Available(serial string) []string {
-	st, ok := s.state.State(serial)
+	st, _, ok := s.state.Get(serial)
 	if !ok || !s.cmd.Online(serial) {
 		return []string{}
 	}
 	out := []string{ActionLight}
-	switch st.PrintingState {
+	state, _ := st.GcodeState()
+	switch state {
 	case "RUNNING":
 		out = append(out, ActionPause, ActionSpeed)
 	case "PAUSE", "PAUSED":
@@ -98,7 +98,7 @@ func (s *Service) Available(serial string) []string {
 // the activity log ("camera wall" or "MCP").
 func (s *Service) Do(serial, origin string, req Request) (Result, error) {
 	res := Result{Serial: serial, Action: req.Action}
-	if _, ok := s.state.State(serial); !ok {
+	if _, _, ok := s.state.Get(serial); !ok {
 		return res, ErrUnknownPrinter
 	}
 	profile := 0

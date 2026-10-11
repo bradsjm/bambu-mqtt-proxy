@@ -15,6 +15,7 @@ import (
 	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/jobpreview"
 	"bambu-mqtt-proxy/internal/module"
+	"bambu-mqtt-proxy/internal/printer"
 	"bambu-mqtt-proxy/internal/telemetry"
 )
 
@@ -42,7 +43,7 @@ func newPreviewRenderer(t *testing.T, withModule bool) (*StatusRenderer, *teleme
 	t.Helper()
 	printers := previewPrinters()
 	state := telemetry.NewCache(printers, discardLogger())
-	renderer := NewStatusRenderer(NewManager(printers, discardLogger()), state, testConnectivity{})
+	renderer := NewStatusRenderer(NewManager(printers, discardLogger()), printer.NewStore(printers))
 	var service *jobpreview.Service
 	if withModule {
 		service = newPreviewService(t, state)

@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"bambu-mqtt-proxy/internal/module"
-	"bambu-mqtt-proxy/internal/telemetry"
+	"bambu-mqtt-proxy/internal/printer"
 )
 
 // agingModuleValue represents a module value with continuously aging fields.
@@ -23,7 +23,7 @@ func (v agingModuleValue) StableKey() any { return v.State }
 // rejected at wiring time.
 func TestSetModulesRejectsStateKeyCollision(t *testing.T) {
 	printers := previewPrinters()
-	renderer := NewStatusRenderer(NewManager(printers, discardLogger()), telemetry.NewCache(printers, discardLogger()), testConnectivity{})
+	renderer := NewStatusRenderer(NewManager(printers, discardLogger()), printer.NewStore(printers))
 	if err := renderer.SetModules([]module.Module{{Name: "camera_reason", State: func(string) any { return "x" }}}); err == nil {
 		t.Fatal("SetModules must reject a module name colliding with a core tile member")
 	}
@@ -66,7 +66,7 @@ func TestModuleStateStableKey(t *testing.T) {
 // decodes back with identical fields.
 func TestModuleDisplayRowSectionNoteRoundTrip(t *testing.T) {
 	printers := previewPrinters()
-	renderer := NewStatusRenderer(NewManager(printers, discardLogger()), telemetry.NewCache(printers, discardLogger()), testConnectivity{})
+	renderer := NewStatusRenderer(NewManager(printers, discardLogger()), printer.NewStore(printers))
 	want := module.Display{Panel: &module.Panel{Title: "Print checks", Level: 3, Rows: []module.Row{
 		{Label: "Plate", Value: "Not checked", Note: "Proxy started after this print began", Section: "Before printing"},
 		{Label: "Rule", Value: "Stops the print if the plate looks occupied (over 50%)", Section: "Before printing"},

@@ -21,8 +21,7 @@ import (
 	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/control"
-	"bambu-mqtt-proxy/internal/printerview"
-	"bambu-mqtt-proxy/internal/telemetry"
+	"bambu-mqtt-proxy/internal/printer"
 )
 
 // testConnectivity is an empty link-status source for route tests.
@@ -294,12 +293,12 @@ func TestCamWallRoutesServeEmbeddedWall(t *testing.T) {
 		},
 	}
 	manager := NewManager(printers, discardLogger())
-	state := telemetry.NewCache(printers, discardLogger())
+	state := printer.NewStore(printers)
 	activities := activity.New(printers)
 	activities.Record("01S00C351100139", "print_started", activity.Info, "Print started")
-	state.Observe("01S00C351100139", []byte(`{"print":{"chamber_temper":5.0,"print_error":50348044,"hms":[{"attr":50331904,"code":65543},{"attr":117473296,"code":65543}]}}`))
-	state.Observe("00M09A123456789", []byte(`{"print":{"chamber_temper":24.0}}`))
-	renderer := NewStatusRenderer(manager, state, testConnectivity{})
+	state.Apply("01S00C351100139", []byte(`{"print":{"chamber_temper":5.0,"print_error":50348044,"hms":[{"attr":50331904,"code":65543},{"attr":117473296,"code":65543}]}}`))
+	state.Apply("00M09A123456789", []byte(`{"print":{"chamber_temper":24.0}}`))
+	renderer := NewStatusRenderer(manager, state)
 	renderer.SetActivity(activities)
 	mux := http.NewServeMux()
 	renderer.RegisterStatus(mux)
@@ -365,7 +364,7 @@ func TestCamWallRoutesServeEmbeddedWall(t *testing.T) {
 	}
 	// The unknown print-module alert keeps its code and gains only the
 	// reference link; the AMS alert carries the dataset description.
-	if p1s.HMS[0] != (printerview.Alert{ID: "HMS_0300_0100_0001_0007", Severity: "fatal",
+	if p1s.HMS[0] != (printer.Alert{ID: "HMS_0300_0100_0001_0007", Severity: "fatal",
 		URL: "https://printara3d.com/tools/bambu-error-codes/?code=0300-0100"}) {
 		t.Fatalf("unknown HMS alert must keep code and reference link: %+v", p1s.HMS[0])
 	}
@@ -387,8 +386,8 @@ func TestCamWallRoutesServeEmbeddedWall(t *testing.T) {
 }
 
 func TestChangeKeyIgnoresActivityAge(t *testing.T) {
-	first := []Tile{{View: printerview.View{Serial: "S1"}, Activity: []activity.Entry{{ID: 1, AgeSeconds: 2}}}}
-	second := []Tile{{View: printerview.View{Serial: "S1"}, Activity: []activity.Entry{{ID: 1, AgeSeconds: 8}}}}
+	first := []Tile{{View: printer.View{Serial: "S1"}, Activity: []activity.Entry{{ID: 1, AgeSeconds: 2}}}}
+	second := []Tile{{View: printer.View{Serial: "S1"}, Activity: []activity.Entry{{ID: 1, AgeSeconds: 8}}}}
 	a, err := changeKey(first)
 	if err != nil {
 		t.Fatal(err)
@@ -409,8 +408,8 @@ func TestChangeKeyIgnoresActivityAge(t *testing.T) {
 // connect, then another after a report changes display state.
 func TestCameraEventsStreamsChanges(t *testing.T) {
 	printers := []config.Printer{{Serial: "01S00C351100139", Address: "127.0.0.1:8883", Password: "secret-test-only"}}
-	state := telemetry.NewCache(printers, discardLogger())
-	renderer := NewStatusRenderer(NewManager(printers, discardLogger()), state, testConnectivity{})
+	state := printer.NewStore(printers)
+	renderer := NewStatusRenderer(NewManager(printers, discardLogger()), state)
 	mux := http.NewServeMux()
 	renderer.RegisterStatus(mux)
 	srv := httptest.NewServer(mux)
@@ -450,7 +449,7 @@ func TestCameraEventsStreamsChanges(t *testing.T) {
 	if len(first.Printers) != 1 || first.Printers[0].PrintState != nil {
 		t.Fatalf("initial event = %+v", first)
 	}
-	state.Observe("01S00C351100139", []byte(`{"print":{"gcode_state":"RUNNING"}}`))
+	state.Apply("01S00C351100139", []byte(`{"print":{"gcode_state":"RUNNING"}}`))
 	if second := nextEvent(); second.Printers[0].PrintState == nil || *second.Printers[0].PrintState != "RUNNING" {
 		t.Fatalf("change event = %+v", second)
 	}
@@ -463,9 +462,9 @@ func TestCameraEventsStreamsChanges(t *testing.T) {
 // its own object.
 func TestCameraStatusProjectsFilamentAndStage(t *testing.T) {
 	printers := []config.Printer{{Serial: "01S00C351100139", Address: "127.0.0.1:8883", Password: "secret-test-only"}}
-	state := telemetry.NewCache(printers, discardLogger())
-	renderer := NewStatusRenderer(NewManager(printers, discardLogger()), state, testConnectivity{})
-	state.Observe("01S00C351100139", []byte(`{"print":{"stg_cur":4,"ams":{"tray_now":"0","ams":[
+	state := printer.NewStore(printers)
+	renderer := NewStatusRenderer(NewManager(printers, discardLogger()), state)
+	state.Apply("01S00C351100139", []byte(`{"print":{"stg_cur":4,"ams":{"tray_now":"0","ams":[
 		{"id":"1","tray":[{"id":"3","tray_type":"PETG","tray_color":"FF8000FF","remain":25,"state":3}]},
 		{"id":"0","humidity_raw":12,"tray":[{"id":"0","tray_type":"PLA","tray_color":"FFFF00FF","remain":64,"state":3}]}]},
 		"vt_tray":{"id":"254","tray_type":"ABS","tray_color":"000000FF"}}}`))
@@ -552,11 +551,11 @@ func TestCameraStatusProjectsFilamentAndStage(t *testing.T) {
 
 	// The idle sentinel and unknown stage ids leave stage null, so
 	// consumers keep the printer state.
-	state.Observe("01S00C351100139", []byte(`{"print":{"stg_cur":255}}`))
+	state.Apply("01S00C351100139", []byte(`{"print":{"stg_cur":255}}`))
 	if tile = getTile(); tile.Stage != nil {
 		t.Fatalf("idle sentinel stage = %q, want null", *tile.Stage)
 	}
-	state.Observe("01S00C351100139", []byte(`{"print":{"stg_cur":99}}`))
+	state.Apply("01S00C351100139", []byte(`{"print":{"stg_cur":99}}`))
 	if tile = getTile(); tile.Stage != nil {
 		t.Fatalf("unknown stage = %q, want null", *tile.Stage)
 	}
@@ -647,9 +646,9 @@ func (f *fakeCommander) Light(string, bool) error {
 
 func TestControlEndpoint(t *testing.T) {
 	printers := []config.Printer{{Serial: "S1", Name: "Shop"}}
-	state := telemetry.NewCache(printers, discardLogger())
+	state := printer.NewStore(printers)
 	cmd := &fakeCommander{}
-	renderer := NewStatusRenderer(NewManager(printers, discardLogger()), state, testConnectivity{})
+	renderer := NewStatusRenderer(NewManager(printers, discardLogger()), state)
 	renderer.SetControl(control.New(cmd, state, nil))
 	mux := http.NewServeMux()
 	renderer.RegisterStatus(mux)

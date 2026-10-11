@@ -13,6 +13,7 @@ import (
 
 func TestRecentKeepsNewestCapacityEntries(t *testing.T) {
 	log := New([]config.Printer{{Serial: "S1"}})
+	baseID := log.nextID
 	for range Capacity + 5 {
 		log.Record("S1", "event", Info, "message")
 	}
@@ -20,8 +21,8 @@ func TestRecentKeepsNewestCapacityEntries(t *testing.T) {
 	if len(events) != Capacity {
 		t.Fatalf("got %d events, want %d", len(events), Capacity)
 	}
-	if events[0].ID != Capacity+5 || events[len(events)-1].ID != 6 {
-		t.Fatalf("retained IDs = %d..%d, want %d..6", events[0].ID, events[len(events)-1].ID, Capacity+5)
+	if events[0].ID != baseID+Capacity+5 || events[len(events)-1].ID != baseID+6 {
+		t.Fatalf("retained IDs = %d..%d, want %d..%d", events[0].ID, events[len(events)-1].ID, baseID+Capacity+5, baseID+6)
 	}
 	if events[0].AgeSeconds < 0 || events[0].Time.Location() != time.UTC {
 		t.Fatalf("timestamp/age = %v/%v", events[0].Time, events[0].AgeSeconds)

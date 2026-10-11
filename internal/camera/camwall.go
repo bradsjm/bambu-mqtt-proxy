@@ -20,8 +20,7 @@ import (
 	"bambu-mqtt-proxy/internal/control"
 	"bambu-mqtt-proxy/internal/jsonobj"
 	"bambu-mqtt-proxy/internal/module"
-	"bambu-mqtt-proxy/internal/printerview"
-	"bambu-mqtt-proxy/internal/telemetry"
+	"bambu-mqtt-proxy/internal/printer"
 )
 
 //go:embed camwall.html
@@ -53,7 +52,7 @@ const controlMaxBody = 4 << 10
 // plus camera-wall-only state. It carries only display state: never
 // serial-derived credentials or raw configuration.
 type Tile struct {
-	printerview.View
+	printer.View
 	CameraOK     bool             `json:"camera_supported"`
 	CameraReason string           `json:"camera_reason,omitempty"`
 	Activity     []activity.Entry `json:"activity,omitempty"` // recent events, newest first
@@ -121,19 +120,23 @@ func coreJSONKeys(t reflect.Type) map[string]bool {
 	return keys
 }
 
-// NewStatusRenderer pairs the camera manager with the telemetry cache.
+// StatusRenderer combines printer documents with camera and module display state.
 type StatusRenderer struct {
-	cameras  *Manager
-	state    *telemetry.Cache
-	status   connectivitySource
-	printer  controlService  // optional printer controls
-	activity *activity.Log   // optional recent-event source
-	modules  []module.Module // optional module display hooks
+	// cameras supplies camera capabilities and the latest frames.
+	cameras *Manager
+	// state supplies the printer-authoritative display views.
+	state *printer.Store
+	// printer supplies optional user controls.
+	printer controlService
+	// activity supplies recent printer events.
+	activity *activity.Log
+	// modules supplies optional module display hooks.
+	modules []module.Module
 }
 
 // NewStatusRenderer builds the /camera/status payload renderer.
-func NewStatusRenderer(cameras *Manager, state *telemetry.Cache, status connectivitySource) *StatusRenderer {
-	return &StatusRenderer{cameras: cameras, state: state, status: status}
+func NewStatusRenderer(cameras *Manager, state *printer.Store) *StatusRenderer {
+	return &StatusRenderer{cameras: cameras, state: state}
 }
 
 // controlService is the allow-listed printer control backend behind POST
@@ -166,23 +169,13 @@ func (r *StatusRenderer) SetModules(mods []module.Module) error {
 	return nil
 }
 
-// connectivitySource reports printer link state per serial, so the camera
-// wall can distinguish an idle printer from a disconnected one.
-type connectivitySource interface {
-	Status() map[string]bool
-}
-
-// Tiles merges telemetry and camera state for every configured printer,
-// ordered by serial.
+// Tiles combines printer views with camera and module state, ordered by serial.
 func (r *StatusRenderer) Tiles() []Tile {
-	connected := r.status.Status()
-	r.state.SetConnected(connected)
-	states := r.state.Snapshot()
+	states := r.state.Views()
 	tiles := make([]Tile, 0, len(states))
 	for _, st := range states {
-		sv, _ := r.state.Session(st.Serial)
 		t := Tile{
-			View:         printerview.Build(st, sv, st.Connected, time.Now()),
+			View:         st,
 			CameraOK:     r.cameras.WebSupported(st.Serial),
 			CameraReason: r.cameras.WebUnavailableReason(st.Serial),
 			Controls:     []string{},

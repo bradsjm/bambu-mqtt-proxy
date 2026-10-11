@@ -29,16 +29,21 @@ const mcpOrigin = "MCP"
 type (
 	// SerialIn names one printer.
 	SerialIn struct {
+		// Serial identifies the printer.
 		Serial string `json:"serial"`
 	}
 	// ChamberLightIn switches the chamber light.
 	ChamberLightIn struct {
+		// Serial identifies the printer.
 		Serial string `json:"serial"`
-		On     bool   `json:"on"`
+		// On selects the chamber light state.
+		On bool `json:"on"`
 	}
 	// SpeedProfileIn selects a print speed profile.
 	SpeedProfileIn struct {
-		Serial  string `json:"serial"`
+		// Serial identifies the printer.
+		Serial string `json:"serial"`
+		// Profile selects the speed profile.
 		Profile string `json:"profile"`
 	}
 )
@@ -47,71 +52,51 @@ type (
 // fresh projection after a successful send; the printer's next report
 // confirms the effect.
 type ControlOut struct {
-	Serial string            `json:"serial"`
-	Action string            `json:"action"`
-	Sent   bool              `json:"sent"`
-	State  *PrinterState     `json:"state,omitempty"`
-	Error  *module.ToolError `json:"error,omitempty"`
+	// Serial identifies the printer.
+	Serial string `json:"serial"`
+	// Action identifies the command.
+	Action string `json:"action"`
+	// Sent reports whether the command was sent.
+	Sent bool `json:"sent"`
+	// State contains the current printer state after sending.
+	State *PrinterState `json:"state,omitempty"`
+	// Error describes an expected operational failure.
+	Error *module.ToolError `json:"error,omitempty"`
 }
 
-// boolRequiredProp declares a boolean property.
-func boolRequiredProp(description string) *jsonschema.Schema {
-	return &jsonschema.Schema{Type: "boolean", Description: description}
-}
-
-// registerControlTools adds the printer control tools. They exist only
-// when a control service is wired.
+// registerControlTools registers commands with their required inputs.
 func (s *Server) registerControlTools() {
-	mcp.AddTool(s.srv, &mcp.Tool{
-		Name:        "pause_print",
-		Description: "Pause the running print. Available while the printer reports RUNNING.",
-		Annotations: module.Command("Pause print", false, true),
-		InputSchema: module.SerialInput(nil),
-	}, func(_ context.Context, _ *mcp.CallToolRequest, in SerialIn) (*mcp.CallToolResult, ControlOut, error) {
-		return s.doControl(in.Serial, control.Request{Action: control.ActionPause})
-	})
-	mcp.AddTool(s.srv, &mcp.Tool{
-		Name:        "resume_print",
-		Description: "Resume a paused print. The printer reheats on its own; no temperature command is sent.",
-		Annotations: module.Command("Resume print", false, true),
-		InputSchema: module.SerialInput(nil),
-	}, func(_ context.Context, _ *mcp.CallToolRequest, in SerialIn) (*mcp.CallToolResult, ControlOut, error) {
-		return s.doControl(in.Serial, control.Request{Action: control.ActionResume})
-	})
-	mcp.AddTool(s.srv, &mcp.Tool{
-		Name:        "stop_print",
-		Description: "Emergency stop: immediately cancel the current print. No confirmation.",
-		Annotations: module.Command("Stop print", true, false),
-		InputSchema: module.SerialInput(nil),
-	}, func(_ context.Context, _ *mcp.CallToolRequest, in SerialIn) (*mcp.CallToolResult, ControlOut, error) {
-		return s.doControl(in.Serial, control.Request{Action: control.ActionStop})
-	})
-
-	lightProps := map[string]*jsonschema.Schema{
-		"on": boolRequiredProp("true switches the chamber light on, false switches it off."),
+	for _, command := range []struct {
+		// name identifies the MCP tool.
+		name string
+		// action identifies the printer command.
+		action string
+		// description explains the command.
+		description string
+	}{
+		{"pause_print", control.ActionPause, "Pause the print."},
+		{"resume_print", control.ActionResume, "Resume the print."},
+		{"stop_print", control.ActionStop, "Emergency stop the print immediately."},
+	} {
+		mcp.AddTool(s.srv, &mcp.Tool{Name: command.name, Description: command.description,
+			Annotations: module.Command(command.description, command.action == control.ActionStop, command.action != control.ActionStop),
+			InputSchema: module.SerialInput(nil),
+		}, func(_ context.Context, _ *mcp.CallToolRequest, in SerialIn) (*mcp.CallToolResult, ControlOut, error) {
+			return s.doControl(in.Serial, control.Request{Action: command.action})
+		})
 	}
-	mcp.AddTool(s.srv, &mcp.Tool{
-		Name:        "set_chamber_light",
-		Description: "Switch the chamber light on or off.",
+	mcp.AddTool(s.srv, &mcp.Tool{Name: "set_chamber_light", Description: "Switch the chamber light on or off.",
 		Annotations: module.Command("Set chamber light", false, true),
-		InputSchema: module.SerialInput(lightProps, "on"),
+		InputSchema: module.SerialInput(map[string]*jsonschema.Schema{"on": {Type: "boolean"}}, "on"),
 	}, func(_ context.Context, _ *mcp.CallToolRequest, in ChamberLightIn) (*mcp.CallToolResult, ControlOut, error) {
-		on := in.On
-		return s.doControl(in.Serial, control.Request{Action: control.ActionLight, On: &on})
+		return s.doControl(in.Serial, control.Request{Action: control.ActionLight, On: new(in.On)})
 	})
-
-	profile := enumProp("Print speed profile.", []any{"silent", "standard", "sport", "ludicrous"}, "standard")
-	profile.Default = nil
-	speedProps := map[string]*jsonschema.Schema{"profile": profile}
-	mcp.AddTool(s.srv, &mcp.Tool{
-		Name:        "set_speed_profile",
-		Description: "Change the print speed profile of a running or paused print.",
+	mcp.AddTool(s.srv, &mcp.Tool{Name: "set_speed_profile", Description: "Select the print speed profile.",
 		Annotations: module.Command("Set speed profile", false, true),
-		InputSchema: module.SerialInput(speedProps, "profile"),
+		InputSchema: module.SerialInput(map[string]*jsonschema.Schema{"profile": {Type: "string", Enum: []any{"silent", "standard", "sport", "ludicrous"}}}, "profile"),
 	}, func(_ context.Context, _ *mcp.CallToolRequest, in SpeedProfileIn) (*mcp.CallToolResult, ControlOut, error) {
 		return s.doControl(in.Serial, control.Request{Action: control.ActionSpeed, Profile: in.Profile})
 	})
-
 }
 
 // doControl sends one control request and renders the shared result.
@@ -138,7 +123,7 @@ func (s *Server) doControl(serial string, req control.Request) (*mcp.CallToolRes
 // controlSent completes a successful control result with fresh state.
 func (s *Server) controlSent(out ControlOut) (*mcp.CallToolResult, ControlOut, error) {
 	out.Sent = true
-	if st, ok := s.buildPrinterState(out.Serial, s.now()); ok {
+	if st, ok := s.buildPrinterState(out.Serial); ok {
 		out.State = &st
 	}
 	return shortText(nil, fmt.Sprintf("%s: %s sent", out.Serial, out.Action)), out, nil

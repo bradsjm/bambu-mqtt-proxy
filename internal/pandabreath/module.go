@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"bambu-mqtt-proxy/internal/module"
-	"bambu-mqtt-proxy/internal/printerview"
+	"bambu-mqtt-proxy/internal/printer"
 )
 
 // Display tuning. The device reports whole degrees about once a second, so
@@ -103,7 +103,7 @@ func (s *Store) snapshot(serial string) (v ModuleState, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r, have := s.readings[serial]
-	fresh := have && time.Since(r.at) <= printerview.FreshnessWindow
+	fresh := have && time.Since(r.at) <= printer.FreshnessWindow
 	switch {
 	case fresh:
 		v.Link = LinkConnected

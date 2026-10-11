@@ -6,6 +6,7 @@
 package activity
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"sync"
@@ -29,13 +30,20 @@ const (
 // read, so clients can show relative times without trusting their own
 // clock.
 type Entry struct {
-	ID         uint64    `json:"id"`            // monotonically increases across all printers
-	Time       time.Time `json:"time"`          // UTC event timestamp
-	Kind       string    `json:"kind"`          // stable event code
-	Severity   string    `json:"severity"`      // info, warning, or error
-	Message    string    `json:"message"`       // display-ready event text
-	AgeSeconds float64   `json:"age_seconds"`   // event age when read
-	URL        string    `json:"url,omitempty"` // optional reference link for the event
+	// ID increases across the log and starts from the process clock.
+	ID uint64 `json:"id"`
+	// Time contains the UTC event timestamp.
+	Time time.Time `json:"time"`
+	// Kind identifies the event.
+	Kind string `json:"kind"`
+	// Severity classifies the event as info, warning, or error.
+	Severity string `json:"severity"`
+	// Message contains display-ready event text.
+	Message string `json:"message"`
+	// AgeSeconds contains the event age at read time.
+	AgeSeconds float64 `json:"age_seconds"`
+	// URL optionally links to an event reference.
+	URL string `json:"url,omitempty"`
 
 	// Observation is the source-event evidence for generators that must pin
 	// an entry to the original job that caused it: JobGen identifies the
@@ -50,34 +58,44 @@ type Entry struct {
 // proved the event, so consumers can reject entries recorded against
 // telemetry that has since switched to another print.
 type Observation struct {
-	JobGen uint64 // Job generation at event time.
+	// JobGen identifies the job generation at event time.
+	JobGen uint64
 }
 
 // Log holds one ring buffer per configured printer. A nil *Log is valid and
 // records nothing, so producers need no feature checks.
 type Log struct {
-	mu       sync.Mutex          // guards IDs, printer rings, and the observer
-	nextID   uint64              // ID assigned to the next event
-	rings    map[string]*ring    // configured printer event buffers
-	now      func() time.Time    // event clock; replaceable by package tests
-	observer func(string, Entry) // optional callback for newly recorded entries
+	// mu guards IDs, rings, and the observer.
+	mu sync.Mutex
+	// nextID contains the last assigned event ID.
+	nextID uint64
+	// rings contains the configured printer buffers.
+	rings map[string]*ring
+	// now supplies the event clock.
+	now func() time.Time
+	// observer receives newly recorded entries without the lock.
+	observer func(string, Entry)
+	// changed wakes all waiters when an entry is recorded.
+	changed chan struct{}
 }
 
 // ring is a fixed-capacity circular buffer; next is the slot the following
 // write overwrites.
 type ring struct {
-	buf  []Entry // events in circular-buffer order
-	next int     // next overwrite slot after the buffer fills
+	// buf holds entries in circular-buffer order.
+	buf []Entry
+	// next selects the next overwrite slot after the buffer fills.
+	next int
 }
 
-// New builds a log for the configured printers; events for other serials are
-// ignored.
+// New builds a configured printer log with IDs seeded from the current microsecond.
+// Events for other serials are ignored.
 func New(printers []config.Printer) *Log {
 	rings := make(map[string]*ring, len(printers))
 	for _, p := range printers {
 		rings[p.Serial] = &ring{buf: make([]Entry, 0, Capacity)}
 	}
-	return &Log{rings: rings, now: time.Now}
+	return &Log{rings: rings, now: time.Now, nextID: uint64(time.Now().UnixMicro()), changed: make(chan struct{})}
 }
 
 // Record appends one event for serial. Producers that must pin the event
@@ -126,6 +144,8 @@ func (l *Log) record(serial, kind, severity, message, url string, observation Ob
 		r.buf[r.next] = e
 		r.next = (r.next + 1) % len(r.buf)
 	}
+	close(l.changed)
+	l.changed = make(chan struct{})
 	observer := l.observer
 	l.mu.Unlock()
 	// Report processing calls this method, so the observer runs unlocked
@@ -167,6 +187,41 @@ func (l *Log) Recent(serial string) []Entry {
 		out = append(out, e)
 	}
 	return out
+}
+
+// Wait returns newer entries immediately or waits until an entry arrives or ctx ends.
+// Unknown serials and a nil log return nil.
+func (l *Log) Wait(ctx context.Context, serial string, afterID uint64) []Entry {
+	if l == nil {
+		return nil
+	}
+	for {
+		l.mu.Lock()
+		r, ok := l.rings[serial]
+		if !ok {
+			l.mu.Unlock()
+			return nil
+		}
+		var entries []Entry
+		now := l.now()
+		for i := range len(r.buf) {
+			e := r.buf[(r.next-1-i+len(r.buf))%len(r.buf)]
+			if e.ID > afterID {
+				e.AgeSeconds = now.Sub(e.Time).Seconds()
+				entries = append(entries, e)
+			}
+		}
+		wake := l.changed
+		l.mu.Unlock()
+		if len(entries) != 0 {
+			return entries
+		}
+		select {
+		case <-wake:
+		case <-ctx.Done():
+			return nil
+		}
+	}
 }
 
 // Register mounts GET /activity (every printer) and GET /activity/{serial}

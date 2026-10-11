@@ -113,12 +113,15 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	table := routing.NewTable(serials, aliases)
 	inject := broker.NewInjector(logger)
 	activities := activity.New(cfg.Printers)
+	printerStore := printer.NewStore(cfg.Printers)
 	state := telemetry.NewCache(cfg.Printers, logger)
 	state.SetActivity(activities)
 	links := printer.New(cfg.Printers, logger, func(serial, topic string, payload []byte) {
 		inject.PublishDownstream(topic, payload)
+		printerStore.Apply(serial, payload)
 		state.Observe(serial, payload)
 	}, func(serial string, online bool) {
+		printerStore.SetOnline(serial, online)
 		state.SetConnected(map[string]bool{serial: online})
 		if online {
 			activities.Record(serial, "connected", activity.Info, "Printer connected")
@@ -129,7 +132,7 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	// Panda Breath accessory chamber readings: one read-only WebSocket per
 	// printer configured with a panda_breath address, for models whose
 	// reports carry no usable chamber sensor. The wall and MCP project the
-	// reading through the telemetry cache, so the observer runs
+	// reading through the document store, so the observer runs
 	// independently of the camera feature; with the shared HTTP listener
 	// off nothing can serve a projection and no device connection opens.
 	var breath *pandabreath.Store
@@ -146,7 +149,7 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	}
 	// Printer controls: the only allow-listed path from the camera wall and
 	// MCP to printer commands. No heater or temperature command exists.
-	controls := control.New(links, state, activities)
+	controls := control.New(links, printerStore, activities)
 	// Printer job preview: one best-effort FTPS retrieval of the current
 	// print's sliced 3MF render and metadata per settled job, shared by the
 	// camera wall and MCP. It serves through the shared HTTP listener and
@@ -174,7 +177,7 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		} else {
 			cameras = camera.NewManager(cfg.Printers, logger)
 		}
-		renderer = camera.NewStatusRenderer(cameras, state, links)
+		renderer = camera.NewStatusRenderer(cameras, printerStore)
 		renderer.SetActivity(activities)
 		renderer.SetControl(controls)
 	}
@@ -282,6 +285,7 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	var observers []func(string, activity.Entry)
 	for _, mod := range mods {
 		if mod.ChamberReading != nil && !chamberSet {
+			printerStore.SetChamberReader(mod.ChamberReading)
 			state.SetChamberReader(mod.ChamberReading)
 			chamberSet = true
 		}
@@ -302,7 +306,7 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		}
 	}
 	// MCP endpoint on the shared HTTP listener, on by default and disabled
-	// with mcp.enabled: false. Its sampler reads
+	// with mcp.enabled: false. It reads
 	// cached state for every configured printer; printer commands go only
 	// through the allow-listed control service. Disabled features must leave the
 	// Deps interface fields truly nil: a typed nil would pass the nil check
@@ -310,13 +314,12 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 	var mcpsrv *mcpserver.Server
 	if cfg.MCPEnabled() {
 		deps := mcpserver.Deps{
-			Printers:     cfg.Printers,
-			State:        state,
-			Connectivity: links,
-			Activity:     activities,
-			Control:      controls,
-			Modules:      mods,
-			Log:          logger,
+			Printers: cfg.Printers,
+			State:    printerStore,
+			Activity: activities,
+			Control:  controls,
+			Modules:  mods,
+			Log:      logger,
 		}
 		if cameras != nil {
 			deps.Cameras = cameras
@@ -411,7 +414,6 @@ func serveOnce(sigCtx context.Context, path, logLevel string, store *configui.St
 		store.Register(httpSrv.Mux())
 		if mcpsrv != nil {
 			mcpsrv.Register(httpSrv.Mux())
-			mcpsrv.Start()
 			logger.Info("mcp endpoint serving", "path", "/mcp")
 		}
 		if cfg.CameraEnabled() {

@@ -1,4 +1,4 @@
-package printerview
+package printer
 
 // This file projects the report's stg_cur stage id to display-name form
 // for the shared printer view.
