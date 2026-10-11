@@ -86,7 +86,9 @@ func fetchAddress(ctx context.Context, address string, p config.Printer, k jobKe
 			if int64(len(data)) > readCap {
 				return Result{}, fmt.Errorf("archive exceeds read cap")
 			}
-			return parseArchive(data, k)
+			result, err := parseArchive(data, k)
+			result.ArchiveBytes = len(data)
+			return result, err
 		}
 	}
 	return Result{}, fmt.Errorf("archive not found")

@@ -46,6 +46,8 @@ type Result struct {
 	Metadata *Metadata `json:"job_metadata"`
 	// PNG contains the archived image bytes.
 	PNG []byte `json:"-"`
+	// ArchiveBytes is the downloaded 3MF size, kept for diagnostics.
+	ArchiveBytes int `json:"-"`
 }
 
 // Disabled returns the disabled preview projection.
@@ -282,6 +284,7 @@ func (s *Service) retrieve(ctx context.Context, serial string, k jobKey) {
 	var err error
 	for attempt := 1; attempt <= 3; attempt++ {
 		attemptCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+		started := time.Now()
 		var result Result
 		result, err = s.fetch(attemptCtx, s.printers[serial], k)
 		cancel()
@@ -293,6 +296,11 @@ func (s *Service) retrieve(ctx context.Context, serial string, k jobKey) {
 			return
 		}
 		if err == nil {
+			plate := 0
+			if result.Metadata != nil && result.Metadata.Plate != nil {
+				plate = result.Metadata.Plate.Index
+			}
+			s.log.Debug("job preview retrieved", "serial", serial, "attempt", attempt, "file", k.File, "plate", plate, "archive_bytes", result.ArchiveBytes, "duration_ms", time.Since(started).Milliseconds())
 			at := time.Now().UTC().Format(time.RFC3339Nano)
 			result.Preview = View{Status: StatusReady, JobName: k.Name, Current: true, RetrievedAt: &at}
 			if len(result.PNG) > 0 {
