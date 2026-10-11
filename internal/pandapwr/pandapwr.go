@@ -76,24 +76,24 @@ func New(printers []config.Printer, log *slog.Logger) *Store {
 	return s
 }
 
-// Run polls all devices once per tick until cancellation.
+// Run polls all devices at start and then once per tick until cancellation.
 func (s *Store) Run(ctx context.Context) error {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for {
+		var wg sync.WaitGroup
+		for _, t := range s.targets {
+			wg.Go(func() {
+				if ok, reason := s.poll(ctx, t); !ok && ctx.Err() == nil {
+					s.log.Warn("panda pwr poll failed", "serial", t.serial, "reason", reason)
+				}
+			})
+		}
+		wg.Wait()
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			var wg sync.WaitGroup
-			for _, t := range s.targets {
-				wg.Go(func() {
-					if ok, reason := s.poll(ctx, t); !ok && ctx.Err() == nil {
-						s.log.Warn("panda pwr poll failed", "serial", t.serial, "reason", reason)
-					}
-				})
-			}
-			wg.Wait()
 		}
 	}
 }

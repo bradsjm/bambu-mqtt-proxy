@@ -99,10 +99,11 @@ func run() error {
 	}
 	stop()
 	logger.Info("restarting with the saved configuration")
-	if err := syscall.Exec("/proc/self/exe", os.Args, os.Environ()); err != nil {
-		return fmt.Errorf("restart: exec /proc/self/exe: %w", err)
+	exe, err := os.Executable()
+	if err == nil {
+		err = syscall.Exec(exe, os.Args, os.Environ())
 	}
-	return nil
+	return fmt.Errorf("restart: %w", err)
 }
 
 // serve builds and serves every service from cfg until a signal or a saved
