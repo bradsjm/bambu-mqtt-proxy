@@ -120,7 +120,7 @@ func TestSnapshotRowsConfiguredOrderFailureContinuationAndNoControlEffects(t *te
 	before := s.statusMap()
 	w := snapshotRequest(s, settingsJSON(testSettings()))
 	out := decodeStream(t, w)
-	if !out.DryRun || out.Model != "clef" || out.Cutoff != .5 || out.AssessableMin != .8 || len(out.Printers) != 4 || out.Done.Outcome != "completed" {
+	if !out.DryRun || out.Model != "clef" || out.Cutoff != .5 || out.MinClarity != DefaultMinClarity || len(out.Printers) != 4 || out.Done.Outcome != "completed" {
 		t.Fatalf("response %+v", out)
 	}
 	sort.Strings(captures)
@@ -358,7 +358,7 @@ func TestDiagnosticPOSTsNeverMoveSavedKeys(t *testing.T) {
 
 func TestDiagnosticCredentialBindingAllowsTypedKeyAndStoredFallback(t *testing.T) {
 	base := testSettings()
-	in := settingsView{Provider: ProviderCustom, Endpoint: "https://new.example/check", APIKey: "typed-key", Model: "clef", StopConfidence: .5, FirstLayer: FirstLayerSettings{PauseConfidence: DefaultPauseConfidence}}
+	in := settingsView{Provider: ProviderCustom, Endpoint: "https://new.example/check", APIKey: "typed-key", Model: "clef", StopConfidence: .5, MinClarity: DefaultMinClarity, FirstLayer: FirstLayerSettings{PauseConfidence: DefaultPauseConfidence}}
 	effective, err := resolveTestSettings(in, base)
 	if err != nil || effective.APIKey != "typed-key" || effective.Endpoint != in.Endpoint {
 		t.Fatalf("explicit destination %+v %v", effective, err)

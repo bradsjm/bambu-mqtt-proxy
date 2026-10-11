@@ -26,8 +26,6 @@ const (
 	maxImageBytes = 4 << 20
 	// maxImagePixels is the provider's per-image pixel limit.
 	maxImagePixels = 16_000_000
-	// assessableMin is a local view-quality heuristic, not a physical guarantee.
-	assessableMin = 0.8
 )
 
 // Result holds only numeric answers and allowlisted usage from a valid response.
@@ -342,8 +340,9 @@ func (c *Client) request(ctx context.Context, in requestInput) (out responseResu
 }
 
 // classify applies the same strict occupied threshold in automatic and diagnostic paths.
-func classify(result Result, cutoff float64) string {
-	if result.PAssessable < assessableMin {
+// A check is unclear when the image clarity is strictly below minClarity.
+func classify(result Result, cutoff, minClarity float64) string {
+	if result.PAssessable < minClarity {
 		return "inconclusive"
 	}
 	n := int(math.Round(cutoff * 100))

@@ -18,6 +18,8 @@ type ModuleState struct {
 	Homing bool `json:"homing,omitempty"`
 	// Cutoff is the configured strict occupied-probability threshold.
 	Cutoff float64 `json:"cutoff"`
+	// MinClarity is the configured image-clarity threshold for both checks.
+	MinClarity float64 `json:"min_clarity"`
 	// PClear is nil unless the last check returned a valid score.
 	PClear *float64 `json:"p_clear"`
 	// POccupied is nil unless the last check returned a valid score.
@@ -38,6 +40,8 @@ type FirstLayerState struct {
 	Pause string `json:"pause,omitempty"`
 	// Cutoff is the configured strict pause-capable defect threshold.
 	Cutoff float64 `json:"cutoff"`
+	// MinClarity is the configured image-clarity threshold for both checks.
+	MinClarity float64 `json:"min_clarity"`
 	// PAssessable is nil until a valid five-answer response is available.
 	PAssessable *float64 `json:"p_assessable"`
 	// PTangled is the last valid abnormal filament tangle probability.
@@ -74,10 +78,10 @@ func (s *Service) status(serial string) any {
 		return nil
 	}
 	if !s.settings.On() {
-		return ModuleState{State: "disabled", Cutoff: s.settings.StopConfidence, FirstLayer: FirstLayerState{State: "disabled", Cutoff: s.settings.FirstLayer.PauseConfidence}}
+		return ModuleState{State: "disabled", Cutoff: s.settings.StopConfidence, MinClarity: s.settings.MinClarity, FirstLayer: FirstLayerState{State: "disabled", Cutoff: s.settings.FirstLayer.PauseConfidence, MinClarity: s.settings.MinClarity}}
 	}
 	if s.blocked != "" {
-		return ModuleState{State: "blocked", Cutoff: s.settings.StopConfidence, FirstLayer: FirstLayerState{State: "blocked", Cutoff: s.settings.FirstLayer.PauseConfidence}}
+		return ModuleState{State: "blocked", Cutoff: s.settings.StopConfidence, MinClarity: s.settings.MinClarity, FirstLayer: FirstLayerState{State: "blocked", Cutoff: s.settings.FirstLayer.PauseConfidence, MinClarity: s.settings.MinClarity}}
 	}
 	w.mu.Lock()
 	v := w.status
@@ -111,32 +115,36 @@ func (s *Service) Display(serial string) *module.Display {
 	rows = append(rows, plateRow(v))
 	rows = append(rows, module.Row{
 		Label:   "Rule",
-		Value:   fmt.Sprintf("Stops the print if the plate looks occupied (over %.0f%%)", math.Round(v.Cutoff*100)),
+		Value:   fmt.Sprintf("Stops the print if the plate looks occupied (over %s) and image clarity is at least %s", wholeText(v.Cutoff), wholeText(v.MinClarity)),
 		Section: "Before printing",
 	})
 	if v.POccupied != nil {
-		rows = append(rows, module.Row{
+		row := module.Row{
 			Label:   "Scores",
-			Value:   fmt.Sprintf("Occupied %.0f%% · view clarity %.0f%%", math.Round(*v.POccupied*100), clarity(v.PAssessable)),
+			Value:   fmt.Sprintf("Occupied %s · image clarity %s (needs %s)", scoreText(*v.POccupied, v.Cutoff), clarityText(v.PAssessable, v.MinClarity), wholeText(v.MinClarity)),
 			Section: "Before printing",
-		})
+		}
+		if v.PAssessable != nil && *v.PAssessable < v.MinClarity {
+			row.Tone = "warn"
+		}
+		rows = append(rows, row)
 	}
 	rows = append(rows, firstLayerRow(v.FirstLayer))
 	if v.FirstLayer.State != "disabled" {
 		rows = append(rows, module.Row{
 			Label:   "Rule",
-			Value:   fmt.Sprintf("Pauses the print if tangle, detachment, or nozzle blob is over %.0f%%", math.Round(v.FirstLayer.Cutoff*100)),
+			Value:   fmt.Sprintf("Pauses the print if tangle, detachment, or nozzle blob is over %s and image clarity is at least %s", wholeText(v.FirstLayer.Cutoff), wholeText(v.FirstLayer.MinClarity)),
 			Section: "After layer 1",
 		})
 	}
 	if v.FirstLayer.PAssessable != nil {
 		tone := ""
-		if *v.FirstLayer.PAssessable < 0.8 {
+		if *v.FirstLayer.PAssessable < v.FirstLayer.MinClarity {
 			tone = "warn"
 		}
 		rows = append(rows, module.Row{
-			Label:   "View clarity",
-			Value:   fmt.Sprintf("%.0f%% (needs 80%%)", math.Round(*v.FirstLayer.PAssessable*100)),
+			Label:   "Image clarity",
+			Value:   fmt.Sprintf("%s (needs %s)", scoreText(*v.FirstLayer.PAssessable, v.FirstLayer.MinClarity), wholeText(v.FirstLayer.MinClarity)),
 			Tone:    tone,
 			Section: "After layer 1",
 		})
@@ -144,23 +152,41 @@ func (s *Service) Display(serial string) *module.Display {
 	if v.FirstLayer.PTangled != nil && v.FirstLayer.PDetached != nil && v.FirstLayer.PNozzleBlob != nil && v.FirstLayer.PIncomplete != nil {
 		row := module.Row{
 			Label:   "Findings",
-			Value:   fmt.Sprintf("Tangle %.0f%% · detached %.0f%% · nozzle blob %.0f%% · missing material %.0f%% (warning only)", math.Round(*v.FirstLayer.PTangled*100), math.Round(*v.FirstLayer.PDetached*100), math.Round(*v.FirstLayer.PNozzleBlob*100), math.Round(*v.FirstLayer.PIncomplete*100)),
+			Value:   fmt.Sprintf("Tangle %s · detached %s · nozzle blob %s · missing material %s (warning only)", scoreText(*v.FirstLayer.PTangled, v.FirstLayer.Cutoff), scoreText(*v.FirstLayer.PDetached, v.FirstLayer.Cutoff), scoreText(*v.FirstLayer.PNozzleBlob, v.FirstLayer.Cutoff), scoreText(*v.FirstLayer.PIncomplete, v.FirstLayer.Cutoff)),
 			Section: "After layer 1",
 		}
 		if v.FirstLayer.State == "inconclusive" {
-			row.Note = "Low confidence: camera view too unclear"
+			row.Note = "Image not clear enough: findings not used"
 		}
 		rows = append(rows, row)
 	}
 	return &module.Display{Panel: &module.Panel{Title: "Print checks", Level: 3, Rows: rows}}
 }
 
-// clarity renders a nil-safe view-clarity percentage.
-func clarity(p *float64) float64 {
-	if p == nil {
-		return 0
+// wholeText renders a whole-percentage threshold without decimals.
+func wholeText(p float64) string {
+	return fmt.Sprintf("%.0f%%", math.Round(p*100))
+}
+
+// scoreText renders a score as a whole percentage, adding decimals only
+// while the rendered score would read as equal to the compared threshold,
+// so a score never seems to match a cutoff it is strictly above or below.
+func scoreText(score, ref float64) string {
+	digits := 0
+	text := fmt.Sprintf("%.*f", digits, score*100)
+	for score != ref && digits < 9 && text == fmt.Sprintf("%.*f", digits, ref*100) {
+		digits++
+		text = fmt.Sprintf("%.*f", digits, score*100)
 	}
-	return math.Round(*p * 100)
+	return text + "%"
+}
+
+// clarityText renders a nil-safe image-clarity percentage against its minimum.
+func clarityText(p *float64, min float64) string {
+	if p == nil {
+		return scoreText(0, min)
+	}
+	return scoreText(*p, min)
 }
 
 // plateRow renders the Before printing Plate row for one startup state.
@@ -183,8 +209,8 @@ func plateRow(v ModuleState) module.Row {
 		row.Value, row.Tone = "Possibly occupied, below the stop threshold", "info"
 		row.Note = "Printing continued"
 	case "inconclusive":
-		row.Value = "Inconclusive"
-		row.Note = "Camera view too unclear to judge; printing continued"
+		row.Value = "Image unclear"
+		row.Note = "Image not clear enough to judge; printing continued"
 	case "error":
 		row.Value, row.Tone = "Check failed", "warn"
 		row.Note = reasonNote(name, v.Reason)
@@ -230,8 +256,8 @@ func firstLayerRow(v FirstLayerState) module.Row {
 		row.Value, row.Tone = "Possible problem", "warn"
 		row.Note = "Printing continued; check the printer"
 	case "inconclusive":
-		row.Value = "Inconclusive"
-		row.Note = "Camera view too unclear to judge; printing continued"
+		row.Value = "Image unclear"
+		row.Note = "Image not clear enough to judge; printing continued"
 	case "blocked":
 		row.Value, row.Tone = "Unavailable", "warn"
 		row.Note = reasonNote("First-layer check", "camera_disabled")

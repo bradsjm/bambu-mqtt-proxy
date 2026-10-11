@@ -22,6 +22,10 @@ const (
 	ProviderCloudflare = "cloudflare"
 	// ProviderCustom selects a custom HTTPS endpoint.
 	ProviderCustom = "custom"
+	// DefaultMinClarity is the default image-clarity threshold shared by
+	// both checks. Constructors and page decoders apply it; an explicit
+	// invalid value is never silently replaced.
+	DefaultMinClarity = 0.70
 	// DefaultPauseConfidence is the default strict defect-probability cutoff
 	// for the post-layer-1 pause phase. Constructors and page decoders apply
 	// it; an explicit invalid value is never silently replaced.
@@ -48,6 +52,8 @@ type Settings struct {
 	Model string `yaml:"model"`
 	// StopConfidence is the strict occupied-probability cutoff.
 	StopConfidence float64 `yaml:"stop_confidence"`
+	// MinClarity is the image-clarity threshold shared by both checks.
+	MinClarity float64 `yaml:"min_clarity"`
 	// FirstLayer configures the post-layer-1 defect checks; it runs only
 	// when the overall plate check is enabled.
 	FirstLayer FirstLayerSettings `yaml:"first_layer"`
@@ -118,6 +124,9 @@ func SettingsOf(c *config.Config) (Settings, error) {
 	if n, ok := wholePercent(s.StopConfidence); ok {
 		s.StopConfidence = n
 	}
+	if n, ok := wholePercent(s.MinClarity); ok {
+		s.MinClarity = n
+	}
 	if n, ok := wholePercent(s.FirstLayer.PauseConfidence); ok {
 		s.FirstLayer.PauseConfidence = n
 	}
@@ -152,6 +161,8 @@ type settingsView struct {
 	Model string `json:"model"`
 	// StopConfidence is the occupied-probability cutoff.
 	StopConfidence float64 `json:"stop_confidence"`
+	// MinClarity is the image-clarity threshold for both checks.
+	MinClarity float64 `json:"min_clarity"`
 	// FirstLayer reports the post-layer-1 phase to the page. The page
 	// submission keeps the same shape; an absent or null member keeps the
 	// decode defaults, and the view resolves Enabled so a nil stored
@@ -163,7 +174,7 @@ type settingsView struct {
 // The nested first_layer default keeps the phase on with the default cutoff;
 // an explicit false or an explicit cutoff value in range survives untouched.
 func decodeSettingsView(raw json.RawMessage) (settingsView, error) {
-	in := settingsView{Provider: ProviderCloudflare, Model: "clef", StopConfidence: 0.5,
+	in := settingsView{Provider: ProviderCloudflare, Model: "clef", StopConfidence: 0.5, MinClarity: DefaultMinClarity,
 		FirstLayer: FirstLayerSettings{PauseConfidence: DefaultPauseConfidence}}
 	if len(raw) == 0 {
 		return in, nil
@@ -192,7 +203,7 @@ func validateSettings(s Settings, require bool) (Settings, error) {
 	if s.Provider != ProviderCloudflare && s.Provider != ProviderCustom {
 		return s, errors.New("The plate-check provider must be cloudflare or custom.")
 	}
-	// Both cutoffs are validated unconditionally: an absent value keeps
+	// All thresholds are validated unconditionally: an absent value keeps
 	// the applied default, an explicit one outside the whole-percentage
 	// range is an error, never a silent default.
 	stopAt, ok := wholePercent(s.StopConfidence)
@@ -200,6 +211,11 @@ func validateSettings(s Settings, require bool) (Settings, error) {
 		return s, errors.New("Stop above must be a whole percentage from 50 through 99 percent.")
 	}
 	s.StopConfidence = stopAt
+	minAt, ok := wholePercent(s.MinClarity)
+	if !ok {
+		return s, errors.New("Minimum image clarity must be a whole percentage from 50 through 99 percent.")
+	}
+	s.MinClarity = minAt
 	pauseAt, ok := wholePercent(s.FirstLayer.PauseConfidence)
 	if !ok {
 		return s, errors.New("Pause above must be a whole percentage from 50 through 99 percent.")
@@ -243,7 +259,7 @@ func submittedSettings(in settingsView, key string) Settings {
 	if strings.TrimSpace(in.APIKey) != "" {
 		key = in.APIKey
 	}
-	s := Settings{Enabled: &in.Enabled, Provider: in.Provider, AccountID: in.AccountID, Endpoint: in.Endpoint, APIKey: key, Model: in.Model, StopConfidence: in.StopConfidence, FirstLayer: in.FirstLayer}.normalized()
+	s := Settings{Enabled: &in.Enabled, Provider: in.Provider, AccountID: in.AccountID, Endpoint: in.Endpoint, APIKey: key, Model: in.Model, StopConfidence: in.StopConfidence, MinClarity: in.MinClarity, FirstLayer: in.FirstLayer}.normalized()
 	if s.Provider == ProviderCustom {
 		s.AccountID = ""
 	} else {
@@ -270,7 +286,7 @@ func resolveTestSettings(in settingsView, base Settings) (Settings, error) {
 var ConfigSection = config.Section{
 	Key: "platecheck",
 	New: func() any {
-		return &Settings{Provider: ProviderCloudflare, Model: "clef", StopConfidence: 0.5,
+		return &Settings{Provider: ProviderCloudflare, Model: "clef", StopConfidence: 0.5, MinClarity: DefaultMinClarity,
 			FirstLayer: FirstLayerSettings{PauseConfidence: DefaultPauseConfidence}}
 	},
 	Validate: func(c *config.Config) error {
@@ -283,7 +299,7 @@ var ConfigSection = config.Section{
 	},
 	View: func(file *config.Config) any {
 		s, _ := SettingsOf(file)
-		return settingsView{Enabled: s.On(), Provider: s.Provider, AccountID: s.AccountID, Endpoint: s.Endpoint, HasAPIKey: s.Key() != "", Model: s.Model, StopConfidence: s.StopConfidence,
+		return settingsView{Enabled: s.On(), Provider: s.Provider, AccountID: s.AccountID, Endpoint: s.Endpoint, HasAPIKey: s.Key() != "", Model: s.Model, StopConfidence: s.StopConfidence, MinClarity: s.MinClarity,
 			FirstLayer: FirstLayerSettings{Enabled: new(s.FirstLayer.On()), PauseConfidence: s.FirstLayer.PauseConfidence}}
 	},
 	Save: func(raw json.RawMessage, stored, out *config.Config) error {
@@ -305,6 +321,7 @@ var ConfigSection = config.Section{
 			return &config.PageError{Status: 400, Message: err.Error()}
 		}
 		s.StopConfidence = checked.StopConfidence
+		s.MinClarity = checked.MinClarity
 		s.FirstLayer.PauseConfidence = checked.FirstLayer.PauseConfidence
 		out.SetSection("platecheck", s)
 		return nil

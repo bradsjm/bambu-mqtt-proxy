@@ -95,15 +95,15 @@ func TestFirstLayerStrictCutoffAndWarningOnlyMissingMaterial(t *testing.T) {
 		result LayerResult
 		want   string
 	}{
-		{LayerResult{PAssessable: .8, PTangled: .7}, "warning"},
-		{LayerResult{PAssessable: .8, PTangled: math.Nextafter(.7, 1)}, "pause"},
-		{LayerResult{PAssessable: .8, PDetached: .71}, "pause"},
-		{LayerResult{PAssessable: .8, PNozzleBlob: .71}, "pause"},
-		{LayerResult{PAssessable: .8, PIncomplete: 1}, "warning"},
-		{LayerResult{PAssessable: .8, PIncomplete: .5}, "passed"},
-		{LayerResult{PAssessable: math.Nextafter(.8, 0), PTangled: 1}, "inconclusive"},
+		{LayerResult{PAssessable: .7, PTangled: .7}, "warning"},
+		{LayerResult{PAssessable: .7, PTangled: math.Nextafter(.7, 1)}, "pause"},
+		{LayerResult{PAssessable: .7, PDetached: .71}, "pause"},
+		{LayerResult{PAssessable: .7, PNozzleBlob: .71}, "pause"},
+		{LayerResult{PAssessable: .7, PIncomplete: 1}, "warning"},
+		{LayerResult{PAssessable: .7, PIncomplete: .5}, "passed"},
+		{LayerResult{PAssessable: math.Nextafter(.7, 0), PTangled: 1}, "inconclusive"},
 	} {
-		if got := classifyLayer(tc.result, .7); got != tc.want {
+		if got := classifyLayer(tc.result, .7, DefaultMinClarity); got != tc.want {
 			t.Fatalf("%+v: %s != %s", tc.result, got, tc.want)
 		}
 	}

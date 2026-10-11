@@ -202,6 +202,7 @@ platecheck:
     api_key: ""
     model: clef
     stop_confidence: 0.5
+    min_clarity: 0.7
     first_layer:
         enabled: true
         pause_confidence: 0.7

@@ -136,7 +136,7 @@ func (s *Service) idleStatus() ModuleState {
 	if !s.settings.FirstLayer.On() {
 		layerState = "disabled"
 	}
-	return ModuleState{State: "idle", Cutoff: s.settings.StopConfidence, FirstLayer: FirstLayerState{State: layerState, Cutoff: s.settings.FirstLayer.PauseConfidence}}
+	return ModuleState{State: "idle", Cutoff: s.settings.StopConfidence, MinClarity: s.settings.MinClarity, FirstLayer: FirstLayerState{State: layerState, Cutoff: s.settings.FirstLayer.PauseConfidence, MinClarity: s.settings.MinClarity}}
 }
 
 // SetActivity attaches the activity log before Run.
@@ -319,11 +319,11 @@ func (w *worker) check(parent context.Context, homing bool) {
 		w.logStartupOutcome(operation, pass, "error", reason, nil, state, layer, hasLayer, chamberLightSent, captured, time.Since(started).Milliseconds())
 		return
 	}
-	decision := classify(result, w.s.settings.StopConfidence)
+	decision := classify(result, w.s.settings.StopConfidence, w.s.settings.MinClarity)
 	w.setStatusWithReasonPass(decision, &result, "", homing)
 	switch decision {
 	case "inconclusive":
-		w.s.activity.Record(w.printer.Serial, "platecheck_skipped", activity.Info, checkName(homing)+" view inconclusive, continuing print")
+		w.s.activity.Record(w.printer.Serial, "platecheck_skipped", activity.Info, checkName(homing)+" skipped, image not clear enough ("+scoreText(result.PAssessable, w.s.settings.MinClarity)+", needs "+wholeText(w.s.settings.MinClarity)+"), continuing print")
 		w.logStartupOutcome(operation, pass, decision, "", &result, state, layer, hasLayer, chamberLightSent, captured, time.Since(started).Milliseconds())
 	case "clear", "below_threshold":
 		w.s.activity.Record(w.printer.Serial, "platecheck_passed", activity.Info, checkName(homing)+" passed, continuing print")
@@ -423,7 +423,7 @@ func (w *worker) resolve(e printer.Event) {
 func (w *worker) setStatusWithReasonPass(state string, r *Result, reason string, homing bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	v := ModuleState{State: state, Cutoff: w.s.settings.StopConfidence, Reason: reason, Homing: homing, FirstLayer: w.status.FirstLayer}
+	v := ModuleState{State: state, Cutoff: w.s.settings.StopConfidence, MinClarity: w.s.settings.MinClarity, Reason: reason, Homing: homing, FirstLayer: w.status.FirstLayer}
 	if r != nil {
 		v.PClear = new(r.PClear)
 		v.POccupied = new(r.POccupied)
@@ -464,7 +464,7 @@ func validResult(r Result) bool {
 
 // logStartupOutcome records one debug line for a startup pass decision.
 func (w *worker) logStartupOutcome(operation uint64, pass, decision, reason string, result *Result, state string, layer int, hasLayer, chamberLightSent bool, frame *Frame, durationMs int64) {
-	attrs := []any{"serial", w.printer.Serial, "operation", operation, "pass", pass, "decision", decision, "reason", reason, "cutoff", w.s.settings.StopConfidence, "gcode_state", state, "chamber_light_sent", chamberLightSent}
+	attrs := []any{"serial", w.printer.Serial, "operation", operation, "pass", pass, "decision", decision, "reason", reason, "cutoff", w.s.settings.StopConfidence, "min_clarity", w.s.settings.MinClarity, "gcode_state", state, "chamber_light_sent", chamberLightSent}
 	if result != nil {
 		attrs = append(attrs, "p_clear", result.PClear, "p_occupied", result.POccupied, "p_assessable", result.PAssessable)
 	}

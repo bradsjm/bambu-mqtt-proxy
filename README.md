@@ -396,7 +396,8 @@ plate when a print starts. Set `provider` (`cloudflare`, the default, or `custom
 `clef-flash`); the proxy builds the Workers AI URL. Custom needs `endpoint` (a
 full HTTPS URL that accepts the same request and answer format), `api_key`, and
 a free-text `model`. Also set `stop_confidence` (0.50 to 0.99 in 0.01 steps, default
-0.50). The nested `first_layer` section controls the first-layer phase: it is on
+0.50) and `min_clarity` (0.50 to 0.99 in 0.01 steps, default 0.70), the minimum
+image clarity both checks need before they judge anything. The nested `first_layer` section controls the first-layer phase: it is on
 whenever the plate check is on, `first_layer.enabled: false` disables that phase
 alone, and `first_layer.pause_confidence` (0.50 to 0.99 in 0.01 steps, default
 0.70) is its pause cutoff. Without an explicit `enabled`, the check runs when the
@@ -411,8 +412,8 @@ has reported stage (`stg_cur`) 13 or 14 during the job, it checks at RUNNING
 layer 0. Bed leveling (stage 1) is not a trigger, because leveling is optional
 per job. Each pass waits for a fresh camera frame, may turn the chamber light
 on, uploads that one JPEG to the endpoint, and sends `stop` only when the
-model is sure the view is usable (assessable at least 0.8) and the occupied
-probability is above `stop_confidence`. The startup check does not pause or
+image clarity is at least `min_clarity` and the occupied probability is above
+`stop_confidence`. The startup check does not pause or
 resume prints during startup. Every failure, unclear image, or missing camera
 lets the print continue. A print already underway when the proxy starts is
 never stopped — the panel says `Proxy started after this print began`. Skip and
@@ -429,12 +430,13 @@ them into one of three outcomes:
 
 | Outcome | Condition | Result |
 |---|---|---|
-| **Stop** | `assessable` ≥ 0.8 **and** `occupied` > `stop_confidence` | The proxy sends one `stop` and records it in the activity log. |
-| **Unclear** | `assessable` < 0.8 (blocked view, dark chamber, bad angle) | The print continues; the result is recorded. |
-| **Clear** | `assessable` ≥ 0.8 **and** `occupied` ≤ `stop_confidence` | The print continues. |
+| **Stop** | image clarity ≥ `min_clarity` **and** `occupied` > `stop_confidence` | The proxy sends one `stop` and records it in the activity log. |
+| **Image unclear** | image clarity < `min_clarity` (blocked view, dark chamber, bad angle) | The occupied score is not used; the print continues and the result is recorded. |
+| **Clear** | image clarity ≥ `min_clarity` **and** `occupied` ≤ `stop_confidence` | The print continues. |
 
 Raise `stop_confidence` to avoid false stops; lower it to catch more objects
-on the plate. Any error, timeout, or missing camera is treated like an unclear
+on the plate. Lower `min_clarity` when a camera's images score low but its
+occupied scores are right; raise it to avoid acting on poor images. Any error, timeout, or missing camera is treated like an unclear
 result: the print is never stopped on a failure.
 
 ### First-layer check
@@ -447,16 +449,16 @@ answers five questions:
 
 | Question | Effect |
 |---|---|
-| Is the view usable (`assessable` ≥ 0.8)? | Below 0.8 the check is inconclusive. |
+| Is the image clear enough (image clarity ≥ `min_clarity`)? | Below it, the image is unclear and the check is skipped. |
 | Is the filament tangled? | Pause-capable. |
 | Is a part visibly detached? | Pause-capable. |
 | Is there a nozzle blob at millimeter scale? | Pause-capable. |
 | Is the layer incomplete or material missing? | Warning only. |
 
-With a usable view, any pause-capable probability strictly above
+With a clear enough image, any pause-capable probability strictly above
 `pause_confidence` sends one `pause`. The proxy sends no second pause and
 never resumes the print. Otherwise, any defect probability above 0.5 records
-a warning, and a check with no such defect passes. An inconclusive view, an
+a warning, and a check with no such defect passes. An unclear image, an
 error, a timeout, or a missing camera fails open: the print continues. The
 phase checks each job at most once.
 
@@ -488,7 +490,7 @@ activity log and, with notifications on, to Pushover; first-layer passes,
 confirmed pauses, and skips stay in the activity log. The camera wall shows a
 `Print checks` panel covering both phases, with a `Before printing` section
 (plate state, rule, scores) and an `After layer 1` section (first-layer state,
-rule, view clarity, findings); skips and failures name the reason in a note
+rule, image clarity, findings); skips and failures name the reason in a note
 (for example `Printer offline; no stop sent`).
 
 Chamber cameras look across the plate from one corner, so a tangle, a blob, or

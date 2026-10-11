@@ -71,8 +71,9 @@ func validLayerResult(r LayerResult) bool {
 }
 
 // classifyLayer keeps missing material warning-only and uses a strict pause cutoff.
-func classifyLayer(r LayerResult, cutoff float64) string {
-	if r.PAssessable < assessableMin {
+// A check is unclear when the image clarity is strictly below minClarity.
+func classifyLayer(r LayerResult, cutoff, minClarity float64) string {
+	if r.PAssessable < minClarity {
 		return "inconclusive"
 	}
 	if r.PTangled > cutoff || r.PDetached > cutoff || r.PNozzleBlob > cutoff {

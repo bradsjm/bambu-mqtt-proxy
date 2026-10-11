@@ -80,8 +80,8 @@ type snapshotStart struct {
 	Model string `json:"model"`
 	// Cutoff is the normalized submitted cutoff.
 	Cutoff float64 `json:"cutoff"`
-	// AssessableMin is the fixed local quality gate.
-	AssessableMin float64 `json:"assessable_min"`
+	// MinClarity is the normalized submitted image-clarity threshold.
+	MinClarity float64 `json:"min_clarity"`
 	// Printers preserves configured order.
 	Printers []snapshotPrinter `json:"printers"`
 }
@@ -136,7 +136,7 @@ func (s *Service) handleSnapshots(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	log := s.log.With("operation", operation)
 	log.InfoContext(ctx, "Plate-check snapshot test started", "model", settings.Model, "cutoff", settings.StopConfidence, "printers", len(s.printers))
-	start := snapshotStart{Type: "start", DryRun: true, Model: settings.Model, Cutoff: settings.StopConfidence, AssessableMin: assessableMin, Printers: make([]snapshotPrinter, 0, len(s.printers))}
+	start := snapshotStart{Type: "start", DryRun: true, Model: settings.Model, Cutoff: settings.StopConfidence, MinClarity: settings.MinClarity, Printers: make([]snapshotPrinter, 0, len(s.printers))}
 	online := make([]config.Printer, 0, len(s.printers))
 	skippedRows := make([]snapshotRow, 0, len(s.printers))
 	for _, p := range s.printers {
@@ -162,7 +162,7 @@ func (s *Service) handleSnapshots(w http.ResponseWriter, r *http.Request) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				rows <- s.evaluateSnapshot(ctx, client, p, started, settings.StopConfidence)
+				rows <- s.evaluateSnapshot(ctx, client, p, started, settings.StopConfidence, settings.MinClarity)
 			}()
 		}
 	}
@@ -229,7 +229,7 @@ func (s *Service) handleSnapshots(w http.ResponseWriter, r *http.Request) {
 }
 
 // evaluateSnapshot captures and evaluates one online printer and returns its result row.
-func (s *Service) evaluateSnapshot(ctx context.Context, client DecisionClient, p config.Printer, started time.Time, cutoff float64) snapshotRow {
+func (s *Service) evaluateSnapshot(ctx context.Context, client DecisionClient, p config.Printer, started time.Time, cutoff, minClarity float64) snapshotRow {
 	row := snapshotRow{Serial: p.Serial, Name: p.Name, Model: config.DisplayModel(p.Model, p.Serial), Decision: "error"}
 	captureCtx, captureCancel := context.WithTimeout(ctx, snapshotCaptureTimeout)
 	frame, captureErr := s.frames.Capture(captureCtx, p.Serial, started)
@@ -268,7 +268,7 @@ func (s *Service) evaluateSnapshot(ctx context.Context, client DecisionClient, p
 			row.ErrorCode = errorCategory(evaluationErr)
 			row.Error = fixedSentence(row.ErrorCode)
 		} else {
-			row.Decision = classify(result, cutoff)
+			row.Decision = classify(result, cutoff, minClarity)
 			row.PClear = new(result.PClear)
 			row.POccupied = new(result.POccupied)
 			row.PAssessable = new(result.PAssessable)

@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// checkLayer evaluates two camera views and sends one pause for a severe defect.
+// checkLayer evaluates two camera images and sends one pause for a severe defect.
 func (w *worker) checkLayer(parent context.Context) {
 	ctx, cancel := context.WithTimeout(context.WithValue(parent, operationKey{}, operations.Add(1)), 25*time.Second)
 	defer cancel()
@@ -55,11 +55,11 @@ func (w *worker) checkLayer(parent context.Context) {
 		w.logLayerOutcome(operation, "error", reason, nil, state, layer, hasLayer, captured, time.Since(started).Milliseconds())
 		return
 	}
-	decision := classifyLayer(result, w.s.settings.FirstLayer.PauseConfidence)
+	decision := classifyLayer(result, w.s.settings.FirstLayer.PauseConfidence, w.s.settings.MinClarity)
 	w.setLayerStatus(decision, "", &result)
 	switch decision {
 	case "inconclusive":
-		w.layerEvent("platecheck_layer1_skipped", activity.Info, "First-layer view inconclusive, continuing print", operation)
+		w.layerEvent("platecheck_layer1_skipped", activity.Info, "First-layer check skipped, image not clear enough ("+scoreText(result.PAssessable, w.s.settings.MinClarity)+", needs "+wholeText(w.s.settings.MinClarity)+"), continuing print", operation)
 		w.logLayerOutcome(operation, decision, "", &result, state, layer, hasLayer, captured, time.Since(started).Milliseconds())
 	case "warning":
 		w.layerEvent("platecheck_layer1_warning", activity.Warning, "Possible first-layer problem: "+layerIssues(result, .5, true)+", continuing print", operation)
@@ -111,11 +111,11 @@ func layerIssues(r LayerResult, cutoff float64, includeIncomplete bool) string {
 		{"nozzle blob", r.PNozzleBlob},
 	} {
 		if defect.score > cutoff {
-			issues = append(issues, fmt.Sprintf("%s (%.1f%%)", defect.label, defect.score*100))
+			issues = append(issues, fmt.Sprintf("%s (%s)", defect.label, scoreText(defect.score, cutoff)))
 		}
 	}
 	if includeIncomplete && r.PIncomplete > cutoff {
-		issues = append(issues, fmt.Sprintf("incomplete layer (%.1f%%, warning only)", r.PIncomplete*100))
+		issues = append(issues, fmt.Sprintf("incomplete layer (%s, warning only)", scoreText(r.PIncomplete, cutoff)))
 	}
 	return strings.Join(issues, ", ")
 }
@@ -130,7 +130,7 @@ func (w *worker) setLayerStatus(state, pause string, r *LayerResult) {
 
 // setLayerStatusLocked publishes the first-layer status and reason. The caller holds w.mu.
 func (w *worker) setLayerStatusLocked(state, pause string, r *LayerResult, reason string) {
-	v := FirstLayerState{State: state, Pause: pause, Cutoff: w.s.settings.FirstLayer.PauseConfidence, Reason: reason}
+	v := FirstLayerState{State: state, Pause: pause, Cutoff: w.s.settings.FirstLayer.PauseConfidence, MinClarity: w.s.settings.MinClarity, Reason: reason}
 	if r != nil {
 		v.PAssessable = new(r.PAssessable)
 		v.PTangled = new(r.PTangled)
@@ -178,7 +178,7 @@ func capturedOrNil(frames []Frame) []Frame {
 
 // logLayerOutcome records one debug line for a first-layer decision.
 func (w *worker) logLayerOutcome(operation uint64, decision, reason string, result *LayerResult, state string, layer int, hasLayer bool, frames []Frame, durationMs int64) {
-	attrs := []any{"serial", w.printer.Serial, "operation", operation, "decision", decision, "reason", reason, "cutoff", w.s.settings.FirstLayer.PauseConfidence, "gcode_state", state}
+	attrs := []any{"serial", w.printer.Serial, "operation", operation, "decision", decision, "reason", reason, "cutoff", w.s.settings.FirstLayer.PauseConfidence, "min_clarity", w.s.settings.MinClarity, "gcode_state", state}
 	if result != nil {
 		attrs = append(attrs, "p_assessable", result.PAssessable, "p_tangled", result.PTangled, "p_detached", result.PDetached, "p_nozzle_blob", result.PNozzleBlob, "p_incomplete", result.PIncomplete)
 	}

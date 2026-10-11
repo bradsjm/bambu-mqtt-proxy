@@ -15,10 +15,11 @@ import (
 func TestMain(m *testing.M) { config.RegisterSection(ConfigSection); os.Exit(m.Run()) }
 
 // testSettings returns valid custom-provider settings with the applied
-// defaults: an explicit startup cutoff, and the post-layer-1 phase on with
-// the default pause cutoff, expressed by a nil nested Enabled.
+// defaults: an explicit startup cutoff, the default image-clarity
+// threshold, and the post-layer-1 phase on with the default pause cutoff,
+// expressed by a nil nested Enabled.
 func testSettings() Settings {
-	return Settings{Provider: ProviderCustom, Endpoint: "https://vision.example/check", APIKey: "private-key", Model: "clef", StopConfidence: .5,
+	return Settings{Provider: ProviderCustom, Endpoint: "https://vision.example/check", APIKey: "private-key", Model: "clef", StopConfidence: .5, MinClarity: DefaultMinClarity,
 		FirstLayer: FirstLayerSettings{PauseConfidence: DefaultPauseConfidence}}
 }
 func settingsConfig(s Settings) *config.Config {
@@ -29,14 +30,14 @@ func settingsConfig(s Settings) *config.Config {
 
 // settingsJSON builds the page submission body for s, first_layer included.
 func settingsJSON(s Settings) []byte {
-	b, _ := json.Marshal(settingsView{Enabled: s.On(), Provider: s.Provider, AccountID: s.AccountID, Endpoint: s.Endpoint, APIKey: s.APIKey, Model: s.Model, StopConfidence: s.StopConfidence,
+	b, _ := json.Marshal(settingsView{Enabled: s.On(), Provider: s.Provider, AccountID: s.AccountID, Endpoint: s.Endpoint, APIKey: s.APIKey, Model: s.Model, StopConfidence: s.StopConfidence, MinClarity: s.MinClarity,
 		FirstLayer: FirstLayerSettings{Enabled: new(s.FirstLayer.On()), PauseConfidence: s.FirstLayer.PauseConfidence}})
 	return b
 }
 
 func TestConfigurationDefaultsAndEnable(t *testing.T) {
 	s, err := SettingsOf(&config.Config{})
-	if err != nil || s.On() || s.Provider != ProviderCloudflare || s.Model != "clef" || s.StopConfidence != .5 {
+	if err != nil || s.On() || s.Provider != ProviderCloudflare || s.Model != "clef" || s.StopConfidence != .5 || s.MinClarity != DefaultMinClarity {
 		t.Fatalf("default %+v %v", s, err)
 	}
 	if !s.FirstLayer.On() || s.FirstLayer.PauseConfidence != DefaultPauseConfidence || s.FirstLayer.Enabled != nil {
@@ -198,7 +199,7 @@ func TestConfigViewSaveRedaction(t *testing.T) {
 	_ = json.Unmarshal(raw, &view)
 	// The view resolves the nested default: the stored nil Enabled reads as
 	// enabled true, never as null.
-	if !view.HasAPIKey || view.StopConfidence != .7 || !view.FirstLayer.On() || view.FirstLayer.PauseConfidence != .7 || view.FirstLayer.Enabled == nil || !*view.FirstLayer.Enabled {
+	if !view.HasAPIKey || view.StopConfidence != .7 || view.MinClarity != DefaultMinClarity || !view.FirstLayer.On() || view.FirstLayer.PauseConfidence != .7 || view.FirstLayer.Enabled == nil || !*view.FirstLayer.Enabled {
 		t.Fatal(string(raw))
 	}
 	submitted := s
@@ -283,17 +284,17 @@ func TestStrictPolicyBoundaries(t *testing.T) {
 		{.5, .5, .8, "below_threshold"}, {.5, .49, .8, "would_stop"},
 		{.7, .31, .8, "below_threshold"}, {.7, .29, .8, "would_stop"},
 		{.58, .42, .8, "below_threshold"}, {.58, math.Nextafter(.42, 0), .8, "would_stop"}, {.58, math.Nextafter(.42, 1), .8, "below_threshold"},
-		{.5, .01, .79, "inconclusive"}, {.5, .01, .8, "would_stop"}, {.5, .9, .9, "clear"},
+		{.5, .01, .69, "inconclusive"}, {.5, .01, .7, "would_stop"}, {.5, .9, .9, "clear"},
 	} {
 		r := Result{PClear: tc.clear, POccupied: 1 - tc.clear, PAssessable: tc.assessable}
-		if got := classify(r, tc.cutoff); got != tc.decision {
+		if got := classify(r, tc.cutoff, DefaultMinClarity); got != tc.decision {
 			t.Fatalf("cutoff %.17g clear %.17g assessable %g: %s", tc.cutoff, tc.clear, tc.assessable, got)
 		}
 	}
 	s := testSettings()
 	s.StopConfidence = .58 + 1e-12
 	s, err := validateSettings(s, true)
-	if err != nil || s.StopConfidence != .58 || classify(Result{PClear: .42, POccupied: 1 - .42, PAssessable: .9}, s.StopConfidence) == "would_stop" {
+	if err != nil || s.StopConfidence != .58 || classify(Result{PClear: .42, POccupied: 1 - .42, PAssessable: .9}, s.StopConfidence, s.MinClarity) == "would_stop" {
 		t.Fatal("normalization boundary")
 	}
 }
@@ -338,7 +339,7 @@ func TestConfigSaveAbsentPageSectionUsesDisabledDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, err := SettingsOf(out)
-	if err != nil || got.On() || got.Model != "clef" || got.StopConfidence != .5 {
+	if err != nil || got.On() || got.Model != "clef" || got.StopConfidence != .5 || got.MinClarity != DefaultMinClarity {
 		t.Fatalf("absent section %+v %v", got, err)
 	}
 	// The decode defaults keep the nested phase on at the default cutoff.
@@ -451,7 +452,7 @@ func TestProviderValidationMessages(t *testing.T) {
 		{"key missing", func(s *Settings) { s.APIKey = "" }, true, "No API key is configured. Enter a key."},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s := Settings{Provider: ProviderCloudflare, AccountID: "0123456789abcdef0123456789abcdef", APIKey: "private-key", Model: "clef", StopConfidence: .5,
+			s := Settings{Provider: ProviderCloudflare, AccountID: "0123456789abcdef0123456789abcdef", APIKey: "private-key", Model: "clef", StopConfidence: .5, MinClarity: DefaultMinClarity,
 				FirstLayer: FirstLayerSettings{PauseConfidence: DefaultPauseConfidence}}
 			tc.edit(&s)
 			_, err := validateSettings(s, tc.require)
@@ -478,7 +479,7 @@ func TestProviderValidationMessages(t *testing.T) {
 func TestCloudflareURLAndKeyBinding(t *testing.T) {
 	const account = "0123456789abcdef0123456789abcdef"
 	const other = "fedcba9876543210fedcba9876543210"
-	stored := Settings{Provider: ProviderCloudflare, AccountID: account, APIKey: "stored-key", Model: "clef-flash", StopConfidence: .5,
+	stored := Settings{Provider: ProviderCloudflare, AccountID: account, APIKey: "stored-key", Model: "clef-flash", StopConfidence: .5, MinClarity: DefaultMinClarity,
 		FirstLayer: FirstLayerSettings{PauseConfidence: DefaultPauseConfidence}}
 	want := "https://api.cloudflare.com/client/v4/accounts/" + account + "/ai/run/@cf/cloudflare/clef-flash"
 	if stored.URL() != want || !stored.On() {
@@ -505,10 +506,40 @@ func TestCloudflareURLAndKeyBinding(t *testing.T) {
 		t.Fatalf("changed account save %+v", saved)
 	}
 	// The stored key only follows a diagnostic submission for its own account.
-	if _, err := resolveTestSettings(settingsView{Provider: ProviderCloudflare, AccountID: other, Model: "clef", StopConfidence: .5, FirstLayer: FirstLayerSettings{PauseConfidence: DefaultPauseConfidence}}, stored); err == nil || err.Error() != endpointKeyMessage {
+	if _, err := resolveTestSettings(settingsView{Provider: ProviderCloudflare, AccountID: other, Model: "clef", StopConfidence: .5, MinClarity: DefaultMinClarity, FirstLayer: FirstLayerSettings{PauseConfidence: DefaultPauseConfidence}}, stored); err == nil || err.Error() != endpointKeyMessage {
 		t.Fatalf("diagnostic moved stored key: %v", err)
 	}
-	if s, err := resolveTestSettings(settingsView{Provider: ProviderCloudflare, AccountID: account, Model: "clef", StopConfidence: .5, FirstLayer: FirstLayerSettings{PauseConfidence: DefaultPauseConfidence}}, stored); err != nil || s.Key() != stored.Key() {
+	if s, err := resolveTestSettings(settingsView{Provider: ProviderCloudflare, AccountID: account, Model: "clef", StopConfidence: .5, MinClarity: DefaultMinClarity, FirstLayer: FirstLayerSettings{PauseConfidence: DefaultPauseConfidence}}, stored); err != nil || s.Key() != stored.Key() {
 		t.Fatalf("same account diagnostic %+v: %v", s, err)
+	}
+}
+
+// TestMinClarityBoundaryAndDefault pins the shared image-clarity gate:
+// equal to the minimum passes, strictly below fails in both phases, and a
+// stored section without the key loads the 0.70 default.
+func TestMinClarityBoundaryAndDefault(t *testing.T) {
+	start := Result{PClear: .1, POccupied: .9, PAssessable: .7}
+	if got := classify(start, .5, DefaultMinClarity); got != "would_stop" {
+		t.Fatalf("equal-to-minimum startup = %s, want would_stop", got)
+	}
+	start.PAssessable = math.Nextafter(.7, 0)
+	if got := classify(start, .5, DefaultMinClarity); got != "inconclusive" {
+		t.Fatalf("below-minimum startup = %s, want inconclusive", got)
+	}
+	layer := LayerResult{PAssessable: .7, PTangled: .9}
+	if got := classifyLayer(layer, .7, DefaultMinClarity); got != "pause" {
+		t.Fatalf("equal-to-minimum layer = %s, want pause", got)
+	}
+	layer.PAssessable = math.Nextafter(.7, 0)
+	if got := classifyLayer(layer, .7, DefaultMinClarity); got != "inconclusive" {
+		t.Fatalf("below-minimum layer = %s, want inconclusive", got)
+	}
+	parsed, err := config.Parse([]byte("platecheck:\n  enabled: false\n  provider: custom\n  api_key: 012345\n  endpoint: https://a.example/check\n  model: clef\n  stop_confidence: 0.5\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := SettingsOf(parsed)
+	if err != nil || s.MinClarity != DefaultMinClarity {
+		t.Fatalf("section without min_clarity %+v %v", s, err)
 	}
 }

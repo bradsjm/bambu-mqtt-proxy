@@ -387,7 +387,7 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
         <legend>Vision checks</legend>
         <div class="row">
           <div><label for="f-platecheck">Plate checks</label>
-            <span class="hint" id="f-platecheck-hint">When a print starts, the proxy uploads one current camera snapshot to the selected provider. If the chamber light is off, the proxy turns it on for the snapshot. If the plate looks occupied above the stop cutoff, the proxy sends Stop to the printer without asking. After the first layer finishes, the proxy checks two fresh snapshots for visible defects and can pause the print without asking; missing print material is a warning only. If a check fails or the view is unclear, the print continues. These are best-effort checks, not a safety interlock.</span>
+            <span class="hint" id="f-platecheck-hint">When a print starts, the proxy uploads one current camera snapshot to the selected provider. If the chamber light is off, the proxy turns it on for the snapshot. If the plate looks occupied above the stop cutoff, the proxy sends Stop to the printer without asking. After the first layer finishes, the proxy checks two fresh snapshots for visible defects and can pause the print without asking; missing print material is a warning only. If a check fails or the image is not clear enough, the print continues. These are best-effort checks, not a safety interlock.</span>
             <span class="env" id="platecheck-blocked" hidden></span></div>
           <div class="control"><input id="f-platecheck" class="switch" type="checkbox" role="switch" aria-describedby="f-platecheck-hint" data-field="platecheck.enabled"></div>
         </div>
@@ -428,9 +428,15 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
         </div>
         <div class="row">
           <div><label for="f-platecheck-threshold">Stop above</label>
-            <span class="hint" id="f-platecheck-threshold-hint">The proxy stops a print only when the occupied score is above this value. Higher values mean fewer stops. A score equal to this value does not stop.</span></div>
+            <span class="hint" id="f-platecheck-threshold-hint">The proxy stops a print only when the occupied score is above this value and image clarity is at least the minimum. Higher values mean fewer stops. A score equal to this value does not stop.</span></div>
           <div class="control range"><input id="f-platecheck-threshold" type="range" min="50" max="99" step="1" value="50" aria-describedby="f-platecheck-threshold-hint" aria-valuetext="Stop above 50 percent" data-field="platecheck.stop_confidence" data-type="percent">
             <output id="f-platecheck-threshold-out" for="f-platecheck-threshold" class="mono">50%</output></div>
+        </div>
+        <div class="row">
+          <div><label for="f-platecheck-clarity">Minimum image clarity</label>
+            <span class="hint" id="f-platecheck-clarity-hint">A check judges the plate or the first layer only when its image clarity score is at least this value. Below it, the check is skipped and the print continues. Lower values let more checks decide; higher values avoid acting on poor images. Applies to both checks.</span></div>
+          <div class="control range"><input id="f-platecheck-clarity" type="range" min="50" max="99" step="1" value="70" aria-describedby="f-platecheck-clarity-hint" aria-valuetext="Minimum image clarity 70 percent" data-field="platecheck.min_clarity" data-type="percent">
+            <output id="f-platecheck-clarity-out" for="f-platecheck-clarity" class="mono">70%</output></div>
         </div>
         <div class="row">
           <div><label for="f-platecheck-firstlayer">Recheck after layer 1</label>
@@ -439,7 +445,7 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
         </div>
         <div class="row">
           <div><label for="f-platecheck-pause">Pause above</label>
-            <span class="hint" id="f-platecheck-pause-hint">The proxy pauses a print only when a defect score is above this value. Higher values mean fewer pauses. A score equal to this value does not pause.</span></div>
+            <span class="hint" id="f-platecheck-pause-hint">The proxy pauses a print only when a defect score is above this value and image clarity is at least the minimum. Higher values mean fewer pauses. A score equal to this value does not pause.</span></div>
           <div class="control range"><input id="f-platecheck-pause" type="range" min="50" max="99" step="1" value="70" aria-describedby="f-platecheck-pause-hint" aria-valuetext="Pause above 70 percent" data-field="platecheck.first_layer.pause_confidence" data-type="percent">
             <output id="f-platecheck-pause-out" for="f-platecheck-pause" class="mono">70%</output></div>
         </div>
@@ -745,6 +751,9 @@ function platecheckHints() {
   const range = $("#f-platecheck-threshold"), pct = Number(range.value);
   $("#f-platecheck-threshold-out").textContent = `${pct}%`;
   range.setAttribute("aria-valuetext", `Stop above ${pct} percent`);
+  const clarity = $("#f-platecheck-clarity"), clarityPct = Number(clarity.value);
+  $("#f-platecheck-clarity-out").textContent = `${clarityPct}%`;
+  clarity.setAttribute("aria-valuetext", `Minimum image clarity ${clarityPct} percent`);
   // The pause slider mirrors the Stop slider: the display reads the field
   // value, and it is disabled while the post-layer-1 phase is off.
   const pause = $("#f-platecheck-pause"), pausePct = Number(pause.value);
@@ -1151,10 +1160,10 @@ $("#ai-test").addEventListener("click", () => aiTest.run(async ({ signal, report
    server streams one JSON event per line (start, one result per printer,
    done) and computes every decision; the page only shows it. ---- */
 const PLATECHECK_TEST_FIELDS = new Set(["platecheck.provider", "platecheck.account_id", "platecheck.endpoint",
-  "platecheck.api_key", "platecheck.model", "platecheck.stop_confidence"]);
+  "platecheck.api_key", "platecheck.model", "platecheck.stop_confidence", "platecheck.min_clarity"]);
 // The model select lists the Cloudflare model IDs; the first one is the default.
 const CLOUDFLARE_MODELS = [...$("#f-platecheck-model").options].map(o => o.value);
-const PLATE_LABELS = { would_stop: "Would stop", below_threshold: "Below cutoff", clear: "Clear", inconclusive: "Inconclusive",
+const PLATE_LABELS = { would_stop: "Would stop", below_threshold: "Below cutoff", clear: "Clear", inconclusive: "Image unclear",
   error: "Check failed", skipped: "Skipped" };
 const plural = (k, one, many) => `${k} ${k === 1 ? one : many}`;
 
@@ -1191,7 +1200,8 @@ function plateDigits(v, ref, scale, digits) {
   if (ref !== null && v !== ref) while (d < 9 && s === (ref * scale).toFixed(d)) s = (v * scale).toFixed(++d);
   return s;
 }
-const plateScore = (v, ref) => `${plateDigits(v, ref, 1, 3)} (${plateDigits(v, ref, 100, 1)}%)`;
+// A score as a whole percentage, with decimals only while it would read as equal to ref.
+const plateScore = (v, ref) => `${plateDigits(v, ref, 100, 0)}%`;
 
 function plateEl(tag, cls, text) {
   const el = document.createElement(tag);
@@ -1230,8 +1240,10 @@ function platePending(printer) {
 
 function plateRow(row, answer) {
   const decision = typeof row.decision === "string" ? row.decision : "";
-  const cutoff = plateNumber(answer.cutoff), min = plateNumber(answer.assessable_min);
+  const cutoff = plateNumber(answer.cutoff), min = plateNumber(answer.min_clarity);
   const cutPct = cutoff === null ? null : Math.round(cutoff * 100);
+  const minPct = min === null ? null : Math.round(min * 100);
+  const pOcc = plateNumber(row.p_occupied), pView = plateNumber(row.p_assessable);
   const { item, shot, body, name } = plateCard(row, PLATE_LABELS[decision] || "Unknown result", decision);
 
   const img = row.image;
@@ -1268,7 +1280,9 @@ function plateRow(row, answer) {
     would_stop: `The occupied score is above ${cut}. Dry run: at print start the proxy would stop this print. No command was sent.`,
     below_threshold: `The plate may be occupied, but the occupied score is not above ${cut}. The print would continue.`,
     clear: "The plate looks clear. The print would continue.",
-    inconclusive: `The view is not clear enough to judge${min === null ? "" : `: the assessable score is below ${Math.round(min * 100)}%`}. The print would continue.`,
+    inconclusive: pView === null || minPct === null
+      ? "The image is not clear enough to judge. The print would continue."
+      : `The image is not clear enough to judge: image clarity is ${plateScore(pView, min)} and the check needs at least ${minPct}%. The occupied score is not used, so the print would continue.`,
     error: `${error || "The check failed."} The print would continue.`,
     skipped: error || "This printer was skipped.",
   };
@@ -1276,11 +1290,10 @@ function plateRow(row, answer) {
 
   const scores = plateEl("dl", "platecheck-scores");
   const add = (label, value) => scores.append(plateEl("dt", "", label), plateEl("dd", "", value));
-  const pOcc = plateNumber(row.p_occupied), pClear = plateNumber(row.p_clear), pView = plateNumber(row.p_assessable);
   if (pOcc !== null) add("Occupied", plateScore(pOcc, cutoff));
-  if (pClear !== null) add("Clear", plateScore(pClear, cutPct === null ? null : (100 - cutPct) / 100));
-  if (pView !== null) add("Assessable", plateScore(pView, min));
-  if (cutoff !== null) add("Stop above", `${cutoff.toFixed(2)} (${cutPct}%)`);
+  if (pView !== null) add("Image clarity", plateScore(pView, min));
+  if (cutPct !== null) add("Stop above", `${cutPct}%`);
+  if (minPct !== null) add("Needs image clarity", `${minPct}%`);
   if (typeof answer.model === "string" && answer.model) add("Model", answer.model);
   if (typeof row.model === "string" && row.model) add("Printer", row.model);
   if (typeof row.error_code === "string" && row.error_code) add("Error code", row.error_code);
