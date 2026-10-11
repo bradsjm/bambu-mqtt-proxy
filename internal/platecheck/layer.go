@@ -17,7 +17,7 @@ func (w *worker) checkLayer(parent context.Context) {
 	doc, online, _ := w.s.state.Get(w.printer.Serial)
 	state, _ := doc.GcodeState()
 	if !online || state != "RUNNING" {
-		w.layerSkip("skipped", "print_paused", 0)
+		w.layerSkip("skipped", "print_paused", operationOf(ctx))
 		return
 	}
 	w.setLayerStatus("checking", "", nil)
@@ -31,7 +31,7 @@ func (w *worker) checkLayer(parent context.Context) {
 	for range 2 {
 		frame, err := w.s.frames.Capture(ctx, w.printer.Serial, boundary)
 		if err != nil {
-			w.layerSkip("error", errorCategory(err), 0)
+			w.layerSkip("error", errorCategory(err), operationOf(ctx))
 			return
 		}
 		images = append(images, frame.JPEG)
@@ -43,39 +43,39 @@ func (w *worker) checkLayer(parent context.Context) {
 		if err != nil {
 			reason = errorCategory(err)
 		}
-		w.layerSkip("error", reason, 0)
+		w.layerSkip("error", reason, operationOf(ctx))
 		return
 	}
 	decision := classifyLayer(result, w.s.settings.FirstLayer.PauseConfidence)
 	w.setLayerStatus(decision, "", &result)
 	switch decision {
 	case "inconclusive":
-		w.layerEvent("platecheck_layer1_skipped", activity.Info, "First-layer view inconclusive, continuing print", 0)
+		w.layerEvent("platecheck_layer1_skipped", activity.Info, "First-layer view inconclusive, continuing print", operationOf(ctx))
 	case "warning":
-		w.layerEvent("platecheck_layer1_warning", activity.Warning, "Possible first-layer problem: "+layerIssues(result, .5, true)+", continuing print", 0)
+		w.layerEvent("platecheck_layer1_warning", activity.Warning, "Possible first-layer problem: "+layerIssues(result, .5, true)+", continuing print", operationOf(ctx))
 	case "passed":
-		w.layerEvent("platecheck_layer1_passed", activity.Info, "First-layer check passed, continuing print", 0)
+		w.layerEvent("platecheck_layer1_passed", activity.Info, "First-layer check passed, continuing print", operationOf(ctx))
 	case "pause":
 		doc, online, _ = w.s.state.Get(w.printer.Serial)
 		state, _ = doc.GcodeState()
 		if !online || state != "RUNNING" {
-			w.layerSkip("skipped", "print_paused", 0)
+			w.layerSkip("skipped", "print_paused", operationOf(ctx))
 			return
 		}
 		if ctx.Err() != nil {
-			w.layerSkip("error", errorCategory(ctx.Err()), 0)
+			w.layerSkip("error", errorCategory(ctx.Err()), operationOf(ctx))
 			return
 		}
 		issues := layerIssues(result, w.s.settings.FirstLayer.PauseConfidence, false)
 		layer, _ := doc.Layer()
 		if err := w.s.commands.Pause(w.printer.Serial); err != nil {
 			w.setLayerPause("failed")
-			w.layerEvent("platecheck_layer1_pause_failed", activity.Error, "First-layer pause command failed: "+issues+", check the printer", 0)
+			w.layerEvent("platecheck_layer1_pause_failed", activity.Error, "First-layer pause command failed: "+issues+", check the printer", operationOf(ctx))
 			return
 		}
 		w.layerPending = &pendingCommand{layer: layer}
 		w.setLayerPause("pending")
-		w.layerEvent("platecheck_layer1_pause_sent", activity.Error, "Possible first-layer failure: "+issues+", pause sent", 0)
+		w.layerEvent("platecheck_layer1_pause_sent", activity.Error, "Possible first-layer failure: "+issues+", pause sent", operationOf(ctx))
 	}
 }
 
