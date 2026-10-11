@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -160,6 +161,16 @@ func key(d printer.Doc) jobKey {
 	return jobKey{name, file, plate}
 }
 
+// archive returns the selectors that identify the downloaded file. A .3mf
+// gcode_file names the archive alone: the printer rewrites subtask_name
+// characters after the project_file echo without changing the file.
+func (k jobKey) archive() jobKey {
+	if strings.HasSuffix(strings.ToLower(k.File), ".3mf") {
+		k.Name = ""
+	}
+	return k
+}
+
 // active reports whether a preview can be fetched for the document.
 func active(d printer.Doc) bool {
 	state, _ := d.GcodeState()
@@ -238,18 +249,21 @@ func (s *Service) Run(ctx context.Context) error {
 			return nil
 		case e := <-s.events:
 			k := key(e.Cur)
-			if old, ok := keys[e.Serial]; ok && old != k {
+			if old, ok := keys[e.Serial]; ok && old.archive() != k.archive() {
 				cancels[e.Serial]()
 				delete(keys, e.Serial)
 			}
-			trigger := slices.Contains(e.Kinds, "print_started") || (slices.Contains(e.Kinds, "state_initial") && active(e.Cur)) || (key(e.Prev) != k && active(e.Cur))
+			// A job begins at its first prepare or, without one, at RUNNING.
+			prevState, _ := e.Prev.GcodeState()
+			newJob := (slices.Contains(e.Kinds, "print_preparing") || slices.Contains(e.Kinds, "print_started")) && prevState != "PREPARE" && prevState != "SLICING"
+			trigger := newJob || (slices.Contains(e.Kinds, "state_initial") && active(e.Cur)) || (key(e.Prev).archive() != k.archive() && active(e.Cur))
 			if !trigger {
 				continue
 			}
 			s.mu.Lock()
 			ongoing, fetching := s.pending[e.Serial]
 			s.mu.Unlock()
-			if fetching && ongoing == k {
+			if fetching && ongoing.archive() == k.archive() {
 				continue
 			}
 			workerCtx, cancel := context.WithCancel(ctx)
@@ -275,7 +289,7 @@ func (s *Service) retrieve(ctx context.Context, serial string, k jobKey) {
 			return
 		}
 		d, _, _ := s.state.Get(serial)
-		if key(d) != k {
+		if key(d).archive() != k.archive() {
 			return
 		}
 		if err == nil {
@@ -319,14 +333,14 @@ func (s *Service) Lookup(serial string, image bool) (Result, bool) {
 	defer s.mu.Unlock()
 	if e, ok := s.entries[serial]; ok {
 		result := e.result
-		result.Preview.Current = e.key == key(d)
+		result.Preview.Current = e.key.archive() == key(d).archive()
 		if !image {
 			result.PNG = nil
 		}
 		return result, true
 	}
 	status := StatusUnavailable
-	if k, ok := s.pending[serial]; ok && k == key(d) {
+	if k, ok := s.pending[serial]; ok && k.archive() == key(d).archive() {
 		status = StatusPending
 	}
 	return Result{Preview: View{Status: status}}, true
