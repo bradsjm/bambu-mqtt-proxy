@@ -1,9 +1,6 @@
 package printer
 
 import (
-	"bufio"
-	"encoding/json"
-	"os"
 	"reflect"
 	"testing"
 
@@ -35,25 +32,7 @@ func TestEventReplay(t *testing.T) {
 				got = append(got, e.Kinds...)
 				s.Get(e.Serial)
 			})
-			f, err := os.Open("testdata/" + tc.name)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer f.Close()
-			scanner := bufio.NewScanner(f)
-			scanner.Buffer(make([]byte, 65536), 1<<20)
-			for scanner.Scan() {
-				var line struct {
-					Payload json.RawMessage `json:"payload"`
-				}
-				if err := json.Unmarshal(scanner.Bytes(), &line); err != nil {
-					t.Fatal(err)
-				}
-				s.Apply("S1", line.Payload)
-			}
-			if err := scanner.Err(); err != nil {
-				t.Fatal(err)
-			}
+			replayFixture(t, s, "S1", "testdata/"+tc.name)
 			if !reflect.DeepEqual(got, tc.kinds) {
 				t.Fatalf("kinds = %v, want %v", got, tc.kinds)
 			}

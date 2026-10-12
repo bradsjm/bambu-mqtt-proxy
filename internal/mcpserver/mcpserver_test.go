@@ -2,7 +2,6 @@ package mcpserver
 
 import (
 	"context"
-	"encoding/json"
 	"testing"
 	"time"
 
@@ -12,6 +11,7 @@ import (
 	"bambu-mqtt-proxy/internal/control"
 	"bambu-mqtt-proxy/internal/module"
 	"bambu-mqtt-proxy/internal/printer"
+	"bambu-mqtt-proxy/internal/testutil/mcptest"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -49,18 +49,8 @@ func (*testCamera) Wait(string, context.Context, uint64, time.Duration) *camera.
 // connectTools connects an SDK client through real in-memory transports.
 func connectTools(t *testing.T, s *Server) *mcp.ClientSession {
 	t.Helper()
-	st, ct := mcp.NewInMemoryTransports()
-	ss, err := s.srv.Connect(context.Background(), st, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { ss.Close(); s.Close() })
-	cs, err := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "0"}, nil).Connect(context.Background(), ct, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { cs.Close() })
-	return cs
+	t.Cleanup(s.Close)
+	return mcptest.Connect(t, context.Background(), s.srv)
 }
 
 // callTool calls a tool and requires SDK input and output validation to pass.
@@ -73,20 +63,6 @@ func callTool(t *testing.T, c *mcp.ClientSession, name string, args map[string]a
 		t.Fatalf("%s: %v", name, err)
 	}
 	return res
-}
-
-// decodeTool decodes the SDK's validated structured output.
-func decodeTool[T any](t *testing.T, res *mcp.CallToolResult) T {
-	t.Helper()
-	raw, err := json.Marshal(res.StructuredContent)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var out T
-	if err := json.Unmarshal(raw, &out); err != nil {
-		t.Fatal(err)
-	}
-	return out
 }
 
 // TestToolsValidate checks all core tool outputs and the store/module boundary.
@@ -129,13 +105,13 @@ func TestToolsValidate(t *testing.T) {
 				t.Fatalf("tool error: %+v", res)
 			}
 			if tc.name == "get_printer_state" {
-				out := decodeTool[GetPrinterStateOut](t, res)
+				out := mcptest.Decode[GetPrinterStateOut](t, res)
 				if out.State.Progress == nil || *out.State.Progress != 42 || out.State.Modules["example"] == nil {
 					t.Fatalf("state = %+v", out.State)
 				}
 			}
 			if tc.name == "list_printers" {
-				out := decodeTool[ListPrintersOut](t, res)
+				out := mcptest.Decode[ListPrintersOut](t, res)
 				if len(out.Printers) != 1 || out.Printers[0].Serial != "01S1" {
 					t.Fatalf("fleet = %+v", out)
 				}
@@ -157,7 +133,7 @@ func TestToolErrors(t *testing.T) {
 			args["profile"] = "standard"
 		}
 		res := callTool(t, c, name, args)
-		out := decodeTool[struct {
+		out := mcptest.Decode[struct {
 			Error *module.ToolError `json:"error"`
 		}](t, res)
 		if !res.IsError || out.Error == nil || out.Error.Code != module.CodeUnknownSerial {
@@ -165,7 +141,7 @@ func TestToolErrors(t *testing.T) {
 		}
 	}
 	res := callTool(t, c, "pause_print", map[string]any{"serial": "S1"})
-	out := decodeTool[ControlOut](t, res)
+	out := mcptest.Decode[ControlOut](t, res)
 	if !res.IsError || out.Error == nil || out.Error.Code != errUpstreamUnavailable {
 		t.Fatalf("offline output = %+v", out)
 	}
@@ -197,11 +173,11 @@ func TestWatchAcrossRestart(t *testing.T) {
 	if received.err != nil {
 		t.Fatal(received.err)
 	}
-	out := decodeTool[WatchPrinterOut](t, received.result)
+	out := mcptest.Decode[WatchPrinterOut](t, received.result)
 	if len(out.Events) != 1 || out.Events[0].Kind != "print_paused" || out.Events[0].ID <= after || out.AfterID != out.Events[0].ID {
 		t.Fatalf("watch output = %+v", out)
 	}
-	again := decodeTool[WatchPrinterOut](t, callTool(t, c, "watch_printer", map[string]any{"serial": "S1", "after_id": out.AfterID, "timeout_seconds": 0}))
+	again := mcptest.Decode[WatchPrinterOut](t, callTool(t, c, "watch_printer", map[string]any{"serial": "S1", "after_id": out.AfterID, "timeout_seconds": 0}))
 	if len(again.Events) != 0 || again.AfterID != out.AfterID {
 		t.Fatalf("repeated output = %+v", again)
 	}

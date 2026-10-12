@@ -7,29 +7,25 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
-
-	"bambu-mqtt-proxy/internal/config"
 )
 
 // startProxyChild starts the real run() in a subprocess with one
 // unreachable printer and the shared HTTP listener on, then waits for
 // /livez. The camera and MCP arguments are "" for the enabled default or
-// "false" to write the disable switch into the file. The returned stop func
-// terminates the child and requires a clean exit.
-func startProxyChild(t *testing.T, cameraEnv, mcpEnv string) (url string, cmd *exec.Cmd, out *bytes.Buffer, stop func()) {
+// "false" to write the disable switch into the file. The caller ends the
+// child with stop.
+func startProxyChild(t *testing.T, cameraEnv, mcpEnv string) *childProcess {
 	t.Helper()
 	httpPort := freePort(t)
 	listenPort := freePort(t)
@@ -57,35 +53,9 @@ printers:
 		t.Fatalf("write config: %v", err)
 	}
 
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatalf("test binary: %v", err)
-	}
-	env := append(bmbpxFreeEnv(),
-		childEnv+"=1",
-		config.EnvHTTPPort+"="+strconv.Itoa(httpPort),
-		config.EnvLogLevel+"=error",
-	)
-	c := exec.Command(exe, "-config", configPath)
-	c.Env = env
-	out = &bytes.Buffer{}
-	c.Stdout, c.Stderr = out, out
-	if err := c.Start(); err != nil {
-		t.Fatalf("start child: %v", err)
-	}
-	stopped := false
-	t.Cleanup(func() {
-		if !stopped {
-			_ = c.Process.Kill()
-			_ = c.Wait()
-		}
-	})
-	url = "http://127.0.0.1:" + strconv.Itoa(httpPort)
-	waitFor(t, 10*time.Second, func() bool { return probeOK(url + "/livez") })
-	return url, c, out, func() {
-		stopped = true
-		terminate(t, c, out, &stopped)
-	}
+	c := startChild(t, configPath, httpPort)
+	waitFor(t, 10*time.Second, func() bool { return probeOK(c.url + "/livez") })
+	return c
 }
 
 // postPreview sends one POST to the preview route and returns the status.
@@ -139,8 +109,9 @@ func TestJobPreviewRouteFollowsFeatureSwitch(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			url, _, out, stop := startProxyChild(t, tc.cameraEnv, tc.mcpEnv)
-			defer stop()
+			c := startProxyChild(t, tc.cameraEnv, tc.mcpEnv)
+			defer c.stop(t)
+			url, out := c.url, c.out
 
 			if got := postPreview(t, url, previewPath); got != tc.wantPOST {
 				t.Fatalf("POST %s = %d, want %d; child output:\n%s", previewPath, got, tc.wantPOST, out.String())
@@ -159,7 +130,7 @@ func TestJobPreviewRouteFollowsFeatureSwitch(t *testing.T) {
 func TestModuleMCPWiring(t *testing.T) {
 	for _, on := range []bool{true, false} {
 		t.Run(strconv.FormatBool(on), func(t *testing.T) {
-			base := detectionContractServe(t, on, on, on)
+			base := detectionContractServe(t, on, on)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			body := `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"wiring","version":"0"},"io.modelcontextprotocol/clientCapabilities":{}}}}`
@@ -226,8 +197,9 @@ func TestModuleMCPWiring(t *testing.T) {
 
 // TestJobPreviewTileModulePath checks the jobpreview.job_preview tile member.
 func TestJobPreviewTileModulePath(t *testing.T) {
-	base, _, _, stop := startProxyChild(t, "", "false")
-	defer stop()
+	c := startProxyChild(t, "", "false")
+	defer c.stop(t)
+	base := c.url
 	resp, err := http.Get(base + "/camera/status")
 	if err != nil {
 		t.Fatal(err)

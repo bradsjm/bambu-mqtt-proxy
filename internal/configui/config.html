@@ -978,26 +978,40 @@ function aliasGenState() {
   $("#p-alias-gen").disabled = !$("#p-serial").value.trim() && !$("#p-model").value.trim();
 }
 
+/* Reads the dialog's connection fields with the normalization that saving
+   and testing share. The access code is read separately and never trimmed. */
+function readPrinterDraft() {
+  return {
+    serial: $("#p-serial").value.trim().toUpperCase(),
+    name: $("#p-name").value.trim(),
+    model: $("#p-model").value.trim(),
+    address: $("#p-address").value.trim(),
+    tls: $("#p-tls").checked,
+    insecure_skip_verify: $("#p-skip").checked,
+    username: $("#p-user").value.trim() || "bblp",
+  };
+}
+/* Shows a dialog validation message and focuses the field it names. */
+function dialogFail(msg, el) { $("#dlg-error").textContent = msg; $("#dlg-error").hidden = false; el.focus(); }
+
 function submitPrinter(e) {
   e.preventDefault();
-  const fail = (msg, el) => { $("#dlg-error").textContent = msg; $("#dlg-error").hidden = false; el.focus(); };
-  const serial = $("#p-serial").value.trim().toUpperCase();
+  const d = readPrinterDraft();
   const alias = $("#p-alias").value.trim().toUpperCase();
-  const address = $("#p-address").value.trim();
   const code = $("#p-code").value;
-  if (!serial) return fail("Enter the printer's serial number.", $("#p-serial"));
-  if (cfg.printers.some((p, i) => i !== editing && p.serial === serial)) return fail(`Printer ${serial} is already on the list.`, $("#p-serial"));
-  if (!/^[0-9A-Z]*$/.test(alias)) return fail("The alias can only use digits and capital letters A-Z.", $("#p-alias"));
-  if (alias === serial) return fail("The alias must differ from the printer's own serial number.", $("#p-alias"));
-  if (alias && cfg.printers.some((p, i) => i !== editing && ((p.serial || "").toUpperCase() === alias || (p.alias || "").toUpperCase() === alias))) return fail(`Alias ${alias} is already used by another printer.`, $("#p-alias"));
-  if (!address) return fail("Enter the printer's IP address or host name, for example 192.168.1.42.", $("#p-address"));
-  if (!code && codeNeeded()) return fail("Enter the printer's access code.", $("#p-code"));
+  if (!d.serial) return dialogFail("Enter the printer's serial number.", $("#p-serial"));
+  if (cfg.printers.some((p, i) => i !== editing && p.serial === d.serial)) return dialogFail(`Printer ${d.serial} is already on the list.`, $("#p-serial"));
+  if (!/^[0-9A-Z]*$/.test(alias)) return dialogFail("The alias can only use digits and capital letters A-Z.", $("#p-alias"));
+  if (alias === d.serial) return dialogFail("The alias must differ from the printer's own serial number.", $("#p-alias"));
+  if (alias && cfg.printers.some((p, i) => i !== editing && ((p.serial || "").toUpperCase() === alias || (p.alias || "").toUpperCase() === alias))) return dialogFail(`Alias ${alias} is already used by another printer.`, $("#p-alias"));
+  if (!d.address) return dialogFail("Enter the printer's IP address or host name, for example 192.168.1.42.", $("#p-address"));
+  if (!code && codeNeeded()) return dialogFail("Enter the printer's access code.", $("#p-code"));
   const prev = editing >= 0 ? cfg.printers[editing] : {};
   const p = {
-    serial, alias, name: $("#p-name").value.trim(), model: $("#p-model").value.trim(), address,
+    serial: d.serial, alias, name: d.name, model: d.model, address: d.address,
     settings: {},
-    tls: $("#p-tls").checked, insecure_skip_verify: $("#p-skip").checked,
-    username: $("#p-user").value.trim() || "bblp",
+    tls: d.tls, insecure_skip_verify: d.insecure_skip_verify,
+    username: d.username,
     has_access_code: !!prev.has_access_code,
   };
   for (const [key, input] of printerSettingInputs) {
@@ -1084,19 +1098,12 @@ for (const id of ["p-serial", "p-name", "p-model", "p-address", "p-code", "p-use
 }
 dlg.addEventListener("close", () => printerTest.invalidate());
 $("#p-test").addEventListener("click", () => {
-  const fail = (msg, el) => { $("#dlg-error").textContent = msg; $("#dlg-error").hidden = false; el.focus(); };
-  const serial = $("#p-serial").value.trim().toUpperCase();
-  const address = $("#p-address").value.trim();
+  const d = readPrinterDraft();
   const code = $("#p-code").value;
-  if (!serial) return fail("Enter the printer's serial number.", $("#p-serial"));
-  if (!address) return fail("Enter the printer's IP address or host name, for example 192.168.1.42.", $("#p-address"));
-  if (!code && codeNeeded()) return fail("Enter the printer's access code.", $("#p-code"));
-  const payload = {
-    serial, name: $("#p-name").value.trim(), model: $("#p-model").value.trim(), address,
-    tls: $("#p-tls").checked, insecure_skip_verify: $("#p-skip").checked,
-    username: $("#p-user").value.trim() || "bblp",
-    has_access_code: false, access_code: code,
-  };
+  if (!d.serial) return dialogFail("Enter the printer's serial number.", $("#p-serial"));
+  if (!d.address) return dialogFail("Enter the printer's IP address or host name, for example 192.168.1.42.", $("#p-address"));
+  if (!code && codeNeeded()) return dialogFail("Enter the printer's access code.", $("#p-code"));
+  const payload = { ...d, has_access_code: false, access_code: code };
   printerTest.run(async ({ signal, live, report }) => {
     report("busy", "Connecting…");
     const { res, body } = await postJSON("/config/printers/test", payload, signal);

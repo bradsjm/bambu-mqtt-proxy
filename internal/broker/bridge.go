@@ -103,7 +103,8 @@ func (b *Bridge) OnWill(cl *mqtt.Client, will mqtt.Will) (mqtt.Will, error) {
 // OnACLCheck permits configured report/request subscriptions and request publishes.
 func (b *Bridge) OnACLCheck(_ *mqtt.Client, topic string, write bool) bool {
 	if write {
-		return b.table.AllowedPublish(topic)
+		_, ok := b.table.RequestSerial(topic)
+		return ok
 	}
 	return b.table.AllowedSubscribe(topic)
 }
@@ -116,18 +117,15 @@ func (b *Bridge) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, 
 	if cl.Net.Inline {
 		return pk, nil
 	}
-	serials := b.table.PrintersFor(pk.TopicName)
-	if len(serials) == 0 {
+	serial, ok := b.table.RequestSerial(pk.TopicName)
+	if !ok {
 		return pk, packets.CodeSuccessIgnore
 	}
-	if !b.table.AllowedPublish(pk.TopicName) {
-		return pk, packets.CodeSuccessIgnore
-	}
-	if err := b.links.Send(serials[0], pk.Payload); err != nil {
+	if err := b.links.Send(serial, pk.Payload); err != nil {
 		if errors.Is(err, printer.ErrOffline) {
-			b.log.Debug("printer request dropped while offline", "serial", serials[0], "client", cl.ID)
+			b.log.Debug("printer request dropped while offline", "serial", serial, "client", cl.ID)
 		} else {
-			b.log.Warn("printer request failed", "serial", serials[0], "client", cl.ID, "error", err)
+			b.log.Warn("printer request failed", "serial", serial, "client", cl.ID, "error", err)
 		}
 	}
 	return pk, packets.CodeSuccessIgnore

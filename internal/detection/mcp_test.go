@@ -6,12 +6,12 @@ package detection
 
 import (
 	"context"
-	"encoding/json"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"bambu-mqtt-proxy/internal/module"
+	"bambu-mqtt-proxy/internal/testutil/mcptest"
 )
 
 // connectDetectionMCP connects an SDK client to a server that carries only
@@ -22,20 +22,7 @@ func connectDetectionMCP(t *testing.T, e *Engine) *mcp.ClientSession {
 	t.Helper()
 	srv := mcp.NewServer(&mcp.Implementation{Name: "test", Version: "0"}, nil)
 	e.registerMCP(srv)
-	ctx := context.Background()
-	sTransport, cTransport := mcp.NewInMemoryTransports()
-	serverSession, err := srv.Connect(ctx, sTransport, nil)
-	if err != nil {
-		t.Fatalf("server connect: %v", err)
-	}
-	t.Cleanup(func() { serverSession.Close() })
-	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
-	clientSession, err := client.Connect(ctx, cTransport, nil)
-	if err != nil {
-		t.Fatalf("client connect: %v", err)
-	}
-	t.Cleanup(func() { clientSession.Close() })
-	return clientSession
+	return mcptest.Connect(t, context.Background(), srv)
 }
 
 // newEngineMCP builds the engine under test without starting it.
@@ -58,20 +45,6 @@ func callAIMonitoring(t *testing.T, client *mcp.ClientSession, serial string, en
 	return res
 }
 
-// decodeOut reads the structured output into AIMonitoringOut.
-func decodeOut(t *testing.T, res *mcp.CallToolResult) AIMonitoringOut {
-	t.Helper()
-	raw, err := json.Marshal(res.StructuredContent)
-	if err != nil {
-		t.Fatalf("marshal structured: %v", err)
-	}
-	var out AIMonitoringOut
-	if err := json.Unmarshal(raw, &out); err != nil {
-		t.Fatalf("unmarshal structured: %v (raw %s)", err, raw)
-	}
-	return out
-}
-
 // textOf returns the concatenated text content.
 func textOf(res *mcp.CallToolResult) string {
 	text := ""
@@ -90,7 +63,7 @@ func TestSetAIMonitoringUnknownSerial(t *testing.T) {
 	if !res.IsError {
 		t.Fatalf("unknown serial not flagged error: %+v", res)
 	}
-	out := decodeOut(t, res)
+	out := mcptest.Decode[AIMonitoringOut](t, res)
 	if out.Error == nil || out.Error.Code != module.CodeUnknownSerial ||
 		out.Error.Message != "serial is not configured: NOPE" {
 		t.Fatalf("unknown serial output = %+v", out)
@@ -109,7 +82,7 @@ func TestSetAIMonitoringNoPrintSession(t *testing.T) {
 	if !res.IsError {
 		t.Fatalf("no session not flagged error: %+v", res)
 	}
-	out := decodeOut(t, res)
+	out := mcptest.Decode[AIMonitoringOut](t, res)
 	if out.Error == nil || out.Error.Code != CodeNoPrintSession {
 		t.Fatalf("no session output = %+v", out)
 	}
@@ -127,7 +100,7 @@ func TestSetAIMonitoringSuccessFreshStatus(t *testing.T) {
 	if res.IsError {
 		t.Fatalf("expected success, got error result: %+v", res)
 	}
-	out := decodeOut(t, res)
+	out := mcptest.Decode[AIMonitoringOut](t, res)
 	if out.Serial != "S1" || out.Error != nil {
 		t.Fatalf("success output = %+v", out)
 	}
@@ -146,7 +119,7 @@ func TestSetAIMonitoringSuccessFreshStatus(t *testing.T) {
 	if res.IsError {
 		t.Fatalf("re-enable flagged error: %+v", res)
 	}
-	out = decodeOut(t, res)
+	out = mcptest.Decode[AIMonitoringOut](t, res)
 	if out.Detection == nil || !out.Detection.Enabled {
 		t.Fatalf("re-enabled detection = %+v", out.Detection)
 	}

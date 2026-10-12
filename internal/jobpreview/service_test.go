@@ -4,7 +4,6 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
-	"encoding/json"
 	"image"
 	"image/png"
 	"io"
@@ -16,6 +15,7 @@ import (
 
 	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/printer"
+	"bambu-mqtt-proxy/internal/testutil/mcptest"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -143,31 +143,13 @@ func TestKeyChangeAndMCP(t *testing.T) {
 	}
 	server := mcp.NewServer(&mcp.Implementation{Name: "preview-test", Version: "1"}, nil)
 	svc.Module().MCP(server)
-	st, ct := mcp.NewInMemoryTransports()
-	ss, err := server.Connect(ctx, st, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ss.Close()
-	client := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "1"}, nil)
-	cs, err := client.Connect(ctx, ct, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cs.Close()
+	cs := mcptest.Connect(t, ctx, server)
 	for _, serial := range []string{"S1", "unknown"} {
 		result, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "get_job_preview", Arguments: map[string]any{"serial": serial}})
 		if err != nil {
 			t.Fatal(err)
 		}
-		var out JobPreviewOut
-		data, err := json.Marshal(result.StructuredContent)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := json.Unmarshal(data, &out); err != nil {
-			t.Fatal(err)
-		}
+		out := mcptest.Decode[JobPreviewOut](t, result)
 		if serial == "unknown" {
 			if !result.IsError || out.Error == nil {
 				t.Fatal("unknown serial accepted")

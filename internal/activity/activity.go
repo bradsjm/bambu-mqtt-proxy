@@ -75,6 +75,22 @@ type ring struct {
 	next int
 }
 
+// snapshot returns copies of the entries with IDs above afterID, newest
+// first, with ages measured at now. It returns nil when no entry qualifies.
+// Callers hold Log.mu.
+func (r *ring) snapshot(now time.Time, afterID uint64) []Entry {
+	var out []Entry
+	for i := range len(r.buf) {
+		// Walk backwards from the newest slot, the one just before next.
+		e := r.buf[(r.next-1-i+len(r.buf))%len(r.buf)]
+		if e.ID > afterID {
+			e.AgeSeconds = now.Sub(e.Time).Seconds()
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
 // New builds a configured printer log with IDs seeded from the current microsecond.
 // Events for other serials are ignored.
 func New(printers []config.Printer) *Log {
@@ -174,15 +190,7 @@ func (l *Log) Recent(serial string) []Entry {
 	if !ok || len(r.buf) == 0 {
 		return nil
 	}
-	now := l.now()
-	out := make([]Entry, 0, len(r.buf))
-	for i := range len(r.buf) {
-		// Walk backwards from the newest slot, the one just before next.
-		e := r.buf[(r.next-1-i+len(r.buf))%len(r.buf)]
-		e.AgeSeconds = now.Sub(e.Time).Seconds()
-		out = append(out, e)
-	}
-	return out
+	return r.snapshot(l.now(), 0)
 }
 
 // Wait returns newer entries immediately or waits until an entry arrives or ctx ends.
@@ -198,15 +206,7 @@ func (l *Log) Wait(ctx context.Context, serial string, afterID uint64) []Entry {
 			l.mu.Unlock()
 			return nil
 		}
-		var entries []Entry
-		now := l.now()
-		for i := range len(r.buf) {
-			e := r.buf[(r.next-1-i+len(r.buf))%len(r.buf)]
-			if e.ID > afterID {
-				e.AgeSeconds = now.Sub(e.Time).Seconds()
-				entries = append(entries, e)
-			}
-		}
+		entries := r.snapshot(l.now(), afterID)
 		wake := l.changed
 		l.mu.Unlock()
 		if len(entries) != 0 {

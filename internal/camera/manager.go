@@ -90,7 +90,7 @@ func (m *Manager) webSupported(serial string) (config.Printer, bool) {
 		return m.supported(serial)
 	}
 	p, ok := m.bySerial[serial]
-	return p, ok && webCameraSupported(p.Model, p.Serial)
+	return p, ok && WebCameraSupported(p.Model, p.Serial)
 }
 
 // WebSupported reports web-camera capability without starting a capture.
@@ -143,6 +143,34 @@ func (m *Manager) get(serial string) *capture {
 	return c
 }
 
+// captureFor resolves serial to its shared capture under one eligibility
+// policy. web admits every web-camera model and refuses RTSPS models while
+// FFmpeg is missing; otherwise only chamber-protocol models qualify.
+// Ineligible serials never create a capture, and a closed manager reports
+// StatusUnavailable.
+func (m *Manager) captureFor(serial string, web bool) (*capture, Status) {
+	var ok bool
+	if web {
+		_, ok = m.webSupported(serial)
+	} else {
+		_, ok = m.supported(serial)
+	}
+	if !ok {
+		if _, known := m.bySerial[serial]; known {
+			return nil, StatusUnsupportedModel
+		}
+		return nil, StatusUnknownSerial
+	}
+	if web && m.WebUnavailableReason(serial) != "" {
+		return nil, StatusUnavailable
+	}
+	c := m.get(serial)
+	if c == nil {
+		return nil, StatusUnavailable
+	}
+	return c, StatusOK
+}
+
 // matchCameraCredentials resolves a raw camera session's NUL-padded username
 // and access-code fields to the configured eligible printer they belong to.
 // Access codes are printer-generated and unique, so an exact field match
@@ -185,17 +213,9 @@ func nulPaddedEqual(field []byte, value string) bool {
 // reason so handlers can answer 404, 422, or 503 without opening camera
 // sockets for ineligible printers.
 func (m *Manager) Snapshot(serial string, wait func(*capture) (*Frame, bool)) (*Frame, Status) {
-	p, ok := m.supported(serial)
-	if !ok {
-		if _, known := m.bySerial[serial]; known {
-			return nil, StatusUnsupportedModel
-		}
-		return nil, StatusUnknownSerial
-	}
-	_ = p
-	c := m.get(serial)
-	if c == nil {
-		return nil, StatusUnavailable
+	c, st := m.captureFor(serial, false)
+	if st != StatusOK {
+		return nil, st
 	}
 	frame, okFrame := wait(c)
 	if !okFrame || frame == nil {
@@ -206,18 +226,9 @@ func (m *Manager) Snapshot(serial string, wait func(*capture) (*Frame, bool)) (*
 
 // WebSnapshot returns a camera frame for a model supported by the web wall.
 func (m *Manager) WebSnapshot(serial string, wait func(*capture) (*Frame, bool)) (*Frame, Status) {
-	if _, ok := m.webSupported(serial); !ok {
-		if _, known := m.bySerial[serial]; known {
-			return nil, StatusUnsupportedModel
-		}
-		return nil, StatusUnknownSerial
-	}
-	if m.WebUnavailableReason(serial) != "" {
-		return nil, StatusUnavailable
-	}
-	c := m.get(serial)
-	if c == nil {
-		return nil, StatusUnavailable
+	c, st := m.captureFor(serial, true)
+	if st != StatusOK {
+		return nil, st
 	}
 	frame, ok := wait(c)
 	if !ok || frame == nil {
@@ -235,15 +246,9 @@ func (m *Manager) SnapshotContext(ctx context.Context, serial string) (*Frame, S
 // frame notification channel. It reports StatusOK only for eligible serials;
 // callers own the matching Release.
 func (m *Manager) Acquire(serial string) (chan struct{}, Status) {
-	if _, ok := m.supported(serial); !ok {
-		if _, known := m.bySerial[serial]; known {
-			return nil, StatusUnsupportedModel
-		}
-		return nil, StatusUnknownSerial
-	}
-	c := m.get(serial)
-	if c == nil {
-		return nil, StatusUnavailable
+	c, st := m.captureFor(serial, false)
+	if st != StatusOK {
+		return nil, st
 	}
 	return c.acquire(), StatusOK
 }
@@ -251,18 +256,9 @@ func (m *Manager) Acquire(serial string) (chan struct{}, Status) {
 // AcquireWeb starts or joins a web camera capture. RTSPS captures are
 // unavailable without FFmpeg and are never started by raw/Gadget/MCP callers.
 func (m *Manager) AcquireWeb(serial string) (chan struct{}, Status) {
-	if _, ok := m.webSupported(serial); !ok {
-		if _, known := m.bySerial[serial]; known {
-			return nil, StatusUnsupportedModel
-		}
-		return nil, StatusUnknownSerial
-	}
-	if m.WebUnavailableReason(serial) != "" {
-		return nil, StatusUnavailable
-	}
-	c := m.get(serial)
-	if c == nil {
-		return nil, StatusUnavailable
+	c, st := m.captureFor(serial, true)
+	if st != StatusOK {
+		return nil, st
 	}
 	return c.acquire(), StatusOK
 }
@@ -277,8 +273,8 @@ func (m *Manager) Release(serial string) {
 	}
 }
 
-// webCameraSupported reports image-capture support for web camera routes.
-func webCameraSupported(model, serial string) bool {
+// WebCameraSupported reports whether the printer model has a supported web-camera transport: the chamber JPEG protocol or RTSPS through FFmpeg. It ignores whether FFmpeg is installed.
+func WebCameraSupported(model, serial string) bool {
 	switch config.DisplayModel(model, serial) {
 	case "P1P", "P1S", "A1", "A1MINI", "X1", "X1C", "X1E", "P2S", "H2S", "H2D":
 		return true

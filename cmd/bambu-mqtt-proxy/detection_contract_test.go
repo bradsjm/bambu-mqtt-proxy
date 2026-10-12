@@ -2,20 +2,14 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
-	"strings"
 	"testing"
 	"time"
-
-	"bambu-mqtt-proxy/internal/configui"
 )
 
 const detectionContractSerial = "01S00CDETECT001"
@@ -115,14 +109,14 @@ func TestDetectionConfigHTTPShape(t *testing.T) {
 		{"no key", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			detectionContractCleanEnv(t)
+			clearBMBPXEnv(t)
 			path := filepath.Join(t.TempDir(), "config.yaml")
 			if tc.fileKey != "" {
 				if err := os.WriteFile(path, []byte(fmt.Sprintf("detection:\n  api_key: %q\n", tc.fileKey)), 0o600); err != nil {
 					t.Fatal(err)
 				}
 			}
-			base := detectionContractStore(t, path)
+			base := configStoreServer(t, path)
 			_, raw := detectionContractRequest(t, http.MethodGet, base+"/config/api", "", "")
 			doc := detectionContractObject(t, raw)
 			d := doc["config"].(map[string]any)["detection"].(map[string]any)
@@ -143,8 +137,8 @@ func TestDetectionConfigHTTPShape(t *testing.T) {
 
 // TestDetectionConfigProbePreflight pins missing-key messages and cross-origin rejection before any Gadget request.
 func TestDetectionConfigProbePreflight(t *testing.T) {
-	detectionContractCleanEnv(t)
-	base := detectionContractStore(t, filepath.Join(t.TempDir(), "absent.yaml"))
+	clearBMBPXEnv(t)
+	base := configStoreServer(t, filepath.Join(t.TempDir(), "absent.yaml"))
 	for _, tc := range []struct {
 		name, site, body, message string
 		code                      int
@@ -166,7 +160,7 @@ func TestDetectionConfigProbePreflight(t *testing.T) {
 
 // TestDetectionUnchangedConfigBytes pins byte-identical page saves with sorted module sections and a stored secret.
 func TestDetectionUnchangedConfigBytes(t *testing.T) {
-	detectionContractCleanEnv(t)
+	clearBMBPXEnv(t)
 	// Keep the page-save fixture independent of the serializer. Module-owned
 	// sections are sorted, so detection precedes notifications.
 	const fixture = `# bambu-mqtt-proxy configuration, written by the /config page.
@@ -213,7 +207,7 @@ safety:
 	if err := os.WriteFile(path, []byte(fixture), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	base := detectionContractStore(t, path)
+	base := configStoreServer(t, path)
 	_, raw := detectionContractRequest(t, http.MethodGet, base+"/config/api", "", "")
 	view, err := json.Marshal(detectionContractObject(t, raw)["config"])
 	if err != nil {
@@ -236,88 +230,22 @@ safety:
 	}
 }
 
-func detectionContractCleanEnv(t *testing.T) {
+func detectionContractServe(t *testing.T, enabled, cameras bool) string {
 	t.Helper()
-	for _, kv := range os.Environ() {
-		if name, _, _ := strings.Cut(kv, "="); strings.HasPrefix(name, "BMBPX_") {
-			t.Setenv(name, "")
-			if err := os.Unsetenv(name); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-}
-
-func detectionContractStore(t *testing.T, path string) string {
-	t.Helper()
-	mux := http.NewServeMux()
-	configui.NewStore(path).Register(mux)
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-	return srv.URL
-}
-
-func detectionContractServe(t *testing.T, enabled, cameras bool, previews ...bool) string {
-	t.Helper()
-	detectionContractCleanEnv(t)
-	port := freePort(t)
-	path := filepath.Join(t.TempDir(), "config.yaml")
-	fixture := fmt.Sprintf(`listen:
-  - port: %d
-    tls: false
-printers:
-  - serial: %q
-    model: P1S
-    address: "127.0.0.1:1"
-    password: "00008888"
-http:
-  port: %d
-camera:
-  enabled: %t
-`, freePort(t), detectionContractSerial, port, cameras)
+	section := ""
 	if enabled {
-		fixture += "detection:\n  enabled: true\n  api_key: contract-dummy-key\n"
+		section = "detection:\n  enabled: true\n  api_key: contract-dummy-key\n"
 	}
-	if len(previews) > 0 {
-		fixture += fmt.Sprintf("job_preview:\n  enabled: %t\n", previews[0])
-	}
-	fixture += "log:\n  level: error\n"
-	if err := os.WriteFile(path, []byte(fixture), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	serveInProcess(t, path)
-	base := fmt.Sprintf("http://127.0.0.1:%d", port)
-	waitFor(t, 15*time.Second, func() bool { return probeOK(base + "/livez") })
-	return base
+	return contractServe(t, detectionContractSerial, cameras, section)
 }
 
 func detectionContractRequest(t *testing.T, method, url, body, site string) (int, []byte) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, method, url, strings.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
+	code, raw := contractRequest(t, 5*time.Second, method, url, body, site)
+	if method == http.MethodGet && code != http.StatusOK {
+		t.Fatalf("GET %s = %d %s", url, code, raw)
 	}
-	if body != "" {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	if site != "" {
-		req.Header.Set("Sec-Fetch-Site", site)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if method == http.MethodGet && resp.StatusCode != http.StatusOK {
-		t.Fatalf("GET %s = %d %s", url, resp.StatusCode, raw)
-	}
-	return resp.StatusCode, raw
+	return code, raw
 }
 
 func detectionContractObject(t *testing.T, raw []byte) map[string]any {

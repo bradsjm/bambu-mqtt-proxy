@@ -107,34 +107,12 @@ camera:
 		t.Fatalf("write config: %v", err)
 	}
 
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatalf("test binary: %v", err)
-	}
-	cmd := exec.Command(exe, "-config", configPath)
-	cmd.Env = append(bmbpxFreeEnv(),
-		childEnv+"=1",
-		config.EnvHTTPPort+"="+strconv.Itoa(httpPort),
-		config.EnvLogLevel+"=error",
-	)
-	var out bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &out, &out
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start child: %v", err)
-	}
-	stopped := false
-	t.Cleanup(func() {
-		if !stopped {
-			_ = cmd.Process.Signal(syscall.SIGTERM)
-			_ = cmd.Wait()
-		}
-	})
-
-	url := "http://127.0.0.1:" + strconv.Itoa(httpPort)
+	c := startChild(t, configPath, httpPort)
+	url := c.url
 	waitFor(t, 10*time.Second, func() bool { return probeOK(url + "/livez") })
 	if !probeOK(url + "/status") {
-		terminate(t, cmd, &out, &stopped)
-		t.Fatalf("/status failed while /livez served; child output:\n%s", out.String())
+		c.stop(t)
+		t.Fatalf("/status failed while /livez served; child output:\n%s", c.out.String())
 	}
 
 	var payload struct {
@@ -149,7 +127,7 @@ camera:
 		t.Fatalf("upstreams = %v, want the configured printer reporting false", payload.Upstreams)
 	}
 
-	terminate(t, cmd, &out, &stopped)
+	c.stop(t)
 }
 
 // runNoKeyChild is the subprocess body: it serves the real run() until the
@@ -230,28 +208,6 @@ func waitFor(t *testing.T, budget time.Duration, check func() bool) {
 	t.Fatalf("condition not met within %s", budget)
 }
 
-// terminate signals the child and requires a clean exit within bounds.
-func terminate(t *testing.T, cmd *exec.Cmd, out *bytes.Buffer, stopped *bool) {
-	t.Helper()
-	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
-		t.Fatalf("signal child: %v", err)
-	}
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	select {
-	case err := <-done:
-		*stopped = true
-		if err != nil {
-			t.Fatalf("child exit after SIGTERM: %v; output:\n%s", err, out.String())
-		}
-	case <-time.After(15 * time.Second):
-		_ = cmd.Process.Kill()
-		<-done
-		*stopped = true
-		t.Fatalf("child did not exit after SIGTERM; output:\n%s", out.String())
-	}
-}
-
 // freePort reserves an ephemeral port and releases it for later use.
 func freePort(t *testing.T) int {
 	t.Helper()
@@ -263,9 +219,19 @@ func freePort(t *testing.T) int {
 	return ln.Addr().(*net.TCPAddr).Port
 }
 
-// startChild starts the test binary as the real proxy on path with its HTTP
-// port set through the environment, and returns its URL and command.
-func startChild(t *testing.T, path string, httpPort int) (string, *exec.Cmd, *bytes.Buffer) {
+// childProcess is one real run() subprocess started by startChild.
+type childProcess struct {
+	url    string        // HTTP base URL set through BMBPX_HTTP_PORT.
+	out    *bytes.Buffer // combined stdout and stderr.
+	cmd    *exec.Cmd
+	done   chan error // receives the single cmd.Wait result.
+	reaped bool       // stop already received from done.
+}
+
+// startChild starts the test binary as the real proxy on path with the HTTP
+// port and error log level set through the environment. One goroutine owns
+// cmd.Wait; test cleanup kills and reaps a child that stop did not end.
+func startChild(t *testing.T, path string, httpPort int) *childProcess {
 	t.Helper()
 	exe, err := os.Executable()
 	if err != nil {
@@ -278,11 +244,41 @@ func startChild(t *testing.T, path string, httpPort int) (string, *exec.Cmd, *by
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start child: %v", err)
 	}
+	c := &childProcess{
+		url:  "http://127.0.0.1:" + strconv.Itoa(httpPort),
+		out:  out,
+		cmd:  cmd,
+		done: make(chan error, 1),
+	}
+	go func() { c.done <- cmd.Wait() }()
 	t.Cleanup(func() {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
+		if !c.reaped {
+			_ = cmd.Process.Kill()
+			<-c.done
+		}
 	})
-	return "http://127.0.0.1:" + strconv.Itoa(httpPort), cmd, out
+	return c
+}
+
+// stop sends SIGTERM and requires a clean exit within 15 seconds; on timeout
+// it kills and reaps the child before failing.
+func (c *childProcess) stop(t *testing.T) {
+	t.Helper()
+	if err := c.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("signal child: %v", err)
+	}
+	select {
+	case err := <-c.done:
+		c.reaped = true
+		if err != nil {
+			t.Fatalf("child exit after SIGTERM: %v; output:\n%s", err, c.out.String())
+		}
+	case <-time.After(15 * time.Second):
+		_ = c.cmd.Process.Kill()
+		<-c.done
+		c.reaped = true
+		t.Fatalf("child did not exit after SIGTERM; output:\n%s", c.out.String())
+	}
 }
 
 // getConfigAPI fetches /config/api once.
@@ -331,7 +327,8 @@ func TestSaveRestartsProcessWithNewConfig(t *testing.T) {
 	const oldSerial, newSerial = "01S00CRESTARTOLD1", "01S00CRESTARTNEW2"
 	httpPort := freePort(t)
 	path := writeChildConfig(t, oldSerial, freePort(t))
-	url, cmd, out := startChild(t, path, httpPort)
+	c := startChild(t, path, httpPort)
+	url, out := c.url, c.out
 	waitFor(t, 10*time.Second, func() bool { return probeOK(url + "/livez") })
 	doc, ok := getConfigAPI(url)
 	if !ok {
@@ -368,8 +365,7 @@ func TestSaveRestartsProcessWithNewConfig(t *testing.T) {
 	if _, ok := status.Upstreams[newSerial]; !ok || len(status.Upstreams) != 1 {
 		t.Fatalf("upstreams = %v, want only %s; output:\n%s", status.Upstreams, newSerial, out)
 	}
-	stopped := false
-	terminate(t, cmd, out, &stopped)
+	c.stop(t)
 }
 
 // TestStartupFailureServesConfigPageWithError starts the binary with an MQTT
@@ -383,7 +379,8 @@ func TestStartupFailureServesConfigPageWithError(t *testing.T) {
 	defer held.Close()
 	httpPort := freePort(t)
 	path := writeChildConfig(t, "01S00CSTARTUPFAIL", held.Addr().(*net.TCPAddr).Port)
-	url, cmd, out := startChild(t, path, httpPort)
+	c := startChild(t, path, httpPort)
+	url := c.url
 
 	var startupErr string
 	waitFor(t, 15*time.Second, func() bool {
@@ -399,8 +396,7 @@ func TestStartupFailureServesConfigPageWithError(t *testing.T) {
 	if !probeOK(url + "/livez") {
 		t.Fatal("/livez does not serve in the failure mode")
 	}
-	stopped := false
-	terminate(t, cmd, out, &stopped)
+	c.stop(t)
 }
 
 func resolvedDetection(t *testing.T, cfg *config.Config) detection.Settings {
@@ -465,10 +461,11 @@ detection:
 	})
 }
 
-// serveInProcess runs serve for the config file until test cleanup and waits
-// for /livez. The HTTP port comes from the file. Fixtures that use it must
-// not run in parallel: cameras bind the fixed raw camera port 6000.
-func serveInProcess(t *testing.T, path string) {
+// serveInProcess runs serve for the config file until test cleanup, waits
+// for /livez, and returns the base URL. The HTTP port comes from the file.
+// Fixtures that use it must not run in parallel: cameras bind the fixed raw
+// camera port 6000.
+func serveInProcess(t *testing.T, path string) string {
 	t.Helper()
 	cfg, err := resolveConfig(path)
 	if err != nil {
@@ -497,4 +494,85 @@ func serveInProcess(t *testing.T, path string) {
 	})
 	base := fmt.Sprintf("http://127.0.0.1:%d", cfg.HTTP.Port)
 	waitFor(t, 15*time.Second, func() bool { return probeOK(base + "/livez") })
+	return base
+}
+
+// clearBMBPXEnv removes inherited BMBPX_* overrides for the test duration, so fixture settings cannot be replaced.
+func clearBMBPXEnv(t *testing.T) {
+	t.Helper()
+	for _, kv := range os.Environ() {
+		if name, _, _ := strings.Cut(kv, "="); strings.HasPrefix(name, "BMBPX_") {
+			t.Setenv(name, "")
+			if err := os.Unsetenv(name); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
+// configStoreServer serves one configuration store on its own test server, like setup mode.
+func configStoreServer(t *testing.T, path string) string {
+	t.Helper()
+	mux := http.NewServeMux()
+	configui.NewStore(path).Register(mux)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+// contractServe runs serve in process for one unreachable P1S printer with
+// the camera switch, an optional module section, and error-level logging,
+// and returns the base URL. Fixtures that use it must not run in parallel:
+// cameras bind the fixed raw camera port 6000.
+func contractServe(t *testing.T, serial string, cameras bool, section string) string {
+	t.Helper()
+	clearBMBPXEnv(t)
+	port := freePort(t)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	fixture := fmt.Sprintf(`listen:
+  - port: %d
+    tls: false
+printers:
+  - serial: %q
+    model: P1S
+    address: "127.0.0.1:1"
+    password: "00008888"
+http:
+  port: %d
+camera:
+  enabled: %t
+`, freePort(t), serial, port, cameras) + section + "log:\n  level: error\n"
+	if err := os.WriteFile(path, []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return serveInProcess(t, path)
+}
+
+// contractRequest performs one request within timeout and returns the
+// status and full body. A non-empty body is sent as JSON, and a non-empty
+// site sets Sec-Fetch-Site.
+func contractRequest(t *testing.T, timeout time.Duration, method, url, body, site string) (int, []byte) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, method, url, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if site != "" {
+		req.Header.Set("Sec-Fetch-Site", site)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp.StatusCode, raw
 }

@@ -83,3 +83,36 @@ func TestRTSPSSecretsNeverReachLogs(t *testing.T) {
 		t.Fatalf("printer password leaked into logs:\n%s", out)
 	}
 }
+
+// TestMissingFFmpegRefusesWebCapture protects the missing-FFmpeg refusal: an
+// RTSPS model stays web-supported but never starts a capture, and native
+// callers refuse it as unsupported.
+func TestMissingFFmpegRefusesWebCapture(t *testing.T) {
+	const serial = "00M09ANOFFMPEG1"
+	m := NewWebManager([]config.Printer{{Serial: serial, Model: "X1C", Address: "127.0.0.1:1", Username: "bblp", Password: "x"}}, discardLogger())
+	m.ffmpegPath = ""
+	t.Cleanup(m.Close)
+
+	if !m.WebSupported(serial) {
+		t.Fatal("WebSupported = false, want true")
+	}
+	if got := m.WebUnavailableReason(serial); got != "RTSPS camera unavailable: FFmpeg is not installed" {
+		t.Fatalf("WebUnavailableReason = %q", got)
+	}
+	if _, st := m.AcquireWeb(serial); st != StatusUnavailable {
+		t.Fatalf("AcquireWeb status = %v, want StatusUnavailable", st)
+	}
+	invoked := false
+	if _, st := m.WebSnapshot(serial, func(*capture) (*Frame, bool) { invoked = true; return nil, false }); st != StatusUnavailable || invoked {
+		t.Fatalf("WebSnapshot status = %v, invoked = %v; want StatusUnavailable, false", st, invoked)
+	}
+	if _, st := m.Acquire(serial); st != StatusUnsupportedModel {
+		t.Fatalf("Acquire status = %v, want StatusUnsupportedModel", st)
+	}
+	m.mu.Lock()
+	_, exists := m.captures[serial]
+	m.mu.Unlock()
+	if exists {
+		t.Fatal("capture was created for a refused serial")
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"bambu-mqtt-proxy/internal/camera"
 	"bambu-mqtt-proxy/internal/config"
 )
 
@@ -102,16 +103,6 @@ type snapshotDone struct {
 	Outcome string `json:"outcome"`
 }
 
-// supportedCamera mirrors the current web-camera model set without speculative support.
-func supportedCamera(p config.Printer) bool {
-	switch config.DisplayModel(p.Model, p.Serial) {
-	case "P1P", "P1S", "A1", "A1MINI", "X1", "X1C", "X1E", "P2S", "H2S", "H2D":
-		return true
-	default:
-		return false
-	}
-}
-
 // handleSnapshots evaluates current configured cameras without touching automatic state or controls.
 func (s *Service) handleSnapshots(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
@@ -142,7 +133,7 @@ func (s *Service) handleSnapshots(w http.ResponseWriter, r *http.Request) {
 	for _, p := range s.printers {
 		printer := snapshotPrinter{Serial: p.Serial, Name: p.Name, Model: config.DisplayModel(p.Model, p.Serial), Status: "checking"}
 		code := ""
-		if !supportedCamera(p) {
+		if !camera.WebCameraSupported(p.Model, p.Serial) {
 			printer.Status, code = "unsupported", "unsupported_camera"
 		} else if !s.commands.Online(p.Serial) {
 			printer.Status, code = "offline", "printer_offline"

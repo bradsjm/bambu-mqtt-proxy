@@ -72,25 +72,7 @@ func TestStoreMerge(t *testing.T) {
 // TestLiveReplay protects the final view contract against a captured P1S delta stream.
 func TestLiveReplay(t *testing.T) {
 	s := NewStore([]config.Printer{{Serial: "01S00C351100139", Name: "Shop", Model: "P1S"}})
-	f, err := os.Open("testdata/live_01S00C351100139_20261010.jsonl")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-	scan := bufio.NewScanner(f)
-	scan.Buffer(make([]byte, 65536), 1000000)
-	for scan.Scan() {
-		var line struct {
-			Payload json.RawMessage `json:"payload"`
-		}
-		if err := json.Unmarshal(scan.Bytes(), &line); err != nil {
-			t.Fatal(err)
-		}
-		s.Apply("01S00C351100139", line.Payload)
-	}
-	if err := scan.Err(); err != nil {
-		t.Fatal(err)
-	}
+	replayFixture(t, s, "01S00C351100139", "testdata/live_01S00C351100139_20261010.jsonl")
 	s.SetOnline("01S00C351100139", true)
 	v, _ := s.View("01S00C351100139")
 	if v.PrintState == nil || *v.PrintState != "RUNNING" || !v.Printing || v.JobName == nil || *v.JobName != "Sunlu_AMS_Heater_Desiccant_Mount_V.2" || v.Progress == nil || *v.Progress != 4 || v.RemainingMinutes == nil || *v.RemainingMinutes != 567 || v.LayerNum == nil || *v.LayerNum != 2 || v.TotalLayers == nil || *v.TotalLayers != 500 || v.NozzleTemp == nil || *v.NozzleTemp != 270.0625 || v.BedTemp == nil || *v.BedTemp != 99.96875 || v.WifiSignalDBm == nil || *v.WifiSignalDBm != -70 || v.SpeedProfile == nil || *v.SpeedProfile != "standard" {
@@ -98,6 +80,31 @@ func TestLiveReplay(t *testing.T) {
 	}
 	if !v.Connected || !v.Freshness.Fresh || v.Freshness.LastReportAgeSeconds == nil || v.ChamberTemp != nil || len(v.AMS) != 1 || v.AMS[0].Temp == nil || *v.AMS[0].Temp != 31.0 || v.ExtSpool == nil || v.ExtSpool.Material != "PLA" {
 		t.Fatalf("final sensors = %+v", v)
+	}
+}
+
+// replayFixture applies every captured payload in the JSONL file at path to
+// serial, in file order.
+func replayFixture(t *testing.T, s *Store, serial, path string) {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	scan := bufio.NewScanner(f)
+	scan.Buffer(make([]byte, 65536), 1<<20)
+	for scan.Scan() {
+		var line struct {
+			Payload json.RawMessage `json:"payload"`
+		}
+		if err := json.Unmarshal(scan.Bytes(), &line); err != nil {
+			t.Fatal(err)
+		}
+		s.Apply(serial, line.Payload)
+	}
+	if err := scan.Err(); err != nil {
+		t.Fatal(err)
 	}
 }
 
