@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -108,6 +109,21 @@ func TestToolsValidate(t *testing.T) {
 				out := mcptest.Decode[GetPrinterStateOut](t, res)
 				if out.State.Progress == nil || *out.State.Progress != 42 || out.State.Modules["example"] == nil {
 					t.Fatalf("state = %+v", out.State)
+				}
+				wire := mcptest.Decode[struct {
+					State map[string]json.RawMessage `json:"state"`
+				}](t, res)
+				var problems []json.RawMessage
+				if err := json.Unmarshal(wire.State["problems"], &problems); err != nil {
+					t.Fatalf("state.problems is not an array: %v", err)
+				}
+				if problems == nil {
+					t.Fatal("state.problems must be a non-null array")
+				}
+				for _, legacy := range []string{"hms", "print_error"} {
+					if _, exists := wire.State[legacy]; exists {
+						t.Fatalf("state includes obsolete field %q", legacy)
+					}
 				}
 			}
 			if tc.name == "list_printers" {

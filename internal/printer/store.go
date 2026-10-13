@@ -8,6 +8,7 @@ import (
 
 	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/config"
+	"bambu-mqtt-proxy/internal/hmscodes"
 )
 
 // storedPrinter holds one configured printer's report and link state.
@@ -30,6 +31,8 @@ type Store struct {
 	subscribers []func(Event)
 	// activity records transitions before subscribers receive them.
 	activity *activity.Log
+	// catalog supplies immutable per-model message snapshots.
+	catalog *hmscodes.Catalog
 	// mu protects printer entries and the accessory reader.
 	mu sync.Mutex
 	// printers indexes configured serials.
@@ -66,8 +69,13 @@ func (s *Store) Apply(serial string, payload []byte) {
 	p.lastReportAt = time.Now()
 	s.printers[serial] = p
 	log, subscribers := s.activity, append([]func(Event){}, s.subscribers...)
+	// catalog is captured with the report so projection needs no store lock.
+	catalog := s.catalog
 	s.mu.Unlock()
-	transitions := Transitions(prev, p.doc)
+	// snap is shared by both projections to prevent refresh-only transitions.
+	snap := catalog.Snapshot(serial)
+	// transitions compares the displayed problems under the same catalog state.
+	transitions := Transitions(prev, p.doc, Problems(prev, serial, snap), Problems(p.doc, serial, snap))
 	event := Event{Serial: serial, Prev: prev, Cur: p.doc, Online: p.online, NewJob: NewJob(prev, p.doc)}
 	for _, transition := range transitions {
 		log.RecordLink(serial, transition.Kind, transition.Severity, transition.Message, transition.URL)
@@ -121,6 +129,13 @@ func (s *Store) SetActivity(log *activity.Log) {
 	s.activity = log
 }
 
+// SetCatalog attaches the concrete per-model message catalog.
+func (s *Store) SetCatalog(c *hmscodes.Catalog) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.catalog = c
+}
+
 // Get returns a read-only published document and connectivity.
 func (s *Store) Get(serial string) (Doc, bool, bool) {
 	s.mu.Lock()
@@ -141,12 +156,16 @@ func (s *Store) View(serial string) (View, bool) {
 	s.mu.Lock()
 	p, ok := s.printers[serial]
 	read := s.chamberRead
+	// catalog is captured once while the entry is protected.
+	catalog := s.catalog
 	s.mu.Unlock()
 	if !ok {
 		return View{}, false
 	}
 	now := time.Now()
-	v := Build(p.doc, p.identity, p.online, p.lastReportAt, now)
+	// snap keeps this view's complete projection on one catalog version.
+	snap := catalog.Snapshot(serial)
+	v := Build(p.doc, p.identity, p.online, p.lastReportAt, now, snap)
 	if read != nil && !config.ChamberTemperatureSupported(v.Model, v.Serial) {
 		if temp, at, ok := read(serial); ok && now.Sub(at) <= FreshnessWindow {
 			v.ChamberTemp = &temp

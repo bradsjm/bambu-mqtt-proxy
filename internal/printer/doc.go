@@ -1,7 +1,6 @@
 package printer
 
 import (
-	"fmt"
 	"math"
 	"strconv"
 	"strings"
@@ -228,12 +227,6 @@ type HMSAlert struct {
 	Attr uint32
 	// Code carries alert severity and the error code.
 	Code uint32
-}
-
-// ID formats the alert in Bambu's published HMS code form,
-// e.g. HMS_0300_0100_0001_0007.
-func (a HMSAlert) ID() string {
-	return fmt.Sprintf("HMS_%04X_%04X_%04X_%04X", a.Attr>>16, a.Attr&0xFFFF, a.Code>>16, a.Code&0xFFFF)
 }
 
 // Severity decodes the severity level carried in the high half of Code.

@@ -31,6 +31,7 @@ import (
 const childEnv = "BMBPX_TEST_RUN_NO_KEY_CHILD"
 
 func TestMain(m *testing.M) {
+	catalogBaseURL = "http://127.0.0.1:1"
 	if os.Getenv(childEnv) != "" {
 		os.Exit(runNoKeyChild())
 	}

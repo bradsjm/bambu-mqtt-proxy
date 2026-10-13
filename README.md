@@ -40,7 +40,7 @@ the camera wall, MCP, and the optional modules.
 | **Apps work unchanged** | Same port 8883, `bblp` username, printer access code, skipped certificate verification; payloads forwarded byte-for-byte (compatible with 2025+ signed-firmware printers). |
 | **Printer connection limits stop mattering** | Any number of clients share one always-on link per printer. |
 | **One endpoint for the whole fleet** | MQTT topics route by serial (`device/{serial}/report`, `device/{serial}/request`); only raw camera connections route by access code instead. |
-| **Optional Pushover notifications** | Print errors, HMS warnings, AI detection alerts, stopped or failed prints, and completions reach one Pushover account, with a camera snapshot when available. |
+| **Optional Pushover notifications** | Error/warning printer problems, AI detection alerts, stopped or failed prints, and completions reach one Pushover account, with a camera snapshot when available. |
 | **Optional over-temperature stop** | A backup to the printer's own thermal protection: a nozzle, bed, or chamber reading at its model's safety limit stops every printer, switches that printer's Panda PWR off, and sends a Pushover emergency alert. |
 | **Printer outages ride out** | Automatic reconnect and resubscribe with a `pushall` warmup. A client that joins late sends its own `pushall` when it needs full state (P1 printers otherwise send deltas only). |
 | **Cameras, two ways** | A live multi-printer dashboard wall — P1/A1 cameras natively, X1/P2S/H2-series cameras through bundled FFmpeg — and a printer-compatible raw passthrough on port 6000. |
@@ -217,7 +217,7 @@ MCP endpoints (unless disabled) are served.
 | `/livez`, `/readyz` | `200 ok` once serving (printer state deliberately excluded — clients stay connected while printers recover) |
 | `/status` | JSON: `{"status":"ok","upstreams":{"<serial>":true\|false}}`, plus `detection` and `platecheck` sections when those modules run |
 | `POST /platecheck/snapshots` | Plate-check dry run used by the `/config` page: checks one fresh snapshot per online, camera-capable printer in parallel and streams the exact images and scores as NDJSON (`start`, one `result` per printer, `done`). Offline printers are skipped. Sends no printer command. Covers the startup check only, not the first-layer phase. Mounted when cameras are on |
-| `/activity`, `/activity/{serial}` | Up to 50 recent per-printer events (in memory; cleared when the proxy restarts); alert and error entries can carry a `url` with an error-code lookup link |
+| `/activity`, `/activity/{serial}` | Up to 50 recent per-printer events (in memory; cleared when the proxy restarts); printer problem and resolution entries carry a `url` with a Bambu reference link |
 | `/camera/{serial}/snapshot` | Single JPEG frame (P1/A1 native; X1/P2S/H2-series converted server-side with FFmpeg) |
 | `/camera/{serial}/stream` | Live multipart MJPEG stream (same model support as the snapshot) |
 | `/camera/{serial}/preview` | Archived plate render of the running print, fetched once per job over FTPS |
@@ -250,17 +250,16 @@ Open `http://<host>:8080/camwall`.
   stop is the emergency stop and sends immediately.
 
 - **Tiles** pair each camera with color-coded print state, a progress edge,
-  and a headline progress/time-left figure. Print errors and HMS alerts appear
-  as a severity-colored banner with a suggested fix, resolved from the
-  [PrintARA Bambu error code database](https://printara3d.com/tools/bambu-error-codes/).
+  and a headline progress/time-left figure. Printer problems appear as a
+  severity-colored banner with messages from Bambu Studio's official
+  per-model message catalog at `e.bambulab.com`.
 - **Detail levels** — click a tile's details panel to step through compact,
   vitals (layer count, finish time, nozzle/bed/chamber temperature gauges),
-  and full details. Full details add the recent activity log (up to 50
-  entries per printer: print state changes, alerts with the same
-  descriptions as the live alert banner, connectivity, AI detection events).
-  Alert and error entries can carry a `Look up` link to the error-code
-  reference. The log is held in memory and starts empty after each proxy
-  restart.
+  and full details. Full details retain every constituent code's description
+  and individual Bambu reference link, plus the recent activity log (up to 50
+  entries per printer: print state changes, printer problems and resolutions,
+  connectivity, AI detection events). Problem entries carry a `Look up` link.
+  The log is held in memory and starts empty after each proxy restart.
 - **Fleet chips** in the top bar count printers per state and double as
   filters; **needs attention** collects failed, paused, and
   serious-alert printers, plus detection warnings or pause attempts when the
@@ -289,6 +288,15 @@ Open `http://<host>:8080/camwall`.
 - **Stateless privacy** — camera and camera-wall endpoints are unauthenticated
   by design: anyone who can reach the HTTP port can view cameras and
   telemetry. The state endpoints never include credentials.
+
+The proxy downloads English catalog messages using each printer's real serial
+prefix, not its alias. It optionally caches the raw catalog in an `hms/`
+directory beside the YAML configuration. A usable cache supplies messages
+immediately at startup. Download failures keep cached messages; without a
+usable cache, visible codes show the download failure and retry after one minute.
+Cache write failures keep downloaded messages in memory, so no writable volume
+is required. Screen and health codes with the same module prefix share a
+problem banner as a presentation heuristic, not proof of one physical fault.
 
 Camera capture is automatic for configured printers: the model is detected
 from the serial prefix, so no per-printer configuration is required. Two
@@ -577,23 +585,23 @@ Enable the Notifications section on `/config` (or the `notifications` YAML
 block) to send print alerts to one [Pushover](https://pushover.net/) account.
 
 - **What notifies** — a print finishing, failing, being cancelled, or stopping
-  before it finishes; printer errors and HMS warnings; AI detection warnings
+  before it finishes; error/warning printer problems; AI detection warnings
   and AI pause attempts, including failed or unconfirmed ones; a build-plate
   check that requests a startup stop, or a first-layer warning or pause
   attempt, including failed or unconfirmed first-layer pauses; the first layer
-  completing; and a pause that leaves an active printer alert. Starts,
-  resumes, reconnects, cleared alerts, and routine plate-check entries
-  (first-layer passes, confirmed pauses, and skips) do not notify.
+  completing; and a pause that leaves an active error/warning printer problem.
+  Starts, resumes, reconnects, resolved or info-level problems, and routine
+  plate-check entries (first-layer passes, confirmed pauses, and skips) do not notify.
 - **What arrives** — events within 2 seconds group into one message per
-  printer: the event summaries, the running file, and each active alert with
-  its error code and suggested fix. The title is the printer's name or
-  serial. A camera snapshot attaches when one is available.
+  printer: the event summaries, the running file, and each active error/warning
+  problem with its codes and official catalog message when available. The title
+  is the printer's name or serial. A camera snapshot attaches when one is available.
 - **Setup** — create a Pushover application for the app token, enter both
   values on `/config`, save, and use **Send test notification**. Pushover
   messages arrive from your own application, so you can filter them.
 - **Delivery is best-effort** — one attempt per message, no retry queue, and
   nothing is stored; a busy queue or failed delivery logs a warning and the
-  proxy moves on. A restart may repeat one active alert.
+  proxy moves on. A restart may repeat one active problem.
 - **Privacy** — enabling this sends print metadata (event text, file name,
   error codes) and, when a camera is available, camera frames to Pushover's
   servers. Leave notifications disabled to keep everything local.

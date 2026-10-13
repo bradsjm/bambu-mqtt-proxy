@@ -373,7 +373,7 @@ body.kiosk .bar { display: none; }
    in SVG — the same drawing for every AMS model. Spools are edge-on: the
    filament band around the hub is the remaining estimate. Each spool has a
    numbered feeder tag whose LED is green (pulsing) when active and red when
-   an HMS alert names that slot. The external spool joins the first strip
+   a printer problem names that slot. The external spool joins the first strip
    after a dashed rule. */
 .ams-units { display: grid; gap: .5rem; }
 .ams-unit { display: grid; gap: .35rem; }
@@ -942,8 +942,8 @@ function detectBadge(d, b) {
   return { tone: "calm", label: "AI" };
 }
 // Detection findings as alert-row entries. The text carries the meaning;
-// severity reuses the HMS scale for color, and prio keeps printer-reported
-// HMS alerts and print errors ahead of detection findings on equal severity.
+// severity keeps detection aliases for color, and prio keeps printer
+// problems ahead of detection findings on equal severity.
 function detectAlerts(d, b) {
   const items = [];
   const old = detectOld(d) ? ` · result ${fmtAgo(Math.round(d.age))} old` : "";
@@ -967,12 +967,14 @@ function detectAlerts(d, b) {
     severity: "common", prio: 1, sevHidden: true, text: `AI attention · ${reasonWords(d) || d.message}` });
   return items;
 }
-// Print errors and HMS alerts, most severe first, with detection findings in
-// the same row without masking severe HMS.
+// Printer problems, most severe first, with detection findings in the same row.
 function alertsOf(p) {
-  const list = (p.hms || []).map(h => ({ code: h.id, severity: h.severity, prio: 0, label: "HMS alert", text: h.text, fix: h.fix, url: h.url }));
-  const pe = p.print_error;
-  if (pe) list.push({ code: pe.id, severity: pe.severity && pe.severity !== "unknown" ? pe.severity : "error", prio: 0, label: "Print error", text: pe.text, fix: pe.fix, url: pe.url });
+  // list adapts grouped printer problems to the existing alert rows.
+  const list = (p.problems || []).map(problem => ({
+    code: (problem.codes || []).map(code => code.code).join(", "),
+    severity: problem.severity, prio: 0, label: "Printer problem",
+    text: problem.message, url: problem.url, codes: problem.codes || []
+  }));
   const d = detectOf(p);
   if (d) list.push(...detectAlerts(d, bucket(p)));
   return list.sort((a, b) => (SEVERITY_RANK[b.severity] || 0) - (SEVERITY_RANK[a.severity] || 0) ||
@@ -1423,14 +1425,20 @@ function renderAMS(t) {
   t.r.amsNote.hidden = !note;
   t.r.amsNote.textContent = note;
 }
-// AMS slot faults from HMS alerts. AMS codes name their slot in the attribute:
-// HMS_07UU_2S00_… is unit UU, slot S (e.g. HMS_0700_2300_0002_0001, AMS 1
-// slot 4 ran out). Other modules and unit-wide codes mark no slot.
+// AMS health codes name their slot: 07UU-2S00-… is unit UU, slot S
+// (e.g. 0700-2300-0002-0001, AMS 1 slot 4 ran out).
+// Other modules and unit-wide codes mark no slot.
 function slotFaults(p) {
   const out = new Set();
-  for (const h of Array.isArray(p.hms) ? p.hms : []) {
-    const m = /^HMS_07([0-9A-F]{2})_2([0-3])00_/.exec(h?.id || "");
-    if (m) out.add(`${parseInt(m[1], 16)}:${m[2]}`);
+  // problem retains its constituent health codes for slot marking.
+  for (const problem of p.problems || []) {
+    // code is one reported identity within the displayed problem.
+    for (const code of problem.codes || []) {
+      if (code.source !== "health") continue;
+      // m captures the AMS unit and slot encoded in a health identity.
+      const m = /^07([0-9A-F]{2})-2([0-3])00-/.exec(code.code || "");
+      if (m) out.add(`${parseInt(m[1], 16)}:${m[2]}`);
+    }
   }
   return out;
 }
@@ -2159,15 +2167,14 @@ function renderTile(t) {
 
   // Alerts stay visible at every detail level: they are why someone looks.
   // Compact and vitals show the top alert on one line; full detail replaces
-  // it with every alert and its fix.
+  // it with every problem and its constituent descriptions and links.
   r.alertRow.hidden = shown.length === 0;
   r.alertFull.hidden = shown.length === 0;
   if (shown.length) {
     const top = shown[0];
     r.alertRow.dataset.sev = top.severity;
     r.alertFull.dataset.sev = top.severity;
-    // Human description first, then the raw code linked to Printara3D's
-    // lookup; codes without a dataset entry still carry the link.
+    // Human description first, then the grouped codes linked to Bambu's reference.
     r.alertText.replaceChildren();
     if (top.text != null) r.alertText.append(top.text);
     if (top.code) {
@@ -2406,13 +2413,26 @@ function renderTile(t) {
     const text = document.createElement("span");
     text.textContent = a.text || `${a.label}${a.severity === "error" ? "" : ` · ${a.severity}`}`;
     li.append(icon(SEVERITY_RANK[a.severity] >= 3 ? "i-alert" : "i-bell"), text);
-    if (a.fix) {
-      const fix = document.createElement("span");
-      fix.className = "alert-fix";
-      fix.textContent = a.fix;
-      li.append(fix);
+    // constituent keeps its own description and reference within the group.
+    for (const constituent of a.codes || []) {
+      if (constituent.message !== a.text) {
+        // description adds code-specific text without repeating the headline.
+        const description = document.createElement("span");
+        description.className = "alert-fix";
+        description.textContent = constituent.message;
+        li.append(description);
+      }
+      // ref links this individual code to its Bambu reference.
+      const ref = document.createElement("a");
+      ref.className = "alert-code";
+      ref.textContent = constituent.code;
+      ref.href = constituent.url;
+      ref.target = "_blank";
+      ref.rel = "noopener";
+      ref.title = "Look up this code";
+      li.append(ref);
     }
-    if (a.code) {
+    if (a.code && !a.codes) {
       const code = document.createElement(a.url ? "a" : "span");
       code.className = "alert-code";
       code.textContent = a.code;

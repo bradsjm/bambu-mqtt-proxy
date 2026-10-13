@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"bambu-mqtt-proxy/internal/activity"
@@ -24,6 +25,7 @@ import (
 	"bambu-mqtt-proxy/internal/control"
 	"bambu-mqtt-proxy/internal/detection"
 	"bambu-mqtt-proxy/internal/health"
+	"bambu-mqtt-proxy/internal/hmscodes"
 	"bambu-mqtt-proxy/internal/httpsrv"
 	"bambu-mqtt-proxy/internal/jobpreview"
 	"bambu-mqtt-proxy/internal/mcpserver"
@@ -36,6 +38,9 @@ import (
 	"bambu-mqtt-proxy/internal/routing"
 	"bambu-mqtt-proxy/internal/safety"
 )
+
+// catalogBaseURL selects the official catalog endpoint; startup tests use loopback.
+var catalogBaseURL = hmscodes.DefaultBaseURL
 
 func main() {
 	if err := run(); err != nil {
@@ -124,6 +129,9 @@ func serve(sigCtx context.Context, cfg *config.Config, logger *slog.Logger, stor
 	activities.SetLogger(logger)
 	printerStore := printer.NewStore(cfg.Printers)
 	printerStore.SetActivity(activities)
+	// catalog supplies cached and downloaded messages for each real serial prefix.
+	catalog := hmscodes.New(catalogBaseURL, filepath.Join(filepath.Dir(store.Path()), "hms"), serials, logger)
+	printerStore.SetCatalog(catalog)
 	links := printer.New(cfg.Printers, logger, func(serial, topic string, payload []byte) {
 		inject.PublishDownstream(topic, payload)
 		printerStore.Apply(serial, payload)
@@ -337,6 +345,17 @@ func serve(sigCtx context.Context, cfg *config.Config, logger *slog.Logger, stor
 		raw = r
 		logger.Info("raw camera endpoint serving", "port", camera.Port)
 	}
+
+	// catalogCtx and cancelCatalog control refreshes before printer reports arrive.
+	catalogCtx, cancelCatalog := context.WithCancel(context.Background())
+	// catalogDone lets teardown wait until every catalog worker stops.
+	catalogDone := make(chan struct{})
+	cancels = append(cancels, cancelCatalog)
+	done = append(done, catalogDone)
+	go func() {
+		defer close(catalogDone)
+		_ = catalog.Run(catalogCtx)
+	}()
 
 	// Start printer links at boot before modules, without waiting for printers.
 	links.Start()

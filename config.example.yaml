@@ -68,10 +68,13 @@ mcp:
 
 notifications:
   # Optional print alerts to one Pushover account (https://pushover.net/):
-  # completions, failures and stops, printer errors and HMS warnings, AI
-  # detection alerts, and pauses that leave an active alert. Also editable
-  # on the /config page, where credentials are write-only: a blank value
-  # keeps the stored one.
+  # completions, failures and stops, error/warning printer problems, AI
+  # detection alerts, and pauses with an active error/warning problem.
+  # Also editable on /config, where credentials are write-only:
+  # a blank value keeps the stored one.
+  # Problem messages use Bambu's official English per-model catalog.
+  # Its optional hms/ cache sits beside this YAML file; write failures
+  # keep downloaded messages in memory.
   # enabled: true
   # provider: pushover
   # pushover:

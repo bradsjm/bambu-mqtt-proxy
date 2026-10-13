@@ -22,7 +22,7 @@ func TestObserverReceivesRecordedEntries(t *testing.T) {
 	})
 
 	log.Record("S1", "print_finished", Info, "done")
-	log.Record("unknown", "print_error", Error, "ignored")
+	log.Record("unknown", "printer_problem", Error, "ignored")
 	if len(calls) != 1 {
 		t.Fatalf("observer calls = %d, want 1", len(calls))
 	}

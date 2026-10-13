@@ -2,7 +2,6 @@ package notification
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"slices"
 	"strings"
@@ -11,7 +10,6 @@ import (
 	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/camera"
 	"bambu-mqtt-proxy/internal/config"
-	"bambu-mqtt-proxy/internal/hmscodes"
 	"bambu-mqtt-proxy/internal/printer"
 )
 
@@ -20,19 +18,19 @@ const batchWindow = 2 * time.Second
 
 // event is one queued activity entry reduced to what delivery needs.
 // pause marks print_paused entries, which notify only when the printer's
-// final state carries an active alert.
+// final state carries an active problem.
 type event struct {
 	// serial identifies the affected printer.
 	serial string
 	// summary holds the operator message.
 	summary string
-	// pause qualifies a pause against active alerts.
+	// pause qualifies a pause against active problems.
 	pause bool
 }
 
-// StateSource reads the core printer document.
+// StateSource reads the core printer view.
 type StateSource interface {
-	Get(string) (printer.Doc, bool, bool)
+	View(string) (printer.View, bool)
 }
 
 // Service turns recorded activity into best-effort notifications: dropped queues and failed deliveries are logged, never fatal.
@@ -41,7 +39,7 @@ type Service struct {
 	names map[string]string
 	// cfg holds delivery credentials.
 	cfg Settings
-	// state reads the core printer document.
+	// state reads the core printer view.
 	state StateSource
 	// logger reports drops and delivery failures.
 	logger *slog.Logger
@@ -136,13 +134,22 @@ func (s *Service) deliverBatch(ctx context.Context, serial string, evs []event) 
 	if ctx.Err() != nil {
 		return
 	}
-	st, _, known := s.state.Get(serial)
-	alerts := activeAlerts(st, known)
+	view, ok := s.state.View(serial)
+	// problems and filename come from one view; an unknown printer has neither.
+	var problems []printer.Problem
+	filename := ""
+	if ok {
+		problems = view.Problems
+		if view.JobName != nil {
+			filename = *view.JobName
+		}
+	}
+	lines := problemLines(problems)
 
-	// Distinct summaries in arrival order; an unqualified pause contributes only when the final state carries an alert.
+	// Distinct summaries in arrival order; an unqualified pause contributes only when the final state carries a problem.
 	summaries := make([]string, 0, len(evs))
 	for _, ev := range evs {
-		if ev.pause && len(alerts) == 0 {
+		if ev.pause && len(lines) == 0 {
 			continue
 		}
 		if !slices.Contains(summaries, ev.summary) {
@@ -162,12 +169,10 @@ func (s *Service) deliverBatch(ctx context.Context, serial string, evs []event) 
 		b.WriteString(summary)
 		b.WriteString("\n")
 	}
-	if filename, ok := st.JobName(); ok && filename != "" {
-		b.WriteString("File: " + filename + "\n")
-	} else if filename, ok := st.GcodeFile(); ok && filename != "" {
+	if filename != "" {
 		b.WriteString("File: " + filename + "\n")
 	}
-	for _, line := range alerts {
+	for _, line := range lines {
 		b.WriteString(line)
 		b.WriteString("\n")
 	}
@@ -202,7 +207,7 @@ func eventSummary(e activity.Entry) string {
 		return "Print cancelled"
 	case "print_stopped":
 		return "Print stopped before finishing"
-	case "print_error", "hms_alert":
+	case "printer_problem":
 		switch e.Severity {
 		case activity.Warning:
 			return "Printer warning"
@@ -223,34 +228,19 @@ func eventSummary(e activity.Entry) string {
 	}
 }
 
-// activeAlerts renders the printer's current alerts, one line each: the nonzero print error and every HMS alert of severity fatal, serious, or common.
-func activeAlerts(st printer.Doc, known bool) []string {
-	if !known {
-		return nil
-	}
+// problemLines renders one `<message> (<codes>)` line per error or warning problem.
+func problemLines(problems []printer.Problem) []string {
 	var lines []string
-	if printError, _ := st.PrintError(); printError != 0 {
-		code := fmt.Sprintf("%04X_%04X", uint32(printError)>>16, uint32(printError)&0xFFFF)
-		lines = append(lines, alertLine(code, hmscodes.PrintError(uint32(printError))))
-	}
-	alerts, _ := st.HMS()
-	for _, a := range alerts {
-		switch a.Severity() {
-		case "fatal", "serious", "common":
-			lines = append(lines, alertLine(a.ID(), hmscodes.HMS(a.Attr)))
+	for _, problem := range problems {
+		if problem.Severity != "error" && problem.Severity != "warning" {
+			continue
 		}
+		// codes preserves the projector's constituent order.
+		codes := make([]string, 0, len(problem.Codes))
+		for _, code := range problem.Codes {
+			codes = append(codes, code.Code)
+		}
+		lines = append(lines, problem.Message+" ("+strings.Join(codes, ", ")+")")
 	}
 	return lines
-}
-
-// alertLine formats one alert as `<code>: <Title> — <Fix>`, omitting empty parts.
-func alertLine(code string, info hmscodes.Info) string {
-	line := code
-	if info.Title != "" {
-		line += ": " + info.Title
-	}
-	if info.Fix != "" {
-		line += " — " + info.Fix
-	}
-	return line
 }

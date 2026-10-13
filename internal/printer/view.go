@@ -3,7 +3,6 @@
 package printer
 
 import (
-	"fmt"
 	"time"
 
 	"bambu-mqtt-proxy/internal/config"
@@ -32,7 +31,7 @@ type View struct {
 	// Stage names the reported stg_cur action when the id is known.
 	// Idle sentinels and unknown ids remain null.
 	Stage *string `json:"stage"`
-	// JobName is the reported subtask_name.
+	// JobName is subtask_name, or gcode_file when the name is empty.
 	JobName *string `json:"job_name"`
 	// StartedAt is gcode_start_time in RFC3339 UTC.
 	StartedAt *string `json:"started_at"`
@@ -78,10 +77,8 @@ type View struct {
 	FirstLayerInspection *bool `json:"first_layer_inspection"`
 	// SpaghettiDetection is the reported printer detection setting.
 	SpaghettiDetection *bool `json:"spaghetti_detection"`
-	// PrintError is null when print_error is 0 or was never reported.
-	PrintError *Alert `json:"print_error"`
-	// HMS lists the current health alerts.
-	HMS []Alert `json:"hms"`
+	// Problems contains the current visible grouped printer conditions.
+	Problems []Problem `json:"problems"`
 	// AMS lists conventional four-slot units sorted by unit id.
 	AMS []AMSUnit `json:"ams"`
 	// ExtSpool is the reported external filament spool.
@@ -102,22 +99,6 @@ type FansView struct {
 	Heatbreak *int `json:"heatbreak"`
 }
 
-// Alert is one printer error or HMS alert. Text and Fix come from the
-// error-code dataset and stay empty for codes it does not cover; URL links
-// the code to its lookup page.
-type Alert struct {
-	// ID is the formatted printer error or HMS identifier.
-	ID string `json:"id"`
-	// Severity is the alert severity.
-	Severity string `json:"severity"`
-	// Text is the dataset description when known.
-	Text string `json:"text,omitempty"`
-	// Fix is the dataset suggested remedy when known.
-	Fix string `json:"fix,omitempty"`
-	// URL links to the alert lookup page.
-	URL string `json:"url,omitempty"`
-}
-
 // Freshness describes liveness evidence for one printer. Fresh is the printer
 // link state; the age is a diagnostic that never gates liveness.
 type Freshness struct {
@@ -132,9 +113,13 @@ type Freshness struct {
 var speedProfiles = [...]string{"silent", "standard", "sport", "ludicrous"}
 
 // Build projects a printer document at the supplied display time.
-func Build(d Doc, identity config.Printer, online bool, lastReportAt time.Time, now time.Time) View {
+func Build(d Doc, identity config.Printer, online bool, lastReportAt time.Time, now time.Time, snap hmscodes.Snapshot) View {
 	state, _ := d.GcodeState()
+	// job selects the shared display and notification filename.
 	job, _ := d.JobName()
+	if job == "" {
+		job, _ = d.GcodeFile()
+	}
 	stage := valuePtr(d.Stage())
 	nozzleType, _ := d.NozzleType()
 	light, _ := d.ChamberLight()
@@ -170,7 +155,7 @@ func Build(d Doc, identity config.Printer, online bool, lastReportAt time.Time, 
 		Timelapse:            valuePtr(d.Timelapse()),
 		FirstLayerInspection: valuePtr(d.FirstLayerInspection()),
 		SpaghettiDetection:   valuePtr(d.SpaghettiDetection()),
-		HMS:                  []Alert{},
+		Problems:             Problems(d, identity.Serial, snap),
 		AMS:                  ams,
 		ExtSpool:             ext,
 	}
@@ -185,35 +170,12 @@ func Build(d Doc, identity config.Printer, online bool, lastReportAt time.Time, 
 	if config.ChamberTemperatureSupported(v.Model, v.Serial) {
 		v.ChamberTemp = temps.Chamber
 	}
-	if n, ok := d.PrintError(); ok && n != 0 {
-		code := uint32(n)
-		info := hmscodes.PrintError(code)
-		a := Alert{ID: fmt.Sprintf("%04X_%04X", code>>16, code&0xFFFF), Severity: "unknown", URL: info.URL, Text: info.Title, Fix: info.Fix}
-		if info.Severity != "" {
-			a.Severity = info.Severity
-		}
-		v.PrintError = &a
-	}
-	alerts, _ := d.HMS()
-	for _, h := range alerts {
-		info := hmscodes.HMS(h.Attr)
-		v.HMS = append(v.HMS, Alert{ID: h.ID(), Severity: h.Severity(), URL: info.URL, Text: info.Title, Fix: info.Fix})
-	}
 	v.Freshness.Fresh = online
 	if !lastReportAt.IsZero() {
 		age := now.Sub(lastReportAt).Seconds()
 		v.Freshness.LastReportAgeSeconds = &age
 	}
 	return v
-}
-
-// ActiveAlerts counts the printer error plus HMS alerts.
-func (v View) ActiveAlerts() int {
-	n := len(v.HMS)
-	if v.PrintError != nil {
-		n++
-	}
-	return n
 }
 
 // nullable omits empty strings.

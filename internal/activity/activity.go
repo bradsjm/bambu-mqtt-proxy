@@ -1,5 +1,5 @@
 // Package activity keeps a bounded, in-memory log of notable events per
-// printer — print starts, pauses, finishes, failures, HMS alerts,
+// printer — print starts, pauses, finishes, failures, printer problems,
 // connectivity changes, and AI detection findings — so the camera wall and
 // the /activity endpoint can show what happened recently. Nothing is
 // persisted: the log starts empty on every proxy start.

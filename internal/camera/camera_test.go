@@ -12,6 +12,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -20,6 +22,7 @@ import (
 	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/control"
+	"bambu-mqtt-proxy/internal/hmscodes"
 	"bambu-mqtt-proxy/internal/printer"
 )
 
@@ -293,9 +296,15 @@ func TestCamWallRoutesServeEmbeddedWall(t *testing.T) {
 	}
 	manager := NewManager(printers, discardLogger())
 	state := printer.NewStore(printers)
+	cacheDir := t.TempDir()
+	catalogJSON := `{"result":0,"ver":1,"data":{"device_hms":{"en":[{"ecode":"0700700000020004","intro":"Official health message"}]},"device_error":{"en":[{"ecode":"07008004","intro":"Official screen message"}]}}}`
+	if err := os.WriteFile(filepath.Join(cacheDir, "hms_en_01S.json"), []byte(catalogJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state.SetCatalog(hmscodes.New("", cacheDir, []string{printers[0].Serial}, discardLogger()))
 	activities := activity.New(printers)
 	activities.Record("01S00C351100139", "print_started", activity.Info, "Print started")
-	state.Apply("01S00C351100139", []byte(`{"print":{"chamber_temper":5.0,"print_error":50348044,"hms":[{"attr":50331904,"code":65543},{"attr":117473296,"code":65543}]}}`))
+	state.Apply("01S00C351100139", []byte(`{"print":{"chamber_temper":5.0,"print_error":117473284,"hms":[{"attr":117469184,"code":131076}]}}`))
 	state.Apply("00M09A123456789", []byte(`{"print":{"chamber_temper":24.0}}`))
 	renderer := NewStatusRenderer(manager, state)
 	renderer.SetActivity(activities)
@@ -343,6 +352,22 @@ func TestCamWallRoutesServeEmbeddedWall(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode /camera/status: %v", err)
 	}
+	var wire struct {
+		Printers []map[string]json.RawMessage `json:"printers"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &wire); err != nil {
+		t.Fatal(err)
+	}
+	for _, tile := range wire.Printers {
+		if raw, ok := tile["problems"]; !ok || string(raw) == "null" {
+			t.Fatalf("printer view must include a non-null problems array: %s", w.Body.Bytes())
+		}
+		for _, legacy := range []string{"hms", "print_error"} {
+			if _, ok := tile[legacy]; ok {
+				t.Fatalf("printer view contains legacy field %q", legacy)
+			}
+		}
+	}
 	if len(payload.Printers) != 2 {
 		t.Fatalf("camera status tiles = %+v", payload.Printers)
 	}
@@ -354,23 +379,13 @@ func TestCamWallRoutesServeEmbeddedWall(t *testing.T) {
 	if !ok || !p1s.CameraOK || p1s.ChamberTemp != nil {
 		t.Fatalf("P1S tile must be camera-supported and omit chamber temp: %+v", p1s)
 	}
-	if p1s.Name != "Garage" || p1s.PrintError == nil || p1s.PrintError.ID != "0300_400C" || p1s.Freshness.LastReportAgeSeconds == nil || len(p1s.HMS) != 2 {
-		t.Fatalf("P1S tile name/errors/report age wrong: %+v", p1s)
+	if p1s.Name != "Garage" || p1s.Freshness.LastReportAgeSeconds == nil || len(p1s.Problems) != 1 {
+		t.Fatalf("P1S tile name/problems/report age wrong: %+v", p1s)
 	}
-	if pe := p1s.PrintError; pe.Text != "Print Cancelled" || pe.Severity != "info" || pe.Fix == "" ||
-		pe.URL != "https://printara3d.com/tools/bambu-error-codes/hms-0300-400c/" {
-		t.Fatalf("P1S print error description wrong: %+v", p1s)
-	}
-	// The unknown print-module alert keeps its code and gains only the
-	// reference link; the AMS alert carries the dataset description.
-	if p1s.HMS[0] != (printer.Alert{ID: "HMS_0300_0100_0001_0007", Severity: "fatal",
-		URL: "https://printara3d.com/tools/bambu-error-codes/?code=0300-0100"}) {
-		t.Fatalf("unknown HMS alert must keep code and reference link: %+v", p1s.HMS[0])
-	}
-	hms := p1s.HMS[1]
-	if hms.ID != "HMS_0700_8010_0001_0007" || hms.Severity != "fatal" || hms.Text != "AMS Motor Overload" ||
-		hms.Fix == "" || hms.URL != "https://printara3d.com/tools/bambu-error-codes/hms-0700-8010/" {
-		t.Fatalf("known HMS alert must carry description: %+v", p1s.HMS[1])
+	problem := p1s.Problems[0]
+	if problem.Severity != "error" || len(problem.Codes) != 2 ||
+		problem.Codes[0].Code != "0700-8004" || problem.Codes[1].Code != "0700-7000-0002-0004" {
+		t.Fatalf("P1S grouped problem codes/severity wrong: %+v", problem)
 	}
 	if len(p1s.Activity) != 1 || p1s.Activity[0].Kind != "print_started" {
 		t.Fatalf("P1S tile activity = %+v", p1s.Activity)

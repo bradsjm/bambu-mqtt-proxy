@@ -68,6 +68,9 @@ func NewStore(path string) *Store {
 	}
 }
 
+// Path returns the immutable YAML configuration path.
+func (s *Store) Path() string { return s.path }
+
 // SetHTTPPort records the port this process serves. A save that changes it
 // test-binds the new port first; with no port recorded the check is skipped.
 func (s *Store) SetHTTPPort(port int) { s.httpPort = port }
