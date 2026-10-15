@@ -4,13 +4,18 @@
 package camera
 
 import (
+	"bytes"
+	"compress/gzip"
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,6 +28,32 @@ import (
 
 //go:embed camwall.html
 var camwallHTML []byte
+
+// camwallGzip is the embedded wall precompressed with best compression.
+var camwallGzip []byte
+
+// camwallETag is the weak validator shared by the identity and gzip wall
+// encodings. A weak tag may cover both content-codings because they carry the
+// same page, and Vary: Accept-Encoding keeps caches from mixing the variants.
+var camwallETag string
+
+// init compresses the embedded wall and derives its validator once.
+func init() {
+	sum := sha256.Sum256(camwallHTML)
+	camwallETag = `W/"` + hex.EncodeToString(sum[:]) + `"`
+	var buf bytes.Buffer
+	w, err := gzip.NewWriterLevel(&buf, gzip.BestCompression)
+	if err != nil {
+		panic("camera: wall gzip level: " + err.Error())
+	}
+	if _, err := w.Write(camwallHTML); err != nil {
+		panic("camera: wall gzip write: " + err.Error())
+	}
+	if err := w.Close(); err != nil {
+		panic("camera: wall gzip close: " + err.Error())
+	}
+	camwallGzip = buf.Bytes()
+}
 
 // Bookmark and home-screen icons for the wall. The page also inlines an SVG
 // favicon; these raster forms cover /favicon.ico probes and iOS, which
@@ -37,6 +68,10 @@ var (
 // controlMaxBody bounds printer control request bodies.
 const controlMaxBody = 4 << 10
 
+// tileActivityLimit bounds the activity entries embedded in one status tile.
+// The full log stays available at GET /activity/{serial}.
+const tileActivityLimit = 20
+
 // Tile is one printer's entry in /camera/status: the shared printer view
 // plus camera-wall-only state. It carries only display state: never
 // serial-derived credentials or raw configuration.
@@ -45,6 +80,8 @@ type Tile struct {
 	CameraOK     bool             `json:"camera_supported"`
 	CameraReason string           `json:"camera_reason,omitempty"`
 	Activity     []activity.Entry `json:"activity,omitempty"` // recent events, newest first
+	// ActivityTotal counts every entry the log holds for this printer.
+	ActivityTotal int `json:"activity_total,omitempty"`
 	// Controls lists the printer controls currently available.
 	Controls []string `json:"controls"`
 	FrameAge float64  `json:"frame_age_seconds,omitempty"`
@@ -165,7 +202,12 @@ func (r *StatusRenderer) Tiles() []Tile {
 			t.FrameAge = time.Since(f.Captured).Seconds()
 			t.FrameSeq = f.Seq
 		}
-		t.Activity = r.activity.Recent(st.Serial)
+		recent := r.activity.Recent(st.Serial)
+		t.ActivityTotal = len(recent)
+		t.Activity = recent
+		if len(t.Activity) > tileActivityLimit {
+			t.Activity = t.Activity[:tileActivityLimit]
+		}
 		for _, mod := range r.modules {
 			if mod.State != nil {
 				if value := mod.State(st.Serial); value != nil {
@@ -200,20 +242,59 @@ func (r *StatusRenderer) payload(tiles []Tile) statusPayload {
 // wall's icons on the shared mux.
 func (r *StatusRenderer) RegisterStatus(mux *http.ServeMux) {
 	mux.HandleFunc("GET /camera/status", func(w http.ResponseWriter, _ *http.Request) {
-		noStore(w)
+		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(r.payload(r.Tiles()))
 	})
 	// Printer controls are protected against cross-origin browser writes.
 	protection := http.NewCrossOriginProtection()
 	mux.Handle("POST /control/{serial}", protection.Handler(http.HandlerFunc(r.handleControl)))
-	mux.HandleFunc("GET /camwall", func(w http.ResponseWriter, _ *http.Request) {
-		noStore(w)
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = w.Write(camwallHTML)
-	})
+	mux.HandleFunc("GET /camwall", serveWall)
 	mux.HandleFunc("GET /favicon.ico", staticAsset("image/x-icon", faviconICO))
 	mux.HandleFunc("GET /apple-touch-icon.png", staticAsset("image/png", appleTouchIconPNG))
+}
+
+// serveWall answers the embedded wall, gzipped when the client accepts it.
+// http.ServeContent handles the weak ETag comparison, 304, HEAD, and
+// Content-Length.
+func serveWall(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("ETag", camwallETag)
+	w.Header().Set("Vary", "Accept-Encoding")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	body := camwallHTML
+	if acceptsGzip(r) {
+		w.Header().Set("Content-Encoding", "gzip")
+		body = camwallGzip
+	}
+	http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(body))
+}
+
+// acceptsGzip reports whether the request accepts gzip with nonzero weight.
+// An explicit gzip entry overrides a "*" wildcard.
+func acceptsGzip(r *http.Request) bool {
+	// gzipWeight and anyWeight hold the listed weights; -1 means not listed.
+	gzipWeight, anyWeight := -1.0, -1.0
+	for _, field := range strings.Split(r.Header.Get("Accept-Encoding"), ",") {
+		name, params, _ := strings.Cut(field, ";")
+		// weight defaults to 1 when the entry has no valid q parameter.
+		weight := 1.0
+		if _, value, ok := strings.Cut(params, "="); ok {
+			if q, err := strconv.ParseFloat(strings.TrimSpace(value), 64); err == nil {
+				weight = q
+			}
+		}
+		switch strings.ToLower(strings.TrimSpace(name)) {
+		case "gzip":
+			gzipWeight = weight
+		case "*":
+			anyWeight = weight
+		}
+	}
+	if gzipWeight < 0 {
+		gzipWeight = anyWeight
+	}
+	return gzipWeight > 0
 }
 
 // staticAsset serves an embedded, immutable-per-build asset.

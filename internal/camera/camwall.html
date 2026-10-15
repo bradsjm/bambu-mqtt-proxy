@@ -1234,7 +1234,12 @@ function createTile(p) {
     sendControl(t, { action: "light", on: !(t.data.chamber_light === "on") }));
   t.r.ctlPause.addEventListener("click", () => sendControl(t, { action: t.r.ctlPause.dataset.action }));
   t.r.ctlStop.addEventListener("click", () => sendControl(t, { action: "stop" }));
-  t.r.actMore.addEventListener("click", () => { t.actAll = !t.actAll; renderActivity(t); });
+  t.r.actMore.addEventListener("click", () => {
+    t.actAll = !t.actAll;
+    t.actFull = null;
+    if (t.actAll) loadFullActivity(t);
+    renderActivity(t);
+  });
   for (const sp of SPEEDS) {
     const btn = document.createElement("button");
     btn.type = "button";
@@ -1313,9 +1318,38 @@ function touchActivityAges(t, shown) {
     if (ago && ago.textContent !== text) ago.textContent = text;
   }
 }
+// loadFullActivity fetches the whole activity log for an expanded tile, one
+// request at a time; sync calls it on every poll while the list is expanded.
+async function loadFullActivity(t) {
+  if (t.actLoading) return;
+  t.actLoading = true;
+  try {
+    const res = await fetch(`/activity/${encodeURIComponent(t.serial)}`, { cache: "no-store", signal: AbortSignal.timeout(5000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    // A collapse during the request discards the result.
+    if (t.actAll && Array.isArray(data.events)) {
+      t.actFull = data.events;
+      renderActivity(t);
+    }
+  } catch (err) {
+    // Drop the stale full list so the expanded view falls back to the fresh status entries.
+    t.actFull = null;
+    renderActivity(t);
+    console.warn(`Full activity log for ${t.serial} did not load: ${err.message}. The list shows the newest status entries and retries on the next status poll.`);
+  } finally {
+    t.actLoading = false;
+  }
+}
 // renderActivity lists recent events, rebuilding rows only when the cheap key misses.
+// Expanded tiles show the full log from loadFullActivity; the status payload
+// carries only the newest entries plus activity_total.
 function renderActivity(t) {
-  const events = Array.isArray(t.data.activity) ? t.data.activity : [];
+  const polled = Array.isArray(t.data.activity) ? t.data.activity : [];
+  // events is the list on screen: the full log while expanded and loaded, else the polled entries.
+  const events = t.actAll && t.actFull ? t.actFull : polled;
+  // total counts every logged entry, including those the status payload left out.
+  const total = Math.max(Number(t.data.activity_total) || 0, events.length);
   // Key covers identity and urls plus the show-all toggle. Ages refresh in place on a hit.
   const key = events.map(e => `${e.id}:${typeof e.url === "string" ? e.url : ""}`).join(",") + `:${t.actAll ? 1 : 0}`;
   if (key === t.activityKey) {
@@ -1332,10 +1366,10 @@ function renderActivity(t) {
   t.actShown = t.actAll ? all : all.slice(0, 8);
   const shown = t.actShown;
   t.r.actEmpty.hidden = events.length > 0;
-  const meta = events.length ? `${events.length} event${events.length > 1 ? "s" : ""}` : "";
+  const meta = total ? `${total} event${total > 1 ? "s" : ""}` : "";
   if (t.r.actMeta.textContent !== meta) t.r.actMeta.textContent = meta;
-  t.r.actMore.hidden = all.length <= 8;
-  const more = t.actAll ? "Show fewer" : `Show all ${all.length}`;
+  t.r.actMore.hidden = !t.actAll && all.length <= 8 && total <= events.length;
+  const more = t.actAll ? "Show fewer" : "Show all";
   if (t.r.actMore.textContent !== more) t.r.actMore.textContent = more;
   t.r.actMore.setAttribute("aria-expanded", String(!!t.actAll));
   const rows = shown.map(e => {
@@ -2935,7 +2969,12 @@ function sync(list) {
   const changed = new Set();
   for (const p of list) {
     const t = tiles.get(p.serial);
-    if (t) { t.data = p; changed.add(p.serial); continue; }
+    if (t) {
+      t.data = p;
+      changed.add(p.serial);
+      if (t.actAll) loadFullActivity(t);
+      continue;
+    }
     const nt = createTile(p);
     tiles.set(p.serial, nt);
     grid.append(nt.el);

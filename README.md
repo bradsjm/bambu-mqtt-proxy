@@ -221,7 +221,7 @@ MCP endpoints (unless disabled) are served.
 | `/camera/{serial}/snapshot` | Single JPEG frame (P1/A1 native; X1/P2S/H2-series converted server-side with FFmpeg) |
 | `/camera/{serial}/stream` | Live multipart MJPEG stream (same model support as the snapshot) |
 | `/camera/{serial}/preview` | Archived plate render of the running print, fetched once per job over FTPS |
-| `/camera/status` | Display state for every printer (no credentials), polled by the wall every second |
+| `/camera/status` | Display state for every printer (no credentials), polled by the wall every second; each printer carries its 20 newest activity entries and `activity_total` (the wall loads the full list from `/activity/{serial}` when expanded) |
 | `/camwall` | Multi-printer camera wall dashboard |
 | `/config`, `/config/api` | Browser configuration page and its JSON API (`GET` never returns access codes; `PUT` saves and restarts the proxy) |
 | `/favicon.ico`, `/apple-touch-icon.png` | Browser-tab, bookmark, and home-screen icons |

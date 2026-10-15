@@ -43,7 +43,8 @@ func (m *Manager) Status(serial string) any {
 	return state
 }
 
-// noStore marks every camera response uncacheable.
+// noStore marks snapshot, stream, and control responses uncacheable. The
+// wall page and its status JSON instead revalidate with no-cache.
 func noStore(w http.ResponseWriter) {
 	w.Header().Set("Cache-Control", "no-store")
 }

@@ -317,14 +317,35 @@ func TestCamWallRoutesServeEmbeddedWall(t *testing.T) {
 	if wallResp.Code != http.StatusOK {
 		t.Fatalf("GET /camwall = %d, want 200", wallResp.Code)
 	}
-	if wallResp.Header().Get("Cache-Control") != "no-store" {
+	if wallResp.Header().Get("Cache-Control") != "no-cache" {
 		t.Errorf("GET /camwall Cache-Control = %q", wallResp.Header().Get("Cache-Control"))
 	}
 	if !strings.HasPrefix(wallResp.Header().Get("Content-Type"), "text/html") {
 		t.Errorf("GET /camwall Content-Type = %q", wallResp.Header().Get("Content-Type"))
 	}
+	if wallResp.Header().Get("Vary") != "Accept-Encoding" {
+		t.Errorf("GET /camwall Vary = %q, want Accept-Encoding", wallResp.Header().Get("Vary"))
+	}
+	if wallResp.Header().Get("ETag") == "" {
+		t.Error("GET /camwall is missing its ETag")
+	}
 	if !strings.Contains(wallResp.Body.String(), "/camera/status") {
 		t.Fatal("embedded wall does not poll camera status")
+	}
+	gzipReq := httptest.NewRequest(http.MethodGet, "/camwall", nil)
+	gzipReq.Header.Set("Accept-Encoding", "gzip")
+	gzipResp := httptest.NewRecorder()
+	mux.ServeHTTP(gzipResp, gzipReq)
+	if gzipResp.Code != http.StatusOK || gzipResp.Header().Get("Content-Encoding") != "gzip" {
+		t.Fatalf("GET /camwall gzip = %d %q", gzipResp.Code, gzipResp.Header().Get("Content-Encoding"))
+	}
+	condReq := httptest.NewRequest(http.MethodGet, "/camwall", nil)
+	condReq.Header.Set("Accept-Encoding", "gzip")
+	condReq.Header.Set("If-None-Match", gzipResp.Header().Get("ETag"))
+	condResp := httptest.NewRecorder()
+	mux.ServeHTTP(condResp, condReq)
+	if condResp.Code != http.StatusNotModified || condResp.Body.Len() != 0 {
+		t.Fatalf("GET /camwall conditional = %d with %d body bytes, want 304 with none", condResp.Code, condResp.Body.Len())
 	}
 	for path, want := range map[string]string{"/favicon.ico": "image/x-icon", "/apple-touch-icon.png": "image/png"} {
 		if !strings.Contains(wallResp.Body.String(), `href="`+path+`"`) {
@@ -389,6 +410,9 @@ func TestCamWallRoutesServeEmbeddedWall(t *testing.T) {
 	}
 	if len(p1s.Activity) != 1 || p1s.Activity[0].Kind != "print_started" {
 		t.Fatalf("P1S tile activity = %+v", p1s.Activity)
+	}
+	if p1s.ActivityTotal != 1 {
+		t.Fatalf("P1S tile activity_total = %d, want 1", p1s.ActivityTotal)
 	}
 	x1c, ok := tiles["00M09A123456789"]
 	if !ok || x1c.CameraOK || x1c.ChamberTemp == nil || *x1c.ChamberTemp != 24 {
