@@ -87,7 +87,12 @@ func Transitions(prev, cur Doc, oldProblems, newProblems []Problem) []Transition
 				add("print_paused", activity.Warning, "Print paused"+filename)
 			}
 		case "FINISH":
-			add("print_finished", activity.Info, "Print finished"+filename)
+			// A FINISH carrying the user-cancel code is a cancelled print.
+			if isCancelCode(errCode) {
+				add("print_cancelled", activity.Warning, "Print cancelled"+filename)
+			} else {
+				add("print_finished", activity.Info, "Print finished"+filename)
+			}
 		case "FAILED":
 			if isCancelCode(errCode) {
 				add("print_cancelled", activity.Warning, "Print cancelled"+filename)

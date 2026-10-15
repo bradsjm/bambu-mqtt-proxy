@@ -60,7 +60,7 @@ func (w *worker) checkLayer(parent context.Context) {
 	switch decision {
 	case "inconclusive":
 		w.layerEvent("platecheck_layer1_skipped", activity.Info, "First-layer check skipped, image not clear enough ("+scoreText(result.PAssessable, w.s.settings.MinClarity)+", needs "+wholeText(w.s.settings.MinClarity)+"), continuing print", operation)
-		w.logLayerOutcome(operation, decision, "", &result, state, layer, hasLayer, captured, time.Since(started).Milliseconds())
+		w.logLayerOutcome(operation, decision, "image_unclear", &result, state, layer, hasLayer, captured, time.Since(started).Milliseconds())
 	case "warning":
 		w.layerEvent("platecheck_layer1_warning", activity.Warning, "Possible first-layer problem: "+layerIssues(result, .5, true)+", continuing print", operation)
 		w.logLayerOutcome(operation, decision, "", &result, state, layer, hasLayer, captured, time.Since(started).Milliseconds())

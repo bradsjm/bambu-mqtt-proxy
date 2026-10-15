@@ -17,6 +17,7 @@ func TestEventReplay(t *testing.T) {
 		{"live_01S00C351100139_20261010.jsonl", []string{"state_initial", "print_preparing", "print_started", "first_layer_complete"}},
 		{"p1s_edge_cases.jsonl", []string{"state_initial", "print_started", "first_layer_complete", "print_finished", "print_started"}},
 		{"p1s_cancel_resend.jsonl", []string{"state_initial", "print_started", "print_paused", "printer_problem", "print_cancelled", "problem_resolved", "print_started", "first_layer_complete"}},
+		{"p1s_stop_finish.jsonl", []string{"state_initial", "print_paused", "print_cancelled"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

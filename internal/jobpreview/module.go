@@ -28,6 +28,12 @@ func (s *Service) Display(serial string) *module.Display {
 	if !ok || result.Preview.Status == StatusReady || result.Preview.Status == StatusDisabled {
 		return nil
 	}
+	// Without an active print there is nothing to retrieve, so only pending shows.
+	if result.Preview.Status != StatusPending {
+		if d, _, _ := s.state.Get(serial); !active(d) {
+			return nil
+		}
+	}
 	value, tone := "Print details unavailable", "warn"
 	if result.Preview.Status == StatusPending {
 		value, tone = "Downloading print details", "info"

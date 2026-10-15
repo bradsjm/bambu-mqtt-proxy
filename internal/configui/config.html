@@ -223,6 +223,7 @@ main input:user-invalid { border-color: var(--error); }
            transform: translate(-50%, 0); transition: transform .35s var(--ease), opacity .35s; }
 .savebar[data-state="idle"] { transform: translate(-50%, 160%); opacity: 0; pointer-events: none; }
 .savebar .msg { flex: 1; display: flex; align-items: center; gap: .6rem; min-width: 0; }
+#save-elapsed { margin-left: .35rem; font-variant-numeric: tabular-nums; }
 .savebar .msg::before { content: ""; width: .55rem; height: .55rem; border-radius: 50%; flex: none; background: var(--pending); }
 .savebar[data-state="busy"] .msg::before { background: var(--focus); animation: pulse 1.2s infinite; }
 .savebar[data-state="done"] .msg::before { background: var(--ok); }
@@ -233,7 +234,7 @@ main input:user-invalid { border-color: var(--error); }
 
 /* Printer dialog */
 dialog { width: min(34rem, calc(100% - 1.5rem)); max-height: calc(100dvh - 2rem); padding: 0; border-radius: 14px;
-         border: 1px solid var(--line); background: var(--panel); color: var(--text); }
+         border: 1px solid var(--line); background: var(--panel); color: var(--text); overflow-y: auto; }
 dialog::backdrop { background: rgb(5 6 8 / .7); -webkit-backdrop-filter: blur(3px); backdrop-filter: blur(3px); }
 dialog form { display: grid; gap: 1rem; padding: 1.25rem; }
 dialog h2 { font-size: 1.1rem; }
@@ -250,7 +251,8 @@ details { border-top: 1px solid var(--line); padding-top: .85rem; }
 details summary { cursor: pointer; color: var(--dim); font-weight: 550; }
 details[open] summary { margin-bottom: .85rem; }
 details .field + .check, details .check + .check { margin-top: .75rem; }
-.dlg-foot { display: flex; justify-content: flex-end; gap: .5rem; padding-top: .25rem; }
+.dlg-foot { position: sticky; bottom: 0; display: flex; justify-content: flex-end; gap: .5rem;
+            margin: 0 -1.25rem -1.25rem; padding: .75rem 1.25rem; background: var(--panel); border-top: 1px solid var(--line); }
 .dlg-error { margin: 0; color: var(--error); font-size: .85rem; }
 
 @media (max-width: 720px) {
@@ -524,8 +526,9 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
 </main>
 
 <div class="savebar" id="savebar" data-state="idle" role="status" aria-live="polite">
-  <div class="msg"><span id="save-msg"></span></div>
+  <div class="msg"><span id="save-msg"></span><span id="save-elapsed" aria-hidden="true"></span></div>
   <div class="actions">
+    <button class="btn" type="button" id="reload" hidden>Reload page</button>
     <button class="btn quiet" type="button" id="discard">Discard</button>
     <button class="btn primary" type="button" id="save">Save and apply</button>
   </div>
@@ -707,6 +710,9 @@ function renderFields() {
   for (const el of document.querySelectorAll("[data-env]")) {
     const env = meta.env_overrides[el.dataset.env];
     el.hidden = !env;
+    // An env-locked value cannot be changed here, so its input is disabled.
+    const input = el.closest(".row")?.querySelector(".control :is(input, select)");
+    if (input) input.disabled = !!env;
     if (env) el.innerHTML = `Set by <code>${esc(env)}</code>, which takes precedence over this value.`;
   }
   pushoverHints();
@@ -784,6 +790,7 @@ function setBar(state, msg) {
   const bar = $("#savebar");
   bar.dataset.state = state;
   $("#save-msg").textContent = msg;
+  $("#save-elapsed").textContent = ""; $("#reload").hidden = true;
   const busy = state === "busy";
   $("#save").disabled = busy; $("#discard").disabled = busy;
   $("#save").hidden = state === "done"; $("#discard").hidden = state === "done";
@@ -818,7 +825,12 @@ function validateForm() {
     if (!el.checkValidity()) { el.reportValidity(); return false; }
   }
   const missing = cfg.printers.find(p => !p.access_code && !p.has_access_code);
-  if (missing) { setBar("error", `Enter the access code for printer ${missing.serial}.`); return false; }
+  if (missing) {
+    setBar("error", `Enter the access code for printer ${missing.serial}.`);
+    openPrinter(cfg.printers.indexOf(missing));
+    dialogFail("Enter the printer's access code.", $("#p-code"));
+    return false;
+  }
   if (cfg.notifications.enabled || cfg.safety?.enabled) {
     const n = cfg.notifications.pushover;
     const blank = (v, has) => !has && !String(v || "").trim();
@@ -857,9 +869,11 @@ async function save() {
     return;
   }
   setBar("busy", "Saved. Restarting the proxy with the new settings…");
-  const deadline = Date.now() + 30000;
+  const began = Date.now();
+  const deadline = began + 30000;
   while (Date.now() < deadline) {
     await new Promise(r => setTimeout(r, 700));
+    $("#save-elapsed").textContent = `${Math.round((Date.now() - began) / 1000)} s`;
     try {
       const data = await fetch(API, { cache: "no-store" }).then(r => r.ok ? r.json() : null);
       if (!data || data.meta.started === oldStart) continue;
@@ -870,6 +884,7 @@ async function save() {
     } catch { /* restarting */ }
   }
   setBar("error", "Saved, but the proxy has not come back after 30 seconds. Check its logs.");
+  $("#reload").hidden = false;
 }
 
 function guard(e) { if (snapshot() !== baseline) e.preventDefault(); }
@@ -1428,6 +1443,7 @@ $("#add-listener").addEventListener("click", () => {
   $(`#listeners .listener:last-child input`).focus();
 });
 $("#save").addEventListener("click", save);
+$("#reload").addEventListener("click", () => location.reload());
 $("#discard").addEventListener("click", () => {
   cfg = JSON.parse(baseline);
   render();

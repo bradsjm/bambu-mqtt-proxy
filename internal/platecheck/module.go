@@ -113,11 +113,6 @@ func (s *Service) Display(serial string) *module.Display {
 	v := value.(ModuleState)
 	var rows []module.Row
 	rows = append(rows, plateRow(v))
-	rows = append(rows, module.Row{
-		Label:   "Rule",
-		Value:   fmt.Sprintf("Stops the print if the plate looks occupied (over %s) and image clarity is at least %s", wholeText(v.Cutoff), wholeText(v.MinClarity)),
-		Section: "Before printing",
-	})
 	if v.POccupied != nil {
 		row := module.Row{
 			Label:   "Scores",
@@ -130,13 +125,6 @@ func (s *Service) Display(serial string) *module.Display {
 		rows = append(rows, row)
 	}
 	rows = append(rows, firstLayerRow(v.FirstLayer))
-	if v.FirstLayer.State != "disabled" {
-		rows = append(rows, module.Row{
-			Label:   "Rule",
-			Value:   fmt.Sprintf("Pauses the print if tangle, detachment, or nozzle blob is over %s and image clarity is at least %s", wholeText(v.FirstLayer.Cutoff), wholeText(v.FirstLayer.MinClarity)),
-			Section: "After layer 1",
-		})
-	}
 	if v.FirstLayer.PAssessable != nil {
 		tone := ""
 		if *v.FirstLayer.PAssessable < v.FirstLayer.MinClarity {

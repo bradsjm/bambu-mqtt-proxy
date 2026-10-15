@@ -324,7 +324,7 @@ func (w *worker) check(parent context.Context, homing bool) {
 	switch decision {
 	case "inconclusive":
 		w.s.activity.Record(w.printer.Serial, "platecheck_skipped", activity.Info, checkName(homing)+" skipped, image not clear enough ("+scoreText(result.PAssessable, w.s.settings.MinClarity)+", needs "+wholeText(w.s.settings.MinClarity)+"), continuing print")
-		w.logStartupOutcome(operation, pass, decision, "", &result, state, layer, hasLayer, chamberLightSent, captured, time.Since(started).Milliseconds())
+		w.logStartupOutcome(operation, pass, decision, "image_unclear", &result, state, layer, hasLayer, chamberLightSent, captured, time.Since(started).Milliseconds())
 	case "clear", "below_threshold":
 		w.s.activity.Record(w.printer.Serial, "platecheck_passed", activity.Info, checkName(homing)+" passed, continuing print")
 		w.logStartupOutcome(operation, pass, decision, "", &result, state, layer, hasLayer, chamberLightSent, captured, time.Since(started).Milliseconds())

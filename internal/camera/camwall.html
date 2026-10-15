@@ -16,7 +16,7 @@
   --bg: #0b0d10; --panel: #14181d; --panel-2: #1b2027; --line: #262d36;
   --text: #e6ebf0; --dim: #8d9aa8; --faint: #5b6673;
   --printing: #34d399; --paused: #fbbf24; --preparing: #60a5fa; --finished: #22d3ee;
-  --failed: #f87171; --idle: #94a3b8; --waiting: #94a3b8; --offline: #64748b;
+  --failed: #f87171; --ended: #94a3b8; --idle: #94a3b8; --waiting: #94a3b8; --offline: #64748b;
   --live: #ef4444; --attention: #f87171;
   --heat: #fb923c; --tile-min: 340px;
   /* Thermal stages: one color per stage wherever a temperature appears. */
@@ -80,7 +80,12 @@ button.chip[aria-pressed="true"] .chip-label { color: var(--text); }
             font-size: .85rem; white-space: nowrap; }
 .nav-link:hover { color: var(--text); background: var(--panel); }
 .nav-link .ic { font-size: 1.05rem; }
-body.kiosk .bar { display: none; }
+/* Kiosk keeps only the health dot, fixed top right; the text stays for screen readers. */
+body.kiosk .bar { position: fixed; top: max(.5rem, env(safe-area-inset-top)); right: max(.5rem, env(safe-area-inset-right));
+                  left: auto; padding: .35rem .5rem; border: 0; border-radius: 999px; background: rgb(10 12 15 / .72); }
+body.kiosk .bar > :not(.actions), body.kiosk .actions > :not(#health) { display: none; }
+body.kiosk .health { margin: 0; }
+body.kiosk #health-text { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 @media (max-width: 640px) {
   .fleet { order: 3; flex-basis: 100%; }
   .chip-label, .health span, .nav-link span { display: none; }
@@ -107,10 +112,10 @@ body.kiosk .bar { display: none; }
 .tile[data-state="paused"] { --accent: var(--paused); }
 .tile[data-state="preparing"] { --accent: var(--preparing); }
 .tile[data-state="finished"] { --accent: var(--finished); }
-.tile[data-state="failed"] { --accent: var(--failed); }
+.tile[data-state="ended"] { --accent: var(--ended); }
 .tile[data-state="waiting"] { --accent: var(--waiting); }
 .tile[data-state="offline"] { --accent: var(--offline); }
-.tile[data-state="failed"], .tile[data-state="paused"] {
+.tile[data-state="paused"] {
   box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 60%, transparent),
               0 0 28px -8px color-mix(in srgb, var(--accent) 70%, transparent); }
 .tile[data-alert="high"] {
@@ -194,9 +199,9 @@ body.kiosk .bar { display: none; }
                 background: rgb(255 255 255 / .12); pointer-events: none; }
 .cam-progress > div { height: 100%; width: var(--pct, 0%); background: var(--bar, var(--accent));
                       box-shadow: 0 0 10px var(--bar, var(--accent)); transition: width .8s var(--ease); }
-/* Preparing shows heat-up toward the targets; a failed print freezes dimmed at the stop. */
+/* Preparing shows heat-up toward the targets; an ended print freezes dimmed at the stop. */
 .tile[data-state="preparing"] .cam-progress { --bar: var(--t-heat); }
-.tile[data-state="failed"] .cam-progress > div { opacity: .55; box-shadow: none; }
+.tile[data-state="ended"] .cam-progress > div { opacity: .55; box-shadow: none; }
 .cam-progress[hidden] { display: none; }
 /* Module overlay: display-only glass pills right-aligned under the feed
    pill, clear of the state, feed, and AI pills, the controls, and the
@@ -229,6 +234,7 @@ body.kiosk .bar { display: none; }
 .ctl-bar .ctl.light[aria-pressed="true"] { color: var(--paused); border-color: color-mix(in srgb, var(--paused) 55%, transparent);
   box-shadow: 0 0 12px -2px color-mix(in srgb, var(--paused) 70%, transparent); }
 .ctl[aria-busy="true"] { opacity: .55; cursor: progress; }
+@media (pointer: coarse) { .ctl-bar .ctl { width: 2.75rem; height: 2.75rem; font-size: 1.2rem; } }
 
 .details { padding: .6rem .7rem .7rem; cursor: pointer; }
 .head { display: flex; align-items: center; gap: .5rem; min-height: 2.5rem; }
@@ -285,7 +291,7 @@ body.kiosk .bar { display: none; }
              font-variant-numeric: tabular-nums; }
 .kpi-meter .segs, .kpi-meter .mbar { flex: 1 1 0; width: 0; min-width: 2.5rem; }
 .kpi-meter b { color: var(--text); font-weight: 600; display: inline-block; text-align: right; min-width: var(--w, 3ch); }
-.tile[data-state="failed"] .kpi-meter { opacity: .6; }
+.tile[data-state="ended"] .kpi-meter { opacity: .6; }
 .kpi-sub { display: inline-flex; align-items: center; gap: .3rem; font-size: .74rem; color: var(--dim);
            font-variant-numeric: tabular-nums; }
 .kpi-sub:empty { display: none; }
@@ -359,7 +365,7 @@ body.kiosk .bar { display: none; }
 .job-archive .ja-note-head { margin: .1rem 0 0; color: var(--faint); font: 600 .62rem/1.6 var(--mono);
                              letter-spacing: .12em; text-transform: uppercase; }
 .job-description p { max-height: 9rem; overflow-y: auto; white-space: pre-wrap; }
-.act-list { max-height: 14rem; overflow-y: auto; display: grid; gap: .25rem; margin: 0; padding: 0; list-style: none; }
+.act-list { display: grid; gap: .25rem; margin: 0; padding: 0; list-style: none; }
 .act-list li { display: grid; grid-template-columns: .45rem auto minmax(0, 1fr) auto; align-items: baseline;
                 gap: .45rem; font-size: .76rem; }
 .act-list li::before { content: ""; width: .45rem; height: .45rem; margin-top: .2rem; border-radius: 50%;
@@ -368,6 +374,7 @@ body.kiosk .bar { display: none; }
 .act-msg { min-width: 0; overflow-wrap: anywhere; }
 .act-ago { min-width: 6ch; text-align: right; color: var(--faint); font-size: .7rem; font-variant-numeric: tabular-nums; }
 .act-link { margin-left: .4rem; color: var(--dim); }
+.act-more { justify-self: start; margin-top: .35rem; padding: .2rem .55rem; font-size: .74rem; color: var(--dim); background: none; border: 1px solid var(--line); border-radius: 6px; cursor: pointer; }
 .act-empty { margin: 0; color: var(--dim); font-size: .78rem; }
 /* Filament overview (full detail only): one spool strip per AMS unit, drawn
    in SVG — the same drawing for every AMS model. Spools are edge-on: the
@@ -723,6 +730,7 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
         <section class="sec activity" aria-label="Recent activity">
           <h3><span>Recent activity</span><span class="sec-meta act-meta"></span></h3>
           <ol class="act-list"></ol>
+          <button class="act-more" type="button" hidden></button>
           <p class="act-empty">No activity since the proxy started.</p>
         </section>
         <div class="mod-host mod-l3" hidden></div>
@@ -753,7 +761,7 @@ const STATES = {
   printing: { label: "Printing", icon: "i-play" },
   paused: { label: "Paused", icon: "i-pause" },
   preparing: { label: "Preparing", icon: "i-hourglass" },
-  failed: { label: "Failed", icon: "i-alert" },
+  ended: { label: "Ended", icon: "i-flag" },
   finished: { label: "Finished", icon: "i-check" },
   idle: { label: "Idle", icon: "i-moon" },
   waiting: { label: "Waiting for data", icon: "i-loader" },
@@ -825,12 +833,12 @@ function bucket(p) {
   if (!p.connected) return "offline";
   return {
     RUNNING: "printing", PAUSE: "paused", PREPARE: "preparing", SLICING: "preparing",
-    FINISH: "finished", FAILED: "failed", "": "waiting",
+    FINISH: "finished", FAILED: "ended", "": "waiting",
   }[(p.print_state || "").toUpperCase()] ?? "idle";
 }
 const reportAgeOf = p => p.freshness?.last_report_age_seconds ?? null;
 const isActive = b => b === "printing" || b === "paused";
-const showsProgress = (b, p) => isActive(b) || b === "finished" || b === "failed";
+const showsProgress = (b, p) => isActive(b) || b === "finished" || b === "ended";
 const nameOf = t => t.data.name || `${t.data.model || "Printer"} ${t.serial}`;
 // OctoEverywhere AI failure detection, normalized to the backend contract.
 // The backend adds a `detection` object to a tile only when an API key is
@@ -914,7 +922,7 @@ function detectOld(d) {
 function detectBadge(d, b) {
   if (!d) return null;
   if (d.state === "disabled") return { tone: "warn", label: "AI off", off: true };
-  if (d.state === "idle") return { tone: "calm", label: "AI ready" };
+  if (d.state === "idle") return { tone: "", label: "AI on" };
   if (detectPausePending(d)) return { tone: "error", label: "Pause pending" };
   if (detectPauseUnconfirmed(d)) return { tone: "error", label: "Pause unconfirmed" };
   if (detectPauseConfirmed(d)) return { tone: "warn", label: "Pause confirmed" };
@@ -981,9 +989,10 @@ function alertsOf(p) {
     (a.prio || 0) - (b.prio || 0));
 }
 const highAlert = p => alertsOf(p).some(a => (SEVERITY_RANK[a.severity] || 0) >= 3);
+// Attention covers extra signals only; ended and paused prints have their own chips.
 function needsAttention(p) {
   const b = bucket(p);
-  if (b === "failed" || b === "paused" || highAlert(p)) return true;
+  if (highAlert(p)) return true;
   // An AI warning or any pause activity counts; low quality alone does not.
   // Losing oversight of an active print counts too: degradation, camera loss,
   // or account suspension all leave the wall watching blind.
@@ -1190,7 +1199,7 @@ function createTile(p) {
       dtCamera: q(".dt-camera"), fCamera: q(".f-camera"),
       dtReport: q(".dt-report"), fReport: q(".f-report"), dtSerial: q(".dt-serial"), fSerial: q(".f-serial"), open: q(".open"),
       stage: q(".pill.state .stage"), amsSec: q(".ams"), amsUnits: q(".ams-units"), amsNote: q(".ams-note"),
-      actList: q(".act-list"), actEmpty: q(".act-empty"),
+      actList: q(".act-list"), actMore: q(".act-more"), actEmpty: q(".act-empty"),
       ctlLight: q(".ctl.light"), ctlLightUse: q(".ctl.light use"), ctlPause: q(".ctl.pause"),
       ctlPauseUse: q(".ctl.pause use"), ctlStop: q(".ctl.stop"), speedSeg: q(".speed-seg"),
       elapsed: q(".elapsed"), elText: q(".el-text"), dtNozzle: q(".dt-nozzle"), fNozzle: q(".f-nozzle"),
@@ -1224,6 +1233,7 @@ function createTile(p) {
     sendControl(t, { action: "light", on: !(t.data.chamber_light === "on") }));
   t.r.ctlPause.addEventListener("click", () => sendControl(t, { action: t.r.ctlPause.dataset.action }));
   t.r.ctlStop.addEventListener("click", () => sendControl(t, { action: "stop" }));
+  t.r.actMore.addEventListener("click", () => { t.actAll = !t.actAll; renderActivity(t); });
   for (const sp of SPEEDS) {
     const btn = document.createElement("button");
     btn.type = "button";
@@ -1250,10 +1260,9 @@ function createTile(p) {
     if (next.key !== t.data.speed_profile) sendControl(t, { action: "speed", profile: next.key });
   });
   details.addEventListener("click", e => {
-    // The activity and filament sections stay readable, so clicks there
-    // must not cycle the detail level.
-    if (e.target.closest("a, .grip, .activity, .ams, .alert-full, .job-archive, .mod-sec, .ctl-bar, .speed-seg") ||
-        getSelection()?.toString()) return;
+    // Only the header row (thumbnail, identity, KPI, chevron) cycles the
+    // detail level, so the sections below stay readable and selectable.
+    if (!e.target.closest(".head") || e.target.closest("a, .grip") || getSelection()?.toString()) return;
     t.level = t.level % 3 + 1;
     prefs.levels[t.serial] = t.level;
     savePrefs();
@@ -1265,14 +1274,47 @@ function createTile(p) {
   return t;
 }
 
+// Collapses runs of 3 or more alternating raised/resolved rows for one problem code into a single row.
+function groupActivity(events) {
+  const codeOf = e => (/\(([^()]+)\)\s*$/.exec(e.message || "") || [])[1] ?? null;
+  const isProblem = e => e.kind === "printer_problem" || e.kind === "problem_resolved";
+  const out = [];
+  let i = 0;
+  while (i < events.length) {
+    const code = isProblem(events[i]) ? codeOf(events[i]) : null;
+    let j = i + 1;
+    if (code !== null) while (j < events.length && isProblem(events[j]) && codeOf(events[j]) === code) j++;
+    const run = events.slice(i, j);
+    const raised = run.filter(e => e.kind === "printer_problem");
+    if (code !== null && run.length >= 3 && raised.length > 0) {
+      const resolved = run[0].kind === "problem_resolved";
+      out.push({
+        ...run[0],
+        severity: resolved ? "info" : raised[0].severity,
+        message: `${raised[0].message} · ${raised.length}× · ${resolved ? "resolved" : "still active"}`,
+        url: raised[0].url || run[0].url,
+      });
+      i = j;
+    } else {
+      out.push(events[i]);
+      i++;
+    }
+  }
+  return out;
+}
 function renderActivity(t) {
   const events = Array.isArray(t.data.activity) ? t.data.activity : [];
-  const key = events.map(e => `${e.id}:${Math.floor(Number(e.age_seconds) || 0)}:${typeof e.url === "string" ? e.url : ""}`).join(",");
+  const all = groupActivity(events);
+  const shown = t.actAll ? all : all.slice(0, 8);
+  const key = events.map(e => `${e.id}:${Math.floor(Number(e.age_seconds) || 0)}:${typeof e.url === "string" ? e.url : ""}`).join(",") + `:${t.actAll ? 1 : 0}`;
   if (key === t.activityKey) return;
   t.activityKey = key;
   t.r.actEmpty.hidden = events.length > 0;
   t.r.actMeta.textContent = events.length ? `${events.length} event${events.length > 1 ? "s" : ""}` : "";
-  const rows = events.map(e => {
+  t.r.actMore.hidden = all.length <= 8;
+  t.r.actMore.textContent = t.actAll ? "Show fewer" : `Show all ${all.length}`;
+  t.r.actMore.setAttribute("aria-expanded", String(!!t.actAll));
+  const rows = shown.map(e => {
     const li = document.createElement("li");
     li.dataset.sev = ["info", "warning", "error"].includes(e.severity) ? e.severity : "info";
     const at = document.createElement("time");
@@ -2061,7 +2103,7 @@ function renderKpi(t, b, pct, progress, remain, reportAge) {
   const heat = b === "preparing" ? heatPct(p) : null;
   if (heat != null) { main.append(valEl(heat, "%", 3)); main.style.setProperty("--kc", "var(--t-heat)"); }
   else if (b === "finished") word("i-check", "Done");
-  else if (b === "failed") word("i-alert", "Failed");
+  else if (b === "ended") word("i-flag", "Ended");
   else if (b === "idle") word("i-moon", "Ready");
   else if (b === "offline") word("i-offline", "Offline");
   else if (progress) main.append(valEl(pct, "%", 3));
@@ -2071,7 +2113,7 @@ function renderKpi(t, b, pct, progress, remain, reportAge) {
   r.kpiMeter.hidden = !layered && heat == null;
   r.kpiLayer.replaceChildren();
   if (layered) {
-    const color = b === "failed" ? "var(--failed)" : "var(--accent)";
+    const color = "var(--accent)";
     if (r.kpiSegs.tagName.toLowerCase() !== "svg") r.kpiSegs.replaceWith(r.kpiSegs = svgEl("svg", { class: "segs", "aria-hidden": "true" }));
     fillSegs(r.kpiSegs, p.layer_num, p.total_layers, color);
     const n = document.createElement("b");
@@ -2098,9 +2140,6 @@ function renderKpi(t, b, pct, progress, remain, reportAge) {
     if (b === "paused") sub.append(" left");
     else if (finish) sub.append(link("→"), icon("i-flag"), bold("clk", finish));
     sub.title = `${remain} left${finish && b !== "paused" ? ` · done at ${finish}` : ""}`;
-  } else if (b === "failed" && progress) {
-    sub.append(bold("", `${pct} %`), " when stopped");
-    sub.title = "";
   } else if (b === "offline" && reportAge != null) {
     sub.append("seen ", bold("", fmtAgo(reportAge)));
     sub.title = "";
@@ -2128,26 +2167,26 @@ function renderTile(t) {
     `${alerts.length ? `, ${alerts.length} alert${alerts.length > 1 ? "s" : ""}` : ""}`);
   r.stateUse.setAttribute("href", `#${s.icon}`);
   r.stateLabel.textContent = s.label;
+  // The offline icon and KPI word already say Offline, so the pill text is redundant.
+  r.stateLabel.hidden = b === "offline";
   t.el.dataset.camera = p.camera_supported ? "yes" : "none";
   // Line one: the name with the model as a dim tag. Unnamed printers use
   // the model as their title, so the tag carries the serial instead.
   r.model.textContent = p.name || p.model || "Printer";
   r.serial.textContent = p.name ? p.model || "" : p.serial;
-  // Stage rides in the state pill as a suffix. It hides where it could be
-  // outdated — offline printers may have stopped mid-action, and
-  // finished or idle printers have ended the print the stage described. A
-  // stage that only repeats the state is dropped.
+  // Stage rides in the state pill as a suffix. It shows only while a print
+  // is printing, paused, or preparing; any other state has no live stage.
+  // A stage that only repeats the state is dropped.
   const stage = stageWords(p.stage);
-  r.stage.hidden = !stage || stage.toLowerCase() === s.label.toLowerCase() || b === "offline" ||
-    b === "finished" || b === "idle";
+  r.stage.hidden = !stage || stage.toLowerCase() === s.label.toLowerCase() || !(isActive(b) || b === "preparing");
   r.stage.textContent = stage;
-  // Line two: the job. It stays through finished, failed, and idle until
+  // Line two: the job. It stays through finished, ended, and idle until
   // the next print replaces it, dimmed once the print is no longer running.
   const job = p.job_name || "";
   const jobLive = isActive(b) || b === "preparing";
   r.jobLine.hidden = !job;
   r.jobLine.classList.toggle("past", !jobLive);
-  r.job.textContent = job;
+  r.job.textContent = job.replaceAll("_", " ").replace(/\s+/g, " ").trim();
   r.jobLine.title = job ? `${jobLive ? "Printing" : "Last job"}: ${job}` : "";
   // Archived preview of this print: head thumb, sliced materials, vitals
   // facts, and the full-detail archive block. Display-only, keyed by
@@ -2276,8 +2315,8 @@ function renderTile(t) {
   r.fDetect.textContent = fact;
   r.jobFacts.hidden = !fact;
   // The section shows only what the header does not: AI facts, the
-  // archive, or a failed print's start time.
-  r.jobSec.hidden = !fact && !t.jobArchShown && !(b === "failed" && p.started_at);
+  // archive, or an ended print's start time.
+  r.jobSec.hidden = !fact && !t.jobArchShown && !(b === "ended" && p.started_at);
   const sig = detSig(d, b);
   if (t.detSig === undefined) t.detSig = sig;
   else if (sig !== t.detSig) { announceDetect(t, t.detSig, sig); t.detSig = sig; }
@@ -2377,8 +2416,8 @@ function renderTile(t) {
   // printer's own facts last.
   const startedAll = p.started_at ? new Date(p.started_at) : null;
   const meta = [
-    // Running prints show their start in the vitals; a failed one only here.
-    startedAll && !isNaN(startedAll) && b === "failed"
+    // Running prints show their start in the vitals; an ended one only here.
+    startedAll && !isNaN(startedAll) && b === "ended"
       ? `Started ${startedAll.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "",
   ].filter(Boolean).join(" · ");
   r.jobMeta.textContent = meta;
