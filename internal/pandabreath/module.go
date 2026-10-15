@@ -110,40 +110,42 @@ func (s *Store) snapshot(serial string) (v ModuleState, ok bool) {
 	return v, true
 }
 
-// Display returns the Panda Breath panel for one printer, or nil when the printer has no configured device.
+// Display returns the Panda Breath panel and warming badge for one printer, or nil when the printer has no configured device or nothing to show.
 func (s *Store) Display(serial string) *module.Display {
 	v, ok := s.snapshot(serial)
 	if !ok {
 		return nil
 	}
-	link := module.Row{Label: "Link"}
+	// Link shows only when something is wrong; a healthy link adds nothing, and
+	// the chamber reading already appears in the printer's temperature chips.
+	var rows []module.Row
 	switch v.Link {
 	case LinkConnected:
-		link.Value, link.Tone = "Connected", "calm"
 	case LinkNoReadings:
-		link.Value, link.Tone = "Connected · no readings", "warn"
+		rows = append(rows, module.Row{Label: "Link", Value: "Connected · no readings", Tone: "warn"})
 	default:
-		link.Value, link.Tone = "Offline", "warn"
+		rows = append(rows, module.Row{Label: "Link", Value: "Offline", Tone: "warn"})
 	}
-	d := &module.Display{Panel: &module.Panel{Title: "Panda Breath", Rows: []module.Row{link}}}
-	if v.ChamberC == nil {
-		return d
+	d := &module.Display{}
+	// Warming is stated once, by the overlay badge; the panel keeps the other trends.
+	if v.ChamberC != nil && v.Trend != "" {
+		switch v.Trend {
+		case TrendWarming:
+			rate := *v.RateCPerMin
+			d.Overlay = []module.Badge{{Text: "Chamber warming", Tone: "calm",
+				Title: fmt.Sprintf("Panda Breath: chamber rising %.1f °C per minute", rate)}}
+		case TrendCooling:
+			rows = append(rows, module.Row{Label: "Trend", Value: fmt.Sprintf("Cooling · −%.1f °C/min", -*v.RateCPerMin)})
+		default:
+			rows = append(rows, module.Row{Label: "Trend", Value: "Steady"})
+		}
 	}
-	d.Panel.Rows = append(d.Panel.Rows, module.Row{Label: "Chamber", Value: fmt.Sprintf("%.0f °C", *v.ChamberC)})
-	if v.Trend == "" {
-		return d
+	if len(rows) > 0 {
+		d.Panel = &module.Panel{Title: "Panda Breath", Rows: rows}
 	}
-	row := module.Row{Label: "Trend", Value: "Steady"}
-	switch v.Trend {
-	case TrendWarming:
-		rate := *v.RateCPerMin
-		row.Value, row.Tone = fmt.Sprintf("Warming · +%.1f °C/min", rate), "calm"
-		d.Overlay = []module.Badge{{Text: "Chamber warming", Tone: "calm",
-			Title: fmt.Sprintf("Panda Breath: chamber rising %.1f °C per minute", rate)}}
-	case TrendCooling:
-		row.Value = fmt.Sprintf("Cooling · −%.1f °C/min", -*v.RateCPerMin)
+	if d.Panel == nil && len(d.Overlay) == 0 {
+		return nil
 	}
-	d.Panel.Rows = append(d.Panel.Rows, row)
 	return d
 }
 

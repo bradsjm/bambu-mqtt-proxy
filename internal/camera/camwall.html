@@ -260,10 +260,11 @@ body.kiosk #health-text { position: absolute; width: 1px; height: 1px; margin: -
 .job-line .ic { flex: none; color: var(--dim); font-size: .85rem; }
 .job-line .job { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .job-line.past { color: var(--dim); }
-/* Archived plate render beside the identity: decorative, never the camera.
+/* Archived plate render beside the identity, as tall as the head row so its
+   top lines up with the text: decorative, never the camera.
    It paints only after the cached PNG has loaded; its click follows the
    existing details cycle. */
-.job-thumb { flex: none; width: 40px; height: 40px; object-fit: contain; background: var(--panel-2);
+.job-thumb { flex: none; align-self: stretch; width: 4rem; height: auto; min-height: 2.5rem; contain: size; object-fit: contain; background: var(--panel-2);
              border: 1px solid var(--line); border-radius: 8px; }
 .job-thumb.past { opacity: .7; }
 /* Sliced material needs on one ellipsized line under the job name, at
@@ -516,7 +517,7 @@ svg.ams-svg { display: block; width: 100%; height: auto; }
 
 @container tile (width < 300px) {
   .pill .label, .pill.state .stage, .serial { display: none; }
-  .job-thumb { width: 32px; height: 32px; border-radius: 6px; }
+  .job-thumb { width: 3rem; border-radius: 6px; }
   /* The detection badge is the only place this state lives, so its label survives narrow tiles. */
   .pill.detect .label { display: initial; }
 }
@@ -962,13 +963,13 @@ function detectAlerts(d, b) {
   else if (detectPauseConfirmed(d)) items.push({ severity: "common", prio: 1, sevHidden: true,
     text: "Printer paused after AI request" });
   // While AI is off for this print, the last warning is history, not a
-  // live finding; the details line carries the off state instead.
+  // live finding; the badge carries the off state instead.
   if (d.warning && d.state !== "disabled") items.push({ severity: "common", prio: 1, sevHidden: true,
     text: `AI warning · score ${d.quality != null ? `${qualityPct(d.quality)} %` : "unknown"}${old}` });
   if (d.cameraLost && isActive(b)) items.push({ severity: "common", prio: 2, sevHidden: true,
     text: "AI lost camera view · inspection degraded" });
   if (d.suspended) items.push({ severity: "info", prio: 1, sevHidden: true,
-    text: "AI inspection suspended · account error" });
+    text: `AI inspection suspended · account error${d.message ? ` · ${d.message}` : ""}` });
   // Attention with no specific flag means the backend has a condition worth
   // surfacing (for example a failed pause attempt) and explains the reason.
   if (!items.length && d.state === "attention" && (reasonWords(d) || d.message)) items.push({
@@ -1028,30 +1029,12 @@ function announceDetect(t, prev, next) {
 
 function detectFact(d, b) {
   const bits = [];
-  if (d.suspended) {
-    bits.push("inspection unavailable");
-    if (d.age != null) bits.push(`last checked ${fmtAgo(Math.round(d.age))}`);
-    if (d.quality != null) bits.push(`last result ${qualityPct(d.quality)} % ${qualityWord(d.quality)}`);
-    bits.push("suspended · account error");
-    if (d.message) bits.push(d.message);
-    return bits.join(" · ");
-  }
-  // The user's per-print off state and its lifetime; pause findings that
-  // were already dispatched stay visible below it.
-  if (d.state === "disabled") {
-    bits.push("off for this print · AI returns with the next print or after a proxy restart");
-    if (detectPausePending(d)) bits.push("pause pending · printer not yet paused");
-    if (detectPauseUnconfirmed(d)) bits.push("pause unconfirmed");
-    if (detectPauseConfirmed(d)) bits.push("pause confirmed by printer");
-    return bits.join(" · ");
-  }
-  // Quality, layer, and check age already show on the vitals line above;
-  // this fact adds only the flags and reasons behind them.
-  if (detectPausePending(d)) bits.push("pause pending · printer not yet paused");
-  if (detectPauseUnconfirmed(d)) bits.push("pause unconfirmed");
-  if (detectPauseConfirmed(d)) bits.push("pause confirmed by printer");
-  if (d.warning) bits.push("warning suggested");
-  if (d.cameraLost) bits.push("camera view lost");
+  // Off and suspended states are already named by the badge and the alert
+  // row, so the fact would only repeat them.
+  if (d.suspended || d.state === "disabled") return "";
+  // Quality, layer, and check age show on the vitals line, and pause,
+  // warning, and camera findings show in the alert row; this fact adds only
+  // the remaining flags and reasons.
   if (d.faster) bits.push("closer monitoring requested");
   if (d.fallback) bits.push("using Gadget backup server");
   if (reasonWords(d)) bits.push(reasonWords(d));
@@ -1674,7 +1657,8 @@ function camView(t) {
 function renderFeed(t) {
   const { feed, feedLabel } = t.r;
   const errored = (t.feed === "live" && t.liveError) || (t.feed === "snap" && t.snap.error);
-  feed.hidden = t.feed === "none";
+  // The placeholder already says "Camera unavailable · retrying", so the pill hides then.
+  feed.hidden = t.feed === "none" || (errored && camView(t)?.[1] === "Camera unavailable · retrying");
   feed.dataset.mode = errored ? "error" : t.feed;
   let label = "";
   if (errored) label = "Retrying";
@@ -1855,7 +1839,7 @@ function renderJobMaterials(t, md) {
 // printer is genuinely on layer 1 of a running, current print: it is the
 // sliced total for that layer, never a countdown or a promise of time
 // remaining, and never shown for a past job. The plate line names the
-// sliced plate, its bed, and the object count as it was at slicing time.
+// sliced plate and its bed as they were at slicing time.
 function renderJobVitals(t, jp, md, b, past) {
   const r = t.r, p = t.data;
   const plate = md && md.plate && typeof md.plate === "object" ? md.plate : null;
@@ -1874,7 +1858,6 @@ function renderJobVitals(t, jp, md, b, past) {
     const bed = mdText(plate.bed_type);
     if (bed) bits.push(bedLabel(bed));
   }
-  if (md && md.object_count != null) bits.push(`Sliced objects: ${md.object_count}`);
   r.plateFact.hidden = !bits.length;
   if (bits.length) r.plateFact.textContent = bits.join(" · ");
   r.jobVitals.hidden = !showFL && !bits.length;
@@ -1911,10 +1894,8 @@ function renderJobArchive(t, md) {
   };
   updateJobArchiveHead(t, md);
   const plate = md.plate && typeof md.plate === "object" ? md.plate : null;
-  if (plate && mdNum(plate.index) > 0) {
-    const name = mdText(plate.name);
-    line(`Plate ${plate.index}${name ? ` · ${name}` : ""}`);
-  }
+  // The vitals line already names the plate and its bed; objects and
+  // materials stay here only where the header does not list them.
   const objects = Array.isArray(md.objects) ? md.objects : [];
   if (objects.length) {
     const word = o => `${objectWord(mdText(o.name))} ×${o.count}`;
@@ -1934,13 +1915,6 @@ function renderJobArchive(t, md) {
       add(det);
     }
   }
-  const mats = Array.isArray(md.materials) ? md.materials : [];
-  const words = mats.map(m => {
-    const type = mdText(m.type), g = mdNum(m.used_g);
-    if (type && g != null) return `${type} ≈${mdMass(g)} g`;
-    return type || (g != null ? `≈${mdMass(g)} g` : "");
-  }).filter(Boolean);
-  if (words.length) line(`Sliced materials: ${words.join(" · ")}`);
   // Estimate and bed come from the selected plate.
   const bits = [];
   if (plate) {
@@ -1950,8 +1924,6 @@ function renderJobArchive(t, md) {
     const g = mdNum(plate.weight_g);
     if (g != null) est.push(`≈${mdMass(g)} g`);
     if (est.length) line(`Sliced estimate: ${est.join(" · ")}`);
-    const bed = mdText(plate.bed_type);
-    if (bed) line(`Sliced bed: ${bedLabel(bed)}`);
   }
   // Defaults order follows the plan: layer height, infill, then supports;
   // supports is a selected-plate value, not the global enable_support flag.
@@ -2102,9 +2074,8 @@ function renderKpi(t, b, pct, progress, remain, reportAge) {
   };
   const heat = b === "preparing" ? heatPct(p) : null;
   if (heat != null) { main.append(valEl(heat, "%", 3)); main.style.setProperty("--kc", "var(--t-heat)"); }
-  else if (b === "finished") word("i-check", "Done");
-  else if (b === "ended") word("i-flag", "Ended");
-  else if (b === "idle") word("i-moon", "Ready");
+  // The state pill already names finished, ended, and idle, so the headline stays empty for them.
+  else if (b === "finished" || b === "ended" || b === "idle") { /* named by the pill */ }
   else if (b === "offline") word("i-offline", "Offline");
   else if (progress) main.append(valEl(pct, "%", 3));
   main.title = heat != null ? `Heating up · ${heat} % of target temperatures` : progress ? `Progress ${pct} %` : "";
@@ -2281,34 +2252,20 @@ function renderTile(t) {
       : "Turn AI monitoring back on for this print";
 
   }
-  r.d2.hidden = !d || d.state === "idle";
-  if (d && d.state !== "idle") {
-    if (d.state === "disabled") {
-      // The off state and its lifetime; a dispatched pause stays visible
-      // in the alert row above.
-      r.d2.dataset.tone = "warn";
-      r.d2q.textContent = "";
-      const off = ["AI is off for this print", "it returns with the next print or after a proxy restart"];
-      if (t.detError) off.push(`last toggle failed: ${t.detError}`);
-      r.d2text.textContent = off.join(" · ");
-    } else if (d.suspended) {
-      r.d2.dataset.tone = detectPausePending(d) || detectPauseUnconfirmed(d) ? "error"
-        : detectPauseConfirmed(d) || d.warning || d.suspended ? "warn" : qualityTone(d.quality) || "";
-      r.d2q.textContent = "";
-      const gone = ["inspection unavailable"];
-      if (d.age != null) gone.push(`last checked ${fmtAgo(Math.round(d.age))}`);
-      r.d2text.textContent = gone.join(" · ");
-    } else {
-      r.d2.dataset.tone = detectPausePending(d) || detectPauseUnconfirmed(d) ? "error"
-        : detectPauseConfirmed(d) || d.warning || d.suspended ? "warn" : qualityTone(d.quality) || "";
-      // The score itself lives on the camera chip; vitals add its meaning.
-      r.d2q.textContent = "";
-      const bits = [d.quality != null ? qualityWord(d.quality) : "no result yet"];
-      if (d.layerNum != null) bits.push(`layer ${d.layerNum}`);
-      if (d.age != null) bits.push(`checked ${fmtAgo(Math.round(d.age))}${detectOld(d) ? " · old" : ""}`);
-      if (d.quality == null) bits.push(reasonWords(d) || d.message);
-      r.d2text.textContent = bits.filter(Boolean).join(" · ");
-    }
+  // The vitals line adds an inspection result's meaning. Off, suspended, and
+  // idle states are named by the badge and the alert row, so it stays hidden.
+  const showD2 = !!d && d.state !== "idle" && d.state !== "disabled" && !d.suspended;
+  r.d2.hidden = !showD2;
+  if (showD2) {
+    r.d2.dataset.tone = detectPausePending(d) || detectPauseUnconfirmed(d) ? "error"
+      : detectPauseConfirmed(d) || d.warning ? "warn" : qualityTone(d.quality) || "";
+    // The score itself lives on the camera chip; vitals add its meaning.
+    r.d2q.textContent = "";
+    const bits = [d.quality != null ? qualityWord(d.quality) : "no result yet"];
+    if (d.layerNum != null) bits.push(`layer ${d.layerNum}`);
+    if (d.age != null) bits.push(`checked ${fmtAgo(Math.round(d.age))}${detectOld(d) ? " · old" : ""}`);
+    if (d.quality == null) bits.push(reasonWords(d) || d.message);
+    r.d2text.textContent = bits.filter(Boolean).join(" · ");
   }
   const fact = d && d.state !== "idle" ? detectFact(d, b) : "";
   r.fDetectDt.hidden = r.fDetect.hidden = !fact;
@@ -2427,7 +2384,6 @@ function renderTile(t) {
     p.nozzle_type ? p.nozzle_type.replaceAll("_", " ") : ""].filter(Boolean).join(" · ");
   r.fNozzle.textContent = nozzle;
   r.dtNozzle.hidden = r.fNozzle.hidden = !nozzle;
-  r.diagMeta.textContent = p.name ? p.model || "" : "";
   const wifi = p.wifi_signal_dbm;
   const bars = wifi == null ? 0 : wifi >= -55 ? 3 : wifi >= -70 ? 2 : 1;
   r.dtWifi.hidden = r.fWifi.hidden = !bars;
@@ -2488,13 +2444,17 @@ function renderTile(t) {
   renderActivity(t);
   renderModules(t);
   renderAMS(t);
+  // The offline headline already says how old the last report is.
+  r.dtReport.hidden = r.fReport.hidden = b === "offline" && reportAge != null;
   r.fReport.textContent = reportAge == null ? "No report yet" : reportAge < 2 ? "Just now" : fmtAgo(reportAge);
   r.fSerial.textContent = p.serial;
+  // An unnamed printer already shows its serial in the header.
+  r.dtSerial.hidden = r.fSerial.hidden = !p.name;
   const frameAge = Math.round(Number(p.frame_age_seconds || 0));
   const frameNote = p.frame_seq ? ` · frame captured ${frameAge ? fmtAgo(frameAge) : "just now"}` : "";
   // The camera stage already says when there is no camera or no printer.
-  r.dtCamera.hidden = r.fCamera.hidden = !p.camera_supported || (!p.connected && !p.camera_reason);
-  r.fCamera.textContent = p.camera_reason || (t.feed === "live" ? `Live stream${frameNote}`
+  r.dtCamera.hidden = r.fCamera.hidden = !p.camera_supported || !!p.camera_reason || !p.connected;
+  r.fCamera.textContent = (t.feed === "live" ? `Live stream${frameNote}`
     : t.feed === "snap" ? `Snapshot every ${prefs.snapSec}s${frameNote}` : "Paused while off-screen");
   r.open.hidden = !p.camera_supported || !p.connected || !!p.camera_reason;
 

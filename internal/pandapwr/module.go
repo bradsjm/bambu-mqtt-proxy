@@ -67,23 +67,26 @@ func (s *Store) snapshot(serial string) (v ModuleState, ok bool) {
 }
 
 // Display returns the Panda PWR panel for one printer, or nil when the
-// printer has no configured device. The panel shows the link state and,
-// while the reading is fresh, the power draw in whole watts.
+// printer has no configured device or nothing to show. The panel shows the
+// link only when offline and, while the reading is fresh, the power draw in
+// whole watts.
 func (s *Store) Display(serial string) *module.Display {
 	v, ok := s.snapshot(serial)
 	if !ok {
 		return nil
 	}
-	link := module.Row{Label: "Link", Value: "Offline", Tone: "warn"}
-	if v.Link == LinkConnected {
-		link.Value, link.Tone = "Connected", "calm"
+	// A healthy link adds nothing, so the Link row shows only when offline.
+	var rows []module.Row
+	if v.Link != LinkConnected {
+		rows = append(rows, module.Row{Label: "Link", Value: "Offline", Tone: "warn"})
 	}
-	d := &module.Display{Panel: &module.Panel{Title: "Panda PWR", Rows: []module.Row{link}}}
-	if v.PowerW == nil {
-		return d
+	if v.PowerW != nil {
+		rows = append(rows, module.Row{Label: "Power", Value: fmt.Sprintf("%.0f W", *v.PowerW)})
 	}
-	d.Panel.Rows = append(d.Panel.Rows, module.Row{Label: "Power", Value: fmt.Sprintf("%.0f W", *v.PowerW)})
-	return d
+	if len(rows) == 0 {
+		return nil
+	}
+	return &module.Display{Panel: &module.Panel{Title: "Panda PWR", Rows: rows}}
 }
 
 // configured reports whether serial has a Panda PWR address. targets is
