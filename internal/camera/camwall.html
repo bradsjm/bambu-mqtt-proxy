@@ -107,7 +107,8 @@ body.kiosk #health-text { position: absolute; width: 1px; height: 1px; margin: -
 .tile { --accent: var(--idle); container: tile / inline-size; position: relative; display: flex;
         flex-direction: column; overflow: hidden; border-radius: var(--radius); background: var(--panel);
         border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--line));
-        transition: border-color .4s, box-shadow .4s; }
+        content-visibility: auto; contain-intrinsic-size: auto 22rem;
+        transition: border-color .4s; }
 .tile[data-state="printing"] { --accent: var(--printing); }
 .tile[data-state="paused"] { --accent: var(--paused); }
 .tile[data-state="preparing"] { --accent: var(--preparing); }
@@ -121,8 +122,8 @@ body.kiosk #health-text { position: absolute; width: 1px; height: 1px; margin: -
 .tile[data-alert="high"] {
   box-shadow: 0 0 0 1px color-mix(in srgb, var(--failed) 70%, transparent),
               0 0 28px -8px color-mix(in srgb, var(--failed) 80%, transparent); }
-.tile.spot { grid-column: 1 / -1; }
-.tile.dragging { z-index: 10; cursor: grabbing; transition: none;
+.tile.spot { grid-column: 1 / -1; content-visibility: visible; }
+.tile.dragging { z-index: 10; cursor: grabbing; transition: none; content-visibility: visible;
                  box-shadow: 0 18px 40px -12px #000, 0 0 0 2px var(--preparing); }
 
 .cam { position: relative; aspect-ratio: 16 / 9; max-height: 78dvh; background: #000; overflow: hidden; }
@@ -147,8 +148,8 @@ body.kiosk #health-text { position: absolute; width: 1px; height: 1px; margin: -
    fixed width so the stage never reflows. */
 .pill { position: absolute; z-index: 4; top: .55rem; display: inline-flex; align-items: center; gap: .35rem;
         height: 1.6rem; padding: 0 .55rem; border-radius: 999px; font-size: .72rem; font-weight: 650;
-        letter-spacing: .03em; pointer-events: none; background: rgb(10 12 15 / .72); white-space: nowrap;
-        font-variant-numeric: tabular-nums; -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); }
+        letter-spacing: .03em; pointer-events: none; background: rgb(10 12 15 / .88); white-space: nowrap;
+        font-variant-numeric: tabular-nums; }
 .pill[hidden] { display: none; }
 .pill.state { left: .55rem; color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent); }
 .pill.state .label { color: var(--text); }
@@ -182,8 +183,9 @@ body.kiosk #health-text { position: absolute; width: 1px; height: 1px; margin: -
 .pill.detect[data-mode="value"] .label { color: var(--dim); }
 .pill.detect[data-mode="value"] .q { margin-left: auto; color: var(--tone, var(--dim)); }
 .pill.detect:not([data-mode="value"]) :is(.q, .tr) { display: none; }
-.pill.detect::after { content: ""; position: absolute; left: 0; bottom: 0; height: 2px; width: var(--p, 0%);
-                      background: var(--tone, var(--dim)); transition: width .6s var(--ease); }
+.pill.detect::after { content: ""; position: absolute; left: 0; bottom: 0; height: 2px; width: 100%;
+                      scale: var(--p, 0%) 1; transform-origin: left;
+                      background: var(--tone, var(--dim)); transition: scale .6s var(--ease); }
 .pill.detect:not([data-mode="value"])::after { display: none; }
 .pill.detect .tr { font-size: .62rem; }
 .pill.detect:disabled { cursor: default; }
@@ -198,8 +200,9 @@ body.kiosk #health-text { position: absolute; width: 1px; height: 1px; margin: -
 .pill.detect[data-old="true"] { opacity: .72; }
 .cam-progress { position: absolute; z-index: 4; left: 0; right: 0; bottom: 0; height: 4px;
                 background: rgb(255 255 255 / .12); pointer-events: none; }
-.cam-progress > div { height: 100%; width: var(--pct, 0%); background: var(--bar, var(--accent));
-                      box-shadow: 0 0 10px var(--bar, var(--accent)); transition: width .8s var(--ease); }
+.cam-progress > div { height: 100%; width: 100%; scale: var(--pct, 0%) 1; transform-origin: left;
+                      background: var(--bar, var(--accent));
+                      box-shadow: 0 0 10px var(--bar, var(--accent)); transition: scale .8s var(--ease); }
 /* Preparing shows heat-up toward the targets; an ended print freezes dimmed at the stop. */
 .tile[data-state="preparing"] .cam-progress { --bar: var(--t-heat); }
 .tile[data-state="ended"] .cam-progress > div { opacity: .55; box-shadow: none; }
@@ -226,8 +229,7 @@ body.kiosk #health-text { position: absolute; width: 1px; height: 1px; margin: -
 .ctl-bar:not(:has(.ctl:not([hidden]))) { display: none; }
 .ctl-bar .ctl { display: grid; place-items: center; width: 2rem; height: 2rem; padding: 0; border-radius: 50%;
                 border: 1px solid color-mix(in srgb, var(--text) 18%, transparent); cursor: pointer; font-size: 1rem;
-                color: var(--text); background: rgb(10 12 15 / .72);
-                -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); }
+                color: var(--text); background: rgb(10 12 15 / .88); }
 .ctl-bar .ctl:hover { background: var(--panel-2); }
 .ctl-bar .ctl:focus-visible { outline-offset: 1px; }
 .ctl-bar .ctl.stop { background: var(--failed); border-color: var(--failed); color: #fff; }
@@ -306,8 +308,8 @@ body.kiosk #health-text { position: absolute; width: 1px; height: 1px; margin: -
 .segs { display: block; height: 6px; }
 .mbar { display: inline-block; flex: none; width: var(--bw, 3rem); height: var(--bh, 4px); border-radius: 3px;
         background: var(--line); overflow: hidden; }
-.mbar > i { display: block; height: 100%; width: var(--p, 0%); background: var(--c, var(--dim)); border-radius: inherit;
-            transition: width .6s var(--ease); }
+.mbar > i { display: block; height: 100%; width: 100%; scale: var(--p, 0%) 1; transform-origin: left;
+            background: var(--c, var(--dim)); border-radius: inherit; transition: scale .6s var(--ease); }
 .tr { display: inline-block; width: .9em; flex: none; font-size: .68em; line-height: 1; text-align: center; color: var(--tc, inherit); }
 .tr:empty, .tr.flat { visibility: hidden; }
 .alert-row { --sev: var(--dim); display: flex; align-items: center; gap: .45rem; margin-top: .45rem;
@@ -479,8 +481,9 @@ svg.ams-svg { display: block; width: 100%; height: auto; }
 .tchip .val { color: var(--c); font-weight: 650; }
 .tchip .tg { display: inline-block; min-width: 4ch; color: var(--dim); font-size: .72em; }
 .tchip .tr { --tc: var(--c); }
-.tchip::after { content: ""; position: absolute; left: 0; bottom: 0; height: 2px; width: var(--p, 0%);
-                background: var(--c); transition: width .6s var(--ease); }
+.tchip::after { content: ""; position: absolute; left: 0; bottom: 0; height: 2px; width: 100%;
+                scale: var(--p, 0%) 1; transform-origin: left;
+                background: var(--c); transition: scale .6s var(--ease); }
 .tchip[data-stage="heat"] { --c: var(--t-heat); }
 .tchip[data-stage="hot"] { --c: var(--t-hot); }
 .tchip[data-stage="cool"] { --c: var(--t-cool); }
@@ -1067,22 +1070,39 @@ function valEl(n, unit, w = 3) {
   return el;
 }
 // Segmented layer meter: filled segments up to the current layer, a half
-// tone for the segment in progress.
+// tone for the segment in progress. Rects persist across renders; only
+// changed fills write, and an unchanged level and color skips all work.
 function fillSegs(svg, n, total, color, count = 24) {
-  const f = total ? Math.max(0, Math.min(1, n / total)) * count : 0, gw = 100 / count;
-  const kids = [];
-  for (let i = 0; i < count; i++) {
-    const fill = i < Math.floor(f) ? color
-      : i === Math.floor(f) && f % 1 > 0 ? `color-mix(in srgb, ${color} 40%, var(--line))` : "var(--line)";
-    const r = svgEl("rect", { x: `${(i * gw + .5).toFixed(2)}%`, y: 0, width: `${(gw - 1).toFixed(2)}%`, height: "100%", rx: 1 });
-    r.style.fill = fill;
-    kids.push(r);
+  const f = total ? Math.max(0, Math.min(1, n / total)) * count : 0;
+  const sig = `${f}|${color}|${count}`;
+  if (svg.dataset.segSig === sig) return;
+  svg.dataset.segSig = sig;
+  const gw = 100 / count, whole = Math.floor(f), frac = f % 1 > 0;
+  let rects = svg.childNodes;
+  if (rects.length !== count) {
+    const kids = [];
+    for (let i = 0; i < count; i++) {
+      kids.push(svgEl("rect", { x: `${(i * gw + .5).toFixed(2)}%`, y: 0, width: `${(gw - 1).toFixed(2)}%`, height: "100%", rx: 1 }));
+    }
+    svg.replaceChildren(...kids);
+    rects = svg.childNodes;
   }
-  svg.replaceChildren(...kids);
+  for (let i = 0; i < count; i++) {
+    const fill = i < whole ? color
+      : i === whole && frac ? `color-mix(in srgb, ${color} 40%, var(--line))` : "var(--line)";
+    if (rects[i].style.fill !== fill) rects[i].style.fill = fill;
+  }
+}
+// trendDir maps a delta to its arrow direction. Single owner of the thresholds.
+function trendDir(d) {
+  return d > .5 ? "up" : d < -.5 ? "dn" : "flat";
 }
 // Rising/falling arrows like a market ticker; steady keeps the slot.
+// Writes only when the direction changed, so steady trends cost no DOM work.
 function setTrend(el, d) {
-  const k = d > .5 ? "up" : d < -.5 ? "dn" : "flat";
+  const k = trendDir(d);
+  if (el.dataset.k === k) return;
+  el.dataset.k = k;
   el.className = `tr ${k}`;
   el.textContent = k === "dn" ? "▼" : "▲";
   el.title = { up: "Rising", dn: "Falling", flat: "Steady" }[k];
@@ -1141,6 +1161,8 @@ function createTile(p) {
   const q = sel => el.querySelector(sel);
   const t = {
     serial: p.serial, el, data: p, feed: "none", hasFrame: false, liveError: false, blobURL: "",
+    // Live retry state: pending timer id and current backoff in ms.
+    liveTimer: 0, liveBackoff: 5000,
     snap: { ctrl: null, pending: false, requested: 0, at: 0, error: false },
     detPending: false, detError: "", ctlPending: false, ctlError: "",
     // Archived preview state: the metadata serialization that last built
@@ -1192,6 +1214,8 @@ function createTile(p) {
     if (t.feed !== "live" || (t.hasFrame && !t.liveError)) return;
     t.hasFrame = true;
     t.liveError = false;
+    // A frame resets the backoff so the next failure retries promptly.
+    t.liveBackoff = 5000;
     renderTile(t);
   });
   img.addEventListener("error", () => {
@@ -1199,9 +1223,7 @@ function createTile(p) {
     t.liveError = true;
     t.hasFrame = false;
     renderTile(t);
-    setTimeout(() => {
-      if (t.feed === "live" && t.liveError) img.src = `/camera/${encodeURIComponent(t.serial)}/stream?retry=${Date.now()}`;
-    }, 5000);
+    scheduleLiveRetry(t);
   });
   hit.addEventListener("click", () => toggleSpotlight(t));
   // The AI control never focuses the camera or cycles detail levels; it
@@ -1281,17 +1303,40 @@ function groupActivity(events) {
   }
   return out;
 }
+// touchActivityAges refreshes the relative-age text of the existing rows
+// in place, so ages tick without rebuilding the list.
+function touchActivityAges(t, shown) {
+  const rows = t.r.actList.children;
+  for (let i = 0; i < shown.length && i < rows.length; i++) {
+    const ago = rows[i].lastChild;
+    const text = fmtAgo(Math.max(0, Math.floor(Number(shown[i].age_seconds) || 0)));
+    if (ago && ago.textContent !== text) ago.textContent = text;
+  }
+}
+// renderActivity lists recent events, rebuilding rows only when the cheap key misses.
 function renderActivity(t) {
   const events = Array.isArray(t.data.activity) ? t.data.activity : [];
-  const all = groupActivity(events);
-  const shown = t.actAll ? all : all.slice(0, 8);
-  const key = events.map(e => `${e.id}:${Math.floor(Number(e.age_seconds) || 0)}:${typeof e.url === "string" ? e.url : ""}`).join(",") + `:${t.actAll ? 1 : 0}`;
-  if (key === t.activityKey) return;
+  // Key covers identity and urls plus the show-all toggle. Ages refresh in place on a hit.
+  const key = events.map(e => `${e.id}:${typeof e.url === "string" ? e.url : ""}`).join(",") + `:${t.actAll ? 1 : 0}`;
+  if (key === t.activityKey) {
+    // Refresh shown ages by id from current events. Returns without rebuilding.
+    const ages = new Map(events.map(e => [e.id, e.age_seconds]));
+    for (const row of t.actShown || []) {
+      if (ages.has(row.id)) row.age_seconds = ages.get(row.id);
+    }
+    touchActivityAges(t, t.actShown || []);
+    return;
+  }
   t.activityKey = key;
+  const all = groupActivity(events);
+  t.actShown = t.actAll ? all : all.slice(0, 8);
+  const shown = t.actShown;
   t.r.actEmpty.hidden = events.length > 0;
-  t.r.actMeta.textContent = events.length ? `${events.length} event${events.length > 1 ? "s" : ""}` : "";
+  const meta = events.length ? `${events.length} event${events.length > 1 ? "s" : ""}` : "";
+  if (t.r.actMeta.textContent !== meta) t.r.actMeta.textContent = meta;
   t.r.actMore.hidden = all.length <= 8;
-  t.r.actMore.textContent = t.actAll ? "Show fewer" : `Show all ${all.length}`;
+  const more = t.actAll ? "Show fewer" : `Show all ${all.length}`;
+  if (t.r.actMore.textContent !== more) t.r.actMore.textContent = more;
   t.r.actMore.setAttribute("aria-expanded", String(!!t.actAll));
   const rows = shown.map(e => {
     const li = document.createElement("li");
@@ -1428,11 +1473,13 @@ function renderAMS(t) {
   const note = units.length || ext
     ? b === "offline" ? "Last known · printer offline" : ""
     : "";
-  renderActiveFilament(t, units, ext, b);
   const faults = slotFaults(p);
   const key = JSON.stringify([units, ext, sensor, note, [...faults]]);
+  // The AMS key covers the active filament's inputs, so both render only
+  // when it misses; no unconditional DOM writes stay on the per-poll path.
   if (key === t.amsKey) return;
   t.amsKey = key;
+  renderActiveFilament(t, units, ext, b);
   const extTitle = sensor == null ? "" : ` · sensor ${sensor ? "detects filament" : "detects no filament"}`;
   const kids = units.map((u, i) => {
     const id = typeof u.id === "number" ? u.id : i;
@@ -1696,10 +1743,10 @@ function thermalStage(cur, target, chamber) {
 const STAGE_WORDS = { off: "off", heat: "heating", hot: "at target", cool: "cooling down", amb: "ambient" };
 // One fixed-width thermal chip: icon, label, value with unit, target, and
 // the trend since about 30 s ago. The underline fills toward the target.
-function tempChip(t, key, iconId, name, cur, target, max) {
+function tempChip(iconId, name, cur, target, max, delta) {
   if (cur == null) return null;
   const v = Math.round(cur), hasTarget = target != null && target > 0;
-  const stage = thermalStage(v, target, key === "chamber");
+  const stage = thermalStage(v, target, name === "Chamber");
   const el = document.createElement("span");
   el.className = "tchip";
   el.dataset.stage = stage;
@@ -1715,11 +1762,10 @@ function tempChip(t, key, iconId, name, cur, target, max) {
   tg.textContent = hasTarget ? `/${Math.round(target)}` : "";
   const tr = document.createElement("span");
   tr.setAttribute("aria-hidden", "true");
-  setTrend(tr, sampleTrend(t, key, v));
+  setTrend(tr, delta);
   el.append(icon(iconId), label, valEl(v, "°C", 3), tg, tr);
   return el;
 }
-
 // All fans in one chip: three mini bars (part · aux · chamber) and the
 // fastest fan's percent; names and values in the title.
 function fanChip(fans) {
@@ -1792,6 +1838,7 @@ const bedLabel = v => BED_LABELS[v] || String(v).replaceAll("_", " ");
 // Display-only extension strip; grouping keeps the full archive name.
 const objectWord = n => n.replace(/\.(stl|obj|3mf)$/i, "");
 
+// renderJobPreview refreshes archived preview fields, rebuilding only on metadata change.
 function renderJobPreview(t, b) {
   const p = t.data, m = p.jobpreview || {}, r = t.r;
   const jp = m.job_preview && typeof m.job_preview === "object"
@@ -1808,8 +1855,11 @@ function renderJobPreview(t, b) {
   // The archive head also depends on the live job name, so it refreshes
   // outside the keyed rebuild; disclosures stay untouched either way.
   updateJobArchiveHead(t, md);
-  t.jobArchShown = t.jobArchBodyShown || !!(t.jobArchHead && !t.jobArchHead.hidden);
-  r.jobArchive.hidden = !t.jobArchShown;
+  const archShown = t.jobArchBodyShown || !!(t.jobArchHead && !t.jobArchHead.hidden);
+  if (archShown !== t.jobArchShown) {
+    t.jobArchShown = archShown;
+    r.jobArchive.hidden = !archShown;
+  }
   r.jobThumb.classList.toggle("past", past);
   r.jobMaterials.classList.toggle("past", past);
   r.jobArchive.classList.toggle("past", past);
@@ -1862,9 +1912,9 @@ function renderJobVitals(t, jp, md, b, past) {
   // state check keeps the estimate tied to the live state alone.
   const showFL = b === "printing" && String(p.print_state || "").toUpperCase() === "RUNNING" &&
     jp.current === true && p.layer_num === 1 && flSec != null && flSec > 0;
-  r.flStat.hidden = !showFL;
-  if (showFL) r.flStat.textContent =
-    `Sliced first layer: ≈${Math.max(1, Math.round(flSec / 60))} min`;
+  const flText = showFL ? `Sliced first layer: ≈${Math.max(1, Math.round(flSec / 60))} min` : "";
+  if (r.flStat.hidden === showFL) r.flStat.hidden = !showFL;
+  if (showFL && r.flStat.textContent !== flText) r.flStat.textContent = flText;
   const bits = [];
   if (plate) {
     const name = mdText(plate.name);
@@ -1872,9 +1922,11 @@ function renderJobVitals(t, jp, md, b, past) {
     const bed = mdText(plate.bed_type);
     if (bed) bits.push(bedLabel(bed));
   }
-  r.plateFact.hidden = !bits.length;
-  if (bits.length) r.plateFact.textContent = bits.join(" · ");
-  r.jobVitals.hidden = !showFL && !bits.length;
+  const plateText = bits.join(" · ");
+  if (r.plateFact.hidden === !!bits.length) r.plateFact.hidden = !bits.length;
+  if (bits.length && r.plateFact.textContent !== plateText) r.plateFact.textContent = plateText;
+  const vitalsHidden = !showFL && !bits.length;
+  if (r.jobVitals.hidden !== vitalsHidden) r.jobVitals.hidden = vitalsHidden;
   r.jobVitals.classList.toggle("past", past);
 }
 
@@ -1885,6 +1937,7 @@ function renderJobVitals(t, jp, md, b, past) {
 function renderJobArchive(t, md) {
   const box = t.r.jobArchive;
   box.replaceChildren();
+  t.jobArchHeadText = undefined;
   if (!md) {
     t.jobArchHead = null;
     t.jobArchBody = null;
@@ -1993,15 +2046,16 @@ function renderJobArchive(t, md) {
 function updateJobArchiveHead(t, md) {
   const head = t.jobArchHead;
   if (!head) return;
-  head.replaceChildren();
   const title = mdText(md?.title), designer = mdText(md?.designer);
   const jobName = mdText(t.data.job_name);
-  if (title && title !== jobName) head.append(title);
-  if (designer) {
-    if (head.textContent) head.append(" · ");
-    head.append(`By ${designer}`);
-  }
-  head.hidden = !head.textContent;
+  // Compose the head text first so unchanged heads skip every DOM write.
+  const text = [title && title !== jobName ? title : "", designer ? `By ${designer}` : ""]
+    .filter(Boolean).join(" · ");
+  if (text === t.jobArchHeadText) return;
+  t.jobArchHeadText = text;
+  head.replaceChildren();
+  if (text) head.append(text);
+  head.hidden = !text;
 }
 
 // The plate thumb is a cached, versioned PNG, assigned once per
@@ -2362,25 +2416,33 @@ function renderTile(t) {
   const heatersOff = [p.nozzle_target, p.bed_target].every(v => !(v > 0)) &&
     [p.nozzle_temp, p.bed_temp].some(v => v != null) &&
     [p.nozzle_temp, p.bed_temp, p.chamber_temp].every(v => v == null || v <= 45);
-  // Trend samples keep flowing while the chips are collapsed.
-  if (heatersOff) {
-    for (const [k, v] of [["nozzle", p.nozzle_temp], ["bed", p.bed_temp], ["chamber", p.chamber_temp]]) {
-      sampleTrend(t, k, v == null ? null : Math.round(v));
+  // Sample trends once per render for the chips and the key. Keeps history identical.
+  const deltas = { nozzle: sampleTrend(t, "nozzle", p.nozzle_temp == null ? null : Math.round(p.nozzle_temp)),
+    bed: sampleTrend(t, "bed", p.bed_temp == null ? null : Math.round(p.bed_temp)),
+    chamber: sampleTrend(t, "chamber", p.chamber_temp == null ? null : Math.round(p.chamber_temp)) };
+  // Round readings for key stability. Matches the displayed chip values.
+  const rnd = v => v == null ? "" : Math.round(v);
+  // Build one key from connection, displayed values, fans, and trend directions. Skips rebuild on match.
+  const chipsKey = [p.connected ? 1 : 0, heatersOff ? 1 : 0,
+    rnd(p.nozzle_temp), rnd(p.nozzle_target), rnd(p.bed_temp), rnd(p.bed_target), rnd(p.chamber_temp),
+    p.fans?.part ?? "", p.fans?.aux ?? "", p.fans?.chamber ?? "",
+    trendDir(deltas.nozzle), trendDir(deltas.bed), trendDir(deltas.chamber)].join("\u0000");
+  if (chipsKey !== t.chipsKey) {
+    t.chipsKey = chipsKey;
+    // Offline printers report nothing live; old readings would read as current.
+    const chips = !p.connected ? [] : (heatersOff ? [offChip(p)] : [
+      tempChip("i-nozzle", "Nozzle", p.nozzle_temp, p.nozzle_target, 300, deltas.nozzle),
+      tempChip("i-bed", "Bed", p.bed_temp, p.bed_target, 120, deltas.bed),
+      tempChip("i-thermo", "Chamber", p.chamber_temp, null, 65, deltas.chamber),
+      fanChip(p.fans),
+    ]).filter(Boolean);
+    if (chips.length) r.temps.replaceChildren(...chips);
+    else {
+      const none = document.createElement("span");
+      none.className = "muted";
+      none.textContent = p.connected ? "No temperatures reported yet" : "No live temperatures while offline";
+      r.temps.replaceChildren(none);
     }
-  }
-  // Offline printers report nothing live; old readings would read as current.
-  const chips = !p.connected ? [] : (heatersOff ? [offChip(p)] : [
-    tempChip(t, "nozzle", "i-nozzle", "Nozzle", p.nozzle_temp, p.nozzle_target, 300),
-    tempChip(t, "bed", "i-bed", "Bed", p.bed_temp, p.bed_target, 120),
-    tempChip(t, "chamber", "i-thermo", "Chamber", p.chamber_temp, null, 65),
-    fanChip(p.fans),
-  ]).filter(Boolean);
-  if (chips.length) r.temps.replaceChildren(...chips);
-  else {
-    const none = document.createElement("span");
-    none.className = "muted";
-    none.textContent = p.connected ? "No temperatures reported yet" : "No live temperatures while offline";
-    r.temps.replaceChildren(none);
   }
 
   // Full detail, print first: the job, then filament, activity, and the
@@ -2490,9 +2552,19 @@ function eligible(t) {
   return !document.hidden && !t.el.hidden && visible.has(t.serial) && t.data.connected &&
     t.data.camera_supported && !t.data.camera_reason;
 }
-function allocate() {
+// allocate assigns live slots and re-renders. A null changed re-renders
+// every tile; a set limits re-renders to its tiles, tiles whose filter
+// visibility flipped, and tiles whose feed changed (scrolling passes an
+// empty set).
+function allocate(changed = null) {
   const order = [...grid.children].map(el => tiles.get(el.dataset.serial));
-  for (const t of order) t.el.hidden = !matchesFilter(t.data);
+  for (const t of order) {
+    const hide = !matchesFilter(t.data);
+    if (t.el.hidden !== hide) {
+      t.el.hidden = hide;
+      changed?.add(t.serial);
+    }
+  }
   const wantsLive = t => isActive(bucket(t.data)) || t.serial === spotlight;
   const live = new Set();
   const spot = spotlight && tiles.get(spotlight);
@@ -2505,13 +2577,33 @@ function allocate() {
     }
   }
   for (const t of order) {
-    setFeed(t, !eligible(t) ? "none" : live.has(t.serial) ? "live" : "snap");
-    renderTile(t);
+    const mode = !eligible(t) ? "none" : live.has(t.serial) ? "live" : "snap";
+    const feedChanged = setFeed(t, mode);
+    if (feedChanged || !changed || changed.has(t.serial)) renderTile(t);
   }
   document.getElementById("no-match").hidden = !order.length || order.some(t => !t.el.hidden);
   renderFleet();
 }
+// clearLiveRetry cancels a pending stream retry for the tile.
+function clearLiveRetry(t) {
+  if (t.liveTimer) { clearTimeout(t.liveTimer); t.liveTimer = 0; }
+  t.liveBackoff = 5000;
+}
+// scheduleLiveRetry retries a failed stream with doubling backoff from 5 s
+// to a 60 s cap, skipping while the tab is hidden or the tile is ineligible.
+function scheduleLiveRetry(t) {
+  clearTimeout(t.liveTimer);
+  t.liveTimer = setTimeout(() => {
+    t.liveTimer = 0;
+    if (t.feed !== "live" || !t.liveError || tiles.get(t.serial) !== t) return;
+    if (document.hidden || !eligible(t)) { scheduleLiveRetry(t); return; }
+    t.liveBackoff = Math.min(60000, t.liveBackoff * 2);
+    t.r.img.src = `/camera/${encodeURIComponent(t.serial)}/stream?retry=${Date.now()}`;
+  }, t.liveBackoff);
+}
+// stopFeed releases the tile's camera connection and cancels its stream retry.
 function stopFeed(t) {
+  clearLiveRetry(t);
   t.snap.ctrl?.abort();
   t.snap.ctrl = null;
   t.snap.pending = false;
@@ -2521,8 +2613,11 @@ function stopFeed(t) {
   }
   t.feed = "none";
 }
+// setFeed switches the tile's feed mode, returning true when it changed.
+// Switching to live revokes the snapshot blob once the stream src is set;
+// switching to none keeps it because the last frame stays shown.
 function setFeed(t, mode) {
-  if (t.feed === mode) return;
+  if (t.feed === mode) return false;
   stopFeed(t);
   t.feed = mode;
   t.liveError = false;
@@ -2530,16 +2625,19 @@ function setFeed(t, mode) {
   if (mode === "live") {
     t.hasFrame = false;
     t.r.img.src = `/camera/${encodeURIComponent(t.serial)}/stream`;
+    if (t.blobURL) { URL.revokeObjectURL(t.blobURL); t.blobURL = ""; }
   } else if (mode === "snap") {
     fetchSnapshot(t);
   }
+  return true;
 }
+// fetchSnapshot loads one still frame, aborting after 10 s through the existing error path.
 async function fetchSnapshot(t) {
   if (t.snap.pending) return;
   const ctrl = new AbortController();
   Object.assign(t.snap, { ctrl, pending: true, requested: Date.now() });
   try {
-    const res = await fetch(`/camera/${encodeURIComponent(t.serial)}/snapshot`, { cache: "no-store", signal: ctrl.signal });
+    const res = await fetch(`/camera/${encodeURIComponent(t.serial)}/snapshot`, { cache: "no-store", signal: AbortSignal.any([ctrl.signal, AbortSignal.timeout(10000)]) });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const url = URL.createObjectURL(await res.blob());
     // Decode off-screen first so the visible frame swaps without flashing.
@@ -2554,6 +2652,8 @@ async function fetchSnapshot(t) {
     t.snap.error = false;
     t.snap.at = Date.now();
   } catch (err) {
+    // TimeoutError from AbortSignal.timeout counts as a fetch failure, not
+    // a deliberate abort, so the tile shows its retry state.
     if (err.name !== "AbortError" && t.snap.ctrl === ctrl) t.snap.error = true;
   } finally {
     if (t.snap.ctrl === ctrl) { t.snap.ctrl = null; t.snap.pending = false; }
@@ -2830,13 +2930,17 @@ function sync(list) {
     if (spotlight === serial) spotlight = null;
   }
   let added = false;
+  // changed marks every tile that received a payload, so allocate re-renders
+  // it; the per-section keys inside renderTile skip unchanged DOM.
+  const changed = new Set();
   for (const p of list) {
     const t = tiles.get(p.serial);
-    if (t) { t.data = p; continue; }
+    if (t) { t.data = p; changed.add(p.serial); continue; }
     const nt = createTile(p);
     tiles.set(p.serial, nt);
     grid.append(nt.el);
     observer.observe(nt.el);
+    changed.add(p.serial);
     added = true;
   }
   if (added && !drag) {
@@ -2847,7 +2951,7 @@ function sync(list) {
   }
   grid.hidden = list.length === 0;
   document.getElementById("empty").hidden = list.length !== 0;
-  allocate();
+  allocate(changed);
 }
 
 // The wall polls /camera/status once a second while the page is visible,
@@ -2857,7 +2961,7 @@ async function poll() {
   if (polling || document.hidden) return;
   polling = true;
   try {
-    const res = await fetch("/camera/status", { cache: "no-store" });
+    const res = await fetch("/camera/status", { cache: "no-store", signal: AbortSignal.timeout(5000) });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     if (!Array.isArray(data.printers)) throw new Error("bad payload");
@@ -2883,13 +2987,14 @@ async function poll() {
   }
 }
 
-// Off-screen tiles release their camera connection.
+// Off-screen tiles release their camera connection. Only tiles whose feed
+// changes re-render; steady tiles keep their DOM untouched while scrolling.
 const observer = new IntersectionObserver(entries => {
   for (const e of entries) {
     if (e.isIntersecting) visible.add(e.target.dataset.serial);
     else visible.delete(e.target.dataset.serial);
   }
-  allocate();
+  allocate(new Set());
 }, { threshold: 0.2 });
 
 // Screen wake lock keeps wall displays on. Browsers expose it only on
@@ -2997,7 +3102,10 @@ document.addEventListener("visibilitychange", () => {
 });
 
 // One-second tick: status poll, snapshot cadence, relative-time labels.
+// A hidden tab does no work; the visibilitychange handler polls and
+// reallocates feeds promptly when the tab becomes visible again.
 setInterval(() => {
+  if (document.hidden) return;
   const now = Date.now();
   for (const t of tiles.values()) {
     if (t.feed === "snap" && !t.snap.pending && now - t.snap.requested >= prefs.snapSec * 1000) fetchSnapshot(t);
