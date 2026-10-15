@@ -443,12 +443,6 @@ svg.ams-svg { display: block; width: 100%; height: auto; }
 .job-vitals { display: grid; gap: .2rem; font-size: .78rem; color: var(--dim);
               font-variant-numeric: tabular-nums; }
 .job-vitals.past { opacity: .7; }
-.detect-l2 { --tone: var(--dim); display: flex; align-items: center; gap: .45rem; font-size: .8rem;
-             color: var(--dim); font-variant-numeric: tabular-nums; }
-.detect-l2 .ic { color: var(--tone); font-size: 1rem; }
-.detect-l2 .d-q { font-weight: 650; color: var(--tone); }
-.detect-l2[data-tone="info"], .detect-l2[data-tone="warn"] { --tone: var(--paused); }
-.detect-l2[data-tone="error"] { --tone: var(--failed); }
 .stat { display: inline-flex; align-items: center; gap: .3rem; white-space: nowrap; }
 .elapsed .el-text { display: inline-block; min-width: 14ch; }
 .elapsed .el-text .sep { color: var(--faint); margin: 0 .25rem; }
@@ -706,7 +700,6 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
           <span class="fl-stat" hidden></span>
           <span class="plate-fact" hidden></span>
         </div>
-        <div class="detect-l2" hidden><svg class="ic" aria-hidden="true"><use href="#i-ai"/></svg><b class="d-q"></b><span class="d-text"></span></div>
         <div class="temps"></div>
         <div class="active-fil" hidden><svg class="ic" aria-hidden="true"><use href="#i-spool"/></svg><i class="swatch"></i><b class="af-slot"></b><span class="af-mat"></span>
           <span class="remain-bar" role="img"><i></i></span><span class="af-pct val"><b></b><small>%</small></span></div>
@@ -895,16 +888,6 @@ const DETECT_REASONS = {
 };
 const reasonWords = d => (d.reason ? DETECT_REASONS[d.reason] || d.reason : "");
 const qualityPct = q => (q == null ? null : Math.max(0, Math.min(100, Math.round(q * 10))));
-function qualityWord(q) {
-  if (q == null) return "";
-  return q <= 1 ? "failure" : q === 2 ? "probable failure" : q === 3 ? "possible failure"
-    : q <= 5 ? "watching" : q <= 7 ? "good" : q <= 9 ? "great" : "perfect";
-}
-function qualityTone(q) {
-  // Quality colors stay factual and never reach alert red; the approved
-  // flags (warning, pause) own the strong tones.
-  return q == null ? null : q <= 3 ? "warn" : q <= 5 ? "info" : "calm";
-}
 // While inspection is running, a result older than a fixed 120 s baseline is
 // history. next_check_seconds counts down to the next inspection, so it never
 // feeds staleness; server state and age decide. Suspended or ended sessions
@@ -1195,8 +1178,8 @@ function createTile(p) {
       afBar: q(".active-fil .remain-bar"), afPct: q(".af-pct b"),
       dtSd: q(".dt-sd"), fSd: q(".f-sd"),
       detect: q(".pill.detect"), detectUse: q(".pill.detect use"), detectLabel: q(".pill.detect .label"),
-      detectQ: q(".pill.detect .q b"), detectTr: q(".pill.detect .tr"), d2: q(".detect-l2"), d2q: q(".detect-l2 .d-q"),
-      d2text: q(".detect-l2 .d-text"), fDetectDt: q(".dt-detect"), fDetect: q(".f-detect"),
+      detectQ: q(".pill.detect .q b"), detectTr: q(".pill.detect .tr"),
+      fDetectDt: q(".dt-detect"), fDetect: q(".f-detect"),
       dtCamera: q(".dt-camera"), fCamera: q(".f-camera"),
       dtReport: q(".dt-report"), fReport: q(".f-report"), dtSerial: q(".dt-serial"), fSerial: q(".f-serial"), open: q(".open"),
       stage: q(".pill.state .stage"), amsSec: q(".ams"), amsUnits: q(".ams-units"), amsNote: q(".ams-note"),
@@ -2353,21 +2336,6 @@ function renderTile(t) {
       : d.enabled !== false ? "Turn AI monitoring off for this print · it returns with the next print or after a proxy restart"
       : "Turn AI monitoring back on for this print";
 
-  }
-  // The vitals line adds an inspection result's meaning. Off, suspended, and
-  // idle states are named by the badge and the alert row, so it stays hidden.
-  const showD2 = !!d && d.state !== "idle" && d.state !== "disabled" && !d.suspended;
-  r.d2.hidden = !showD2;
-  if (showD2) {
-    r.d2.dataset.tone = detectPausePending(d) || detectPauseUnconfirmed(d) ? "error"
-      : detectPauseConfirmed(d) || d.warning ? "warn" : qualityTone(d.quality) || "";
-    // The score itself lives on the camera chip; vitals add its meaning.
-    r.d2q.textContent = "";
-    const bits = [d.quality != null ? qualityWord(d.quality) : "no result yet"];
-    if (d.layerNum != null) bits.push(`layer ${d.layerNum}`);
-    if (d.age != null) bits.push(`checked ${fmtAgo(Math.round(d.age))}${detectOld(d) ? " · old" : ""}`);
-    if (d.quality == null) bits.push(reasonWords(d) || d.message);
-    r.d2text.textContent = bits.filter(Boolean).join(" · ");
   }
   const fact = d && d.state !== "idle" ? detectFact(d, b) : "";
   r.fDetectDt.hidden = r.fDetect.hidden = !fact;
