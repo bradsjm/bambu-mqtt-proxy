@@ -106,7 +106,7 @@ log:
 #   api_key: ""              # write-only on the /config page
 #   model: clef              # cloudflare: clef or clef-flash; custom: any name
 #   stop_confidence: 0.5     # 0.50-0.99; stop above this occupied probability
-#   min_clarity: 0.7         # 0.50-0.99; both checks judge only at or above this image clarity
+#   min_clarity: 0.7         # 0.50-0.99; both checks stop or pause only at or above this image clarity
 #   first_layer:             # runs whenever the plate check is on
 #     enabled: true          # false disables the first-layer phase alone
 #     pause_confidence: 0.7  # 0.50-0.99; pause above this defect probability

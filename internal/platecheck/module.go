@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"strings"
 
 	"bambu-mqtt-proxy/internal/module"
 )
@@ -34,7 +35,8 @@ type ModuleState struct {
 type FirstLayerState struct {
 	// State is the fixed first-layer outcome, independent of startup state.
 	State string `json:"state"`
-	// Reason is the skip or failure code behind State, empty otherwise.
+	// Reason is the skip or failure code behind State, empty otherwise. For warning or
+	// inconclusive, it identifies a failed retry whose earlier findings remain.
 	Reason string `json:"reason,omitempty"`
 	// Pause is pending, confirmed, failed, or unconfirmed after a pause verdict.
 	Pause string `json:"pause,omitempty"`
@@ -143,8 +145,14 @@ func (s *Service) Display(serial string) *module.Display {
 			Value:   fmt.Sprintf("Tangle %s · detached %s · nozzle blob %s · missing material %s (warning only)", scoreText(*v.FirstLayer.PTangled, v.FirstLayer.Cutoff), scoreText(*v.FirstLayer.PDetached, v.FirstLayer.Cutoff), scoreText(*v.FirstLayer.PNozzleBlob, v.FirstLayer.Cutoff), scoreText(*v.FirstLayer.PIncomplete, v.FirstLayer.Cutoff)),
 			Section: "After layer 1",
 		}
-		if v.FirstLayer.State == "inconclusive" {
-			row.Note = "Image not clear enough: findings not used"
+		// note explains what the findings do and do not cover for this outcome.
+		switch limited := *v.FirstLayer.PAssessable < v.FirstLayer.MinClarity; {
+		case v.FirstLayer.State == "inconclusive":
+			row.Note = "No defect score exceeds 50%. Low clarity prevents a pass or automatic pause."
+		case v.FirstLayer.State == "warning" && limited:
+			row.Note = "Visible evidence triggered a warning. Low clarity prevents an automatic pause."
+		default:
+			row.Note = "Only visible areas were assessed."
 		}
 		rows = append(rows, row)
 	}
@@ -242,10 +250,13 @@ func firstLayerRow(v FirstLayerState) module.Row {
 		row.Value, row.Tone = "Looks good", "calm"
 	case "warning":
 		row.Value, row.Tone = "Possible problem", "warn"
+		if v.PAssessable != nil && *v.PAssessable < v.MinClarity {
+			row.Value = "Possible problem (limited view)"
+		}
 		row.Note = "Printing continued; check the printer"
 	case "inconclusive":
-		row.Value = "Image unclear"
-		row.Note = "Image not clear enough to judge; printing continued"
+		row.Value = "Limited view"
+		row.Note = "Image clarity is below the minimum. Printing continued. This does not confirm a good first layer."
 	case "blocked":
 		row.Value, row.Tone = "Unavailable", "warn"
 		row.Note = reasonNote("First-layer check", "camera_disabled")
@@ -272,6 +283,10 @@ func firstLayerRow(v FirstLayerState) module.Row {
 	default:
 		row.Value = "Not checked yet"
 		row.Note = "Checks after the first layer is printed"
+	}
+	if (v.State == "warning" || v.State == "inconclusive") && v.Reason != "" {
+		// A failed retry leaves the earlier findings visible and says why it could not complete.
+		row.Note = strings.TrimSuffix(row.Note, ".") + ". Retry could not complete: " + reasonClause(v.Reason) + ". Earlier findings remain."
 	}
 	return row
 }

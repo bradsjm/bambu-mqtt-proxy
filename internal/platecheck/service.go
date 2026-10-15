@@ -109,6 +109,8 @@ type worker struct {
 	pending *pendingCommand
 	// layerPending tracks an unresolved first-layer pause.
 	layerPending *pendingCommand
+	// layerRetryAt is when the one low-clarity retry becomes due; zero means no retry is pending.
+	layerRetryAt time.Time
 }
 
 // New constructs the module and subscribes without starting work.
@@ -207,7 +209,7 @@ func (w *worker) handle(ctx context.Context, e printer.Event) {
 	if e.NewJob {
 		// A new print clears every finding and outstanding command from the previous print.
 		w.pass1Done, w.homingSeen, w.homingDone, w.stopSent = false, false, false, false
-		w.pending, w.layerPending = nil, nil
+		w.pending, w.layerPending, w.layerRetryAt = nil, nil, time.Time{}
 		w.mu.Lock()
 		w.status = w.s.idleStatus()
 		w.mu.Unlock()
@@ -243,12 +245,21 @@ func (w *worker) handle(ctx context.Context, e printer.Event) {
 			w.check(ctx, true)
 		}
 	}
+	if !w.layerRetryAt.IsZero() {
+		// The retry runs only while layer 2 is still printing; any other report ends the chance.
+		if state != "RUNNING" || !hasLayer || layer != 2 {
+			w.layerRetryAt = time.Time{}
+		} else if !w.s.now().Before(w.layerRetryAt) {
+			w.layerRetryAt = time.Time{}
+			w.checkLayer(ctx, true)
+		}
+	}
 	if slices.Contains(e.Kinds, "first_layer_complete") && w.s.settings.FirstLayer.On() {
 		if w.stopSent {
 			w.layerSkip("skipped", "startup_stopped", 0)
 			w.logLayerOutcome(0, "skipped", "startup_stopped", nil, state, layer, hasLayer, nil, 0)
 		} else {
-			w.checkLayer(ctx)
+			w.checkLayer(ctx, false)
 		}
 	}
 }

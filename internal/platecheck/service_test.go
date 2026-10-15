@@ -3,9 +3,13 @@ package platecheck
 import (
 	"bambu-mqtt-proxy/internal/activity"
 	"bambu-mqtt-proxy/internal/config"
+	"bambu-mqtt-proxy/internal/module"
 	"bambu-mqtt-proxy/internal/printer"
 	"context"
+	"errors"
 	"fmt"
+	"math"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -111,9 +115,10 @@ func (f frameFunc) Capture(ctx context.Context, s string, t time.Time) (Frame, e
 type fakeState struct {
 	doc       printer.Doc
 	subscribe func(printer.Event)
+	offline   bool
 }
 
-func (f *fakeState) Get(string) (printer.Doc, bool, bool) { return f.doc, true, true }
+func (f *fakeState) Get(string) (printer.Doc, bool, bool) { return f.doc, !f.offline, true }
 func (f *fakeState) Subscribe(fn func(printer.Event))     { f.subscribe = fn }
 
 type fixture struct {
@@ -295,4 +300,285 @@ func TestStoreWorkerBoundary(t *testing.T) {
 	if commands.count() != 1 {
 		t.Fatal("expected one command across the real store boundary")
 	}
+}
+
+// lowClarityExample is the saved-view case: 25% clarity with defect scores from 7% to 26%.
+func lowClarityExample() LayerResult {
+	return LayerResult{PAssessable: .25, PTangled: .07, PDetached: .17, PNozzleBlob: .23, PIncomplete: .26}
+}
+
+// visibleTangleLowClarity is a limited view that still shows a clear tangle.
+func visibleTangleLowClarity() LayerResult {
+	return LayerResult{PAssessable: .25, PTangled: .9}
+}
+
+// deliver hands the worker one report and leaves the live printer document unchanged.
+func (f *fixture) deliver(ctx context.Context, cur printer.Doc, kinds ...string) {
+	f.state.subscribe(printer.Event{Serial: "01S1", Prev: f.state.doc, Cur: cur, Online: true, Kinds: kinds, NewJob: printer.NewJob(f.state.doc, cur)})
+	f.w.handle(ctx, <-f.w.events)
+}
+
+// layer returns the published first-layer state.
+func (f *fixture) layer() FirstLayerState { return f.s.moduleState("01S1").(ModuleState).FirstLayer }
+
+// countEvents counts activity entries of one kind.
+func (f *fixture) countEvents(kind string) int {
+	n := 0
+	for _, e := range f.activity.Recent("01S1") {
+		if e.Kind == kind {
+			n++
+		}
+	}
+	return n
+}
+
+// lastMessage returns the newest activity message of one kind.
+func (f *fixture) lastMessage(kind string) string {
+	var id uint64
+	var message string
+	for _, e := range f.activity.Recent("01S1") {
+		if e.Kind == kind && e.ID >= id {
+			id, message = e.ID, e.Message
+		}
+	}
+	return message
+}
+
+// firstLayerLow runs the first check on layer 2 with a low-clarity result and checks the pending retry.
+func (f *fixture) firstLayerLow(t *testing.T, result LayerResult) {
+	t.Helper()
+	f.client.layerResult = result
+	f.event("RUNNING", 2, 0, "first_layer_complete")
+	if f.client.layerCalls != 1 || f.commands.pauses != 0 || f.w.layerRetryAt.IsZero() {
+		t.Fatalf("first check: calls %d pauses %d retry %v", f.client.layerCalls, f.commands.pauses, f.w.layerRetryAt)
+	}
+}
+
+// retryDue advances past the retry delay and delivers a running layer 2 report.
+func (f *fixture) retryDue() {
+	f.clock.advance(layerRetryDelay)
+	f.state.doc = reportDoc("RUNNING", 2, 0)
+	f.deliver(context.Background(), f.state.doc)
+}
+
+func TestFirstLayerLowClarityRetriesOnceWithoutPause(t *testing.T) {
+	for _, tc := range []struct {
+		name, state, kind, message string
+		result                     LayerResult
+	}{
+		{"example", "inconclusive", "platecheck_layer1_skipped", "First-layer check could not assess the print reliably: image clarity 25%, needs 70%. No defect score exceeds 50%. Printing continued.", lowClarityExample()},
+		{"visible defect", "warning", "platecheck_layer1_warning", "Possible first-layer problem in a limited view: filament tangled (90%). Image clarity 25%, needs 70%. No pause sent. Check the printer.", visibleTangleLowClarity()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, "RUNNING")
+			f.firstLayerLow(t, tc.result)
+			if got := f.layer(); got.State != tc.state || f.lastMessage(tc.kind) != tc.message || f.hasEvent("platecheck_layer1_passed") {
+				t.Fatalf("first result %+v message %q", got, f.lastMessage(tc.kind))
+			}
+			f.clock.advance(layerRetryDelay - time.Second)
+			f.event("RUNNING", 2, 0)
+			if f.client.layerCalls != 1 {
+				t.Fatal("retry ran before it was due")
+			}
+			f.clock.advance(time.Second)
+			f.event("RUNNING", 2, 0)
+			if f.client.layerCalls != 2 || f.layer().State != tc.state || f.commands.pauses != 0 || !f.w.layerRetryAt.IsZero() || f.countEvents(tc.kind) != 2 {
+				t.Fatalf("retry: calls %d state %+v pauses %d", f.client.layerCalls, f.layer(), f.commands.pauses)
+			}
+			f.clock.advance(time.Hour)
+			f.event("RUNNING", 2, 0)
+			if f.client.layerCalls != 2 {
+				t.Fatal("a third check ran")
+			}
+		})
+	}
+}
+
+func TestFirstLayerRetryWithClearImagePausesOnce(t *testing.T) {
+	f := newFixture(t, "RUNNING")
+	f.firstLayerLow(t, lowClarityExample())
+	f.client.layerResult = LayerResult{PAssessable: .9, PTangled: .9}
+	f.retryDue()
+	if got := f.layer(); f.commands.pauses != 1 || got.State != "pause" || got.Pause != "pending" || got.Reason != "" || !f.hasEvent("platecheck_layer1_pause_sent") {
+		t.Fatalf("retry pause: pauses %d state %+v", f.commands.pauses, got)
+	}
+	f.deliver(context.Background(), reportDoc("PAUSED", 2, 0))
+	if !f.hasEvent("platecheck_layer1_pause_confirmed") {
+		t.Fatal("retry pause not resolved by the existing lifecycle")
+	}
+}
+
+func TestFirstLayerRetryFailureKeepsFirstResult(t *testing.T) {
+	providerErr := errors.New("provider down")
+	captureErr := errors.New("camera down")
+	for _, tc := range []struct {
+		name   string
+		arm    func(*fixture)
+		reason string
+	}{
+		{"capture", func(f *fixture) {
+			f.s.frames = frameFunc(func(context.Context, string, time.Time) (Frame, error) { return Frame{}, captureErr })
+		}, errorCategory(captureErr)},
+		{"provider", func(f *fixture) { f.client.err = providerErr }, errorCategory(providerErr)},
+		{"invalid response", func(f *fixture) { f.client.layerResult = LayerResult{PAssessable: .9, PIncomplete: math.NaN()} }, "bad_response"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, "RUNNING")
+			f.firstLayerLow(t, visibleTangleLowClarity())
+			first := f.layer()
+			tc.arm(f)
+			f.retryDue()
+			got := f.layer()
+			if got.State != "warning" || got.PTangled == nil || *got.PTangled != *first.PTangled || got.Reason != tc.reason || f.commands.pauses != 0 || f.countEvents("platecheck_layer1_warning") != 1 {
+				t.Fatalf("after failed retry %+v", got)
+			}
+			if f.countEvents("platecheck_layer1_skipped")+f.countEvents("platecheck_layer1_pause_failed") == 0 {
+				t.Fatal("retry failure not recorded")
+			}
+			if note := firstLayerRow(got).Note; !strings.Contains(note, "Retry could not complete: ") || !strings.Contains(note, "Earlier findings remain.") {
+				t.Fatalf("retry failure not shown: %q", note)
+			}
+		})
+	}
+}
+
+func TestFirstLayerRetryClearedBeforeDue(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cur  printer.Doc
+	}{
+		{"paused", reportDoc("PAUSED", 2, 0)},
+		{"finished", reportDoc("FINISH", 2, 0)},
+		{"layer missing", printer.Doc{"print": map[string]any{"gcode_state": "RUNNING"}}},
+		{"layer 3", reportDoc("RUNNING", 3, 0)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, "RUNNING")
+			f.firstLayerLow(t, visibleTangleLowClarity())
+			f.deliver(context.Background(), tc.cur)
+			f.state.doc = tc.cur
+			if !f.w.layerRetryAt.IsZero() || f.layer().State != "warning" {
+				t.Fatalf("retry not cleared or first result lost: %+v", f.layer())
+			}
+			f.clock.advance(time.Hour)
+			f.state.doc = reportDoc("RUNNING", 2, 0)
+			f.deliver(context.Background(), f.state.doc)
+			if f.client.layerCalls != 1 || f.layer().Reason != "" || f.countEvents("platecheck_layer1_skipped") != 0 {
+				t.Fatalf("cleared retry restarted: calls %d state %+v", f.client.layerCalls, f.layer())
+			}
+		})
+	}
+}
+
+func TestFirstLayerNewJobClearsFindingsAndRetry(t *testing.T) {
+	f := newFixture(t, "RUNNING")
+	f.firstLayerLow(t, visibleTangleLowClarity())
+	f.clock.advance(time.Hour)
+	// The live and previous documents show an ended print, so a RUNNING layer 2 report starts a new job.
+	f.state.doc = reportDoc("IDLE", 0, 0)
+	f.deliver(context.Background(), reportDoc("RUNNING", 2, 0))
+	if got := f.layer(); got.State != "idle" || got.PTangled != nil || got.Reason != "" || !f.w.layerRetryAt.IsZero() || f.client.layerCalls != 1 || f.countEvents("platecheck_layer1_skipped") != 0 {
+		t.Fatalf("new job kept prior findings or retry: calls %d state %+v", f.client.layerCalls, got)
+	}
+}
+
+func TestFirstLayerRetryRejectsLiveStateChange(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		live   printer.Doc
+		off    bool
+		reason string
+	}{
+		{"offline", reportDoc("RUNNING", 2, 0), true, "printer_offline"},
+		{"paused", reportDoc("PAUSED", 2, 0), false, "print_paused"},
+		{"layer 3", reportDoc("RUNNING", 3, 0), false, "print_past_start"},
+		{"layer missing", printer.Doc{"print": map[string]any{"gcode_state": "RUNNING"}}, false, "layer_not_reported"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, "RUNNING")
+			f.firstLayerLow(t, visibleTangleLowClarity())
+			f.clock.advance(layerRetryDelay)
+			queued := reportDoc("RUNNING", 2, 0)
+			f.state.doc, f.state.offline = tc.live, tc.off
+			f.deliver(context.Background(), queued)
+			got := f.layer()
+			if f.client.layerCalls != 1 || f.commands.pauses != 0 || f.commands.lights != 0 || got.State != "warning" || got.PTangled == nil || got.Reason != tc.reason {
+				t.Fatalf("queued retry ran or lost findings: calls %d state %+v", f.client.layerCalls, got)
+			}
+		})
+	}
+}
+
+func TestFirstLayerCompletionAboveLayerTwoSchedulesNoRetry(t *testing.T) {
+	f := newFixture(t, "RUNNING")
+	f.client.layerResult = lowClarityExample()
+	f.event("RUNNING", 3, 0, "first_layer_complete")
+	if f.client.layerCalls != 1 || f.layer().State != "inconclusive" || !f.w.layerRetryAt.IsZero() {
+		t.Fatalf("calls %d state %+v retry %v", f.client.layerCalls, f.layer(), f.w.layerRetryAt)
+	}
+}
+
+func TestFirstLayerRetryPauseGuards(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		arm    func(*fixture, context.CancelFunc)
+		reason string
+	}{
+		{"state changes", func(f *fixture, _ context.CancelFunc) {
+			f.client.layerHook = func() { f.state.doc = reportDoc("PAUSED", 2, 0) }
+		}, "print_paused"},
+		{"context expires", func(f *fixture, cancel context.CancelFunc) { f.client.layerHook = cancel }, errorCategory(context.Canceled)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, "RUNNING")
+			f.firstLayerLow(t, visibleTangleLowClarity())
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			f.client.layerResult = LayerResult{PAssessable: .9, PTangled: .9}
+			tc.arm(f, cancel)
+			f.clock.advance(layerRetryDelay)
+			f.deliver(ctx, reportDoc("RUNNING", 2, 0))
+			got := f.layer()
+			if f.commands.pauses != 0 || got.State != "warning" || got.Pause != "" || got.Reason != tc.reason || f.countEvents("platecheck_layer1_warning") != 1 {
+				t.Fatalf("guarded retry pause: pauses %d state %+v", f.commands.pauses, got)
+			}
+		})
+	}
+}
+
+func TestFirstLayerDisplayExplainsLimitedViews(t *testing.T) {
+	rows := func(f *fixture) map[string]module.Row {
+		out := map[string]module.Row{}
+		for _, r := range f.s.Display("01S1").Panel.Rows {
+			out[r.Label] = r
+		}
+		return out
+	}
+	t.Run("inconclusive", func(t *testing.T) {
+		f := newFixture(t, "RUNNING")
+		f.firstLayerLow(t, lowClarityExample())
+		r := rows(f)
+		if r["First layer"].Value != "Limited view" || r["First layer"].Note != "Image clarity is below the minimum. Printing continued. This does not confirm a good first layer." ||
+			r["Findings"].Note != "No defect score exceeds 50%. Low clarity prevents a pass or automatic pause." ||
+			!strings.Contains(r["Findings"].Value, "Tangle 7% · detached 17% · nozzle blob 23% · missing material 26%") || r["Image clarity"].Value != "25% (needs 70%)" {
+			t.Fatalf("rows %+v", r)
+		}
+	})
+	t.Run("warning", func(t *testing.T) {
+		f := newFixture(t, "RUNNING")
+		f.firstLayerLow(t, visibleTangleLowClarity())
+		r := rows(f)
+		if r["First layer"].Value != "Possible problem (limited view)" || r["First layer"].Tone != "warn" || r["Findings"].Note != "Visible evidence triggered a warning. Low clarity prevents an automatic pause." {
+			t.Fatalf("rows %+v", r)
+		}
+	})
+	t.Run("assessable result", func(t *testing.T) {
+		f := newFixture(t, "RUNNING")
+		f.client.layerResult = LayerResult{PAssessable: .9}
+		f.event("RUNNING", 2, 0, "first_layer_complete")
+		r := rows(f)
+		if r["First layer"].Value != "Looks good" || r["Findings"].Note != "Only visible areas were assessed." {
+			t.Fatalf("rows %+v", r)
+		}
+	})
 }

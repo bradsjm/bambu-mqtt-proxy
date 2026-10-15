@@ -44,6 +44,17 @@ func TestFirstLayerFiveQuestionsTwoOriginalImages(t *testing.T) {
 				}
 			}
 		}
+		for _, key := range []string{"filament_tangled", "part_detached", "nozzle_blob", "layer_incomplete"} {
+			if !strings.Contains(in.Questions[key].Instructions, "Use direct visible evidence only. Do not infer a defect or its absence in areas hidden by the toolhead.") {
+				t.Errorf("%s misses the visible-evidence rule", key)
+			}
+		}
+		if !strings.Contains(in.Questions["layer_incomplete"].Instructions, "Areas hidden by the toolhead are not evidence of missing material.") {
+			t.Error("layer_incomplete treats hidden areas as missing material")
+		}
+		if v := in.Questions["view_assessable"]; !strings.Contains(v.Instructions, "Partial toolhead occlusion alone does not make the views unassessable.") || !strings.Contains(v.Criteria["true"], "even if the toolhead hides another area") {
+			t.Errorf("view_assessable ignores partial occlusion: %+v", v)
+		}
 		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"success":true,"result":` + layerJSON() + `}`)), Header: make(http.Header)}, nil
 	})}
 	r, err := c.EvaluateFirstLayer(context.Background(), images, "P1S")
@@ -101,7 +112,11 @@ func TestFirstLayerStrictCutoffAndWarningOnlyMissingMaterial(t *testing.T) {
 		{LayerResult{PAssessable: .7, PNozzleBlob: .71}, "pause"},
 		{LayerResult{PAssessable: .7, PIncomplete: 1}, "warning"},
 		{LayerResult{PAssessable: .7, PIncomplete: .5}, "passed"},
-		{LayerResult{PAssessable: math.Nextafter(.7, 0), PTangled: 1}, "inconclusive"},
+		{LayerResult{PAssessable: math.Nextafter(.7, 0), PTangled: 1}, "warning"},
+		{LayerResult{PAssessable: math.Nextafter(.7, 0), PIncomplete: 1}, "warning"},
+		{LayerResult{PAssessable: .25, PTangled: .07, PDetached: .17, PNozzleBlob: .23, PIncomplete: .26}, "inconclusive"},
+		{LayerResult{PAssessable: .25, PNozzleBlob: math.Nextafter(.5, 1)}, "warning"},
+		{LayerResult{PAssessable: .25, PNozzleBlob: .5, PIncomplete: .5}, "inconclusive"},
 	} {
 		if got := classifyLayer(tc.result, .7, DefaultMinClarity); got != tc.want {
 			t.Fatalf("%+v: %s != %s", tc.result, got, tc.want)

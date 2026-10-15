@@ -558,8 +558,9 @@ func TestTypeSafeURLAndKeyBinding(t *testing.T) {
 }
 
 // TestMinClarityBoundaryAndDefault pins the shared image-clarity gate:
-// equal to the minimum passes, strictly below fails in both phases, and a
-// stored section without the key loads the 0.70 default.
+// equal to the minimum can pause, strictly below cannot pause in either
+// phase (a visible first-layer defect then warns), and a stored section
+// without the key loads the 0.70 default.
 func TestMinClarityBoundaryAndDefault(t *testing.T) {
 	start := Result{PClear: .1, POccupied: .9, PAssessable: .7}
 	if got := classify(start, .5, DefaultMinClarity); got != "would_stop" {
@@ -574,8 +575,8 @@ func TestMinClarityBoundaryAndDefault(t *testing.T) {
 		t.Fatalf("equal-to-minimum layer = %s, want pause", got)
 	}
 	layer.PAssessable = math.Nextafter(.7, 0)
-	if got := classifyLayer(layer, .7, DefaultMinClarity); got != "inconclusive" {
-		t.Fatalf("below-minimum layer = %s, want inconclusive", got)
+	if got := classifyLayer(layer, .7, DefaultMinClarity); got != "warning" {
+		t.Fatalf("below-minimum layer = %s, want warning", got)
 	}
 	parsed, err := config.Parse([]byte("platecheck:\n  enabled: false\n  provider: custom\n  api_key: 012345\n  endpoint: https://a.example/check\n  model: clef\n  stop_confidence: 0.5\n"))
 	if err != nil {

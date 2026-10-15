@@ -405,7 +405,7 @@ plate when a print starts. Set `provider` (`cloudflare`, the default, or `custom
 full HTTPS URL that accepts the same request and answer format), `api_key`, and
 a free-text `model`. Also set `stop_confidence` (0.50 to 0.99 in 0.01 steps, default
 0.50) and `min_clarity` (0.50 to 0.99 in 0.01 steps, default 0.70), the minimum
-image clarity both checks need before they judge anything. The nested `first_layer` section controls the first-layer phase: it is on
+image clarity the startup check needs to stop a print and the first-layer check needs to pause one. The nested `first_layer` section controls the first-layer phase: it is on
 whenever the plate check is on, `first_layer.enabled: false` disables that phase
 alone, and `first_layer.pause_confidence` (0.50 to 0.99 in 0.01 steps, default
 0.70) is its pause cutoff. Without an explicit `enabled`, the check runs when the
@@ -457,7 +457,7 @@ answers five questions:
 
 | Question | Effect |
 |---|---|
-| Is the image clear enough (image clarity ≥ `min_clarity`)? | Below it, the image is unclear and the check is skipped. |
+| Are the visible printed areas in focus and lit well enough (image clarity ≥ `min_clarity`)? | Below it, no pause or pass is possible; visible findings can still warn. Partial toolhead occlusion alone does not lower clarity. |
 | Is the filament tangled? | Pause-capable. |
 | Is a part visibly detached? | Pause-capable. |
 | Is there a nozzle blob at millimeter scale? | Pause-capable. |
@@ -466,9 +466,16 @@ answers five questions:
 With a clear enough image, any pause-capable probability strictly above
 `pause_confidence` sends one `pause`. The proxy sends no second pause and
 never resumes the print. Otherwise, any defect probability above 0.5 records
-a warning, and a check with no such defect passes. An unclear image, an
-error, a timeout, or a missing camera fails open: the print continues. The
-phase checks each job at most once.
+a warning, and a check with no such defect passes. Below `min_clarity`, the
+same defect scores can warn but never pause, and a result with no score above
+0.5 is recorded as inconclusive, not as a pass. Scores describe visible areas
+only. The model is told not to infer defects in areas hidden by the toolhead.
+After a low-clarity result at layer 2, the proxy runs one more check on the
+first running layer 2 report at least 15 seconds later. A later pause,
+finished print, or layer 3 cancels it. The retry replaces the first result only
+when it completes, and a failed retry keeps the first findings and shows the
+reason. An error, a timeout, or a missing camera fails open: the print
+continues. Each job gets at most one first-layer check plus that one retry.
 
 With `log.level: debug`, both checks also save every JPEG they capture for a check to
 `$TMPDIR/bambu-mqtt-proxy/platecheck/` (`/tmp/...` in the container) and add

@@ -10,8 +10,28 @@ import (
 	"time"
 )
 
+// layerRetryDelay is the minimum wait before the one retry of a low-clarity first-layer result.
+const layerRetryDelay = 15 * time.Second
+
+// layerLiveReason returns the cataloged reason a first-layer check must not run on the live printer state, or empty.
+// A retry also requires layer 2 so that it never leaks into a later layer.
+func layerLiveReason(online bool, state string, layer int, hasLayer, retry bool) string {
+	switch {
+	case retry && !online:
+		return "printer_offline"
+	case !online || state != "RUNNING":
+		return "print_paused"
+	case retry && !hasLayer:
+		return "layer_not_reported"
+	case retry && layer != 2:
+		return "print_past_start"
+	}
+	return ""
+}
+
 // checkLayer evaluates two camera images and sends one pause for a severe defect.
-func (w *worker) checkLayer(parent context.Context) {
+// A retry keeps the earlier result visible until a valid replacement is published.
+func (w *worker) checkLayer(parent context.Context, retry bool) {
 	ctx, cancel := context.WithTimeout(context.WithValue(parent, operationKey{}, operations.Add(1)), 25*time.Second)
 	defer cancel()
 	operation := operationOf(ctx)
@@ -19,12 +39,14 @@ func (w *worker) checkLayer(parent context.Context) {
 	doc, online, _ := w.s.state.Get(w.printer.Serial)
 	state, _ := doc.GcodeState()
 	layer, hasLayer := doc.Layer()
-	if !online || state != "RUNNING" {
-		w.layerSkip("skipped", "print_paused", operation)
-		w.logLayerOutcome(operation, "skipped", "print_paused", nil, state, layer, hasLayer, nil, time.Since(started).Milliseconds())
+	if reason := layerLiveReason(online, state, layer, hasLayer, retry); reason != "" {
+		w.layerCheckSkip("skipped", reason, operation, retry)
+		w.logLayerOutcome(operation, "skipped", reason, nil, state, layer, hasLayer, nil, time.Since(started).Milliseconds())
 		return
 	}
-	w.setLayerStatus("checking", "", nil)
+	if !retry {
+		w.setLayerStatus("checking", "", nil)
+	}
 	boundary := w.s.now()
 	if light, _ := doc.ChamberLight(); light == "off" {
 		if w.s.commands.Light(w.printer.Serial, true) == nil {
@@ -37,7 +59,7 @@ func (w *worker) checkLayer(parent context.Context) {
 		frame, err := w.s.frames.Capture(ctx, w.printer.Serial, boundary)
 		if err != nil {
 			reason := errorCategory(err)
-			w.layerSkip("error", reason, operation)
+			w.layerCheckSkip("error", reason, operation, retry)
 			w.logLayerOutcome(operation, "error", reason, nil, state, layer, hasLayer, capturedOrNil(captured), time.Since(started).Milliseconds())
 			return
 		}
@@ -51,18 +73,32 @@ func (w *worker) checkLayer(parent context.Context) {
 		if err != nil {
 			reason = errorCategory(err)
 		}
-		w.layerSkip("error", reason, operation)
+		w.layerCheckSkip("error", reason, operation, retry)
 		w.logLayerOutcome(operation, "error", reason, nil, state, layer, hasLayer, captured, time.Since(started).Milliseconds())
 		return
 	}
 	decision := classifyLayer(result, w.s.settings.FirstLayer.PauseConfidence, w.s.settings.MinClarity)
-	w.setLayerStatus(decision, "", &result)
+	// limited is true when image clarity is below the minimum, so findings describe visible areas only.
+	limited := result.PAssessable < w.s.settings.MinClarity
+	if decision != "pause" {
+		// A pause verdict is published only after its live-state guards pass.
+		w.setLayerStatus(decision, "", &result)
+		if !retry && limited && hasLayer && layer == 2 {
+			// The retry runs on the first eligible layer 2 report after the delay and is never repeated.
+			w.layerRetryAt = w.s.now().Add(layerRetryDelay)
+		}
+	}
 	switch decision {
 	case "inconclusive":
-		w.layerEvent("platecheck_layer1_skipped", activity.Info, "First-layer check skipped, image not clear enough, continuing print", operation)
+		w.layerEvent("platecheck_layer1_skipped", activity.Info, fmt.Sprintf("First-layer check could not assess the print reliably: image clarity %s, needs %s. No defect score exceeds 50%%. Printing continued.", scoreText(result.PAssessable, w.s.settings.MinClarity), wholeText(w.s.settings.MinClarity)), operation)
 		w.logLayerOutcome(operation, decision, "image_unclear", &result, state, layer, hasLayer, captured, time.Since(started).Milliseconds())
 	case "warning":
-		w.layerEvent("platecheck_layer1_warning", activity.Warning, "Possible first-layer problem: "+layerIssues(result, .5, true)+", continuing print", operation)
+		// message is the existing warning text for assessable images and the limited-view text otherwise.
+		message := "Possible first-layer problem: " + layerIssues(result, .5, true) + ", continuing print"
+		if limited {
+			message = fmt.Sprintf("Possible first-layer problem in a limited view: %s. Image clarity %s, needs %s. No pause sent. Check the printer.", layerIssues(result, .5, true), scoreText(result.PAssessable, w.s.settings.MinClarity), wholeText(w.s.settings.MinClarity))
+		}
+		w.layerEvent("platecheck_layer1_warning", activity.Warning, message, operation)
 		w.logLayerOutcome(operation, decision, "", &result, state, layer, hasLayer, captured, time.Since(started).Milliseconds())
 	case "passed":
 		w.layerEvent("platecheck_layer1_passed", activity.Info, "First-layer check passed, continuing print", operation)
@@ -71,17 +107,18 @@ func (w *worker) checkLayer(parent context.Context) {
 		doc, online, _ = w.s.state.Get(w.printer.Serial)
 		state, _ = doc.GcodeState()
 		layer, hasLayer = doc.Layer()
-		if !online || state != "RUNNING" {
-			w.layerSkip("skipped", "print_paused", operation)
-			w.logLayerOutcome(operation, "skipped", "print_paused", nil, state, layer, hasLayer, captured, time.Since(started).Milliseconds())
+		if reason := layerLiveReason(online, state, layer, hasLayer, retry); reason != "" {
+			w.layerCheckSkip("skipped", reason, operation, retry)
+			w.logLayerOutcome(operation, "skipped", reason, nil, state, layer, hasLayer, captured, time.Since(started).Milliseconds())
 			return
 		}
 		if ctx.Err() != nil {
 			reason := errorCategory(ctx.Err())
-			w.layerSkip("error", reason, operation)
+			w.layerCheckSkip("error", reason, operation, retry)
 			w.logLayerOutcome(operation, "error", reason, nil, state, layer, hasLayer, captured, time.Since(started).Milliseconds())
 			return
 		}
+		w.setLayerStatus(decision, "", &result)
 		issues := layerIssues(result, w.s.settings.FirstLayer.PauseConfidence, false)
 		pauseErr := w.s.commands.Pause(w.printer.Serial)
 		if pauseErr != nil {
@@ -121,7 +158,8 @@ func layerIssues(r LayerResult, cutoff float64, includeIncomplete bool) string {
 }
 
 // setLayerStatus replaces only first-layer state and stores copies of all scores.
-// Every other status change clears the skip reason; layerSkip sets it.
+// Every other status change clears the reason; layerSkip sets it, and a failed
+// retry sets it on a retained warning or inconclusive result.
 func (w *worker) setLayerStatus(state, pause string, r *LayerResult) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -152,6 +190,20 @@ func (w *worker) setLayerPause(pause string) {
 func (w *worker) layerSkip(state, reason string, operation uint64) {
 	w.mu.Lock()
 	w.setLayerStatusLocked(state, "", nil, reason)
+	w.mu.Unlock()
+	w.layerEvent("platecheck_layer1_skipped", activity.Info, activitySentence("First-layer check", state, reason), operation)
+}
+
+// layerCheckSkip records a first-layer skip or failure for the first attempt or the retry.
+// The first attempt replaces the status through layerSkip. A retry keeps the earlier
+// outcome and scores and records only why it could not complete.
+func (w *worker) layerCheckSkip(state, reason string, operation uint64, retry bool) {
+	if !retry {
+		w.layerSkip(state, reason, operation)
+		return
+	}
+	w.mu.Lock()
+	w.status.FirstLayer.Reason = reason
 	w.mu.Unlock()
 	w.layerEvent("platecheck_layer1_skipped", activity.Info, activitySentence("First-layer check", state, reason), operation)
 }
