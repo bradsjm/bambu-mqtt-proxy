@@ -41,7 +41,7 @@ the camera wall, MCP, and the optional modules.
 | **Printer connection limits stop mattering** | Any number of clients share one always-on link per printer. |
 | **One endpoint for the whole fleet** | MQTT topics route by serial (`device/{serial}/report`, `device/{serial}/request`); only raw camera connections route by access code instead. |
 | **Optional Pushover notifications** | Error/warning printer problems, AI detection alerts, stopped or failed prints, and completions reach one Pushover account, with a camera snapshot when available. |
-| **Optional over-temperature stop** | A backup to the printer's own thermal protection: a nozzle, bed, or chamber reading at its model's safety limit stops every printer, switches that printer's Panda PWR off, and sends a Pushover emergency alert. |
+| **Optional over-temperature stop** | A backup to the printer's own thermal protection: a nozzle, bed, or chamber reading at its model's safety limit stops every printer, switches that printer's Panda Power off, and sends a Pushover emergency alert. |
 | **Printer outages ride out** | Automatic reconnect and resubscribe with a `pushall` warmup. A client that joins late sends its own `pushall` when it needs full state (P1 printers otherwise send deltas only). |
 | **Cameras, two ways** | A live multi-printer dashboard wall — P1/A1 cameras natively, X1/P2S/H2-series cameras through bundled FFmpeg — and a printer-compatible raw passthrough on port 6000. |
 | **Optional AI failure detection** | With an OctoEverywhere Gadget key, snapshots from active prints are analyzed and the proxy pauses likely failures. No key, no uploads, no automatic pauses. |
@@ -367,7 +367,7 @@ On by default; disable with `mcp.enabled: false`. MCP protocol
   `state.modules.pandabreath` with the device `link`, its fresh
   `chamber_c` reading, and the `trend` and signed `rate_c_per_min`, or
   `state.modules.pandapwr` with the device `link` and its fresh
-  `power_w` in watts; Panda PWR has no MCP tool), so
+  `power_w` in watts; Panda Power has no MCP tool), so
   one tool stays current whatever capabilities are enabled.
 - The endpoint never learns printer credentials; control commands go through
   the same allow-listed command service as the camera wall.
@@ -634,8 +634,8 @@ protection. It needs the Pushover app token and user key in the
   | X1E | 340 °C | 135 °C | 80 °C |
   | H2D, H2D Pro, H2S, H2C, X2D, and unknown models | 370 °C | 135 °C | 80 °C |
 
-- **What happens** — one `stop` command to every printer, one Panda PWR
-  power-off (`POST /set power=0`) to the printer that tripped when it has
+- **What happens** — one `stop` command to every printer, one Panda Power
+  switch-off (`POST /set power=0`) to the printer that tripped when it has
   `panda_pwr` set, and one Pushover emergency alert that repeats every 30
   seconds for up to an hour until acknowledged. The alert lists any stop or
   power-off that failed. Each action is one attempt, with no retry or

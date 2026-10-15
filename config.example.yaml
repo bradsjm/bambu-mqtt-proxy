@@ -40,7 +40,7 @@ printers:
     password: "12345678"
     # Optional accessory modules, each addressed on the local network:
     # panda_breath: panda-breath-blue.iot # Panda Breath host or IP (optional :port); chamber temperature
-    # panda_pwr: 192.168.4.1 # Panda PWR host or IP (optional :port); printer power draw
+    # panda_pwr: 192.168.4.1 # Panda Power host or IP (optional :port); printer power draw
   # Non-standard endpoint (custom firmware or fronting relay):
   # - serial: "01P00A987654321"
   #   address: "192.168.1.43:1883"
@@ -85,7 +85,7 @@ safety:
   # Optional over-temperature stop, a best-effort backup to the printer's own
   # thermal protection. When a printer's nozzle, bed, or chamber reaches its
   # model's safety limit, the proxy stops every printer, switches that
-  # printer's Panda PWR off when panda_pwr is set, and sends one Pushover
+  # printer's Panda Power off when panda_pwr is set, and sends one Pushover
   # emergency alert. Requires the Pushover credentials above, even while
   # notifications are disabled. Also a switch on the /config page.
   # enabled: true

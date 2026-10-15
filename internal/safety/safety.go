@@ -224,11 +224,11 @@ func (s *Service) respond(parent context.Context, p config.Printer, probe string
 		cancel()
 		if err != nil {
 			s.log.Error("safety power off failed", "serial", p.Serial, "error", err)
-			lines = append(lines, "Panda PWR power off FAILED: "+err.Error())
+			lines = append(lines, "Panda Power switch-off FAILED: "+err.Error())
 		} else {
 			s.log.Warn("safety power off sent", "serial", p.Serial)
-			s.act.Record(p.Serial, "safety_power_off", activity.Warning, "Panda PWR power off sent")
-			lines = append(lines, "Panda PWR power off sent.")
+			s.act.Record(p.Serial, "safety_power_off", activity.Warning, "Panda Power switch-off sent")
+			lines = append(lines, "Panda Power switch-off sent.")
 		}
 	}
 	ctx, cancel := context.WithTimeout(parent, 20*time.Second)

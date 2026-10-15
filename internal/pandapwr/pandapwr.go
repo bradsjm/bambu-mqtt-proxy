@@ -85,7 +85,7 @@ func (s *Store) Run(ctx context.Context) error {
 		for _, t := range s.targets {
 			wg.Go(func() {
 				if ok, reason := s.poll(ctx, t); !ok && ctx.Err() == nil {
-					s.log.Warn("panda pwr poll failed", "serial", t.serial, "reason", reason)
+					s.log.Warn("Panda Power poll failed", "serial", t.serial, "reason", reason)
 				}
 			})
 		}
@@ -137,21 +137,21 @@ func (s *Store) poll(ctx context.Context, t target) (ok bool, reason string) {
 func PowerOff(ctx context.Context, address string) error {
 	host, err := config.HostOnly(address)
 	if err != nil {
-		return fmt.Errorf("panda pwr power off %q: %w", address, err)
+		return fmt.Errorf("Panda Power switch-off %q: %w", address, err)
 	}
 	url := "http://" + host + "/set"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader("power=0"))
 	if err != nil {
-		return fmt.Errorf("panda pwr power off: %w", err)
+		return fmt.Errorf("Panda Power switch-off: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("panda pwr power off: %w", err)
+		return fmt.Errorf("Panda Power switch-off: %w", err)
 	}
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("panda pwr power off %s: HTTP %s", url, resp.Status)
+		return fmt.Errorf("Panda Power switch-off %s: HTTP %s", url, resp.Status)
 	}
 	return nil
 }

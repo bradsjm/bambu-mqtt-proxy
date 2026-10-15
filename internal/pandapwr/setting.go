@@ -10,9 +10,9 @@ const AddressKey = "panda_pwr"
 // gives.
 var AddressSetting = config.PrinterSetting{
 	Key:         AddressKey,
-	Label:       "Panda PWR address",
+	Label:       "Panda Power address",
 	Placeholder: "192.168.4.1",
-	Hint:        "Host name or IP address of a Panda PWR smart plug, with an optional port. It supplies the printer's power draw.",
+	Hint:        "Host name or IP address of a Panda Power smart plug, with an optional port. It supplies the printer's power draw.",
 	Validate: func(value string) error {
 		_, err := config.HostOnly(value)
 		return err

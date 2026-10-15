@@ -86,7 +86,7 @@ func (s *Store) Display(serial string) *module.Display {
 	if len(rows) == 0 {
 		return nil
 	}
-	return &module.Display{Panel: &module.Panel{Title: "Panda PWR", Rows: rows}}
+	return &module.Display{Panel: &module.Panel{Title: "Panda Power", Rows: rows}}
 }
 
 // configured reports whether serial has a Panda PWR address. targets is
