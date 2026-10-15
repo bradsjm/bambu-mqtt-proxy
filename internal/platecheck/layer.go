@@ -192,6 +192,14 @@ func (w *worker) logLayerOutcome(operation uint64, decision, reason string, resu
 		}
 		attrs = append(attrs, "frame_seq"+suffix, frame.Seq, "frame_age_ms"+suffix, w.s.now().Sub(frame.Captured).Milliseconds())
 	}
+	// clarity names the image clarity in saved debug file names.
+	var clarity *float64
+	if result != nil {
+		clarity = &result.PAssessable
+	}
+	if paths := w.saveDebugImages("layer1", operation, frames, clarity); paths != nil {
+		attrs = append(attrs, "image_files", paths)
+	}
 	attrs = append(attrs, "duration_ms", durationMs)
 	w.s.log.Debug("First-layer check outcome", attrs...)
 }

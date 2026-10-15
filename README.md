@@ -470,6 +470,14 @@ a warning, and a check with no such defect passes. An unclear image, an
 error, a timeout, or a missing camera fails open: the print continues. The
 phase checks each job at most once.
 
+With `log.level: debug`, both checks also save every JPEG they capture for a check to
+`$TMPDIR/bambu-mqtt-proxy/platecheck/` (`/tmp/...` in the container) and add
+the paths to the outcome log line as `image_files`. File names carry the
+serial, capture time, check (`startup`, `homing`, or `layer1`), image
+number, image clarity in percent (`none` without a valid result), and frame
+sequence. Nothing deletes these files; remove them when you are done, and
+use `docker cp` or a volume on that directory to read them.
+
 ### Cloudflare free allowance
 
 Cloudflare Workers AI gives every account 10,000 neurons per day at no charge,

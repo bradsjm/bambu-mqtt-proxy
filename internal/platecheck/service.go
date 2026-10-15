@@ -2,8 +2,11 @@ package platecheck
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -473,7 +476,48 @@ func (w *worker) logStartupOutcome(operation uint64, pass, decision, reason stri
 	}
 	if frame != nil {
 		attrs = append(attrs, "frame_seq", frame.Seq, "frame_age_ms", w.s.now().Sub(frame.Captured).Milliseconds())
+		// clarity names the image clarity in saved debug file names.
+		var clarity *float64
+		if result != nil {
+			clarity = &result.PAssessable
+		}
+		if paths := w.saveDebugImages(pass, operation, []Frame{*frame}, clarity); paths != nil {
+			attrs = append(attrs, "image_files", paths)
+		}
 	}
 	attrs = append(attrs, "duration_ms", durationMs)
 	w.s.log.Debug("Plate-check outcome", attrs...)
+}
+
+// debugImageDir is where debug logging saves every JPEG sent for a plate or first-layer check.
+var debugImageDir = filepath.Join(os.TempDir(), "bambu-mqtt-proxy", "platecheck")
+
+// saveDebugImages writes the evaluated JPEGs while debug logging is on and
+// returns the written paths. File names carry the printer, capture time,
+// check, image clarity, and frame sequence so the files sort and compare.
+func (w *worker) saveDebugImages(check string, operation uint64, frames []Frame, clarity *float64) []string {
+	if len(frames) == 0 || !w.s.log.Enabled(context.Background(), slog.LevelDebug) {
+		return nil
+	}
+	// score is the image clarity in whole percent, or "none" without a valid result.
+	score := "none"
+	if clarity != nil {
+		score = fmt.Sprintf("%03.0f", *clarity*100)
+	}
+	if err := os.MkdirAll(debugImageDir, 0o755); err != nil {
+		w.s.log.Warn("Plate-check debug image directory not created; images from this check are not saved", "serial", w.printer.Serial, "operation", operation, "dir", debugImageDir, "error", err)
+		return nil
+	}
+	// paths lists the files written for this check, in capture order.
+	var paths []string
+	for i, f := range frames {
+		name := fmt.Sprintf("%s_%s_%s-%d_clarity%s_seq%d.jpg", w.printer.Serial, f.Captured.Format("20060102-150405.000"), check, i+1, score, f.Seq)
+		path := filepath.Join(debugImageDir, name)
+		if err := os.WriteFile(path, f.JPEG, 0o644); err != nil {
+			w.s.log.Warn("Plate-check debug image not saved; the check result is unaffected", "serial", w.printer.Serial, "operation", operation, "path", path, "error", err)
+			continue
+		}
+		paths = append(paths, path)
+	}
+	return paths
 }
