@@ -169,11 +169,11 @@ main input:user-invalid { border-color: var(--error); }
 .control.range { align-items: center; gap: .75rem; }
 .control.range input[type=range] { flex: 1; min-width: 0; min-height: 44px; margin: 0; cursor: pointer; }
 .control.range output { min-width: 4ch; text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
-.platecheck-results { display: grid; gap: .6rem; }
+.platecheck-results { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 20rem), 1fr)); gap: .6rem; align-items: start; }
 .platecheck-results:empty { display: none; }
-.platecheck-item { display: grid; grid-template-columns: minmax(0, 15rem) minmax(0, 1fr); gap: .75rem 1rem; align-items: start;
+.platecheck-item { display: grid; grid-template-columns: minmax(0, 1fr); gap: .75rem; align-items: start;
                    padding: .75rem; border: 1px solid var(--line); border-radius: 9px; background: var(--bg); }
-.platecheck-item.open { grid-template-columns: minmax(0, 1fr); }
+.platecheck-item.open { grid-column: 1 / -1; }
 .platecheck-shot { margin: 0; min-width: 0; }
 .platecheck-thumb { display: block; width: 100%; padding: 0; border: 1px solid var(--line); border-radius: 7px; overflow: hidden;
                     background: var(--panel); cursor: zoom-in; }
@@ -200,6 +200,10 @@ main input:user-invalid { border-color: var(--error); }
 .platecheck-scores { display: grid; grid-template-columns: auto 1fr; gap: .2rem .9rem; margin: 0; font-size: .84rem; }
 .platecheck-scores dt { color: var(--dim); }
 .platecheck-scores dd { margin: 0; font-family: var(--mono); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.platecheck-scores dd[data-clarity="ok"] { color: var(--ok); }
+.platecheck-scores dd[data-clarity="low"] { color: var(--pending); }
+.platecheck-scores dd[data-occupied="stop"] { color: var(--error); }
+.platecheck-scores dd[data-occupied="continue"] { color: var(--ok); }
 .platecheck-foot { margin: .75rem 0 0; }
 
 .btn { display: inline-flex; align-items: center; justify-content: center; gap: .45rem; padding: .5rem .95rem;
@@ -260,7 +264,7 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
   .control { justify-content: flex-start; }
   .listener { grid-template-columns: 1fr auto auto; }
   .listener input[type=text] { grid-column: 1 / -1; }
-  .platecheck-item { grid-template-columns: 1fr; }
+  .platecheck-results { grid-template-columns: 1fr; }
   .control > .test-status { text-align: left; }
   .pair { grid-template-columns: 1fr; }
   .savebar .msg span { font-size: .85rem; }
@@ -436,16 +440,16 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
           <div class="control"><input id="f-platecheck-key" type="password" autocomplete="new-password" spellcheck="false" aria-describedby="f-platecheck-key-hint" data-field="platecheck.api_key"></div>
         </div>
         <div class="row">
-          <div><label for="f-platecheck-threshold">Stop above</label>
-            <span class="hint" id="f-platecheck-threshold-hint">The proxy stops a print only when the occupied score is above this value and image clarity is at least the minimum. Higher values mean fewer stops. A score equal to this value does not stop.</span></div>
-          <div class="control range"><input id="f-platecheck-threshold" type="range" min="50" max="99" step="1" value="50" aria-describedby="f-platecheck-threshold-hint" aria-valuetext="Stop above 50 percent" data-field="platecheck.stop_confidence" data-type="percent">
-            <output id="f-platecheck-threshold-out" for="f-platecheck-threshold" class="mono">50%</output></div>
-        </div>
-        <div class="row">
           <div><label for="f-platecheck-clarity">Minimum image clarity</label>
             <span class="hint" id="f-platecheck-clarity-hint">A check judges the plate or the first layer only when its image clarity score is at least this value. Below it, the check is skipped and the print continues. Lower values let more checks decide; higher values avoid acting on poor images. Applies to both checks.</span></div>
           <div class="control range"><input id="f-platecheck-clarity" type="range" min="50" max="99" step="1" value="70" aria-describedby="f-platecheck-clarity-hint" aria-valuetext="Minimum image clarity 70 percent" data-field="platecheck.min_clarity" data-type="percent">
             <output id="f-platecheck-clarity-out" for="f-platecheck-clarity" class="mono">70%</output></div>
+        </div>
+        <div class="row">
+          <div><label for="f-platecheck-threshold">Stop above</label>
+            <span class="hint" id="f-platecheck-threshold-hint">The proxy stops a print only when the occupied score is above this value and image clarity is at least the minimum. Higher values mean fewer stops. A score equal to this value does not stop.</span></div>
+          <div class="control range"><input id="f-platecheck-threshold" type="range" min="50" max="99" step="1" value="50" aria-describedby="f-platecheck-threshold-hint" aria-valuetext="Stop above 50 percent" data-field="platecheck.stop_confidence" data-type="percent">
+            <output id="f-platecheck-threshold-out" for="f-platecheck-threshold" class="mono">50%</output></div>
         </div>
         <div class="row">
           <div><label for="f-platecheck-firstlayer">Recheck after layer 1</label>
@@ -1322,13 +1326,25 @@ function plateRow(row, answer) {
   body.append(plateEl("p", "platecheck-note", notes[decision] || "The proxy returned a decision that this page does not know."));
 
   const scores = plateEl("dl", "platecheck-scores");
-  const add = (label, value) => scores.append(plateEl("dt", "", label), plateEl("dd", "", value));
-  if (pOcc !== null) add("Occupied", plateScore(pOcc, cutoff));
-  if (pView !== null) add("Image clarity", plateScore(pView, min));
-  if (cutPct !== null) add("Stop above", `${cutPct}%`);
-  if (minPct !== null) add("Needs image clarity", `${minPct}%`);
+  const add = (label, value) => {
+    const dd = plateEl("dd", "", value);
+    scores.append(plateEl("dt", "", label), dd);
+    return dd;
+  };
+  // Image clarity leads; its color shows whether it meets the minimum.
+  if (pView !== null) {
+    const dd = add("Image clarity", plateScore(pView, min));
+    if (min !== null) dd.dataset.clarity = pView >= min ? "ok" : "low";
+  }
+  if (pOcc !== null) {
+    const dd = add("Occupied", plateScore(pOcc, cutoff));
+    // The score is only used when clarity passed, so inconclusive and error rows stay uncolored.
+    if (decision === "would_stop") dd.dataset.occupied = "stop";
+    else if (decision === "clear" || decision === "below_threshold") dd.dataset.occupied = "continue";
+  }
+  const trip = plateNumber(row.round_trip_ms);
+  if (trip !== null) add("Round trip", `${trip} ms`);
   if (typeof answer.model === "string" && answer.model) add("Model", answer.model);
-  if (typeof row.model === "string" && row.model) add("Printer", row.model);
   if (typeof row.error_code === "string" && row.error_code) add("Error code", row.error_code);
   body.append(scores);
   return item;

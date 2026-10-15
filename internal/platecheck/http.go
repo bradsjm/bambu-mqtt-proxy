@@ -51,6 +51,8 @@ type snapshotRow struct {
 	FrameSequence uint64 `json:"frame_sequence"`
 	// ImageBytes is the uploaded JPEG byte count.
 	ImageBytes int `json:"image_bytes"`
+	// RoundTripMs is the provider request time in milliseconds, or null when no request was sent.
+	RoundTripMs *int64 `json:"round_trip_ms"`
 	// Image remains present after an inference error, but not a capture error.
 	Image *snapshotImage `json:"image"`
 	// ErrorCode is a fixed safe category.
@@ -253,7 +255,9 @@ func (s *Service) evaluateSnapshot(ctx context.Context, client DecisionClient, p
 		row.Error = fixedSentence(row.ErrorCode)
 	} else {
 		evaluationCtx, evaluationCancel := context.WithTimeout(ctx, requestTimeout)
+		sent := time.Now()
 		result, evaluationErr := client.Evaluate(evaluationCtx, upload, row.Model)
+		row.RoundTripMs = new(time.Since(sent).Milliseconds())
 		evaluationCancel()
 		if evaluationErr == nil && !validResult(result) {
 			evaluationErr = &safeError{code: "bad_response"}
