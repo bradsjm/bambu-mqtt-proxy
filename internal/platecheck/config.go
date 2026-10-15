@@ -22,6 +22,12 @@ const (
 	ProviderCloudflare = "cloudflare"
 	// ProviderCustom selects a custom HTTPS endpoint.
 	ProviderCustom = "custom"
+	// ProviderTypeSafe selects the TypeSafe System One API.
+	ProviderTypeSafe = "typesafe"
+	// typesafeURL is the fixed TypeSafe System One endpoint.
+	typesafeURL = "https://api.typesafe.ai/v1/systemone"
+	// typesafeModel is the only accepted TypeSafe model ID.
+	typesafeModel = "jev-1.14.0"
 	// DefaultMinClarity is the default image-clarity threshold shared by
 	// both checks. Constructors and page decoders apply it; an explicit
 	// invalid value is never silently replaced.
@@ -97,6 +103,9 @@ func (s Settings) normalized() Settings {
 // URL returns the provider endpoint for these settings.
 func (s Settings) URL() string {
 	s = s.normalized()
+	if s.Provider == ProviderTypeSafe {
+		return typesafeURL
+	}
 	if s.Provider == ProviderCustom {
 		return s.Endpoint
 	}
@@ -108,6 +117,9 @@ func (s Settings) URL() string {
 
 // destination identifies the account or endpoint to which a credential belongs.
 func (s Settings) destination() string {
+	if s.Provider == ProviderTypeSafe {
+		return "typesafe"
+	}
 	if s.Provider == ProviderCustom {
 		return "custom " + s.Endpoint
 	}
@@ -200,8 +212,8 @@ var accountIDPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
 // validateSettings validates and normalizes settings, optionally requiring credentials.
 func validateSettings(s Settings, require bool) (Settings, error) {
 	s = s.normalized()
-	if s.Provider != ProviderCloudflare && s.Provider != ProviderCustom {
-		return s, errors.New("The plate-check provider must be cloudflare or custom.")
+	if s.Provider != ProviderCloudflare && s.Provider != ProviderCustom && s.Provider != ProviderTypeSafe {
+		return s, errors.New("The plate-check provider must be cloudflare, custom, or typesafe.")
 	}
 	// All thresholds are validated unconditionally: an absent value keeps
 	// the applied default, an explicit one outside the whole-percentage
@@ -221,7 +233,8 @@ func validateSettings(s Settings, require bool) (Settings, error) {
 		return s, errors.New("Pause above must be a whole percentage from 50 through 99 percent.")
 	}
 	s.FirstLayer.PauseConfidence = pauseAt
-	if s.Provider == ProviderCloudflare {
+	switch s.Provider {
+	case ProviderCloudflare:
 		if s.Endpoint != "" {
 			return s, errors.New("The Cloudflare provider builds the endpoint from the account ID. Remove the endpoint or choose the custom provider.")
 		}
@@ -234,7 +247,15 @@ func validateSettings(s Settings, require bool) (Settings, error) {
 		if require && s.AccountID == "" {
 			return s, errors.New("No Cloudflare account ID is configured. Enter the account ID.")
 		}
-	} else {
+	case ProviderTypeSafe:
+		// The TypeSafe provider uses a fixed endpoint and model.
+		if s.AccountID != "" || s.Endpoint != "" {
+			return s, errors.New("The TypeSafe provider uses a fixed endpoint. Remove the account ID and endpoint or choose another provider.")
+		}
+		if s.Model != typesafeModel {
+			return s, errors.New("The TypeSafe model must be jev-1.14.0.")
+		}
+	default:
 		if s.Model == "" {
 			return s, errors.New("Enter the model name for the custom endpoint.")
 		}
@@ -260,9 +281,14 @@ func submittedSettings(in settingsView, key string) Settings {
 		key = in.APIKey
 	}
 	s := Settings{Enabled: &in.Enabled, Provider: in.Provider, AccountID: in.AccountID, Endpoint: in.Endpoint, APIKey: key, Model: in.Model, StopConfidence: in.StopConfidence, MinClarity: in.MinClarity, FirstLayer: in.FirstLayer}.normalized()
-	if s.Provider == ProviderCustom {
+	switch s.Provider {
+	case ProviderCustom:
 		s.AccountID = ""
-	} else {
+	case ProviderTypeSafe:
+		// TypeSafe pins both the endpoint and the model server-side.
+		s.AccountID = ""
+		s.Endpoint = ""
+	default:
 		s.Endpoint = ""
 	}
 	return s

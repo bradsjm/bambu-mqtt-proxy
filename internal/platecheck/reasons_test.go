@@ -26,6 +26,7 @@ func TestReasonCatalogCoversEveryCode(t *testing.T) {
 		"unsupported_camera":       "printer camera not supported",
 		"invalid_image":            "camera image was not valid",
 		"image_too_large":          "camera image too large",
+		"image_too_small":          "camera image too small",
 		"auth_rejected":            "AI provider rejected the API key",
 		"endpoint_unreachable":     "AI provider unreachable",
 		"timeout":                  "AI provider timed out",
@@ -118,14 +119,14 @@ func TestReasonCatalogCoversEveryCode(t *testing.T) {
 		"print_ended", "print_paused", "printer_offline", "start_not_observed",
 		"startup_stopped", "camera_disabled", "check_timeout", "capture_timeout",
 		"camera_unavailable", "unsupported_camera", "invalid_image",
-		"image_too_large", "auth_rejected", "endpoint_unreachable", "timeout",
+		"image_too_large", "image_too_small", "auth_rejected", "endpoint_unreachable", "timeout",
 		"rate_limited", "bad_response", "model_error", "canceled",
 	} {
 		if _, ok := clauses[code]; !ok {
 			t.Errorf("code %q used by the package is missing from the catalog table", code)
 		}
 	}
-	for _, code := range []string{"auth_rejected", "endpoint_unreachable", "timeout", "rate_limited", "bad_response", "model_error", "invalid_image", "image_too_large", "canceled", "printer_offline", "unsupported_camera", "camera_unavailable", "capture_timeout"} {
+	for _, code := range []string{"auth_rejected", "endpoint_unreachable", "timeout", "rate_limited", "bad_response", "model_error", "invalid_image", "image_too_large", "image_too_small", "canceled", "printer_offline", "unsupported_camera", "camera_unavailable", "capture_timeout"} {
 		if !strings.Contains(fixedSentence(code), " ") {
 			t.Errorf("fixedSentence(%q) lost its /config sentence", code)
 		}

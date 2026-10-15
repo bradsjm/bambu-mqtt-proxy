@@ -25,17 +25,18 @@ type LayerResult struct {
 	OutputTokens int `json:"output_tokens"`
 }
 
-// EvaluateFirstLayer evaluates two original JPEGs without changing startup diagnostics.
+// EvaluateFirstLayer evaluates two camera JPEGs, scaled down only when the provider limits require it, without changing startup diagnostics.
 func (c *Client) EvaluateFirstLayer(ctx context.Context, frames [][]byte, printerModel string) (LayerResult, error) {
 	if len(frames) != 2 {
 		return LayerResult{}, &safeError{code: "invalid_image"}
 	}
 	images := make([]imageInput, 0, 2)
 	for _, data := range frames {
-		if _, _, err := imageDimensions(data); err != nil {
+		fitted, _, _, err := fitImage(c.settings.Provider, data)
+		if err != nil {
 			return LayerResult{}, err
 		}
-		images = append(images, imageInput{ContentType: "image/jpeg", Base64: base64.StdEncoding.EncodeToString(data)})
+		images = append(images, imageInput{ContentType: "image/jpeg", Base64: base64.StdEncoding.EncodeToString(fitted)})
 	}
 	if len(printerModel) > 64 {
 		printerModel = printerModel[:64]

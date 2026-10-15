@@ -395,9 +395,9 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
         </div>
         <div class="row">
           <div><label for="f-platecheck-provider">Service provider</label>
-            <span class="hint" id="f-platecheck-provider-hint">Cloudflare runs the plate-check models on Workers AI. Custom sends requests to your own HTTPS endpoint, which must accept the same request and answer format.</span></div>
+            <span class="hint" id="f-platecheck-provider-hint">Cloudflare runs the plate-check models on Workers AI. TypeSafe runs the Jev model on the TypeSafe API, where image input is an experimental feature. Custom sends requests to your own HTTPS endpoint, which must accept the same request and answer format.</span></div>
           <div class="control"><select id="f-platecheck-provider" aria-describedby="f-platecheck-provider-hint" data-field="platecheck.provider" style="max-width:12rem">
-            <option value="cloudflare">Cloudflare</option><option value="custom">Custom</option>
+            <option value="cloudflare">Cloudflare</option><option value="custom">Custom</option><option value="typesafe">TypeSafe</option>
           </select></div>
         </div>
         <div class="row" data-provider="cloudflare">
@@ -418,6 +418,13 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
             <option value="clef-flash">Clef Flash</option>
           </select></div>
         </div>
+        <div class="row" data-provider="typesafe">
+          <div><label for="f-platecheck-model-typesafe">Model</label>
+            <span class="hint" id="f-platecheck-model-typesafe-hint">Jev 1.14. Camera images larger than 1568 pixels on a side are scaled down before upload.</span></div>
+          <div class="control"><select id="f-platecheck-model-typesafe" aria-describedby="f-platecheck-model-typesafe-hint" data-field="platecheck.model" style="max-width:12rem">
+            <option value="jev-1.14.0">Jev 1.14</option>
+          </select></div>
+        </div>
         <div class="row" data-provider="custom">
           <div><label for="f-platecheck-model-custom">Model</label>
             <span class="hint" id="f-platecheck-model-custom-hint">The model name your endpoint expects.</span></div>
@@ -425,7 +432,7 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
         </div>
         <div class="row">
           <div><label for="f-platecheck-key">API key</label>
-            <span class="hint" id="f-platecheck-key-hint">A Cloudflare API token with Workers AI access, or the key of your custom endpoint. It is stored in the config file and never shown here.</span></div>
+            <span class="hint" id="f-platecheck-key-hint">A Cloudflare API token with Workers AI access, a TypeSafe API key, or the key of your custom endpoint. It is stored in the config file and never shown here.</span></div>
           <div class="control"><input id="f-platecheck-key" type="password" autocomplete="new-password" spellcheck="false" aria-describedby="f-platecheck-key-hint" data-field="platecheck.api_key"></div>
         </div>
         <div class="row">
@@ -1138,10 +1145,12 @@ $("#main").addEventListener("input", e => {
     if (t === "lines") v = el.value.split("\n").map(s => s.trim()).filter(Boolean);
     if (t === "percent") v = Number(el.value) / 100;
     setPath(field, v);
-    // The Cloudflare model select and the custom model field share one value.
+    // The provider model selects and the custom model field share one value.
     if (field === "platecheck.provider") {
       if (v === "cloudflare" && !CLOUDFLARE_MODELS.includes(cfg.platecheck.model)) setPath("platecheck.model", CLOUDFLARE_MODELS[0]);
+      if (v === "typesafe" && !TYPESAFE_MODELS.includes(cfg.platecheck.model)) setPath("platecheck.model", TYPESAFE_MODELS[0]);
       $("#f-platecheck-model").value = cfg.platecheck.model;
+      $("#f-platecheck-model-typesafe").value = cfg.platecheck.model;
       $("#f-platecheck-model-custom").value = cfg.platecheck.model;
     }
     if (field.startsWith("notifications.pushover.")) pushoverHints();
@@ -1185,6 +1194,8 @@ const PLATECHECK_TEST_FIELDS = new Set(["platecheck.provider", "platecheck.accou
   "platecheck.api_key", "platecheck.model", "platecheck.stop_confidence", "platecheck.min_clarity"]);
 // The model select lists the Cloudflare model IDs; the first one is the default.
 const CLOUDFLARE_MODELS = [...$("#f-platecheck-model").options].map(o => o.value);
+// The TypeSafe model select lists the Jev model IDs; the first one is the default.
+const TYPESAFE_MODELS = [...$("#f-platecheck-model-typesafe").options].map(o => o.value);
 const PLATE_LABELS = { would_stop: "Would stop", below_threshold: "Below cutoff", clear: "Clear", inconclusive: "Image unclear",
   error: "Check failed", skipped: "Skipped" };
 const plural = (k, one, many) => `${k} ${k === 1 ? one : many}`;

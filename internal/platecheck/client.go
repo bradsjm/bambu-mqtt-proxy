@@ -3,9 +3,11 @@ package platecheck
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"image"
 	"image/jpeg"
 	"io"
 	"log/slog"
@@ -14,6 +16,8 @@ import (
 	"net/http"
 	"net/url"
 	"time"
+
+	"golang.org/x/image/draw"
 )
 
 // Client limits bound remote requests and local JPEG inspection.
@@ -26,6 +30,14 @@ const (
 	maxImageBytes = 4 << 20
 	// maxImagePixels is the provider's per-image pixel limit.
 	maxImagePixels = 16_000_000
+	// typesafeMaxSide is the longest side Jev accepts without a 400 rejection.
+	typesafeMaxSide = 1568
+	// typesafeMinSide is the shortest side Jev accepts.
+	typesafeMinSide = 256
+	// typesafeMinPixels is the smallest total pixel count Jev accepts.
+	typesafeMinPixels = 78_400
+	// typesafeJPEGQuality preserves plate detail when downscaling to Jev limits.
+	typesafeJPEGQuality = 90
 )
 
 // Result holds only numeric answers and allowlisted usage from a valid response.
@@ -48,9 +60,9 @@ type Result struct {
 type DecisionClient interface {
 	// Probe checks a text-only answer without uploading an image.
 	Probe(context.Context) error
-	// Evaluate sends one JPEG and returns the two required probabilities.
+	// Evaluate sends one camera JPEG, scaled down only when the provider limits require it, and returns the two required probabilities.
 	Evaluate(context.Context, []byte, string) (Result, error)
-	// EvaluateFirstLayer sends two original JPEGs and returns five required scores.
+	// EvaluateFirstLayer sends two camera JPEGs, scaled down only when the provider limits require them, and returns five required scores.
 	EvaluateFirstLayer(context.Context, [][]byte, string) (LayerResult, error)
 }
 
@@ -121,6 +133,8 @@ func fixedSentence(code string) string {
 		return "The camera image is not a valid JPEG. The print would continue."
 	case "image_too_large":
 		return "The camera image exceeds the provider image limit. The print would continue."
+	case "image_too_small":
+		return "The camera image is smaller than the TypeSafe minimum of 256 pixels per side and 78,400 pixels in total. The print would continue."
 	case "canceled":
 		return "The plate check was canceled."
 	case "printer_offline":
@@ -150,7 +164,7 @@ type question struct {
 type imageInput struct {
 	// ContentType fixes the uploaded media type.
 	ContentType string `json:"content_type"`
-	// Base64 carries the original bytes without conversion.
+	// Base64 carries the camera bytes, scaled down only when the provider limits require it.
 	Base64 string `json:"base64"`
 }
 
@@ -164,6 +178,50 @@ type requestInput struct {
 	Questions map[string]question `json:"questions"`
 	// Images is absent from connectivity probes.
 	Images []imageInput `json:"images,omitempty"`
+}
+
+// typesafeAsset carries one referenced JPEG for the TypeSafe System One API.
+type typesafeAsset struct {
+	// Type is always image.
+	Type string `json:"type"`
+	// Format is always jpg.
+	Format string `json:"format"`
+	// Data is standard base64 without a data: prefix.
+	Data string `json:"data_base64"`
+}
+
+// typesafeState carries the evaluated content with ordered image references.
+type typesafeState struct {
+	// Description identifies the content being evaluated.
+	Description string `json:"description"`
+	// Images holds the ordered asset references.
+	Images []string `json:"images,omitempty"`
+}
+
+// typesafeRequest is the TypeSafe System One wire input.
+type typesafeRequest struct {
+	// Model selects the configured model.
+	Model string `json:"model"`
+	// State carries the evaluated content.
+	State typesafeState `json:"state"`
+	// Questions is the fixed question map.
+	Questions map[string]question `json:"questions"`
+	// Assets carries each referenced image, absent from probes.
+	Assets map[string]typesafeAsset `json:"assets,omitempty"`
+}
+
+// typesafeRequestOf maps the shared wire input onto the TypeSafe request shape.
+func typesafeRequestOf(in requestInput) typesafeRequest {
+	out := typesafeRequest{Model: in.Model, State: typesafeState{Description: in.State}, Questions: in.Questions}
+	for _, img := range in.Images {
+		ref := rand.Text()
+		out.State.Images = append(out.State.Images, ref)
+		if out.Assets == nil {
+			out.Assets = map[string]typesafeAsset{}
+		}
+		out.Assets[ref] = typesafeAsset{Type: "image", Format: "jpg", Data: img.Base64}
+	}
+	return out
 }
 
 // answer requires both a noul type and a present numeric value.
@@ -229,9 +287,44 @@ func imageDimensions(data []byte) (int, int, error) {
 	return cfg.Width, cfg.Height, nil
 }
 
-// Evaluate uploads one original JPEG and parses the two fixed numeric answers.
+// fitImage returns the exact JPEG that the provider receives and its dimensions.
+func fitImage(provider string, data []byte) ([]byte, int, int, error) {
+	// TypeSafe rejects images outside fixed dimension limits and never resizes them,
+	// so for that provider a larger frame is scaled down and re-encoded; other
+	// providers receive the original bytes.
+	w, h, err := imageDimensions(data)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	if provider != ProviderTypeSafe {
+		return data, w, h, nil
+	}
+	if w > typesafeMaxSide || h > typesafeMaxSide {
+		src, err := jpeg.Decode(bytes.NewReader(data))
+		if err != nil {
+			return nil, 0, 0, &safeError{code: "invalid_image"}
+		}
+		scale := float64(typesafeMaxSide) / float64(max(w, h))
+		nw := max(1, int(math.Round(float64(w)*scale)))
+		nh := max(1, int(math.Round(float64(h)*scale)))
+		dst := image.NewRGBA(image.Rect(0, 0, nw, nh))
+		draw.CatmullRom.Scale(dst, dst.Bounds(), src, src.Bounds(), draw.Src, nil)
+		var buf bytes.Buffer
+		if err := jpeg.Encode(&buf, dst, &jpeg.Options{Quality: typesafeJPEGQuality}); err != nil {
+			return nil, 0, 0, &safeError{code: "invalid_image"}
+		}
+		data, w, h = buf.Bytes(), nw, nh
+	}
+	if w < typesafeMinSide || h < typesafeMinSide || w*h < typesafeMinPixels {
+		return nil, 0, 0, &safeError{code: "image_too_small"}
+	}
+	return data, w, h, nil
+}
+
+// Evaluate uploads one camera JPEG, scaled down only when the provider limits require it, and parses the two fixed numeric answers.
 func (c *Client) Evaluate(ctx context.Context, data []byte, printerModel string) (Result, error) {
-	if _, _, err := imageDimensions(data); err != nil {
+	data, _, _, err := fitImage(c.settings.Provider, data)
+	if err != nil {
 		return Result{}, err
 	}
 	questions := map[string]question{
@@ -282,7 +375,11 @@ func (c *Client) request(ctx context.Context, in requestInput) (out responseResu
 	if parseErr != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || endpoint != c.keyEndpoint {
 		return out, &safeError{code: "auth_rejected"}
 	}
-	raw, marshalErr := json.Marshal(in)
+	var payload any = in
+	if c.settings.Provider == ProviderTypeSafe {
+		payload = typesafeRequestOf(in)
+	}
+	raw, marshalErr := json.Marshal(payload)
 	if marshalErr != nil {
 		return out, &safeError{code: "bad_response"}
 	}
@@ -292,6 +389,9 @@ func (c *Client) request(ctx context.Context, in requestInput) (out responseResu
 	}
 	req.Header.Set("Authorization", "Bearer "+c.settings.Key())
 	req.Header.Set("Content-Type", "application/json")
+	if c.settings.Provider == ProviderTypeSafe && len(in.Images) > 0 {
+		req.Header.Set("TypeSafe-Danger-Zone-Images", "true")
+	}
 	resp, sendErr := c.http.Do(req)
 	if sendErr != nil {
 		return out, &safeError{code: errorCategory(sendErr)}

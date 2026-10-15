@@ -196,6 +196,28 @@ func TestSnapshotKeepsExactUploadedJPEGWithTLSProvider(t *testing.T) {
 	}
 }
 
+func TestSnapshotTypeSafeStreamsFittedImage(t *testing.T) {
+	started := time.Now()
+	frame := sizedJPEG(t, 1920, 1080)
+	frames := frameFunc(func(ctx context.Context, serial string, after time.Time) (Frame, error) {
+		return Frame{JPEG: frame, Seq: 7, Captured: started.Add(time.Nanosecond), Width: 1920, Height: 1080}, nil
+	})
+	s := New([]config.Printer{{Serial: "01S1", Model: "P1S"}}, testSettings(), nil, frames, nil, &fakeCommands{}, nil)
+	s.newClient = func(Settings, *slog.Logger) DecisionClient { return &fakeDecision{} }
+	row := s.evaluateSnapshot(context.Background(), s.newClient(Settings{}, nil), config.Printer{Serial: "01S1", Model: "P1S"}, started, ProviderTypeSafe, .5, DefaultMinClarity)
+	if row.Image == nil || row.Image.Width != 1568 || row.Image.Height != 882 {
+		t.Fatalf("row %+v", row)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(row.Image.Data)
+	if err != nil || len(decoded) != row.ImageBytes {
+		t.Fatalf("bytes %d err %v", row.ImageBytes, err)
+	}
+	refitted, w, h, err := fitImage(ProviderTypeSafe, decoded)
+	if err != nil || w != 1568 || h != 882 || !bytes.Equal(refitted, decoded) {
+		t.Fatal("streamed image differs from upload")
+	}
+}
+
 func TestSnapshotValidationBeforeActivityAndEffectiveSettings(t *testing.T) {
 	captures, factory := 0, 0
 	frames := frameFunc(func(ctx context.Context, serial string, after time.Time) (Frame, error) {

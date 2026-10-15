@@ -49,7 +49,7 @@ type snapshotRow struct {
 	CapturedAt *time.Time `json:"captured_at"`
 	// FrameSequence identifies the shared capture frame.
 	FrameSequence uint64 `json:"frame_sequence"`
-	// ImageBytes is the original JPEG byte count.
+	// ImageBytes is the uploaded JPEG byte count.
 	ImageBytes int `json:"image_bytes"`
 	// Image remains present after an inference error, but not a capture error.
 	Image *snapshotImage `json:"image"`
@@ -153,7 +153,7 @@ func (s *Service) handleSnapshots(w http.ResponseWriter, r *http.Request) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				rows <- s.evaluateSnapshot(ctx, client, p, started, settings.StopConfidence, settings.MinClarity)
+				rows <- s.evaluateSnapshot(ctx, client, p, started, settings.Provider, settings.StopConfidence, settings.MinClarity)
 			}()
 		}
 	}
@@ -220,7 +220,7 @@ func (s *Service) handleSnapshots(w http.ResponseWriter, r *http.Request) {
 }
 
 // evaluateSnapshot captures and evaluates one online printer and returns its result row.
-func (s *Service) evaluateSnapshot(ctx context.Context, client DecisionClient, p config.Printer, started time.Time, cutoff, minClarity float64) snapshotRow {
+func (s *Service) evaluateSnapshot(ctx context.Context, client DecisionClient, p config.Printer, started time.Time, provider string, cutoff, minClarity float64) snapshotRow {
 	row := snapshotRow{Serial: p.Serial, Name: p.Name, Model: config.DisplayModel(p.Model, p.Serial), Decision: "error"}
 	captureCtx, captureCancel := context.WithTimeout(ctx, snapshotCaptureTimeout)
 	frame, captureErr := s.frames.Capture(captureCtx, p.Serial, started)
@@ -231,15 +231,18 @@ func (s *Service) evaluateSnapshot(ctx context.Context, client DecisionClient, p
 	if captureErr == nil && !frame.Captured.After(started) {
 		captureErr = &safeError{code: "capture_timeout"}
 	}
+	var upload []byte
 	if captureErr == nil {
-		width, height, imageErr := imageDimensions(frame.JPEG)
+		var width, height int
+		var imageErr error
+		upload, width, height, imageErr = fitImage(provider, frame.JPEG)
 		if imageErr != nil {
 			captureErr = imageErr
 		} else {
 			row.CapturedAt = new(frame.Captured.UTC())
 			row.FrameSequence = frame.Seq
-			row.ImageBytes = len(frame.JPEG)
-			row.Image = &snapshotImage{Type: "image/jpeg", Data: base64.StdEncoding.EncodeToString(frame.JPEG), Width: width, Height: height}
+			row.ImageBytes = len(upload)
+			row.Image = &snapshotImage{Type: "image/jpeg", Data: base64.StdEncoding.EncodeToString(upload), Width: width, Height: height}
 		}
 	}
 	if captureErr != nil {
@@ -250,7 +253,7 @@ func (s *Service) evaluateSnapshot(ctx context.Context, client DecisionClient, p
 		row.Error = fixedSentence(row.ErrorCode)
 	} else {
 		evaluationCtx, evaluationCancel := context.WithTimeout(ctx, requestTimeout)
-		result, evaluationErr := client.Evaluate(evaluationCtx, frame.JPEG, row.Model)
+		result, evaluationErr := client.Evaluate(evaluationCtx, upload, row.Model)
 		evaluationCancel()
 		if evaluationErr == nil && !validResult(result) {
 			evaluationErr = &safeError{code: "bad_response"}

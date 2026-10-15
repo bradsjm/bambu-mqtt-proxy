@@ -36,6 +36,8 @@ func reasonClause(code string) string {
 		return "camera image was not valid"
 	case "image_too_large":
 		return "camera image too large"
+	case "image_too_small":
+		return "camera image too small"
 	case "auth_rejected":
 		return "AI provider rejected the API key"
 	case "endpoint_unreachable":

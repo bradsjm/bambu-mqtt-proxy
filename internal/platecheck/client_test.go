@@ -28,6 +28,16 @@ func testJPEG(t *testing.T) []byte {
 	}
 	return b.Bytes()
 }
+
+func sizedJPEG(t *testing.T, w, h int) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	var b bytes.Buffer
+	if err := jpeg.Encode(&b, img, nil); err != nil {
+		t.Fatal(err)
+	}
+	return b.Bytes()
+}
 func resultJSON(clear, assessable float64) string {
 	b, _ := json.Marshal(map[string]any{"model": "clef", "answers": map[string]any{"plate_clear": map[string]any{"type": "noul", "noul": clear}, "view_assessable": map[string]any{"type": "noul", "noul": assessable}}, "usage": map[string]int{"input_tokens": 11, "output_tokens": 3}})
 	return string(b)
@@ -269,5 +279,135 @@ func TestClientPinsCredentialDestination(t *testing.T) {
 	c.http = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) { t.Fatal("insecure credential request"); return nil, nil })}
 	if err := c.Probe(context.Background()); err == nil {
 		t.Fatal("insecure endpoint accepted")
+	}
+}
+
+func TestClientTypeSafeWire(t *testing.T) {
+	s := Settings{Provider: ProviderTypeSafe, APIKey: "private-key", Model: typesafeModel, StopConfidence: .5, MinClarity: DefaultMinClarity, FirstLayer: FirstLayerSettings{PauseConfidence: DefaultPauseConfidence}}
+	c := NewClient(s, nil)
+	frame := sizedJPEG(t, 1280, 720)
+	seen := map[string]int{}
+	c.http = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.String() != typesafeURL {
+			t.Errorf("URL %s", r.URL.String())
+		}
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var body struct {
+			Model     string                   `json:"model"`
+			State     typesafeState            `json:"state"`
+			Questions map[string]question      `json:"questions"`
+			Assets    map[string]typesafeAsset `json:"assets"`
+		}
+		if err := json.Unmarshal(raw, &body); err != nil {
+			t.Fatal(err)
+		}
+		if body.Model != typesafeModel || body.State.Description == "" {
+			t.Error("model/state")
+		}
+		if bytes.Contains(raw, []byte("images")) && body.State.Images == nil {
+			t.Error("legacy images member sent")
+		}
+		if len(body.State.Images) == 0 {
+			if r.Header.Get("TypeSafe-Danger-Zone-Images") != "" {
+				t.Error("probe sent the images header")
+			}
+			if body.Assets != nil {
+				t.Error("probe sent assets")
+			}
+			if len(body.Questions) != 1 {
+				t.Error("probe questions")
+			}
+			seen["probe"]++
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"answers":{"connection_test":{"type":"noul","noul":0.9}},"usage":{"input_tokens":1,"output_tokens":1}}`)), Header: make(http.Header)}, nil
+		}
+		if r.Header.Get("TypeSafe-Danger-Zone-Images") != "true" {
+			t.Error("missing images header")
+		}
+		if len(body.State.Images) == 1 {
+			ref := body.State.Images[0]
+			asset, ok := body.Assets[ref]
+			if !ok || len(body.Assets) != 1 || asset.Type != "image" || asset.Format != "jpg" {
+				t.Error("asset shape")
+			}
+			decoded, err := base64.StdEncoding.DecodeString(asset.Data)
+			if err != nil || !bytes.Equal(decoded, frame) {
+				t.Error("JPEG changed")
+			}
+			for _, q := range body.Questions {
+				if strings.Contains(q.Instructions, ref) {
+					t.Error("reference leaked into instructions")
+				}
+			}
+			if len(body.Questions) != 2 {
+				t.Error("startup questions")
+			}
+			seen["evaluate"]++
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(resultJSON(.1, .9))), Header: make(http.Header)}, nil
+		}
+		if len(body.State.Images) == 2 {
+			if body.State.Images[0] == body.State.Images[1] || len(body.Assets) != 2 {
+				t.Error("references not distinct")
+			}
+			for i, ref := range body.State.Images {
+				asset, ok := body.Assets[ref]
+				if !ok || asset.Type != "image" || asset.Format != "jpg" {
+					t.Errorf("asset %d shape", i)
+				}
+			}
+			if len(body.Questions) != 5 {
+				t.Error("layer questions")
+			}
+			seen["layer"]++
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(layerJSON())), Header: make(http.Header)}, nil
+		}
+		t.Fatalf("unexpected image count %d", len(body.State.Images))
+		return nil, nil
+	})}
+	if err := c.Probe(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	r, err := c.Evaluate(context.Background(), frame, "P1S")
+	if err != nil || r.PClear != .1 {
+		t.Fatalf("evaluate %+v %v", r, err)
+	}
+	lr, err := c.EvaluateFirstLayer(context.Background(), [][]byte{frame, frame}, "P1S")
+	if err != nil || lr.PAssessable != .8 {
+		t.Fatalf("layer %+v %v", lr, err)
+	}
+	if seen["probe"] != 1 || seen["evaluate"] != 1 || seen["layer"] != 1 {
+		t.Fatalf("calls %v", seen)
+	}
+}
+
+func TestFitImage(t *testing.T) {
+	large := sizedJPEG(t, 1920, 1080)
+	fitted, w, h, err := fitImage(ProviderTypeSafe, large)
+	if err != nil || w != 1568 || h != 882 {
+		t.Fatalf("scaled %dx%d %v", w, h, err)
+	}
+	if cfg, err := jpeg.DecodeConfig(bytes.NewReader(fitted)); err != nil || cfg.Width != 1568 || cfg.Height != 882 {
+		t.Fatalf("output headers %+v %v", cfg, err)
+	}
+	again, _, _, err := fitImage(ProviderTypeSafe, fitted)
+	if err != nil || !bytes.Equal(again, fitted) {
+		t.Fatal("fitImage not idempotent")
+	}
+	small := sizedJPEG(t, 1280, 720)
+	same, _, _, err := fitImage(ProviderTypeSafe, small)
+	if err != nil || !bytes.Equal(same, small) {
+		t.Fatal("in-limit image changed")
+	}
+	custom, _, _, err := fitImage(ProviderCustom, large)
+	if err != nil || !bytes.Equal(custom, large) {
+		t.Fatal("custom image changed")
+	}
+	if _, _, _, err := fitImage(ProviderTypeSafe, sizedJPEG(t, 200, 200)); errorCategory(err) != "image_too_small" {
+		t.Fatalf("small accepted: %v", err)
+	}
+	if _, _, _, err := fitImage(ProviderTypeSafe, sizedJPEG(t, 4000, 300)); errorCategory(err) != "image_too_small" {
+		t.Fatalf("wide accepted: %v", err)
 	}
 }

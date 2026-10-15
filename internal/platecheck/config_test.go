@@ -440,7 +440,7 @@ func TestProviderValidationMessages(t *testing.T) {
 		require bool
 		message string
 	}{
-		{"provider", func(s *Settings) { s.Provider = "" }, false, "The plate-check provider must be cloudflare or custom."},
+		{"provider", func(s *Settings) { s.Provider = "" }, false, "The plate-check provider must be cloudflare, custom, or typesafe."},
 		{"cutoff", func(s *Settings) { s.StopConfidence = .585 }, false, "Stop above must be a whole percentage from 50 through 99 percent."},
 		{"cloudflare endpoint", func(s *Settings) { s.Endpoint = "https://old.example/check" }, false, "The Cloudflare provider builds the endpoint from the account ID. Remove the endpoint or choose the custom provider."},
 		{"cloudflare model", func(s *Settings) { s.Model = "other" }, false, "The Cloudflare model must be clef or clef-flash."},
@@ -449,6 +449,20 @@ func TestProviderValidationMessages(t *testing.T) {
 		{"custom model", func(s *Settings) { s.Provider = ProviderCustom; s.Model = "" }, false, "Enter the model name for the custom endpoint."},
 		{"custom URL", func(s *Settings) { s.Provider = ProviderCustom; s.Endpoint = "http://example/check" }, false, "The endpoint must be a full HTTPS URL without credentials, a query, or a fragment."},
 		{"endpoint missing", func(s *Settings) { s.Provider = ProviderCustom }, true, "No endpoint is configured. Enter an HTTPS endpoint."},
+		{"typesafe account", func(s *Settings) { s.Provider = ProviderTypeSafe; s.Model = typesafeModel }, false, "The TypeSafe provider uses a fixed endpoint. Remove the account ID and endpoint or choose another provider."},
+		{"typesafe endpoint", func(s *Settings) {
+			s.Provider = ProviderTypeSafe
+			s.AccountID = ""
+			s.Endpoint = "https://api.typesafe.ai/v1/systemone"
+			s.Model = typesafeModel
+		}, false, "The TypeSafe provider uses a fixed endpoint. Remove the account ID and endpoint or choose another provider."},
+		{"typesafe model", func(s *Settings) {
+			s.Provider = ProviderTypeSafe
+			s.AccountID = ""
+			s.Endpoint = ""
+			s.Model = "jev-1.13.0"
+		}, false, "The TypeSafe model must be jev-1.14.0."},
+		{"typesafe missing model", func(s *Settings) { s.Provider = ProviderTypeSafe; s.AccountID = ""; s.Endpoint = ""; s.Model = "" }, false, "The TypeSafe model must be jev-1.14.0."},
 		{"key missing", func(s *Settings) { s.APIKey = "" }, true, "No API key is configured. Enter a key."},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -461,11 +475,11 @@ func TestProviderValidationMessages(t *testing.T) {
 			}
 		})
 	}
-	s := testSettings()
-	s.Model = "  arbitrary model / with punctuation  "
-	got, err := validateSettings(s, true)
-	if err != nil || got.Model != strings.TrimSpace(s.Model) {
-		t.Fatalf("custom model %+v: %v", got, err)
+	// A TypeSafe submission with a key and the pinned model validates.
+	valid := Settings{Provider: ProviderTypeSafe, APIKey: "private-key", Model: typesafeModel, StopConfidence: .5, MinClarity: DefaultMinClarity,
+		FirstLayer: FirstLayerSettings{PauseConfidence: DefaultPauseConfidence}}
+	if _, err := validateSettings(valid, true); err != nil {
+		t.Fatalf("valid typesafe rejected: %v", err)
 	}
 	old, err := config.Parse([]byte("platecheck:\n  endpoint: https://old.example/check\n  api_key: key\n"))
 	if err != nil {
@@ -511,6 +525,35 @@ func TestCloudflareURLAndKeyBinding(t *testing.T) {
 	}
 	if s, err := resolveTestSettings(settingsView{Provider: ProviderCloudflare, AccountID: account, Model: "clef", StopConfidence: .5, MinClarity: DefaultMinClarity, FirstLayer: FirstLayerSettings{PauseConfidence: DefaultPauseConfidence}}, stored); err != nil || s.Key() != stored.Key() {
 		t.Fatalf("same account diagnostic %+v: %v", s, err)
+	}
+}
+
+// TestTypeSafeURLAndKeyBinding pins the TypeSafe endpoint and credential
+// isolation: the provider resolves to its fixed URL, and a stored
+// Cloudflare or custom key never moves to or from TypeSafe.
+func TestTypeSafeURLAndKeyBinding(t *testing.T) {
+	s := Settings{Provider: ProviderTypeSafe, APIKey: "k", Model: typesafeModel, StopConfidence: .5, MinClarity: DefaultMinClarity,
+		FirstLayer: FirstLayerSettings{PauseConfidence: DefaultPauseConfidence}}
+	if s.URL() != typesafeURL || !s.On() {
+		t.Fatalf("URL %s, on %v", s.URL(), s.On())
+	}
+	stored := Settings{Provider: ProviderCloudflare, AccountID: "0123456789abcdef0123456789abcdef", APIKey: "stored-key", Model: "clef-flash", StopConfidence: .5, MinClarity: DefaultMinClarity,
+		FirstLayer: FirstLayerSettings{PauseConfidence: DefaultPauseConfidence}}
+	view := settingsView{Enabled: true, Provider: ProviderTypeSafe, Model: typesafeModel, StopConfidence: .5, MinClarity: DefaultMinClarity,
+		FirstLayer: FirstLayerSettings{PauseConfidence: DefaultPauseConfidence}}
+	var page *config.PageError
+	// A TypeSafe submission with a blank key and enabled true must not
+	// reuse the stored Cloudflare key.
+	blank, _ := json.Marshal(settingsView{Enabled: true, Provider: ProviderTypeSafe, Model: typesafeModel, StopConfidence: .5, MinClarity: DefaultMinClarity,
+		FirstLayer: FirstLayerSettings{Enabled: new(true), PauseConfidence: DefaultPauseConfidence}})
+	out := &config.Config{}
+	if err := ConfigSection.Save(blank, settingsConfig(stored), out); err == nil {
+		t.Fatal("TypeSafe save reused the stored Cloudflare key")
+	} else if !errors.As(err, &page) || page.Status != 400 || page.Message != "No API key is configured. Enter a key." {
+		t.Fatalf("unexpected save error %v", err)
+	}
+	if _, err := resolveTestSettings(view, stored); err == nil || err.Error() != endpointKeyMessage {
+		t.Fatalf("diagnostic moved stored key: %v", err)
 	}
 }
 
