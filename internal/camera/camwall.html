@@ -192,7 +192,8 @@ body.kiosk #health-text { position: absolute; width: 1px; height: 1px; margin: -
 .pill.detect[data-tone="calm"] { --tone: var(--printing); }
 .pill.detect[data-tone="info"], .pill.detect[data-tone="warn"] { --tone: var(--paused); }
 .pill.detect[data-tone="error"] { --tone: var(--failed); }
-.pill.detect[data-processing="true"] { animation: detect-scan 1.5s ease-in-out infinite; }
+/* While a result is pending, only the icon breathes; the pill itself stays still. */
+.pill.detect[data-processing="true"] .ic { animation: detect-pulse 1.6s ease-in-out infinite; }
 .pill.detect .label { overflow: hidden; text-overflow: ellipsis; }
 .pill.detect[data-old="true"] { opacity: .72; }
 .cam-progress { position: absolute; z-index: 4; left: 0; right: 0; bottom: 0; height: 4px;
@@ -242,11 +243,6 @@ body.kiosk #health-text { position: absolute; width: 1px; height: 1px; margin: -
         border: 0; border-radius: 8px; background: none; color: var(--faint); cursor: grab;
         touch-action: none; font-size: 1.1rem; }
 .grip:hover, .grip:focus-visible { color: var(--text); background: var(--panel-2); }
-/* With a mouse, the grip appears on hover; touch screens always show it. */
-@media (hover: hover) {
-  .grip { opacity: 0; transition: opacity .2s; }
-  .tile:hover .grip, .grip:focus-visible, .tile.dragging .grip { opacity: 1; }
-}
 /* Head: name with its model tag on line one, the job on line two; the KPI
    column mirrors it with progress over layer and time left. */
 .ident { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: .1rem; }
@@ -565,8 +561,8 @@ legend { padding: 0; margin-bottom: .4rem; font-size: .85rem; }
 .check:has(input:disabled) { color: var(--dim); cursor: default; }
 
 @keyframes pulse { 50% { opacity: .35; } }
-@keyframes detect-scan {
-  50% { border-color: var(--tone); box-shadow: 0 0 9px color-mix(in srgb, var(--tone) 55%, transparent); }
+@keyframes detect-pulse {
+  50% { opacity: .35; transform: scale(.85); }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
@@ -1582,11 +1578,29 @@ function spoolG(p, cx, s, num, extra, fault) {
     }
     g.append(svgEl("path", { d: `M${x + 1.6} ${y + 4}V${y + h - 4}M${x + w - fl + 1.6} ${y + 4}V${y + h - 4}`,
       stroke: "rgb(255 255 255 / .14)", "stroke-linecap": "round" }));
-    const mat = String(s.material || "Unknown");
-    g.append(svgEl("text", { class: "lbl", x: cx, y: mid + (remain == null ? 3.5 : -2), fill: "#fff",
-      "font-size": mat.length > 4 ? 8.5 : 10, "font-weight": 700 }, mat.length > 8 ? `${mat.slice(0, 7)}…` : mat));
+    // A long name wraps onto a second line at a word break; each line
+    // is cut at 8 characters so it stays inside the flanges.
+    const mat = String(s.material || "Unknown").trim();
+    const cut = t => (t.length > 8 ? `${t.slice(0, 7)}…` : t);
+    const words = mat.split(/\s+/);
+    let lines = [cut(mat)];
+    if (mat.length > 8 && words.length > 1) {
+      let first = words[0], i = 1;
+      while (i < words.length - 1 && `${first} ${words[i]}`.length <= 8) first += ` ${words[i++]}`;
+      lines = [cut(first), cut(words.slice(i).join(" "))];
+    }
+    // The label block stays centred on the spool: one line sits where it
+    // always did, two lines straddle that position, and the percent stays below.
+    const base = lines.length === 1 ? [mid + (remain == null ? 3.5 : -2)]
+      : remain == null ? [mid - 1, mid + 8] : [mid - 8.5, mid + .5];
+    // The font shrinks so the widest line keeps about 3 units of clearance
+    // from each flange (the winding is iw wide; bold glyphs average ~.64 em).
+    const widest = Math.max(...lines.map(l => l.length));
+    const fs = Math.min(lines.length > 1 || mat.length > 4 ? 8.5 : 10, (iw - 6) / (widest * .64));
+    lines.forEach((line, i) => g.append(svgEl("text", { class: "lbl", x: cx, y: base[i], fill: "#fff",
+      "font-size": fs.toFixed(1), "font-weight": 700 }, line)));
     if (remain != null) {
-      g.append(svgEl("text", { class: "lbl", x: cx, y: mid + 9, "font-size": 9, "font-weight": 650,
+      g.append(svgEl("text", { class: "lbl", x: cx, y: mid + (lines.length > 1 ? 11 : 9), "font-size": 9, "font-weight": 650,
         fill: fault ? "#ff8a8a" : remain < 20 ? "var(--paused)" : "#fff" }, `${remain} %`));
     }
   }
