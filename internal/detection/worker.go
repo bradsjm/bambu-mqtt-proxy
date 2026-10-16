@@ -37,6 +37,8 @@ type worker struct {
 	counter uint64
 	// disabled stores the user's per-print toggle.
 	disabled bool
+	// held stores the user's idle toggle off that survives prints until re-enabled.
+	held bool
 	// latched permits only one pause attempt per print.
 	latched bool
 	// pauseLayer is the reported layer at command dispatch.
@@ -71,7 +73,7 @@ func (w *worker) apply(ev printer.Event) {
 		w.counter++
 		w.disabled, w.latched, w.lightDone = false, false, false
 		w.pauseLayer = nil
-		w.st = Status{State: StateMonitoring, PauseState: PauseNone, Enabled: true}
+		w.st = Status{State: StateMonitoring, PauseState: PauseNone, Enabled: !w.held}
 		w.due, w.resultAt = time.Time{}, time.Time{}
 		w.troubleSince, w.failures, w.successes, w.lastCause = time.Time{}, 0, 0, ""
 		state, _ := ev.Cur.GcodeState()
@@ -143,13 +145,17 @@ func (w *worker) view() *Status {
 	if !w.due.IsZero() && active(w.doc) {
 		s.NextCheckSeconds = max(0, time.Until(w.due).Seconds())
 	}
-	s.Enabled = !w.disabled
+	s.Enabled = !w.disabled && !w.held
 	_, hasState := w.doc.GcodeState()
 	switch {
 	case w.e.blocked != "":
 		s.State, s.Reason, s.Message = StateBlocked, w.e.blocked, "detection requires the camera feature"
 	case !w.eligible:
 		s.State, s.Reason, s.Message = StateUnsupported, ReasonCameraUnsupported, "printer model does not support camera frames"
+	case w.held:
+		s.State, s.Reason, s.DisabledUntil = StateDisabled, ReasonUserDisabled, DisabledUntilUserEnables
+		s.Processing, s.CameraLost, s.NextCheckSeconds = false, false, 0
+		s.Message = "AI inspections are off until turned back on; a proxy restart also turns them back on"
 	case w.disabled:
 		s.State, s.Reason, s.DisabledUntil = StateDisabled, ReasonUserDisabled, DisabledUntilPrintEnd
 		s.Processing, s.CameraLost, s.NextCheckSeconds = false, false, 0
@@ -198,7 +204,7 @@ func (w *worker) run(ctx context.Context) {
 		suspended, _ := w.e.AccountSuspended()
 		w.mu.Lock()
 		state, _ := w.doc.GcodeState()
-		allowed := w.e.blocked == "" && w.eligible && !suspended && !w.disabled && w.online && state == "RUNNING" && w.counter != 0 && w.st.Reason != ReasonRequestInvalid
+		allowed := w.e.blocked == "" && w.eligible && !suspended && !w.disabled && !w.held && w.online && state == "RUNNING" && w.counter != 0 && w.st.Reason != ReasonRequestInvalid
 		counter, doc, due := w.counter, w.doc, w.due
 		w.mu.Unlock()
 		if !allowed {
@@ -284,7 +290,7 @@ func (w *worker) run(ctx context.Context) {
 // ones; cause is the plain-language explanation shown to users.
 func (w *worker) fail(counter uint64, reason, cause string, err error, recommended int) {
 	w.mu.Lock()
-	if counter != w.counter || w.disabled {
+	if counter != w.counter || w.disabled || w.held {
 		w.mu.Unlock()
 		return
 	}
@@ -385,13 +391,13 @@ func (w *worker) accept(counter uint64, doc printer.Doc, res Result) {
 	w.commandMu.Lock()
 	defer w.commandMu.Unlock()
 	w.mu.Lock()
-	if counter != w.counter || w.disabled || !active(w.doc) {
+	if counter != w.counter || w.disabled || w.held || !active(w.doc) {
 		w.st.Processing = false
 		cause := "inactive"
 		switch {
 		case counter != w.counter:
 			cause = "stale_counter"
-		case w.disabled:
+		case w.disabled || w.held:
 			cause = "disabled"
 		}
 		w.mu.Unlock()
@@ -465,7 +471,7 @@ func (w *worker) autoLight(counter uint64) {
 	defer w.commandMu.Unlock()
 	w.mu.Lock()
 	state, _ := w.doc.GcodeState()
-	send := counter == w.counter && !w.disabled && !w.lightDone && w.online && state == "RUNNING"
+	send := counter == w.counter && !w.disabled && !w.held && !w.lightDone && w.online && state == "RUNNING"
 	if send {
 		w.lightDone = true
 		mode, _ := w.doc.ChamberLight()

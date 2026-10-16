@@ -73,21 +73,24 @@ func TestSetAIMonitoringUnknownSerial(t *testing.T) {
 	}
 }
 
-func TestSetAIMonitoringNoPrintSession(t *testing.T) {
+func TestSetAIMonitoringIdleDisableHolds(t *testing.T) {
 	e, _ := newEngineMCP(t)
 	client := connectDetectionMCP(t, e)
-	// S1 is configured but has no active print session, so disabling has
-	// nothing to override.
+	// S1 has no active print session, so disabling holds AI off until it is
+	// turned back on.
 	res := callAIMonitoring(t, client, "S1", false)
-	if !res.IsError {
-		t.Fatalf("no session not flagged error: %+v", res)
+	if res.IsError {
+		t.Fatalf("expected success, got error result: %+v", res)
 	}
 	out := mcptest.Decode[AIMonitoringOut](t, res)
-	if out.Error == nil || out.Error.Code != CodeNoPrintSession {
-		t.Fatalf("no session output = %+v", out)
+	if out.Error != nil {
+		t.Fatalf("idle disable output = %+v", out)
 	}
-	if out.Serial != "S1" || out.Detection != nil {
-		t.Fatalf("no session fields = %+v", out)
+	if out.Serial != "S1" || out.Detection == nil || out.Detection.Enabled {
+		t.Fatalf("idle disable fields = %+v", out)
+	}
+	if out.Detection.State != StateDisabled || out.Detection.Reason != ReasonUserDisabled || out.Detection.DisabledUntil != DisabledUntilUserEnables {
+		t.Fatalf("idle disable state = %+v", out.Detection)
 	}
 }
 

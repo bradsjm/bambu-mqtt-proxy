@@ -44,7 +44,6 @@ func TestDetectionHTTPContract(t *testing.T) {
 		jsonError                bool
 	}{
 		{"cross-site", detectionContractSerial, `{"enabled":false}`, "cross-site", 403, false},
-		{"no active print", detectionContractSerial, `{"enabled":false}`, "same-origin", 409, true},
 		{"unknown serial", "UNKNOWN", `{"enabled":false}`, "same-origin", 404, true},
 		{"malformed", detectionContractSerial, `{"enabled":`, "same-origin", 400, true},
 		{"unknown field", detectionContractSerial, `{"enabled":false,"extra":true}`, "same-origin", 400, true},
@@ -61,6 +60,27 @@ func TestDetectionHTTPContract(t *testing.T) {
 			}
 		})
 	}
+	// Disabling with no reports yet holds AI off until re-enabled instead of
+	// answering 409. A stale non-empty token still answers 409.
+	t.Run("idle disable holds", func(t *testing.T) {
+		code, raw := detectionContractRequest(t, http.MethodPut, base+"/detection/"+detectionContractSerial, `{"enabled":false}`, "same-origin")
+		if code != http.StatusOK {
+			t.Fatalf("PUT = %d %s, want %d", code, raw, http.StatusOK)
+		}
+		detectionContractState(t, detectionContractObject(t, raw), map[string]any{
+			"state": "disabled", "reason": "user_disabled", "pause_state": "none", "enabled": false,
+			"disabled_until": "user_enables_or_restart",
+			"message":        "AI inspections are off until turned back on; a proxy restart also turns them back on",
+		})
+		code, body := detectionContractRequest(t, http.MethodPut, base+"/detection/"+detectionContractSerial, `{"enabled":false,"session_id":"1"}`, "same-origin")
+		if code != http.StatusConflict {
+			t.Fatalf("PUT = %d %s, want %d", code, body, http.StatusConflict)
+		}
+		code, raw = detectionContractRequest(t, http.MethodPut, base+"/detection/"+detectionContractSerial, `{"enabled":true}`, "same-origin")
+		if code != http.StatusOK {
+			t.Fatalf("PUT = %d %s, want %d", code, raw, http.StatusOK)
+		}
+	})
 }
 
 // TestDetectionOffHTTPContract pins omission and the disabled route's status without fixing its error representation.

@@ -43,6 +43,8 @@ const (
 	ReasonRequestInvalid    = "request_invalid"
 	ReasonUserDisabled      = "user_disabled"
 	DisabledUntilPrintEnd   = "print_end_or_restart"
+	// DisabledUntilUserEnables marks the held idle toggle off until re-enabled.
+	DisabledUntilUserEnables = "user_enables_or_restart"
 )
 
 // Toggle errors distinguish an unknown printer from an unavailable print.
@@ -67,9 +69,9 @@ type Status struct {
 	Warning bool `json:"warning,omitempty"`
 	// PauseState describes the once-per-print pause attempt.
 	PauseState string `json:"pause_state"`
-	// Enabled reports the user's per-print permission.
+	// Enabled reports the user's toggle permission, combining the per-print and held offs.
 	Enabled bool `json:"enabled"`
-	// DisabledUntil describes the override lifetime.
+	// DisabledUntil describes the override lifetime: per-print or until re-enabled.
 	DisabledUntil string `json:"disabled_until,omitempty"`
 	// SessionID is the decimal print counter echoed by the wall toggle.
 	SessionID string `json:"session_id,omitempty"`
@@ -250,7 +252,11 @@ func (e *Engine) DetectionMap() map[string]any {
 	return out
 }
 
-// SetDetectionEnabled changes the per-print toggle and validates its token.
+// SetDetectionEnabled changes the user toggle and validates its token.
+// Enabling clears both the per-print off and the held idle off. Disabling
+// during an active print sets the per-print off until the print ends;
+// disabling while idle sets the held off until re-enabled. Both offs live in
+// memory and clear on proxy restart.
 func (e *Engine) SetDetectionEnabled(serial string, enabled bool, sessionID string) (any, error) {
 	w := e.workers[serial]
 	if w == nil {
@@ -259,20 +265,31 @@ func (e *Engine) SetDetectionEnabled(serial string, enabled bool, sessionID stri
 	w.commandMu.Lock()
 	w.mu.Lock()
 	var err error
+	var held bool
 	if !enabled {
 		switch {
 		case e.blocked != "" || !w.eligible:
 			err = ErrDetectionUnavailable
-		case !active(w.doc) || w.counter == 0:
+		case active(w.doc) && w.counter != 0:
+			if sessionID != strconv.FormatUint(w.counter, 10) {
+				err = ErrStaleSession
+			}
+		case active(w.doc):
 			err = ErrNoPrintSession
-		case sessionID != strconv.FormatUint(w.counter, 10):
+		case sessionID != "":
 			err = ErrStaleSession
+		default:
+			held = true
 		}
 	}
 	if err == nil {
-		w.disabled = !enabled
 		if enabled {
+			w.disabled, w.held = false, false
 			w.lightDone = false
+		} else if held {
+			w.held = true
+		} else {
+			w.disabled = true
 		}
 		if w.cancel != nil {
 			w.cancel()

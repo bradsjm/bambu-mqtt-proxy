@@ -10,8 +10,8 @@ import (
 	"bambu-mqtt-proxy/internal/module"
 )
 
-// Tool error code local to set_ai_monitoring: no print is active, or the
-// echoed session token is stale, so there is nothing to override.
+// Tool error code local to set_ai_monitoring: the echoed session token is
+// stale or missing for the requested toggle, so there is nothing to override.
 const CodeNoPrintSession = "no_print_session"
 
 // AIMonitoringIn names one printer and the requested toggle.
@@ -32,17 +32,18 @@ type AIMonitoringOut struct {
 // registerMCP adds the detection module's MCP tool. The core calls it once
 // in mcpserver.New, only when detection runs unblocked in the
 // configuration. Like the camera wall's PUT /detection/{serial}, the tool
-// applies the per-print override and records no activity entry.
+// applies the user toggle and records no activity entry.
 func (e *Engine) registerMCP(srv *mcp.Server) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "set_ai_monitoring",
-		Description: "Turn AI failure detection off or back on for the current print. The override ends with the print. " +
+		Description: "Turn AI failure detection off or back on. During a print, false turns AI off for that print; " +
+			"while idle, false turns it off until it is turned back on; true turns it back on. " +
 			"The fresh detection status after the change is served at state.modules.detection.",
 		Annotations: module.Command("Set AI monitoring", false, true),
 		InputSchema: module.SerialInput(map[string]*jsonschema.Schema{
 			"enabled": {
 				Type:        "boolean",
-				Description: "false turns AI failure detection off for the current print; true turns it back on.",
+				Description: "During a print, false turns AI failure detection off for that print; while idle, false turns it off until it is turned back on; true turns it back on.",
 			},
 		}, "enabled"),
 	}, func(_ context.Context, _ *mcp.CallToolRequest, in AIMonitoringIn) (*mcp.CallToolResult, AIMonitoringOut, error) {

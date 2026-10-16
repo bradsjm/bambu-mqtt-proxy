@@ -2,6 +2,7 @@ package detection
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -203,6 +204,36 @@ func TestBootMidPrintToggleHTTP(t *testing.T) {
 				t.Fatal("new print did not reset toggle")
 			}
 		})
+	}
+}
+
+// TestIdleDisableHoldsAcrossPrints pins the held idle toggle: an empty token
+// succeeds while idle, a stale token answers 409, the off survives a new
+func TestIdleDisableHoldsAcrossPrints(t *testing.T) {
+	w := newEtWorld(t)
+	w.report("FINISH", 0)
+	if _, err := w.engine.SetDetectionEnabled("S1", false, ""); err != nil {
+		t.Fatalf("idle disable: %v", err)
+	}
+	if st := w.status(); st.Enabled || st.State != StateDisabled || st.DisabledUntil != DisabledUntilUserEnables {
+		t.Fatalf("held status = %+v", st)
+	}
+	if _, err := w.engine.SetDetectionEnabled("S1", false, "1"); !errors.Is(err, ErrStaleSession) {
+		t.Fatalf("stale idle token = %v, want ErrStaleSession", err)
+	}
+	w.report("PREPARE", 0)
+	w.report("RUNNING", 0)
+	if st := w.status(); st.Enabled || st.State != StateDisabled || st.DisabledUntil != DisabledUntilUserEnables {
+		t.Fatalf("held status survived print = %+v", st)
+	}
+	if token := w.status().SessionID; token == "" {
+		t.Fatal("held active print serves no session token")
+	}
+	if _, err := w.engine.SetDetectionEnabled("S1", true, ""); err != nil {
+		t.Fatalf("re-enable: %v", err)
+	}
+	if st := w.status(); !st.Enabled || st.State == StateDisabled {
+		t.Fatalf("re-enabled status = %+v", st)
 	}
 }
 

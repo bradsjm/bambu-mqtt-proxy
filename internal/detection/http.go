@@ -9,8 +9,9 @@ import (
 // detectionPutMaxBody bounds the per-print toggle request body.
 const detectionPutMaxBody = 4 << 10
 
-// handlePut applies the per-print AI detection toggle.
-// Disabling requires the current print token; stale tokens or no print answer 409.
+// handlePut applies the AI detection toggle. Disabling during an active print
+// needs the current print token and lasts for that print; disabling while idle
+// needs an empty token and holds until re-enabled. Stale tokens answer 409.
 func (e *Engine) handlePut(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	var in struct {

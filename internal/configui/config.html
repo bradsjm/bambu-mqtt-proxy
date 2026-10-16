@@ -372,7 +372,7 @@ details .field + .check, details .check + .check { margin-top: .75rem; }
         <legend>Gadget AI</legend>
         <div class="row">
           <div><label for="f-ai">AI detection</label>
-            <span class="hint">Checks camera snapshots of active prints on P1P, P1S, A1, and A1 mini, and can warn or pause a likely failure. The AI badge on a camera wall tile turns detection off for the current print only; this switch controls all printers.</span>
+            <span class="hint">Checks camera snapshots of active prints on P1P, P1S, A1, and A1 mini, and can warn or pause a likely failure. The AI badge on a camera wall tile turns detection off for one printer: during a print until that print ends, or while idle until you turn it back on; this switch controls all printers.</span>
             <span class="env" id="ai-blocked" hidden></span></div>
           <div class="control"><input id="f-ai" class="switch" type="checkbox" role="switch" data-field="detection.enabled"></div>
         </div>

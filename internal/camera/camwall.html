@@ -882,7 +882,7 @@ const DETECT_REASONS = {
   camera_unavailable: "camera unavailable",
   api_retrying: "retrying Gadget",
   request_invalid: "Gadget rejected the request",
-  user_disabled: "turned off for this print",
+  user_disabled: "turned off by the user",
   pause_unconfirmed: "pause not confirmed by printer",
   pause_command_failed: "pause command failed",
 };
@@ -897,15 +897,15 @@ function detectOld(d) {
   return d.age > DETECT_OLD_SEC;
 }
 // One compact verdict for the stage badge, shown for configured detection.
-// While a print runs it is a real control: the user's per-print off state
+// It is a real control on active and idle printers: the user's off state
 // shows slashed and amber, and pause findings still surface below it. An
-// idle eligible printer shows a quiet noninteractive readiness cue. The
-// printer's own state pill always stays authoritative; this badge only
-// adds what the AI saw.
+// idle eligible printer shows a readiness cue that the user can click to
+// hold AI off. The printer's own state pill always stays authoritative;
+// this badge only adds what the AI saw.
 function detectBadge(d, b) {
   if (!d) return null;
-  if (d.state === "disabled") return { tone: "warn", label: "AI off", off: true };
-  if (d.state === "idle") return { tone: "", label: "AI on" };
+  if (d.state === "disabled") return { tone: "warn", label: "AI Disabled", off: true };
+  if (d.state === "idle") return { tone: "", label: "AI Enabled" };
   if (detectPausePending(d)) return { tone: "error", label: "Pause pending" };
   if (detectPauseUnconfirmed(d)) return { tone: "error", label: "Pause unconfirmed" };
   if (detectPauseConfirmed(d)) return { tone: "warn", label: "Pause confirmed" };
@@ -2292,12 +2292,12 @@ function renderTile(t) {
   // Detection rendering: a compact badge on the stage, inspection details at
   // level 2, facts at level 3, and a transition announcement. Without a
   // detection object (no API key) every element above stays hidden.
-  // The AI badge is a real control on an active print: keyboard
+  // The AI badge is a real control on active and idle printers: keyboard
   // reachable, with a stable printer-specific name, and aria-pressed
   // carrying the on/off permission. Server state stays authoritative:
   // repeat clicks wait, and the next status poll or the toggle's own
   // authoritative answer corrects the display everywhere.
-  const controllable = !!d && d.sessionId !== "" && !d.suspended &&
+  const controllable = !!d && !d.suspended &&
     d.state !== "unsupported" && d.state !== "blocked";
   r.detect.hidden = !bd;
   r.detect.disabled = !bd || !controllable;
@@ -2329,12 +2329,17 @@ function renderTile(t) {
       `${score != null ? `, score ${score} %${delta > 0 ? ", rising" : delta < 0 ? ", falling" : ""}` : ""}`);
     r.detect.setAttribute("aria-pressed", String(d.enabled !== false));
     r.detect.setAttribute("aria-busy", String(t.detPending === true));
-    // The title carries the action and the override's lifetime; the
-    // failure note takes precedence until the next attempt.
+    // The title carries the action and the off state's lifetime: the
+    // per-print off returns with the next print, the idle off holds until
+    // the user turns it back on or the proxy restarts. The failure note
+    // takes precedence until the next attempt.
     r.detect.title = t.detError ? `Last toggle failed: ${t.detError}`
       : !controllable ? ""
-      : d.enabled !== false ? "Turn AI monitoring off for this print · it returns with the next print or after a proxy restart"
-      : "Turn AI monitoring back on for this print";
+      : d.enabled !== false
+        ? d.sessionId !== ""
+          ? "Turn AI monitoring off for this print · it returns with the next print or after a proxy restart"
+          : "Turn AI monitoring off · it stays off until you turn it back on or the proxy restarts"
+        : "Turn AI monitoring back on";
 
   }
   const fact = d && d.state !== "idle" ? detectFact(d, b) : "";
@@ -2674,13 +2679,16 @@ function toggleSpotlight(t) {
   if (next) t.el.scrollIntoView({ block: "nearest", behavior: reduceMotion.matches ? "auto" : "smooth" });
 }
 
-// Per-print AI toggle: PUT the new permission with the current print's
-// opaque session token. One request per tile at a time — repeat clicks
-// wait — and the server's authoritative answer, mirrored by polling to every
-// open browser, decides what the badge shows next.
+// AI toggle: PUT the new permission with the current print's opaque session
+// token, or an empty token when the printer is idle. An empty token off on an
+// idle printer holds until the user turns AI back on or the proxy restarts;
+// while a print runs the token must match that print. One request per tile at
+// a time — repeat clicks wait — and the server's authoritative answer,
+// mirrored by polling to every open browser, decides what the badge shows
+// next.
 async function toggleDetection(t) {
   const d = detectOf(t.data);
-  if (t.detPending || !d || d.sessionId === "" || d.suspended ||
+  if (t.detPending || !d || d.suspended ||
       d.state === "unsupported" || d.state === "blocked") return;
   const enable = d.enabled === false;
   t.detPending = true;
