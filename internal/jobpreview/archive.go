@@ -215,7 +215,7 @@ func parseArchive(data []byte, k jobKey) (Result, error) {
 				}
 				message := strings.ReplaceAll(w.Message, "_", " ")
 				if w.Message == "bed_temperature_too_high_than_filament" {
-					message = "Sliced bed temperature exceeds the filament recommendation"
+					message = "Keep door open on enclosed printers to avoid nozzle clogs"
 				}
 				if message == "" {
 					message = code
