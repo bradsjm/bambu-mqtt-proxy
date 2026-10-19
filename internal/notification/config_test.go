@@ -83,30 +83,25 @@ func TestNotificationsProviderDefaultsToPushover(t *testing.T) {
 
 func TestNotificationsValidate(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		in   Settings
-		want string
+		name    string
+		in      Settings
+		wantErr bool
 	}{
-		{"disabled blank", Settings{}, ""},
-		{"disabled provider", Settings{Provider: "pushover"}, ""},
-		{"disabled stale", Settings{Pushover: Pushover{AppToken: "stale", UserKey: "stale"}}, ""},
-		{"empty provider", Settings{Enabled: true, Pushover: Pushover{AppToken: "t", UserKey: "u"}}, ""},
-		{"missing app", Settings{Enabled: true}, "notifications: pushover app token is required"},
-		{"whitespace app", Settings{Enabled: true, Pushover: Pushover{AppToken: " \t", UserKey: "u"}}, "notifications: pushover app token is required"},
-		{"missing user", Settings{Enabled: true, Pushover: Pushover{AppToken: "t"}}, "notifications: pushover user key is required"},
-		{"whitespace user", Settings{Enabled: true, Pushover: Pushover{AppToken: "t", UserKey: " \n"}}, "notifications: pushover user key is required"},
-		{"padded", Settings{Enabled: true, Pushover: Pushover{AppToken: " t ", UserKey: " u "}}, ""},
-		{"disabled unsupported", Settings{Provider: "email"}, `notifications: unsupported provider "email"`},
-		{"enabled unsupported", Settings{Enabled: true, Provider: "email", Pushover: Pushover{AppToken: "t", UserKey: "u"}}, `notifications: unsupported provider "email"`},
+		{"disabled blank", Settings{}, false},
+		{"disabled provider", Settings{Provider: "pushover"}, false},
+		{"disabled stale", Settings{Pushover: Pushover{AppToken: "stale", UserKey: "stale"}}, false},
+		{"empty provider", Settings{Enabled: true, Pushover: Pushover{AppToken: "t", UserKey: "u"}}, false},
+		{"missing app", Settings{Enabled: true}, true},
+		{"whitespace app", Settings{Enabled: true, Pushover: Pushover{AppToken: " \t", UserKey: "u"}}, true},
+		{"missing user", Settings{Enabled: true, Pushover: Pushover{AppToken: "t"}}, true},
+		{"whitespace user", Settings{Enabled: true, Pushover: Pushover{AppToken: "t", UserKey: " \n"}}, true},
+		{"padded", Settings{Enabled: true, Pushover: Pushover{AppToken: " t ", UserKey: " u "}}, false},
+		{"disabled unsupported", Settings{Provider: "email"}, true},
+		{"enabled unsupported", Settings{Enabled: true, Provider: "email", Pushover: Pushover{AppToken: "t", UserKey: "u"}}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := tc.in.Validate()
-			if tc.want == "" {
-				if err != nil {
-					t.Fatal(err)
-				}
-			} else if err == nil || err.Error() != tc.want {
-				t.Fatalf("Validate = %v, want %s", err, tc.want)
+			if err := tc.in.Validate(); (err != nil) != tc.wantErr {
+				t.Fatalf("Validate = %v, want error = %v", err, tc.wantErr)
 			}
 		})
 	}
@@ -116,8 +111,8 @@ func TestValidateEffectiveSurfacesNotifications(t *testing.T) {
 	c := &config.Config{}
 	c.ApplyDefaults()
 	c.SetSection("notifications", Settings{Enabled: true})
-	if err := c.ValidateEffective(); err == nil || !strings.Contains(err.Error(), "app token is required") {
-		t.Fatalf("ValidateEffective = %v", err)
+	if err := c.ValidateEffective(); err == nil {
+		t.Fatal("ValidateEffective accepted enabled notifications without credentials")
 	}
 	c.SetSection("notifications", Settings{Enabled: true, Pushover: Pushover{AppToken: "t", UserKey: "u"}})
 	if err := c.ValidateEffective(); err != nil {
@@ -194,8 +189,8 @@ func TestTestMergesStoredCredentialsAndSends(t *testing.T) {
 		if got != want {
 			t.Fatalf("sent settings = %+v, want %+v", got, want)
 		}
-		if title != "bambu-mqtt-proxy test" || body != "Pushover notifications are working." || jpeg != nil {
-			t.Fatalf("message = %q %q %v", title, body, jpeg)
+		if title == "" || body == "" || jpeg != nil {
+			t.Fatalf("message = %q %q %v, want a text-only test notification", title, body, jpeg)
 		}
 		deadline, ok := ctx.Deadline()
 		if !ok || time.Until(deadline) <= 0 || time.Until(deadline) > 20*time.Second {

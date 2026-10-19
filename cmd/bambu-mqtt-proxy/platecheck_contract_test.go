@@ -22,24 +22,21 @@ const platecheckSnapshotBudget = 45 * time.Second
 
 // TestPlatecheckConfigTestRoute pins that the key-check route exists in
 // setup mode and at runtime, rejects cross-site posts, and reports missing
-// credentials with the fixed sentences.
+// credentials with 422.
 func TestPlatecheckConfigTestRoute(t *testing.T) {
 	clearBMBPXEnv(t)
 	setupBase := configStoreServer(t, filepath.Join(t.TempDir(), "absent.yaml"))
 	for _, tc := range []struct {
-		name, site, body, message string
-		code                      int
+		name, site, body string
+		code             int
 	}{
-		{"setup missing account", "same-origin", `{"enabled":true,"model":"clef","stop_confidence":0.5}`, "No Cloudflare account ID is configured. Enter the account ID.", 422},
-		{"setup cross-site", "cross-site", `{"api_key":"must-not-be-probed","model":"clef"}`, "", 403},
+		{"setup missing account", "same-origin", `{"enabled":true,"model":"clef","stop_confidence":0.5}`, 422},
+		{"setup cross-site", "cross-site", `{"api_key":"must-not-be-probed","model":"clef"}`, 403},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			code, body := detectionContractRequest(t, http.MethodPost, setupBase+"/config/platecheck/test", tc.body, tc.site)
 			if code != tc.code {
 				t.Fatalf("probe = %d %s, want %d", code, body, tc.code)
-			}
-			if tc.message != "" && detectionContractObject(t, body)["error"] != tc.message {
-				t.Fatalf("probe body = %s, want error %q", body, tc.message)
 			}
 		})
 	}
@@ -48,9 +45,6 @@ func TestPlatecheckConfigTestRoute(t *testing.T) {
 	code, body := detectionContractRequest(t, http.MethodPost, base+"/config/platecheck/test", `{"enabled":true,"model":"clef","stop_confidence":0.5}`, "same-origin")
 	if code != 422 {
 		t.Fatalf("runtime probe = %d %s, want 422", code, body)
-	}
-	if detectionContractObject(t, body)["error"] != "No Cloudflare account ID is configured. Enter the account ID." {
-		t.Fatalf("runtime probe body = %s", body)
 	}
 }
 

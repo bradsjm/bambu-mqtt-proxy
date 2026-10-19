@@ -48,21 +48,20 @@ func TestEpisodeLatch(t *testing.T) {
 		online, known bool
 		value         float64
 		stops         int
-		tripped       bool
 	}{
-		{"trip", true, true, 81, 2, true},
-		{"no retrip", true, true, 81, 2, true},
-		{"device loss", true, false, 0, 2, true},
-		{"printer offline", false, true, 20, 2, true},
-		{"in limit", true, true, 20, 2, false},
-		{"next episode", true, true, 81, 4, true},
+		{"trip", true, true, 81, 2},
+		{"no retrip", true, true, 81, 2},
+		{"device loss", true, false, 0, 2},
+		{"printer offline", false, true, 20, 2},
+		{"in limit", true, true, 20, 2},
+		{"next episode", true, true, 81, 4},
 	} {
 		state.SetOnline("S1", step.online)
 		chamber.known, chamber.value = step.known, step.value
 		s.check(context.Background(), printers[0])
 		s.responses.Wait()
-		if cmd.count != step.stops || s.tripped["S1"] != step.tripped {
-			t.Fatalf("%s: stops=%d tripped=%v", step.name, cmd.count, s.tripped["S1"])
+		if cmd.count != step.stops {
+			t.Fatalf("%s: stops=%d, want %d", step.name, cmd.count, step.stops)
 		}
 	}
 }

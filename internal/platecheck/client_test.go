@@ -68,7 +68,7 @@ func TestClientTLSWireAndProbeNoImage(t *testing.T) {
 			t.Error("request model/state")
 		}
 		if calls == 1 {
-			if len(in.Images) != 0 || len(in.Questions) != 1 || in.Questions["connection_test"].Instructions != "Is this a connectivity test?" {
+			if len(in.Images) != 0 || len(in.Questions) != 1 || in.Questions["connection_test"].Type != "noul" {
 				t.Error("probe uploaded image or wrong question")
 			}
 			_, _ = io.WriteString(w, `{"answers":{"connection_test":{"type":"noul","noul":0.9}},"usage":{"input_tokens":1,"output_tokens":1}}`)
@@ -80,7 +80,7 @@ func TestClientTLSWireAndProbeNoImage(t *testing.T) {
 			if err != nil || !bytes.Equal(decoded, jpegBytes) {
 				t.Error("JPEG changed")
 			}
-			if in.Questions["plate_clear"].Type != "noul" || !strings.Contains(in.Questions["plate_clear"].Criteria["true"], "toolhead") || !strings.Contains(in.State, "P1S") {
+			if in.Questions["plate_clear"].Type != "noul" || !strings.Contains(in.State, "P1S") {
 				t.Error("fixed policy question")
 			}
 			_, _ = io.WriteString(w, `{"success":true,"result":`+resultJSON(.127, .962)+`}`)

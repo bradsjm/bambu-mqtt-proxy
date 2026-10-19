@@ -3,6 +3,7 @@ package control
 import (
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 
 	"bambu-mqtt-proxy/internal/activity"
@@ -128,7 +129,7 @@ func TestStopSendsAndRecordsActivity(t *testing.T) {
 		t.Fatalf("stop = %+v %v, sent %v", res, err, cmd.sent)
 	}
 	if e := log.Recent("S1"); len(e) != 1 || e[0].Kind != "control_stop" || e[0].Severity != activity.Warning ||
-		e[0].Message != "Emergency stop sent from camera wall" {
+		!strings.Contains(e[0].Message, "camera wall") {
 		t.Fatalf("activity = %+v", e)
 	}
 }

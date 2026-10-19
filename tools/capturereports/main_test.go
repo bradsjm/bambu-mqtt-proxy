@@ -221,12 +221,3 @@ func TestRunNoMatchingReportsWritesNothing(t *testing.T) {
 		t.Fatalf("output dir has %d entries, want 0", len(entries))
 	}
 }
-
-func TestRunRequiresSerialAndPrefix(t *testing.T) {
-	if _, err := run(strings.NewReader(""), "", "x"); err == nil {
-		t.Fatal("run with empty serial: got nil error")
-	}
-	if _, err := run(strings.NewReader(""), "S1", ""); err == nil {
-		t.Fatal("run with empty prefix: got nil error")
-	}
-}

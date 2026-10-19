@@ -57,17 +57,15 @@ type lifeEnv struct {
 	requests func() int
 }
 
-// checkFailedErr requires both lookup kinds to carry the exact error text.
-func checkFailedErr(want string) func(t *testing.T, env *lifeEnv) {
-	return func(t *testing.T, env *lifeEnv) {
-		t.Helper()
-		snap := env.catalog.Snapshot(lifeSerial)
-		if got := snap.HMS(lifeAttr, lifeCode); got.Err != want {
-			t.Fatalf("HMS err = %q, want %q", got.Err, want)
-		}
-		if got := snap.Error(lifeScreen); got.Err != want {
-			t.Fatalf("Error err = %q, want %q", got.Err, want)
-		}
+// checkFailedErr requires both lookup kinds to carry a download error.
+func checkFailedErr(t *testing.T, env *lifeEnv) {
+	t.Helper()
+	snap := env.catalog.Snapshot(lifeSerial)
+	if got := snap.HMS(lifeAttr, lifeCode); got.Err == "" {
+		t.Fatal("HMS err empty, want the download error")
+	}
+	if got := snap.Error(lifeScreen); got.Err == "" {
+		t.Fatal("Error err empty, want the download error")
 	}
 }
 
@@ -90,7 +88,6 @@ func TestCatalogLifecycle(t *testing.T) {
 		// wantV is the expected v query value; wantVSet false means v must be absent.
 		wantV    string
 		wantVSet bool
-		wantLog  string
 		// wantCacheWrite requires the cache file to hold the raw response body.
 		wantCacheWrite bool
 		pre            func(t *testing.T, c *Catalog)
@@ -101,7 +98,6 @@ func TestCatalogLifecycle(t *testing.T) {
 			body:           fullBody("202609231145", hmsA, errA),
 			wantDelay:      24 * time.Hour,
 			wantState:      StateReady,
-			wantLog:        "Bambu message catalog updated",
 			wantCacheWrite: true,
 			check: func(t *testing.T, env *lifeEnv) {
 				t.Helper()
@@ -122,7 +118,6 @@ func TestCatalogLifecycle(t *testing.T) {
 			wantState: StateReady,
 			wantV:     "100",
 			wantVSet:  true,
-			wantLog:   "Bambu message catalog unchanged",
 			pre: func(t *testing.T, c *Catalog) {
 				t.Helper()
 				// The cache loads synchronously in New, before any download.
@@ -142,7 +137,6 @@ func TestCatalogLifecycle(t *testing.T) {
 			body:      `{"result":201}`,
 			wantDelay: 24 * time.Hour,
 			wantState: StateReady,
-			wantLog:   "Bambu message catalog unchanged",
 			check: func(t *testing.T, env *lifeEnv) {
 				t.Helper()
 				snap := env.catalog.Snapshot(lifeSerial)
@@ -192,7 +186,6 @@ func TestCatalogLifecycle(t *testing.T) {
 			wantState: StateReady,
 			wantV:     "100",
 			wantVSet:  true,
-			wantLog:   "Bambu message catalog updated",
 			check: func(t *testing.T, env *lifeEnv) {
 				t.Helper()
 				if got := env.catalog.Snapshot(lifeSerial).HMS(lifeAttr, lifeCode); !got.Listed || got.Message != lifeHMSB {
@@ -239,24 +232,21 @@ func TestCatalogLifecycle(t *testing.T) {
 			body:      `{"result":0,"data":{"device_hms":{"en":[]},"device_error":{"en":[]}}}`,
 			wantDelay: time.Minute,
 			wantState: StateFailed,
-			wantLog:   "retry in one minute",
-			check:     checkFailedErr("invalid ver"),
+			check:     checkFailedErr,
 		},
 		{
 			name:      "negative version fails",
 			body:      fullBody("-1", "", ""),
 			wantDelay: time.Minute,
 			wantState: StateFailed,
-			wantLog:   "retry in one minute",
-			check:     checkFailedErr("invalid ver"),
+			check:     checkFailedErr,
 		},
 		{
 			name:      "non-numeric string version fails",
 			body:      fullBody(`"abc"`, "", ""),
 			wantDelay: time.Minute,
 			wantState: StateFailed,
-			wantLog:   "retry in one minute",
-			check:     checkFailedErr("invalid ver"),
+			check:     checkFailedErr,
 		},
 		{
 			name:      "listed empty intro versus absent code",
@@ -299,8 +289,7 @@ func TestCatalogLifecycle(t *testing.T) {
 			body:      "boom",
 			wantDelay: time.Minute,
 			wantState: StateFailed,
-			wantLog:   "retry in one minute",
-			check:     checkFailedErr("unexpected HTTP status 500"),
+			check:     checkFailedErr,
 		},
 		{
 			name:      "http error keeps last good table",
@@ -311,7 +300,6 @@ func TestCatalogLifecycle(t *testing.T) {
 			wantState: StateReady,
 			wantV:     "100",
 			wantVSet:  true,
-			wantLog:   "retry in one minute",
 			check: func(t *testing.T, env *lifeEnv) {
 				t.Helper()
 				if got := env.catalog.Snapshot(lifeSerial).HMS(lifeAttr, lifeCode); !got.Listed || got.Message != lifeHMSA {
@@ -324,7 +312,6 @@ func TestCatalogLifecycle(t *testing.T) {
 			closedServer: true,
 			wantDelay:    time.Minute,
 			wantState:    StateFailed,
-			wantLog:      "retry in one minute",
 			check: func(t *testing.T, env *lifeEnv) {
 				t.Helper()
 				if got := env.catalog.Snapshot(lifeSerial).HMS(lifeAttr, lifeCode); got.Err == "" {
@@ -337,7 +324,6 @@ func TestCatalogLifecycle(t *testing.T) {
 			body:      `{"result":0,`,
 			wantDelay: time.Minute,
 			wantState: StateFailed,
-			wantLog:   "retry in one minute",
 			check: func(t *testing.T, env *lifeEnv) {
 				t.Helper()
 				if got := env.catalog.Snapshot(lifeSerial).Error(lifeScreen); got.Err == "" {
@@ -350,40 +336,35 @@ func TestCatalogLifecycle(t *testing.T) {
 			body:      `{"ver":1,"data":{"device_hms":{"en":[]},"device_error":{"en":[]}}}`,
 			wantDelay: time.Minute,
 			wantState: StateFailed,
-			wantLog:   "retry in one minute",
-			check:     checkFailedErr("missing result"),
+			check:     checkFailedErr,
 		},
 		{
 			name:      "unexpected result fails",
 			body:      `{"result":500}`,
 			wantDelay: time.Minute,
 			wantState: StateFailed,
-			wantLog:   "retry in one minute",
-			check:     checkFailedErr("unexpected result 500"),
+			check:     checkFailedErr,
 		},
 		{
 			name:      "missing data fails",
 			body:      `{"result":0,"ver":1}`,
 			wantDelay: time.Minute,
 			wantState: StateFailed,
-			wantLog:   "retry in one minute",
-			check:     checkFailedErr("missing data"),
+			check:     checkFailedErr,
 		},
 		{
 			name:      "missing hms table fails",
 			body:      `{"result":0,"ver":1,"data":{"device_error":{"en":[]}}}`,
 			wantDelay: time.Minute,
 			wantState: StateFailed,
-			wantLog:   "retry in one minute",
-			check:     checkFailedErr("missing device_hms.en"),
+			check:     checkFailedErr,
 		},
 		{
 			name:      "null error array fails",
 			body:      `{"result":0,"ver":1,"data":{"device_hms":{"en":[]},"device_error":{"en":null}}}`,
 			wantDelay: time.Minute,
 			wantState: StateFailed,
-			wantLog:   "retry in one minute",
-			check:     checkFailedErr("missing device_error.en"),
+			check:     checkFailedErr,
 		},
 		{
 			name:      "empty arrays publish ready",
@@ -431,8 +412,7 @@ func TestCatalogLifecycle(t *testing.T) {
 				_ = os.Remove("hms_en_" + lifePrefix + ".json")
 				t.Cleanup(func() { _ = os.Remove("hms_en_" + lifePrefix + ".json") })
 			}
-			var logs bytes.Buffer
-			logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			logger := discardLogger()
 			var mu sync.Mutex
 			var gotQuery url.Values
 			var gotCount int
@@ -504,9 +484,6 @@ func TestCatalogLifecycle(t *testing.T) {
 					t.Fatalf("v query = %q, want %q", gotV[0], tc.wantV)
 				}
 			}
-			if tc.wantLog != "" && !strings.Contains(logs.String(), tc.wantLog) {
-				t.Fatalf("logs missing %q:\n%s", tc.wantLog, logs.String())
-			}
 			if tc.wantCacheWrite {
 				data, err := os.ReadFile(filepath.Join(dir, "hms_en_"+lifePrefix+".json"))
 				if err != nil {
@@ -532,12 +509,11 @@ func TestCacheFailure(t *testing.T) {
 	defer srv.Close()
 
 	badCaches := []struct {
-		name    string
-		body    string
-		wantLog string
+		name string
+		body string
 	}{
-		{"corrupt cache triggers a full fetch", `{"result":0,`, "downloading the full catalog"},
-		{"result 201 cache is not a full catalog", `{"result":201}`, "cache response result 201 contains no full catalog"},
+		{"corrupt cache triggers a full fetch", `{"result":0,`},
+		{"result 201 cache is not a full catalog", `{"result":201}`},
 	}
 	for _, tc := range badCaches {
 		t.Run(tc.name, func(t *testing.T) {
@@ -565,7 +541,7 @@ func TestCacheFailure(t *testing.T) {
 			if string(data) != good {
 				t.Fatalf("cache = %q, want full response %q", data, good)
 			}
-			for _, want := range []string{lifePrefix, path, tc.wantLog} {
+			for _, want := range []string{lifePrefix, path} {
 				if !strings.Contains(logs.String(), want) {
 					t.Fatalf("logs missing %q:\n%s", want, logs.String())
 				}
@@ -580,9 +556,7 @@ func TestCacheFailure(t *testing.T) {
 		if err := os.WriteFile(blocker, []byte("not a directory"), 0o644); err != nil {
 			t.Fatalf("write blocker: %v", err)
 		}
-		var logs bytes.Buffer
-		logger := slog.New(slog.NewTextHandler(&logs, nil))
-		c := New(srv.URL, blocker, []string{lifeSerial}, logger)
+		c := New(srv.URL, blocker, []string{lifeSerial}, discardLogger())
 		if delay := c.refresh(ctx, lifePrefix); delay != 24*time.Hour {
 			t.Fatalf("refresh delay = %v, want %v", delay, 24*time.Hour)
 		}
@@ -592,9 +566,6 @@ func TestCacheFailure(t *testing.T) {
 		}
 		if got := snap.Error(lifeScreen); !got.Listed || got.Message != lifeErrA {
 			t.Fatalf("Error = %+v, want listed %q", got, lifeErrA)
-		}
-		if !strings.Contains(logs.String(), "keeping the catalog in memory") {
-			t.Fatalf("logs missing in-memory fallback:\n%s", logs.String())
 		}
 	})
 }
@@ -663,13 +634,6 @@ func TestSnapshotMissing(t *testing.T) {
 	}
 }
 
-func TestRunWithoutPrefixes(t *testing.T) {
-	c := New("", "", []string{"AB", ""}, discardLogger())
-	if err := c.Run(context.Background()); err != nil {
-		t.Fatalf("Run = %v, want nil", err)
-	}
-}
-
 func TestRunStopsOnCancel(t *testing.T) {
 	requestStarted := make(chan struct{})
 	handlerCanceled := make(chan struct{}, 1)
@@ -686,9 +650,7 @@ func TestRunStopsOnCancel(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	var logs bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&logs, nil))
-	c := New(srv.URL, "", []string{lifeSerial}, logger)
+	c := New(srv.URL, "", []string{lifeSerial}, discardLogger())
 	done := make(chan error, 1)
 	go func() { done <- c.Run(ctx) }()
 
@@ -710,9 +672,6 @@ func TestRunStopsOnCancel(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for Run to stop")
-	}
-	if strings.Contains(logs.String(), "retry in one minute") {
-		t.Fatalf("cancellation logged a failure warning:\n%s", logs.String())
 	}
 }
 

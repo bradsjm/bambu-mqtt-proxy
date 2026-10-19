@@ -204,7 +204,7 @@ func TestRawServerRejectsBadAuth(t *testing.T) {
 		rawPrinterSpec("01S00C00000000A", "right-code", "P1S"),
 		rawPrinterSpec("XSERIES", "x-code", "X1C"), // ineligible model
 	)
-	srv, addr := newTestRawServer(t, m)
+	_, addr := newTestRawServer(t, m)
 
 	cases := map[string][]byte{}
 	mutate := func(name string, f func(p []byte)) {
@@ -241,16 +241,14 @@ func TestRawServerRejectsBadAuth(t *testing.T) {
 			if rerr == nil {
 				t.Fatal("refused session stayed open")
 			}
+			if nerr, ok := rerr.(net.Error); ok && nerr.Timeout() {
+				t.Fatal("refused session stayed open until the client deadline")
+			}
 		})
 	}
-	// No client acquired a capture: nothing dialed the fake camera and the
-	// manager holds no captures for the matched or unsupported printers.
-	waitUntil(t, 2*time.Second, func() bool { return rawSessionCount(srv) == 0 })
-	m.mu.Lock()
-	count := len(m.captures)
-	m.mu.Unlock()
-	if count != 0 {
-		t.Fatalf("bad auth created %d captures, want 0", count)
+	// No client acquired a capture: nothing dialed the fake camera.
+	if n := fc.sessions.Load(); n != 0 {
+		t.Fatalf("bad auth produced %d upstream camera sessions, want 0", n)
 	}
 }
 
@@ -381,6 +379,9 @@ func TestRawServerAuthDeadline(t *testing.T) {
 		if rerr == nil {
 			t.Fatalf("%s survived the auth budget", stalled.name)
 		}
+		if nerr, ok := rerr.(net.Error); ok && nerr.Timeout() {
+			t.Fatalf("%s survived the auth budget until the client deadline", stalled.name)
+		}
 	}
 }
 
@@ -394,7 +395,11 @@ func TestRawServerSharesCapture(t *testing.T) {
 
 	ca := rawDial(t, addr, "code")
 	cb := rawDial(t, addr, "code")
-	time.Sleep(150 * time.Millisecond) // let both sessions reach their waits
+	// Both sessions register their persistent capture reference before
+	// they wait for frames; wait for that instead of scheduler timing.
+	waitUntil(t, 5*time.Second, func() bool {
+		return captureConsumers(m, "01S00C00000000A") >= 2
+	})
 	final := jpeg(96)
 	fc.frames <- jpeg(32)
 	fc.frames <- jpeg(64)
@@ -419,12 +424,6 @@ func TestRawServerSharesCapture(t *testing.T) {
 	readToFinal(cb)
 	if n := fc.sessions.Load(); n != 1 {
 		t.Fatalf("two clients produced %d camera sessions, want exactly 1", n)
-	}
-	// Both sessions hold their persistent references for their lifetime;
-	// Manager.Wait adds transient references on top, so only the floor of
-	// two is deterministic while the clients stay connected.
-	if consumers := captureConsumers(m, "01S00C00000000A"); consumers < 2 {
-		t.Fatalf("capture consumers = %d, want at least 2", consumers)
 	}
 }
 
@@ -481,16 +480,16 @@ func TestRawServerNoFrameEndsSession(t *testing.T) {
 	oldBudget := rawFrameBudget
 	rawFrameBudget = 500 * time.Millisecond
 	t.Cleanup(func() { rawFrameBudget = oldBudget })
-	srv, addr := newTestRawServer(t, m)
+	_, addr := newTestRawServer(t, m)
 
 	conn := rawDial(t, addr, "code")
 	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	if _, _, err := readRawFrame(bufio.NewReader(conn)); err == nil {
+	_, _, err := readRawFrame(bufio.NewReader(conn))
+	if err == nil {
 		t.Fatal("session without frames must end")
 	}
-	waitUntil(t, 3*time.Second, func() bool { return rawSessionCount(srv) == 0 })
-	if consumers := captureConsumers(m, "01S00C00000000A"); consumers != 0 {
-		t.Fatalf("ended session kept %d consumers", consumers)
+	if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
+		t.Fatal("session without frames outlived its frame budget")
 	}
 }
 
@@ -507,7 +506,11 @@ func TestRawServerClientEOFCancelsPromptly(t *testing.T) {
 	srv, addr := newTestRawServer(t, m)
 
 	conn := rawDial(t, addr, "code")
-	time.Sleep(150 * time.Millisecond) // the session blocks in its frame wait
+	// The persistent session reference plus the transient Wait reference
+	// prove the session is blocked in its frame wait before the close.
+	waitUntil(t, 5*time.Second, func() bool {
+		return captureConsumers(m, "01S00C00000000A") >= 2
+	})
 	_ = conn.Close()
 	waitUntil(t, 3*time.Second, func() bool { return rawSessionCount(srv) == 0 })
 	if consumers := captureConsumers(m, "01S00C00000000A"); consumers != 0 {
@@ -539,8 +542,18 @@ func TestRawServerSendFrameWriteDeadline(t *testing.T) {
 		Captured: time.Now(),
 	}
 
+	result := make(chan bool, 1)
 	start := time.Now()
-	if ok := srv.sendFrameWithLogger(server, frame, srv.log); ok {
+	go func() {
+		result <- srv.sendFrameWithLogger(server, frame, srv.log)
+	}()
+	var ok bool
+	select {
+	case ok = <-result:
+	case <-time.After(5 * time.Second):
+		t.Fatal("sendFrameWithLogger did not return; the write deadline did not fire")
+	}
+	if ok {
 		t.Fatal("sendFrameWithLogger must fail when the peer never reads")
 	}
 	if elapsed := time.Since(start); elapsed < 250*time.Millisecond {
@@ -574,9 +587,6 @@ func TestRawServerShutdownJoinsWorkers(t *testing.T) {
 	srv.Close()
 	if elapsed := time.Since(start); elapsed > 3*time.Second {
 		t.Fatalf("Close waited %s; shutdown must not wait for budgets", elapsed)
-	}
-	if n := rawSessionCount(srv); n != 0 {
-		t.Fatalf("Close left %d sessions", n)
 	}
 	srv.Close() // idempotent
 

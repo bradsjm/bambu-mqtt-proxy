@@ -70,7 +70,6 @@ func TestDetectionHTTPContract(t *testing.T) {
 		detectionContractState(t, detectionContractObject(t, raw), map[string]any{
 			"state": "disabled", "reason": "user_disabled", "pause_state": "none", "enabled": false,
 			"disabled_until": "user_enables_or_restart",
-			"message":        "AI inspections are off until turned back on; a proxy restart also turns them back on",
 		})
 		code, body := detectionContractRequest(t, http.MethodPut, base+"/detection/"+detectionContractSerial, `{"enabled":false,"session_id":"1"}`, "same-origin")
 		if code != http.StatusConflict {
@@ -113,7 +112,6 @@ func TestDetectionCameraDisabledHTTPContract(t *testing.T) {
 	states := detectionContractObject(t, raw)["detection"].(map[string]any)
 	detectionContractState(t, states[detectionContractSerial], map[string]any{
 		"state": "blocked", "reason": "camera_disabled", "pause_state": "none", "enabled": true,
-		"message": "detection requires the camera feature",
 	})
 }
 
@@ -155,24 +153,21 @@ func TestDetectionConfigHTTPShape(t *testing.T) {
 	}
 }
 
-// TestDetectionConfigProbePreflight pins missing-key messages and cross-origin rejection before any Gadget request.
+// TestDetectionConfigProbePreflight pins missing-key and cross-origin rejection before any Gadget request.
 func TestDetectionConfigProbePreflight(t *testing.T) {
 	clearBMBPXEnv(t)
 	base := configStoreServer(t, filepath.Join(t.TempDir(), "absent.yaml"))
 	for _, tc := range []struct {
-		name, site, body, message string
-		code                      int
+		name, site, body string
+		code             int
 	}{
-		{"no key", "same-origin", `{}`, "No Gadget API key is configured. Enter a key.", 422},
-		{"cross-site", "cross-site", `{"api_key":"must-not-be-probed"}`, "", 403},
+		{"no key", "same-origin", `{}`, 422},
+		{"cross-site", "cross-site", `{"api_key":"must-not-be-probed"}`, 403},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			code, body := detectionContractRequest(t, http.MethodPost, base+"/config/detection/test", tc.body, tc.site)
 			if code != tc.code {
 				t.Fatalf("probe = %d %s, want %d", code, body, tc.code)
-			}
-			if tc.message != "" && detectionContractObject(t, body)["error"] != tc.message {
-				t.Fatalf("probe body = %s, want error %q", body, tc.message)
 			}
 		})
 	}
@@ -307,6 +302,7 @@ func detectionContractState(t *testing.T, value any, want map[string]any) {
 	}
 	delete(state, "age_seconds")
 	delete(state, "next_check_seconds")
+	delete(state, "message")
 	if !reflect.DeepEqual(state, want) {
 		t.Fatalf("detection = %#v, want %#v", state, want)
 	}

@@ -64,8 +64,7 @@ func TestSetAIMonitoringUnknownSerial(t *testing.T) {
 		t.Fatalf("unknown serial not flagged error: %+v", res)
 	}
 	out := mcptest.Decode[AIMonitoringOut](t, res)
-	if out.Error == nil || out.Error.Code != module.CodeUnknownSerial ||
-		out.Error.Message != "serial is not configured: NOPE" {
+	if out.Error == nil || out.Error.Code != module.CodeUnknownSerial {
 		t.Fatalf("unknown serial output = %+v", out)
 	}
 	if out.Detection != nil {

@@ -6,6 +6,9 @@ import (
 	"log/slog"
 	"net"
 	"testing"
+	"time"
+
+	mqtt "github.com/eclipse/paho.mqtt.golang"
 
 	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/printer"
@@ -48,6 +51,7 @@ func TestNewListenerFailureReleasesPortAndInjector(t *testing.T) {
 	links := printer.New(cfg.Printers, logger, nil, nil)
 	t.Cleanup(links.Close)
 	table := routing.NewTable([]string{cfg.Printers[0].Serial}, nil)
+	report := fmt.Sprintf("device/%s/report", cfg.Printers[0].Serial)
 
 	srv, err := New(cfg, table, links, inject, logger)
 	if err == nil {
@@ -67,7 +71,8 @@ func TestNewListenerFailureReleasesPortAndInjector(t *testing.T) {
 	_ = probe.Close()
 
 	// A retry with only the valid listener binds it and attaches the
-	// injector only after success.
+	// injector after success: a downstream subscriber receives a report
+	// published through it.
 	cfg.Listen = cfg.Listen[:1]
 	srv2, err := New(cfg, table, links, inject, logger)
 	if err != nil {
@@ -78,6 +83,37 @@ func TestNewListenerFailureReleasesPortAndInjector(t *testing.T) {
 	}
 	if err := srv2.Serve(); err != nil {
 		t.Fatalf("serve retry: %v", err)
+	}
+	received := make(chan string, 1)
+	opts := mqtt.NewClientOptions().
+		AddBroker(fmt.Sprintf("tcp://127.0.0.1:%d", port)).
+		SetClientID("injector-test").
+		SetUsername(cfg.Printers[0].Username).
+		SetPassword(cfg.Printers[0].Password).
+		SetCleanSession(true).
+		SetConnectTimeout(5 * time.Second).
+		SetDefaultPublishHandler(func(_ mqtt.Client, m mqtt.Message) {
+			received <- string(m.Payload())
+		})
+	client := mqtt.NewClient(opts)
+	connect := client.Connect()
+	if !connect.WaitTimeout(5*time.Second) || connect.Error() != nil {
+		t.Fatalf("subscriber connect: %v", connect.Error())
+	}
+	t.Cleanup(func() { client.Disconnect(100) })
+	sub := client.Subscribe(report, 0, nil)
+	if !sub.WaitTimeout(5*time.Second) || sub.Error() != nil {
+		t.Fatalf("subscribe: %v", sub.Error())
+	}
+	const payload = `{"print":{"gcode_state":"RUNNING"}}`
+	inject.PublishDownstream(report, []byte(payload))
+	select {
+	case got := <-received:
+		if got != payload {
+			t.Fatalf("injected payload = %q, want %q", got, payload)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("successful construction did not attach the injector")
 	}
 	if err := srv2.Close(); err != nil {
 		t.Fatalf("close retry: %v", err)

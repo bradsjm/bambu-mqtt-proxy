@@ -47,7 +47,7 @@ func TestWillNeverFansOutOrRetains(t *testing.T) {
 					t.Fatalf("will connect: %v", token.Error())
 				}
 				_ = socket.Close()
-				waitFor(t, 5*time.Second, func() bool { return p.logs.count("will suppressed") == i+1 })
+				waitFor(t, 5*time.Second, func() bool { return p.logs.clientTopic(fmt.Sprintf("will-%d", i), topic) == 1 })
 			}
 			late := connect(t, p, "will-late", "bblp", accessCode, false)
 			if got := late.subscribe(t, reportTopic(serial1), 0); got != 0 {

@@ -4,6 +4,7 @@ import (
 	"bambu-mqtt-proxy/internal/config"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -120,12 +121,12 @@ func TestParseDetectionNumericLookingKey(t *testing.T) {
 	}
 }
 
-// TestEnabledRequiresKeyNamesOnlyTheYAMLKey pins the validation message:
-// it must point at detection.api_key alone, without any variable name.
+// TestEnabledRequiresKeyNamesOnlyTheYAMLKey requires the validation error to
+// name the YAML key detection.api_key.
 func TestEnabledRequiresKeyNamesOnlyTheYAMLKey(t *testing.T) {
 	on := true
 	err := (settingsConfig(Settings{Enabled: &on})).ValidateEffective()
-	if err == nil || err.Error() != "detection: enabled requires an API key (detection.api_key)" {
-		t.Fatalf("ValidateEffective = %v, want the detection.api_key message", err)
+	if err == nil || !strings.Contains(err.Error(), "detection.api_key") {
+		t.Fatalf("ValidateEffective = %v, want the detection.api_key key named", err)
 	}
 }

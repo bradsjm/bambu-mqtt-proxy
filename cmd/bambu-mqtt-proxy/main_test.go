@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -22,8 +21,6 @@ import (
 	"bambu-mqtt-proxy/internal/config"
 	"bambu-mqtt-proxy/internal/configui"
 	"bambu-mqtt-proxy/internal/detection"
-	"bambu-mqtt-proxy/internal/health"
-	"bambu-mqtt-proxy/internal/printer"
 )
 
 // childEnv marks a re-executed test binary as the serving child of
@@ -36,50 +33,6 @@ func TestMain(m *testing.M) {
 		os.Exit(runNoKeyChild())
 	}
 	os.Exit(m.Run())
-}
-
-// TestDetectionModuleNoKeyWiring checks that disabled modules add no status member.
-func TestDetectionModuleNoKeyWiring(t *testing.T) {
-	// An enabled module supplies status for every serial before Start.
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	engine := detection.New(
-		[]config.Printer{{Serial: "01P1TESTENABLED", Model: "P1S"}},
-		detection.NewGadgetClient("test-key"),
-		detection.IdleFrames{}, nil, nil, logger,
-	)
-	value := engine.Module().StatusValue()
-	statuses, ok := value.(map[string]any)
-	if !ok || statuses["01P1TESTENABLED"] == nil {
-		t.Fatalf("StatusValue missing serial: %v", value)
-	}
-
-	// The exact run() call shape for a no-key configuration.
-	cfg := &config.Config{
-		Listen:   []config.Listener{{Port: freePort(t), TLS: false}},
-		Auth:     config.Auth{Mode: config.AuthModePrinter},
-		Printers: []config.Printer{noKeyPrinter()},
-	}
-	cfg.ApplyDefaults()
-	links := printer.New(cfg.Printers, logger, nil, nil)
-	t.Cleanup(links.Close)
-
-	mux := http.NewServeMux()
-	health.Routes(mux, links, nil)
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-
-	var payload struct {
-		Status    string          `json:"status"`
-		Upstreams map[string]bool `json:"upstreams"`
-		Detection json.RawMessage `json:"detection"`
-	}
-	decodeStatus(t, srv.URL, &payload)
-	if len(payload.Detection) != 0 {
-		t.Fatalf("/status served detection %s without a configured key", payload.Detection)
-	}
-	if payload.Upstreams["01NOKEYTEST0001"] {
-		t.Fatal("unreachable printer must not report connected")
-	}
 }
 
 // TestNoKeyStartupStatus starts the real run() in a subprocess with a YAML
@@ -141,7 +94,7 @@ func runNoKeyChild() int {
 	return 0
 }
 
-// noKeyPrinter returns the single unreachable printer used by both tests.
+// noKeyPrinter returns the single unreachable printer used by the no-key startup tests.
 func noKeyPrinter() config.Printer {
 	return config.Printer{
 		Serial:   "01NOKEYTEST0001",

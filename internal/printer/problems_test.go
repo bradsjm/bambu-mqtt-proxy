@@ -3,6 +3,7 @@ package printer
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -97,12 +98,13 @@ func TestProblemsVisibility(t *testing.T) {
 		severity string
 	}{{0x03004001, "error"}, {0x03008001, "warning"}, {0x0300C001, "info"}, {0x03001001, "error"}} {
 		got := Problems(problemDoc(tc.code), problemSerial, snap)
-		if len(got) != 1 || got[0].Severity != tc.severity || !strings.HasSuffix(got[0].Message, "has no text for this code.") {
+		display := fmt.Sprintf("%04X-%04X", tc.code>>16, tc.code&0xFFFF)
+		if len(got) != 1 || got[0].Severity != tc.severity || !strings.Contains(got[0].Message, display) {
 			t.Fatalf("missing screen %08X = %+v", tc.code, got)
 		}
 	}
 	loading := Problems(problemDoc(0x07008004, health), problemSerial, hmscodes.Snapshot{})
-	if len(loading) != 1 || len(loading[0].Codes) != 2 || loading[0].Severity != "error" || loading[0].Message != "Printer reported code 0700-8004. Bambu's message list for this printer is still downloading." {
+	if len(loading) != 1 || len(loading[0].Codes) != 2 || loading[0].Severity != "error" || !strings.Contains(loading[0].Message, "0700-8004") {
 		t.Fatalf("loading = %+v", loading)
 	}
 	for _, tc := range []struct {
@@ -167,9 +169,8 @@ func TestProblemsFailedCatalog(t *testing.T) {
 		t.Fatalf("failed projection = %+v", got)
 	}
 	for _, code := range got[0].Codes {
-		want := "Printer reported code " + code.Code + ". Bambu's message list for this printer could not be downloaded: " + lookup.Err
-		if code.Message != want {
-			t.Fatalf("failed message = %q, want %q", code.Message, want)
+		if !strings.Contains(code.Message, code.Code) || !strings.Contains(code.Message, lookup.Err) {
+			t.Fatalf("failed message = %q, want code %q and error %q", code.Message, code.Code, lookup.Err)
 		}
 	}
 }
@@ -234,7 +235,9 @@ func TestOneEntryPerFault(t *testing.T) {
 				t.Fatalf("entries = %+v", entries)
 			}
 			if tc.name == "together" {
-				if entries[1].Message != "Printer error: "+retractionMessage+" (0700-8004, 0700-7000-0002-0004)" || entries[1].URL != hmscodes.HMSURL(problemSerial, 117469184, 131076) {
+				if !strings.Contains(entries[1].Message, "0700-8004") ||
+					!strings.Contains(entries[1].Message, "0700-7000-0002-0004") ||
+					entries[1].URL != hmscodes.HMSURL(problemSerial, 117469184, 131076) {
 					t.Fatalf("announcement = %+v", entries[1])
 				}
 			}
@@ -277,12 +280,22 @@ func TestProblemReplacementAndSeverity(t *testing.T) {
 		current := []Problem{{Severity: severity, Message: "New condition", URL: "new", Codes: []ProblemCode{{Code: "0300-0002", Source: "screen"}}}}
 		doc := Doc{"print": map[string]any{"gcode_state": "RUNNING"}}
 		got := Transitions(doc, doc, old, current)
-		want := []Transition{
-			{"printer_problem", severity, "Printer " + severity + ": New condition (0300-0002)", "new"},
-			{"problem_resolved", "info", "Problem resolved: Old condition (0300-0001)", "old"},
+		want := []struct {
+			kind     string
+			severity string
+			url      string
+			code     string
+		}{
+			{"printer_problem", severity, "new", "0300-0002"},
+			{"problem_resolved", "info", "old", "0300-0001"},
 		}
-		if !reflect.DeepEqual(got, want) {
-			t.Fatalf("%s replacement = %+v, want %+v", severity, got, want)
+		if len(got) != len(want) {
+			t.Fatalf("%s replacement = %+v, want %d transitions", severity, got, len(want))
+		}
+		for i, w := range want {
+			if got[i].Kind != w.kind || got[i].Severity != w.severity || got[i].URL != w.url || !strings.Contains(got[i].Message, w.code) {
+				t.Fatalf("%s transition %d = %+v, want kind %q severity %q url %q code %q", severity, i, got[i], w.kind, w.severity, w.url, w.code)
+			}
 		}
 	}
 }

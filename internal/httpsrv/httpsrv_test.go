@@ -56,7 +56,9 @@ func TestStopEndsStreamingHandlers(t *testing.T) {
 	}
 
 	first := []byte("data: hello\n\n")
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		fmt.Sprintf("http://127.0.0.1:%d/events", port), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -111,12 +113,23 @@ func TestStopForceClosesHandlerIgnoringContext(t *testing.T) {
 		resp *http.Response
 		err  error
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		fmt.Sprintf("http://127.0.0.1:%d/stuck", port), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	res := make(chan result, 1)
 	go func() {
-		resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/stuck", port))
+		resp, err := http.DefaultClient.Do(req)
 		res <- result{resp: resp, err: err}
 	}()
-	<-entered
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stuck handler was not entered")
+	}
 
 	started := time.Now()
 	s.Stop()

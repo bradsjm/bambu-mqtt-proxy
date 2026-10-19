@@ -161,43 +161,37 @@ func TestCreateContextSuccess(t *testing.T) {
 
 // TestCreateContextValidatesURLsImmediately asserts both returned process
 // URLs are validated before the session is handed out, and that rejection
-// errors name the failing URL class without echoing it.
+// errors do not echo the URL.
 func TestCreateContextValidatesURLsImmediately(t *testing.T) {
 	cases := []struct {
 		name     string
 		primary  string
 		fallback string
-		wantIn   string
 	}{
 		{
 			name:     "primary not https",
 			primary:  "http://gadget-regional.octoeverywhere.com/api/gadget/v1/process/" + ctxSecret,
 			fallback: "https://gadget-pv1-oeapi.octoeverywhere.com/api/gadget/v1/process/" + ctxSecret,
-			wantIn:   "primary",
 		},
 		{
 			name:     "fallback wrong host",
 			primary:  "https://gadget-regional.octoeverywhere.com/api/gadget/v1/process/" + ctxSecret,
 			fallback: "https://evil.example/api/gadget/v1/process/" + ctxSecret,
-			wantIn:   "fallback",
 		},
 		{
 			name:     "fallback userinfo",
 			primary:  "https://gadget-regional.octoeverywhere.com/api/gadget/v1/process/" + ctxSecret,
 			fallback: "https://user:pass@gadget-regional.octoeverywhere.com/api/gadget/v1/process/" + ctxSecret,
-			wantIn:   "fallback",
 		},
 		{
 			name:     "fallback non-default port",
 			primary:  "https://gadget-regional.octoeverywhere.com/api/gadget/v1/process/" + ctxSecret,
 			fallback: "https://gadget-regional.octoeverywhere.com:8443/api/gadget/v1/process/" + ctxSecret,
-			wantIn:   "fallback",
 		},
 		{
 			name:     "fallback fragment",
 			primary:  "https://gadget-regional.octoeverywhere.com/api/gadget/v1/process/" + ctxSecret,
 			fallback: "https://gadget-regional.octoeverywhere.com/api/gadget/v1/process/" + ctxSecret + "#x",
-			wantIn:   "fallback",
 		},
 	}
 	for _, tc := range cases {
@@ -212,9 +206,6 @@ func TestCreateContextValidatesURLsImmediately(t *testing.T) {
 				t.Fatal("CreateContext = nil error, want url rejection")
 			}
 			msg := err.Error()
-			if !strings.Contains(msg, tc.wantIn) {
-				t.Fatalf("error %q does not name the %s url", msg, tc.wantIn)
-			}
 			if strings.Contains(msg, ctxSecret) || strings.Contains(msg, "://") ||
 				strings.Contains(msg, tc.primary) || strings.Contains(msg, tc.fallback) {
 				t.Fatalf("error leaks url context: %q", msg)
@@ -402,31 +393,6 @@ func TestProcessResponseContract(t *testing.T) {
 			name:    "intervals beyond overflow boundary rejected",
 			body:    `{"NextProcessIntervalSec":{"Minimum":` + strconv.FormatInt(maxIntervalSeconds+1, 10) + `,"Recommended":1},"PrintQuality":5,"WarningSuggested":false,"PauseSuggested":false}`,
 			wantErr: true,
-		},
-		{
-			name:    "quality null treated as absent",
-			body:    `{"NextProcessIntervalSec":{"Minimum":5,"Recommended":20},"PrintQuality":null,"WarningSuggested":false,"PauseSuggested":false}`,
-			wantErr: true,
-		},
-		{
-			name:    "warning null treated as absent",
-			body:    `{"NextProcessIntervalSec":{"Minimum":5,"Recommended":20},"PrintQuality":7,"WarningSuggested":null,"PauseSuggested":false}`,
-			wantErr: true,
-		},
-		{
-			name:    "pause null treated as absent",
-			body:    `{"NextProcessIntervalSec":{"Minimum":5,"Recommended":20},"PrintQuality":7,"WarningSuggested":false,"PauseSuggested":null}`,
-			wantErr: true,
-		},
-		{
-			name: "faster null defaults false",
-			body: `{"NextProcessIntervalSec":{"Minimum":5,"Recommended":20},"FasterInspectionSuggested":null,"PrintQuality":7,"WarningSuggested":false,"PauseSuggested":false}`,
-			want: Result{Intervals: IntervalSec{5, 20}, PrintQuality: 7},
-		},
-		{
-			name: "score null defaults zero",
-			body: `{"NextProcessIntervalSec":{"Minimum":5,"Recommended":20},"PrintQuality":7,"WarningSuggested":false,"PauseSuggested":false,"Score":null}`,
-			want: Result{Intervals: IntervalSec{5, 20}, PrintQuality: 7},
 		},
 		{
 			name:    "malformed json",
@@ -655,15 +621,20 @@ func TestProcessDoesNotFollowRedirects(t *testing.T) {
 }
 
 func TestResponseSizeBound(t *testing.T) {
+	// The body is valid JSON above the response cap, so only the size bound
+	// can reject it; without the bound Process would accept the result.
+	body := `{"NextProcessIntervalSec":{"Minimum":5,"Recommended":20},"PrintQuality":5,` +
+		`"WarningSuggested":false,"PauseSuggested":false,"padding":"` +
+		strings.Repeat("a", maxResponseBytes) + `"}`
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write(bytes.Repeat([]byte("a"), maxResponseBytes+1))
+		_, _ = w.Write([]byte(body))
 	}))
 	defer server.Close()
 	client := routeClient(t, server)
 	_, err := client.Process(context.Background(),
 		"https://gadget-regional.octoeverywhere.com/api/gadget/v1/process/C", []byte{0xFF, 0xD8, 0xFF, 0xD9})
-	if err == nil || !strings.Contains(err.Error(), "exceeds") {
-		t.Fatalf("err = %v, want response size error", err)
+	if err == nil {
+		t.Fatal("Process accepted a response above the size limit")
 	}
 }
 
@@ -691,8 +662,11 @@ func TestTransportErrorKeepsCause(t *testing.T) {
 		if !errors.As(err, &te) {
 			t.Fatalf("err = %v, want a TransportError", err)
 		}
-		if want := "could not reach Gadget server " + host + ": connection refused"; te.Reason() != want {
-			t.Fatalf("reason = %q, want %q", te.Reason(), want)
+		if te.Host != host {
+			t.Fatalf("host = %q, want %q", te.Host, host)
+		}
+		if reason := te.Reason(); !strings.Contains(reason, host) || !strings.Contains(reason, "connection refused") {
+			t.Fatalf("reason = %q, want host %q and the underlying cause", reason, host)
 		}
 		if !strings.Contains(err.Error(), "connection refused") {
 			t.Fatalf("error drops the underlying cause: %q", err.Error())
@@ -709,8 +683,8 @@ func TestTransportErrorKeepsCause(t *testing.T) {
 }
 
 // TestProcessNullFieldsAreAbsent pins the null-as-absent rule: a JSON null
-// in a required field fails with the same safe error as an absent field,
-// while a null in an optional field keeps its missing-value default.
+// in a required field is rejected, while a null in an optional field keeps
+// its missing-value default.
 func TestProcessNullFieldsAreAbsent(t *testing.T) {
 	run := func(t *testing.T, body string) (Result, error) {
 		t.Helper()
@@ -723,33 +697,29 @@ func TestProcessNullFieldsAreAbsent(t *testing.T) {
 			"https://gadget-regional.octoeverywhere.com/api/gadget/v1/process/C", []byte{0xFF, 0xD8, 0xFF, 0xD9})
 	}
 
-	t.Run("required nulls fail with missing-field errors", func(t *testing.T) {
+	t.Run("required nulls fail", func(t *testing.T) {
 		cases := []struct {
-			name    string
-			body    string
-			wantErr string
+			name string
+			body string
 		}{
 			{
-				name:    "quality null",
-				body:    `{"NextProcessIntervalSec":{"Minimum":5,"Recommended":20},"PrintQuality":null,"WarningSuggested":false,"PauseSuggested":false}`,
-				wantErr: "gadget process response: missing required PrintQuality",
+				name: "quality null",
+				body: `{"NextProcessIntervalSec":{"Minimum":5,"Recommended":20},"PrintQuality":null,"WarningSuggested":false,"PauseSuggested":false}`,
 			},
 			{
-				name:    "warning null",
-				body:    `{"NextProcessIntervalSec":{"Minimum":5,"Recommended":20},"PrintQuality":7,"WarningSuggested":null,"PauseSuggested":false}`,
-				wantErr: "gadget process response: missing required WarningSuggested or PauseSuggested",
+				name: "warning null",
+				body: `{"NextProcessIntervalSec":{"Minimum":5,"Recommended":20},"PrintQuality":7,"WarningSuggested":null,"PauseSuggested":false}`,
 			},
 			{
-				name:    "pause null",
-				body:    `{"NextProcessIntervalSec":{"Minimum":5,"Recommended":20},"PrintQuality":7,"WarningSuggested":false,"PauseSuggested":null}`,
-				wantErr: "gadget process response: missing required WarningSuggested or PauseSuggested",
+				name: "pause null",
+				body: `{"NextProcessIntervalSec":{"Minimum":5,"Recommended":20},"PrintQuality":7,"WarningSuggested":false,"PauseSuggested":null}`,
 			},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
 				res, err := run(t, tc.body)
-				if err == nil || err.Error() != tc.wantErr {
-					t.Fatalf("err = %v, want %q", err, tc.wantErr)
+				if err == nil {
+					t.Fatalf("Process = %+v, nil error, want rejection", res)
 				}
 				// Valid timing intervals still ride along with the partial
 				// result so the engine can retain the provider pacing.

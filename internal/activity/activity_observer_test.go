@@ -23,16 +23,15 @@ func TestObserverReceivesRecordedEntries(t *testing.T) {
 
 	log.Record("S1", "print_finished", Info, "done")
 	log.Record("unknown", "printer_problem", Error, "ignored")
-	if len(calls) != 1 {
-		t.Fatalf("observer calls = %d, want 1", len(calls))
-	}
-	if calls[0].serial != "S1" || calls[0].e.Kind != "print_finished" ||
-		calls[0].e.Severity != Info || calls[0].e.Message != "done" || calls[0].e.ID == 0 {
-		t.Fatalf("observer call = %+v", calls[0])
+	if len(calls) != 1 || calls[0].serial != "S1" {
+		t.Fatalf("observer calls = %+v, want one call for S1", calls)
 	}
 	stored := log.Recent("S1")[0]
-	if calls[0].e.ID != stored.ID || !calls[0].e.Time.Equal(stored.Time) {
-		t.Fatalf("observer entry %+v differs from stored %+v", calls[0].e, stored)
+	observed := calls[0].e
+	if observed.ID == 0 || observed.ID != stored.ID || !observed.Time.Equal(stored.Time) ||
+		observed.Kind != stored.Kind || observed.Severity != stored.Severity ||
+		observed.Message != stored.Message || observed.URL != stored.URL {
+		t.Fatalf("observer entry %+v differs from stored %+v", observed, stored)
 	}
 
 	// A nil function clears the observer.

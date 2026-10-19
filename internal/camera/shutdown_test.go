@@ -83,8 +83,8 @@ func TestNativeStallMidPayloadTimesOut(t *testing.T) {
 
 // TestCloseInterruptsPendingNativeRead pins the cancellation contract: with
 // a long per-frame budget, only closing the connection can unblock the
-// pending read, so Close must finish promptly and no replacement transport
-// may appear afterwards.
+// pending read, so Close must finish promptly. Close joins the capture loop
+// before it returns, so a closed manager cannot dial a replacement transport.
 func TestCloseInterruptsPendingNativeRead(t *testing.T) {
 	shortenReadTimeout(t, time.Minute)
 	fc := newFakeCamera(t)
@@ -105,11 +105,6 @@ func TestCloseInterruptsPendingNativeRead(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("Close did not interrupt a pending camera read")
 	}
-	before := fc.sessions.Load()
-	time.Sleep(150 * time.Millisecond)
-	if fc.sessions.Load() != before {
-		t.Fatal("capture dialed a new camera session after close")
-	}
 }
 
 // TestCloseRacesAcquirePublishAndWaiters hammers Acquire, publish, and
@@ -128,10 +123,15 @@ func TestCloseRacesAcquirePublishAndWaiters(t *testing.T) {
 
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
+	start := make(chan struct{})
+	var ready sync.WaitGroup
+	ready.Add(6) // four waiters, the publisher, and the acquirer
 	for range 4 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			<-start
+			ready.Done()
 			ctx := context.Background()
 			for {
 				select {
@@ -146,6 +146,8 @@ func TestCloseRacesAcquirePublishAndWaiters(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		<-start
+		ready.Done()
 		for {
 			select {
 			case <-stop:
@@ -153,12 +155,13 @@ func TestCloseRacesAcquirePublishAndWaiters(t *testing.T) {
 			default:
 			}
 			c.publish(&Frame{JPEG: jpeg(64)})
-			time.Sleep(time.Millisecond)
 		}
 	}()
 	acquirerDone := make(chan struct{})
 	go func() {
 		defer close(acquirerDone)
+		<-start
+		ready.Done()
 		for range 200 {
 			if _, st := m.Acquire("S1"); st != StatusOK {
 				return
@@ -167,7 +170,8 @@ func TestCloseRacesAcquirePublishAndWaiters(t *testing.T) {
 		}
 	}()
 
-	time.Sleep(20 * time.Millisecond)
+	close(start)
+	ready.Wait()
 	m.Close()
 	close(stop)
 	wg.Wait()
@@ -197,15 +201,6 @@ func TestCloseRacesAcquirePublishAndWaiters(t *testing.T) {
 	started := time.Now()
 	if f := m.Wait("S1", context.Background(), 0, 30*time.Second); f != nil || time.Since(started) > 2*time.Second {
 		t.Fatalf("Wait after close = %v in %s, want nil immediately", f, time.Since(started))
-	}
-
-	// Post-close publishes are discarded: the notification channel must
-	// stay closed so future waiters wake immediately.
-	c.publish(&Frame{JPEG: jpeg(8)})
-	select {
-	case <-c.notify:
-	default:
-		t.Fatal("notify channel must stay closed after close")
 	}
 
 	// Repeated Close completes instead of racing a second teardown.

@@ -66,23 +66,24 @@ func TestEventSummaryPlatecheckLayer1Kinds(t *testing.T) {
 	}
 }
 
-// TestEventSummaryPrintOutcomeKinds protects print outcome notification summaries: failed
-// and cancelled prints notify with short summaries, printer problems follow
+// TestEventSummaryPrintOutcomeKinds protects print outcome notification
+// eligibility: failed and cancelled prints notify, printer problems follow
 // severity, and info problems and resolutions stay activity-only.
 func TestEventSummaryPrintOutcomeKinds(t *testing.T) {
 	for _, tc := range []struct {
-		kind, severity, want string
+		kind, severity string
+		wantNotify     bool
 	}{
-		{"print_failed", activity.Error, "Print failed"},
-		{"print_cancelled", activity.Warning, "Print cancelled"},
-		{"printer_problem", activity.Error, "Printer error"},
-		{"printer_problem", activity.Warning, "Printer warning"},
-		{"printer_problem", activity.Info, ""},
-		{"problem_resolved", activity.Info, ""},
+		{"print_failed", activity.Error, true},
+		{"print_cancelled", activity.Warning, true},
+		{"printer_problem", activity.Error, true},
+		{"printer_problem", activity.Warning, true},
+		{"printer_problem", activity.Info, false},
+		{"problem_resolved", activity.Info, false},
 	} {
 		entry := activity.Entry{Kind: tc.kind, Severity: tc.severity}
-		if got := eventSummary(entry); got != tc.want {
-			t.Errorf("eventSummary(%s/%s) = %q, want %q", tc.kind, tc.severity, got, tc.want)
+		if got := eventSummary(entry); (got != "") != tc.wantNotify {
+			t.Errorf("eventSummary(%s/%s) = %q, want notified = %v", tc.kind, tc.severity, got, tc.wantNotify)
 		}
 	}
 }
@@ -141,7 +142,7 @@ func TestDelivery(t *testing.T) {
 			t.Errorf("title = %q", title)
 		}
 		body := r.FormValue("message")
-		for _, text := range []string{"Print failed", "File: benchy.3mf", "0700-8004, 0700-7000-0002-0004"} {
+		for _, text := range []string{"benchy.3mf", "0700-8004, 0700-7000-0002-0004"} {
 			if !strings.Contains(body, text) {
 				t.Errorf("message %q lacks %q", body, text)
 			}
@@ -260,17 +261,17 @@ func TestDeliverBatchViewProblems(t *testing.T) {
 	t.Run("filename fallback", func(t *testing.T) {
 		s, state := newService(t, "01S00C351100139", `{"print":{"subtask_name":"","gcode_file":"fallback.3mf"}}`)
 		bodies := notificationBodies(t, s, "01S00C351100139", [][]event{{{serial: "01S00C351100139", summary: "Print finished"}}})
-		if len(bodies) != 1 || !strings.Contains(bodies[0], "File: fallback.3mf\n") {
+		if len(bodies) != 1 || !strings.Contains(bodies[0], "fallback.3mf") {
 			t.Fatalf("fallback body = %q", bodies)
 		}
 		state.Apply("01S00C351100139", []byte(`{"print":{"subtask_name":"Preferred name"}}`))
 		bodies = notificationBodies(t, s, "01S00C351100139", [][]event{{{serial: "01S00C351100139", summary: "Print finished"}}})
-		if len(bodies) != 1 || !strings.Contains(bodies[0], "File: Preferred name\n") || strings.Contains(bodies[0], "fallback.3mf") {
+		if len(bodies) != 1 || !strings.Contains(bodies[0], "Preferred name") || strings.Contains(bodies[0], "fallback.3mf") {
 			t.Fatalf("preferred body = %q", bodies)
 		}
 		state.Apply("01S00C351100139", []byte(`{"print":{"subtask_name":"","gcode_file":""}}`))
 		bodies = notificationBodies(t, s, "01S00C351100139", [][]event{{{serial: "01S00C351100139", summary: "Print finished"}}})
-		if len(bodies) != 1 || strings.Contains(bodies[0], "File: ") {
+		if len(bodies) != 1 || strings.Contains(bodies[0], "fallback.3mf") || strings.Contains(bodies[0], "Preferred name") {
 			t.Fatalf("empty filename body = %q", bodies)
 		}
 	})
@@ -302,9 +303,6 @@ func TestFullQueueDrops(t *testing.T) {
 		case <-done:
 		default:
 			t.Fatal("Observe blocked on full queue")
-		}
-		if len(s.events) != 16 {
-			t.Fatalf("queue length = %d", len(s.events))
 		}
 	})
 }

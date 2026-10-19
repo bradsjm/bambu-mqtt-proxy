@@ -59,7 +59,8 @@ func TestBootOfflineWildcardAndReconnect(t *testing.T) {
 	}
 	client := connect(t, p, "boot-wildcard", "bblp", accessCode, false)
 	client.publish(t, requestTopic(serial2), "OFFLINE-DO-NOT-REPLAY", 0, false)
-	waitFor(t, 5*time.Second, func() bool { return p.logs.count("printer request dropped while offline") == 1 })
+	// The SUBACK below is the ordering barrier: mochi processes this client's
+	// PUBLISH before the following SUBSCRIBE on the same connection.
 	if got := client.subscribe(t, "device/+/report", 0); got != 0 {
 		t.Fatalf("wildcard SUBACK with offline printer = %#x", got)
 	}
@@ -94,7 +95,12 @@ func TestBootOfflineWildcardAndReconnect(t *testing.T) {
 func TestRefusedSubscriptionRetriesOnOpenConnection(t *testing.T) {
 	fp := newFakePrinter(t, freePort(t), true)
 	p := startProxy(t, []config.Printer{printerSpec(fp.port, serial1)})
-	waitFor(t, 5*time.Second, func() bool { return p.logs.count("printer report subscription refused") == 1 })
+	// The recorder sees the refused SUBSCRIBE attempt on the open connection.
+	waitFor(t, 5*time.Second, func() bool {
+		fp.rec.mu.Lock()
+		defer fp.rec.mu.Unlock()
+		return fp.rec.subs[reportTopic(serial1)] >= 1
+	})
 	if p.links.Online(serial1) || fp.rec.count(requestTopic(serial1), warmupPayload()) != 0 {
 		t.Fatal("refused subscription became online or sent pushall")
 	}

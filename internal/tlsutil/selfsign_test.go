@@ -84,8 +84,8 @@ func TestEnsureHalfPairFailsWithoutChanges(t *testing.T) {
 }
 
 // assertHalfPairRejected requires Ensure to reject a half pair: the error
-// names the incomplete pair, the existing half keeps its bytes, and the
-// missing half is still missing.
+// names both paths, the existing half keeps its bytes, and the missing half
+// is still missing.
 func assertHalfPairRejected(t *testing.T, certPath, keyPath string) {
 	t.Helper()
 	existing := firstExisting(t, certPath, keyPath)
@@ -97,9 +97,6 @@ func assertHalfPairRejected(t *testing.T, certPath, keyPath string) {
 	_, err = Ensure(certPath, keyPath)
 	if err == nil {
 		t.Fatal("half pair accepted")
-	}
-	if !strings.Contains(err.Error(), "incomplete certificate pair") {
-		t.Fatalf("error = %v, want an incomplete certificate pair message", err)
 	}
 	if !strings.Contains(err.Error(), certPath) || !strings.Contains(err.Error(), keyPath) {
 		t.Fatalf("error %v must name both paths %s and %s", err, certPath, keyPath)

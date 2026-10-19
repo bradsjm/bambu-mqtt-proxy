@@ -55,6 +55,12 @@ func TestSendPostsMultipartMessage(t *testing.T) {
 		Provider: "pushover",
 		Pushover: Pushover{AppToken: " app-token ", UserKey: " user-key "},
 	}
+	// Pushover's documented title and message limits.
+	// https://pushover.net/api#limits
+	const (
+		pushoverTitleLimit   = 250
+		pushoverMessageLimit = 1024
+	)
 	longTitle := strings.Repeat("t", 300)
 	longBody := strings.Repeat("m", 2000)
 	jpeg := []byte{0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3}
@@ -64,11 +70,11 @@ func TestSendPostsMultipartMessage(t *testing.T) {
 	if gotFields["token"] != "app-token" || gotFields["user"] != "user-key" {
 		t.Fatalf("credentials = %+v", gotFields)
 	}
-	if gotFields["title"] != strings.Repeat("t", maxTitleRunes) {
-		t.Fatalf("title length = %d, want %d", len([]rune(gotFields["title"])), maxTitleRunes)
+	if gotFields["title"] != strings.Repeat("t", pushoverTitleLimit) {
+		t.Fatalf("title length = %d, want %d", len([]rune(gotFields["title"])), pushoverTitleLimit)
 	}
-	if gotFields["message"] != strings.Repeat("m", maxMessageRunes) {
-		t.Fatalf("message length = %d, want %d", len([]rune(gotFields["message"])), maxMessageRunes)
+	if gotFields["message"] != strings.Repeat("m", pushoverMessageLimit) {
+		t.Fatalf("message length = %d, want %d", len([]rune(gotFields["message"])), pushoverMessageLimit)
 	}
 	if gotDisposition != `form-data; name="attachment"; filename="snapshot.jpg"` || gotType != "image/jpeg" {
 		t.Fatalf("attachment header = %q %q", gotDisposition, gotType)
@@ -100,7 +106,7 @@ func TestSendStatusZeroReturnsErrorWithoutCredentials(t *testing.T) {
 	}
 }
 
-// TestSendHTTPErrorReturnsSafeError pins the non-200 wording and that no
+// TestSendHTTPErrorReturnsSafeError pins the non-200 status and that no
 // response body reaches the caller.
 func TestSendHTTPErrorReturnsSafeError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -112,8 +118,8 @@ func TestSendHTTPErrorReturnsSafeError(t *testing.T) {
 	cfg := Settings{Provider: "pushover",
 		Pushover: Pushover{AppToken: "secret-token", UserKey: "secret-user"}}
 	err := Send(context.Background(), cfg, "title", "body", []byte{1})
-	if err == nil || err.Error() != "pushover rejected the notification (HTTP 502)" {
-		t.Fatalf("Send error = %v", err)
+	if err == nil || !strings.Contains(err.Error(), "502") {
+		t.Fatalf("Send error = %v, want an HTTP 502 rejection", err)
 	}
 	if strings.Contains(err.Error(), "secret-response-body") {
 		t.Fatalf("error leaks the response body: %v", err)

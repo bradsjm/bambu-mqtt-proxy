@@ -2,9 +2,14 @@ package pandapwr
 
 import (
 	"bambu-mqtt-proxy/internal/config"
+	"context"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 )
 
 // logger returns a quiet logger.
@@ -28,14 +33,45 @@ func TestAddressSettingValidate(t *testing.T) {
 }
 
 // TestNewBuildsHTTPHostTarget requires New to build the http:// base from a
-// bare host name instead of trimming a stored URL.
+// bare host name instead of trimming a stored URL. The target is observed
+// through a real poll request.
 func TestNewBuildsHTTPHostTarget(t *testing.T) {
+	type poll struct{ host, path string }
+	polls := make(chan poll, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case polls <- poll{host: r.Host, path: r.URL.Path}:
+		default:
+		}
+		_, _ = w.Write([]byte(`{"power":12}`))
+	}))
+	defer srv.Close()
+	addr := strings.TrimPrefix(srv.URL, "http://")
 	s := New([]config.Printer{{Serial: "S1",
-		Settings: map[string]any{AddressKey: "192.168.4.1"}}}, logger())
-	if len(s.targets) != 1 || s.targets[0].addr != "http://192.168.4.1" {
-		t.Fatalf("targets = %+v, want S1 at http://192.168.4.1", s.targets)
+		Settings: map[string]any{AddressKey: addr}}}, logger())
+	state, ok := s.Module().State("S1").(ModuleState)
+	if !ok || state.Link != LinkOffline {
+		t.Fatalf("configured state = %+v, want offline", s.Module().State("S1"))
 	}
-	if s.moduleState("S1") == nil {
-		t.Fatal("configured printer returned no state")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- s.Run(ctx) }()
+	select {
+	case got := <-polls:
+		if got.host != addr || got.path != "/update_ele_data" {
+			t.Fatalf("poll = %+v, want host %q at /update_ele_data", got, addr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no poll request arrived")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Panda Power Run did not return after cancel")
 	}
 }

@@ -237,7 +237,7 @@ func startProxyAuth(t *testing.T, mode string, printers []config.Printer) *proxy
 	}
 	healthPort := freePort(t)
 
-	logs := &testLogs{seen: make(map[string]int), online: make(map[string][]bool)}
+	logs := &testLogs{seen: make(map[string]int), clientTopics: make(map[string]int), online: make(map[string][]bool)}
 	logger := slog.New(logs)
 	serials := make([]string, 0, len(printers))
 	aliases := make(map[string]string, len(printers))
@@ -401,9 +401,11 @@ func waitFor(t *testing.T, timeout time.Duration, fn func() bool) {
 
 // testLogs records lifecycle messages as bounded-wait observations.
 type testLogs struct {
-	mu     sync.Mutex
-	seen   map[string]int
-	online map[string][]bool
+	mu   sync.Mutex
+	seen map[string]int
+	// clientTopics counts records that carry both client and topic attributes, keyed by "client|topic".
+	clientTopics map[string]int
+	online       map[string][]bool
 }
 
 // Enabled enables diagnostic lifecycle observations.
@@ -411,8 +413,21 @@ func (*testLogs) Enabled(context.Context, slog.Level) bool { return true }
 
 // Handle records the message without storing credentials or packet contents.
 func (l *testLogs) Handle(_ context.Context, record slog.Record) error {
+	var client, topic string
+	record.Attrs(func(a slog.Attr) bool {
+		switch a.Key {
+		case "client":
+			client = a.Value.String()
+		case "topic":
+			topic = a.Value.String()
+		}
+		return true
+	})
 	l.mu.Lock()
 	l.seen[record.Message]++
+	if client != "" && topic != "" {
+		l.clientTopics[client+"|"+topic]++
+	}
 	l.mu.Unlock()
 	signalObservation()
 	return nil
@@ -429,6 +444,13 @@ func (l *testLogs) count(message string) int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.seen[message]
+}
+
+// clientTopic reports how many records named both client and topic.
+func (l *testLogs) clientTopic(client, topic string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.clientTopics[client+"|"+topic]
 }
 
 // freePort reserves an ephemeral port for the test.

@@ -45,7 +45,7 @@ func TestCameraFramesStrictPostTriggerAndImmutableBytes(t *testing.T) {
 		{JPEG: data, Seq: 6, Captured: boundary}, {JPEG: data, Seq: 7, Captured: boundary.Add(time.Millisecond)},
 	}}
 	frame, err := (cameraFrames{m: f}).Capture(context.Background(), "01S1", boundary)
-	if err != nil || frame.Seq != 7 || frame.Width != 8 || frame.Height != 6 || &frame.JPEG[0] != &data[0] {
+	if err != nil || frame.Seq != 7 || frame.Width != 8 || frame.Height != 6 {
 		t.Fatalf("frame %+v err %v", frame, err)
 	}
 	if f.acquired != 1 || f.released != 1 || len(f.after) != 2 || f.after[0] != 5 || f.after[1] != 6 {

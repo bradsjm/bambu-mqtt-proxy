@@ -38,21 +38,24 @@ func TestFirstLayerFiveQuestionsTwoOriginalImages(t *testing.T) {
 			if q.Type != "noul" {
 				t.Fatalf("missing noul %s", key)
 			}
-			for _, exclusion := range []string{"plate texture", "plate markings", "reflections", "brim", "skirt", "purge lines", "designed holes", "toolhead", "normal thin strings", "expected footprint"} {
+			for _, exclusion := range []string{"plate texture", "plate markings", "reflections", "brim", "skirt", "purge lines", "designed holes", "printer toolhead itself", "normal thin strings", "visible expected footprint"} {
 				if !strings.Contains(q.Instructions, exclusion) {
 					t.Errorf("%s misses %s", key, exclusion)
 				}
 			}
 		}
 		for _, key := range []string{"filament_tangled", "part_detached", "nozzle_blob", "layer_incomplete"} {
-			if !strings.Contains(in.Questions[key].Instructions, "Use direct visible evidence only. Do not infer a defect or its absence in areas hidden by the toolhead.") {
+			if !strings.Contains(in.Questions[key].Instructions, "direct visible evidence only") {
 				t.Errorf("%s misses the visible-evidence rule", key)
 			}
+			if !strings.Contains(in.Questions[key].Instructions, "areas hidden by the toolhead") {
+				t.Errorf("%s misses the hidden-area safeguard", key)
+			}
 		}
-		if !strings.Contains(in.Questions["layer_incomplete"].Instructions, "Areas hidden by the toolhead are not evidence of missing material.") {
+		if !strings.Contains(in.Questions["layer_incomplete"].Instructions, "not evidence of missing material") {
 			t.Error("layer_incomplete treats hidden areas as missing material")
 		}
-		if v := in.Questions["view_assessable"]; !strings.Contains(v.Instructions, "Partial toolhead occlusion alone does not make the views unassessable.") || !strings.Contains(v.Criteria["true"], "even if the toolhead hides another area") {
+		if v := in.Questions["view_assessable"]; !strings.Contains(v.Instructions, "Partial toolhead occlusion alone") || !strings.Contains(v.Criteria["true"], "even if the toolhead hides another area") {
 			t.Errorf("view_assessable ignores partial occlusion: %+v", v)
 		}
 		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"success":true,"result":` + layerJSON() + `}`)), Header: make(http.Header)}, nil
